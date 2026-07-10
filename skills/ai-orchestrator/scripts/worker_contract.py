@@ -134,9 +134,23 @@ def _resolve_repo_file(repo: Path, value: str, field: str, issues: list[Contract
     return resolved
 
 
+def _normalize_authorized_entry(raw_entry: str) -> str:
+    # Plan authors commonly write `` `path/to/file.py` (new file) `` — an
+    # inline-code span followed by a trailing annotation. str.strip("`")
+    # only trims from the very ends of the string, so it cannot remove a
+    # closing backtick that isn't the last character. Extract the inline
+    # code span explicitly when present; only fall back to raw stripping
+    # for plain (non-backtick-wrapped) entries.
+    stripped = raw_entry.strip()
+    match = re.match(r"`([^`]+)`", stripped)
+    if match:
+        return match.group(1).strip().rstrip(".")
+    return stripped.strip("`").rstrip(".")
+
+
 def _authorized(relative_path: str, entries: list[str]) -> bool:
     for raw_entry in entries:
-        entry = raw_entry.strip().strip("`").rstrip(".")
+        entry = _normalize_authorized_entry(raw_entry)
         if entry.endswith("/") and relative_path.startswith(entry):
             return True
         if any(marker in entry for marker in ("*", "?", "[")) and PurePosixPath(relative_path).full_match(entry):

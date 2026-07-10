@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -114,7 +115,17 @@ def commit_is_descendant(repo: Path, before_head: str | None, after_head: str | 
 
 
 def normalize_authorized_entry(entry: str) -> str:
-    return entry.strip().strip("`").rstrip(".")
+    # Plan authors commonly write `` `path/to/file.py` (new file) `` — an
+    # inline-code span followed by a trailing annotation. str.strip("`")
+    # only trims from the very ends of the string, so it cannot remove a
+    # closing backtick that isn't the last character. Extract the inline
+    # code span explicitly when present; only fall back to raw stripping
+    # for plain (non-backtick-wrapped) entries.
+    stripped = entry.strip()
+    match = re.match(r"`([^`]+)`", stripped)
+    if match:
+        return match.group(1).strip().rstrip(".")
+    return stripped.strip("`").rstrip(".")
 
 
 def is_authorized_path(path: str, authorized_entries: list[str]) -> bool:

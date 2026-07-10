@@ -99,6 +99,17 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(raised.exception.issues[0].code, "file-not-authorized")
         self.assertIn("revise the frozen plan", raised.exception.issues[0].correction)
 
+    def test_authorized_surface_accepts_backtick_entry_with_trailing_annotation(self):
+        # Regression: an authorized_files entry like "`target.py` (new file)"
+        # was previously normalized to "target.py` (new file)" because
+        # str.strip("`") only trims from the very ends of the string, so a
+        # closing backtick followed by an annotation was never removed.
+        self.policy["authorized_files"] = ["`target.py` (new file)"]
+        self.request["access"] = "workspace-write"
+        self.request["files"] = ["target.py"]
+        contract = worker_contract.validate_contract(self.policy, self.request, self.run_dir)
+        self.assertTrue(contract)
+
     def test_contract_mismatch_returns_actionable_corrections(self):
         self.request["slice_id"] = "Slice 2"
         self.request["model"] = "wrong/model"

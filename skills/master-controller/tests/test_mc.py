@@ -3818,6 +3818,22 @@ Continue later.
         self.assertTrue(mc.is_authorized_path("src/a.py", ["src/*.py"]))
         self.assertFalse(mc.is_authorized_path("src/deep/a.py", ["src/*.py"]))
 
+    def test_normalize_authorized_entry_strips_backtick_with_trailing_annotation(self):
+        # Regression: entries like "`file.py` (new file)" were previously
+        # normalized to "file.py` (new file)" because str.strip("`") only
+        # trims from the very ends of the string, so a closing backtick
+        # followed by an annotation was never removed.
+        self.assertEqual(mc.normalize_authorized_entry("`nilakantha.py` (new file)"), "nilakantha.py")
+        self.assertEqual(
+            mc.normalize_authorized_entry(
+                "`tests/__init__.py` (new file, only if required for test discovery; must stay empty)"
+            ),
+            "tests/__init__.py",
+        )
+        self.assertEqual(mc.normalize_authorized_entry("`*.md`"), "*.md")
+        self.assertEqual(mc.normalize_authorized_entry("pi_calculator.py"), "pi_calculator.py")
+        self.assertTrue(mc.is_authorized_path("nilakantha.py", ["`nilakantha.py` (new file)"]))
+
     # --- Review fixes: fail-closed gate ----------------------------------
 
     def _commit_readme_change(self):

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .constants import SENSITIVE_ARTIFACT_NAMES, WORKER_CREDENTIAL_HOMES
-from .git_ops import meaningful_status_lines, unauthorized_files
+from .git_ops import meaningful_status_lines, normalize_authorized_entry, unauthorized_files
 from .models import GateDecision, McError, PlanSlice
 
 
@@ -529,7 +529,7 @@ def write_worker_policy(
         "required_effort": worker_effort or "default",
         "allowed_access": allowed_access,
         "allowed_roles": ["junior-worker", "senior-worker"],
-        "authorized_files": [entry.strip().strip("`").rstrip(".") for entry in plan_slice.authorized_files],
+        "authorized_files": [normalize_authorized_entry(entry) for entry in plan_slice.authorized_files],
     }
     policy_path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return policy_path
@@ -647,7 +647,7 @@ def render_orchestrator_prompt(
         "task": "<bounded worker task>",
         "context": "<task-specific context>",
         "required_skills": [],
-        "files": [entry.strip().strip("`").rstrip(".") for entry in plan_slice.authorized_files],
+        "files": [normalize_authorized_entry(entry) for entry in plan_slice.authorized_files],
         "constraints": ["<task-specific constraint>"],
         "expected_output": "<exact output contract>",
     }
