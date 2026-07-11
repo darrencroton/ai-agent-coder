@@ -2335,6 +2335,7 @@ Continue later.
         self.assertEqual(by_run["workers-1"]["contracted_marker"], "absent")
         self.assertEqual(by_run["workers-1"]["state"], "completed")
         self.assertEqual(by_run["workers-1"]["returncode"], 0)
+        self.assertEqual(by_run["workers-1"]["output_tail"], "How would you like to proceed?")
         self.assertEqual(by_run["workers-2"]["contracted_marker"], "present")
 
     def test_worker_delegation_overview_reports_na_without_contracted_marker(self):

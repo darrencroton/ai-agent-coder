@@ -887,16 +887,32 @@ def worker_delegation_overview(slice_artifact_dir: Path) -> list[dict[str, Any]]
                 except (json.JSONDecodeError, AttributeError):
                     expected = ""
             markers = [marker for marker in ("RESULT:", "SECTION:") if marker in expected]
-            marker_state = "n/a"
-            if markers:
-                out_text = ""
-                outfile = entry.get("outfile")
-                if isinstance(outfile, str) and Path(outfile).is_file():
+            out_text = ""
+            outfile = entry.get("outfile")
+            candidates = [Path(outfile)] if isinstance(outfile, str) else []
+            # Manifest outfile paths are absolute; fall back to the
+            # conventional sibling file so archived/relocated evidence
+            # still reads.
+            candidates.append(run_dir / f"{label}-out.txt")
+            for candidate in candidates:
+                if candidate.is_file():
                     try:
-                        out_text = Path(outfile).read_text(encoding="utf-8", errors="replace")
+                        out_text = candidate.read_text(encoding="utf-8", errors="replace")
                     except OSError:
                         out_text = ""
+                    break
+            marker_state = "n/a"
+            if markers:
                 marker_state = "present" if any(marker in out_text for marker in markers) else "absent"
+            # Verbatim evidence for the reviewer, never interpretation: the
+            # last non-empty output line is usually enough to tell a refusal
+            # ("How would you like to proceed?") from a crash or an answer.
+            output_tail = ""
+            for line in reversed(out_text.splitlines()):
+                stripped = line.strip()
+                if stripped:
+                    output_tail = stripped[:160]
+                    break
             overview.append(
                 {
                     "run_dir": str(run_dir),
@@ -905,6 +921,7 @@ def worker_delegation_overview(slice_artifact_dir: Path) -> list[dict[str, Any]]
                     "state": str(status.get("state", "unknown")),
                     "returncode": status.get("returncode"),
                     "contracted_marker": marker_state,
+                    "output_tail": output_tail,
                 }
             )
     return overview

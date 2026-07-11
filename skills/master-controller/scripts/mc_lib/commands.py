@@ -373,9 +373,10 @@ def summarize(args: argparse.Namespace) -> int:
             ]
             print(f"  workers: {len(overview)} launched, {len(flagged)} flagged")
             for worker in flagged:
+                tail = f' | last output: "{worker["output_tail"]}"' if worker.get("output_tail") else ""
                 print(
                     f"    ! {worker['label']} ({worker['tool']}): state={worker['state']} "
-                    f"returncode={worker['returncode']} contracted_marker={worker['contracted_marker']}"
+                    f"returncode={worker['returncode']} contracted_marker={worker['contracted_marker']}{tail}"
                 )
     print(f"Completed: {len(completed)}/{state['plan']['slice_count']}")
     return 0
