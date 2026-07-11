@@ -146,6 +146,36 @@ HARNESS_PROFILES: dict[str, dict[str, Any]] = {
 
 SENSITIVE_ARTIFACT_NAMES = {"copilot-home", "codex-home", "claude-config-dir", "tool-homes"}
 
+# Plan-lint vocabulary for check-plan. MC's dependency/license/side-effect stop
+# conditions are heuristic (pane markers plus prompt prohibitions), not diff
+# inspection: a silent dependency edit inside an authorized surface would pass
+# the file-authorization gate. The compensating control is plan-level — keep
+# these files out of unattended authorized surfaces or approval-gate the slice —
+# so check-plan warns when an authorized entry looks dependency- or
+# license-shaped. Basenames are matched case-insensitively.
+DEPENDENCY_SURFACE_BASENAMES = {
+    "package.json",
+    "pipfile",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "cargo.toml",
+    "go.mod",
+    "go.sum",
+    "gemfile",
+    "composer.json",
+    "environment.yml",
+    "environment.yaml",
+    "flake.nix",
+}
+DEPENDENCY_SURFACE_PREFIXES = ("requirements",)
+DEPENDENCY_SURFACE_SUFFIXES = (".lock", "-lock.json", "-lock.yaml", "-lock.yml")
+LICENSE_SURFACE_PREFIXES = ("license", "copying", "notice", "patents")
+# Entries that authorize the entire repository defeat the point of a frozen
+# surface; check-plan warns rather than blocks so a deliberate whole-repo
+# doc-sweep slice remains possible, but never silently.
+BROAD_SURFACE_ENTRIES = {"*", "**", "**/*", ".", "./", "/"}
+
 # Worker-tool home directories are not interchangeable. Copilot's real GitHub
 # credential lives outside ~/.copilot (gh CLI config / OS keychain), so
 # redirecting COPILOT_HOME to an isolated per-slice directory only needs a

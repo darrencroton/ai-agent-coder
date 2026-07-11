@@ -47,10 +47,10 @@ from .observation import (
 from .process import run_command
 from .plan import (
     completed_slice_ids,
-    duplicate_slice_numbers,
     eligibility,
     next_slice,
     parse_plan,
+    plan_check_report,
     plan_digest,
     plan_slice_by_id,
     verify_plan_unchanged,
@@ -94,14 +94,22 @@ def init_run(args: argparse.Namespace) -> int:
     repo = resolve_repo(Path(args.repo))
     plan = resolve_plan(Path(args.plan))
     slices = parse_plan(plan)
-    if not slices:
-        raise McError("plan contains no slices")
-    duplicates = duplicate_slice_numbers(slices)
-    if duplicates:
+    # Whole-plan sanity check before any state is created: a plan defect in any
+    # slice (not just the next one) stops init so the operator fixes the plan
+    # before the workflow begins, rather than mid-run at the slice carrying it.
+    report = plan_check_report(plan)
+    if report["errors"]:
         raise McError(
-            "plan has duplicate slice numbers: "
-            + ", ".join(str(number) for number in duplicates)
-            + " (each slice number must be unique so completion tracking cannot silently skip work)"
+            "plan failed pre-run sanity check:\n  - "
+            + "\n  - ".join(report["errors"])
+            + "\nfix the plan and re-run init (use check-plan to re-check after edits)"
+        )
+    for warning in report["warnings"]:
+        print(f"Plan warning: {warning}")
+    if report["approval_gated"]:
+        print(
+            "Approval-gated slices (run stops at each until approved with the approve command): "
+            + ", ".join(report["approval_gated"])
         )
     requested_branch = getattr(args, "branch", None)
     create_branch = bool(getattr(args, "create_branch", False))
@@ -227,6 +235,33 @@ def init_run(args: argparse.Namespace) -> int:
     print(f"Slices discovered: {len(slices)}")
     if assumed_ids:
         print(f"Assumed complete (operator attested): {', '.join(assumed_ids)}")
+    return 0
+
+
+def check_plan(args: argparse.Namespace) -> int:
+    """Pre-run sanity check of a whole implementation plan.
+
+    Standalone form of the check init runs automatically: validates every
+    slice contract and lints authorized surfaces so plan defects surface
+    before a run begins, not mid-run. Exits non-zero when errors are present.
+    """
+    plan = resolve_plan(Path(args.plan))
+    report = plan_check_report(plan)
+    print(f"Plan: {plan}")
+    print(f"Slices discovered: {report['slice_count']}")
+    if report["approval_gated"]:
+        print(
+            "Approval-gated slices (run stops at each until approved with the approve command): "
+            + ", ".join(report["approval_gated"])
+        )
+    for warning in report["warnings"]:
+        print(f"WARNING: {warning}")
+    for error in report["errors"]:
+        print(f"ERROR: {error}")
+    if report["errors"]:
+        print("Result: FAIL — resolve the plan defects above before initializing an MC run.")
+        return 1
+    print("Result: PASS" + (" (with warnings to review)" if report["warnings"] else ""))
     return 0
 
 

@@ -12,6 +12,7 @@ from .cli import build_parser, main
 from .commands import (
     approve_slice,
     archive_sensitive,
+    check_plan,
     finalize_slice,
     init_run,
     list_profiles,
@@ -86,8 +87,10 @@ from .plan import (
     next_slice,
     parse_plan,
     parse_sections,
+    plan_check_report,
     plan_digest,
     plan_slice_by_id,
+    surface_lint,
     verify_plan_unchanged,
 )
 from .process import run_command
@@ -182,6 +185,7 @@ __all__ = [
     "capture_orchestrator_transcript",
     "capture_worker_runs_summary",
     "changed_files_between",
+    "check_plan",
     "claude_orchestrator_transcript_path",
     "commit_is_descendant",
     "completed_slice_ids",
@@ -224,6 +228,7 @@ __all__ = [
     "parse_iso_datetime",
     "parse_worker_tools",
     "pause_until",
+    "plan_check_report",
     "plan_digest",
     "plan_slice_by_id",
     "preflight",
@@ -263,6 +268,7 @@ __all__ = [
     "stop",
     "stop_with_evidence",
     "summarize",
+    "surface_lint",
     "start_model_supervised_slice",
     "start_slice",
     "tmux_session_name",

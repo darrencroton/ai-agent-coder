@@ -2,9 +2,9 @@
 
 Master Controller (MC) supervises execution of an already-approved implementation plan. It is not a planner and it is not an implementer. It runs one frozen slice at a time through an AI coding harness, records durable artifacts, and verifies gates from outside the harness session. When verification finds a fixable gap, MC runs a bounded self-correcting repair loop: it surfaces the specific violation back into the live orchestrator session (preserving the context the orchestrator already built), lets it fix the gap, and re-verifies with the complete, unrelaxed gate. Only integrity breaches, an exhausted repair budget, a tripped same-signature circuit breaker, or policy-required approvals stop the run for a human.
 
-The three roles: **MC** is the deterministic supervisor — it owns run state, worker policy, and gates, steers repairs, never writes slice code, and never delegates to a worker itself. The **orchestrator** is the harness in tmux executing one slice (scoped-implementation → validation → drift-audit → code-review → commit); it reports a structured result but holds no final authority. A **worker** is a bounded helper requested semantically by the orchestrator and launched through `ai-orchestrator`'s deterministic policy/request interface; it owns no gates, never commits, and never re-delegates.
+The three roles: **MC** is the deterministic supervisor — it owns run state, worker policy, and gates, steers repairs, never writes slice code, and never delegates to a worker itself. The **slice orchestrator** is the harness in tmux executing one slice (scoped-implementation → validation → drift-audit → code-review → commit); it reports a structured result but holds no final authority. A **worker** is a bounded helper requested semantically by the orchestrator and launched through `ai-orchestrator`'s deterministic policy/request interface; it owns no gates, never commits, and never re-delegates. In model-supervised operation a fourth seat, the **supervising model**, drives MC's commands and owns operational judgment only — never acceptance (see "Roles and Topology" in `SKILL.md`).
 
-MC has two documented operating styles. Model-supervised MC keeps the MC model in the loop for live operational judgment while deterministic commands own state transitions and gates. Deterministic batch MC runs the existing fail-closed `run-next` and `run --scope remaining` paths for simple unattended execution. The current implementation provides contract docs, durable run state, conservative plan discovery, tmux-backed slice execution, model-supervised observe/send/start/wait/pause/finalize/stop primitives, structured result capture, fail-closed gate verification, looping over remaining slices, cancellation, and summaries.
+MC is one mode with a supervision dial, not two modes. Model-supervised operation is the default: the MC model stays in the loop for live operational judgment while deterministic commands own state transitions and gates. The fail-closed `run-next` and `run --scope remaining` paths are the unattended batch style — the fallback when no supervising model is available or a short conservative run is enough; they stop at the first operational ambiguity by design. Acceptance gates are identical in both styles. The current implementation provides contract docs, whole-plan sanity checking, durable run state, conservative plan discovery, tmux-backed slice execution, model-supervised observe/send/start/wait/pause/finalize/stop primitives, structured result capture, fail-closed gate verification, looping over remaining slices, cancellation, and summaries.
 
 ## What MC Owns
 
@@ -12,6 +12,7 @@ MC has two documented operating styles. Model-supervised MC keeps the MC model i
 - Updating `.ai-mc/current` to the active run.
 - Recording repo, branch, harness, plan, environment preflight, and policy.
 - Parsing implementation-plan markdown conservatively enough to identify frozen slice contracts.
+- Sanity-checking the whole plan before a run begins (`check-plan`, also run automatically at `init`): every slice's required sections, authorized surface, and approval flag, plus lint warnings for dependency/license-shaped authorized files, whole-repo surfaces, and Mode A/B-only batch groupings.
 - Refusing incomplete, ambiguous, approval-gated, or unauthorized slices.
 - Reporting the next eligible slice in `run-next --dry-run`.
 - Running one eligible slice with `run-next`.
@@ -34,6 +35,12 @@ MC has two documented operating styles. Model-supervised MC keeps the MC model i
 - Accepting a slice from screen text, transcript claims, or operational hints without deterministic gate evidence.
 
 ## CLI
+
+Sanity-check a plan before starting (also runs automatically at `init`; errors fail init, warnings print):
+
+```bash
+python3 skills/master-controller/scripts/mc.py check-plan --plan /path/to/plan.md
+```
 
 Initialize a run:
 
@@ -200,7 +207,7 @@ python3 skills/master-controller/scripts/mc.py archive-sensitive --repo /path/to
 
 ## Default MC Execution Flow
 
-`SKILL.md` is the source of truth for the default operating path (this README previously duplicated it and the two copies drifted). In short: choose **model-supervised MC** when live operational handling matters (usage/session limits, transient interruptions) and **deterministic batch MC** when a conservative fail-closed run is enough; follow the step sequences in `SKILL.md` → "Default Operating Path". Do not ask users to hand-compose harness sandbox, model, or effort flags — use `profiles`, `preflight`, `--worker-tools`, `--harness-model`, `--harness-effort`, `--worker-model`, `--worker-effort`, and `--allow-profile-command`.
+`SKILL.md` is the source of truth for the default operating path and holds the single authoritative Mode C launcher (this README previously duplicated the operating path and the two copies drifted). In short: **model-supervised operation is the default**; use the **unattended batch style** when no supervising model is available or a conservative fail-closed run is enough; follow the step sequences in `SKILL.md` → "Default Operating Path" and the launcher in `SKILL.md` → "Launcher". Do not ask users to hand-compose harness sandbox, model, or effort flags — use `profiles`, `preflight`, `--worker-tools`, `--harness-model`, `--harness-effort`, `--worker-model`, `--worker-effort`, and `--allow-profile-command`.
 
 Two operational rules worth repeating here because they bite in practice (details in `SKILL.md` → "Long-Running Command Discipline"):
 
@@ -279,7 +286,7 @@ MC expects implementation-plan slice sections with these headings:
 - `### Validation Plan`
 - `### Rollback Path`
 
-The parser fails closed when a required section is missing, when no files are listed under `Files allowed to change`, or when `Approval needed before implementation` is anything other than an exact `no` (a prefix like "not yet decided" or "none" is treated as unresolved, not as "no", and stops the run).
+The parser fails closed when a required section is missing, when no files are listed under `Files allowed to change`, or when `Approval needed before implementation` is anything other than an exact `no` (a prefix like "not yet decided" or "none" is treated as unresolved, not as "no", and stops the run). `check-plan` applies these checks to every slice at once — plus surface lint for dependency/license-shaped files, whole-repo globs, and batch groupings — so a defect in slice 5 stops the operator at init, not twenty minutes into the run.
 
 An explicit `yes` approval flag can be cleared at runtime with `approve --slice "<Slice N>" --reason "<why>"`, which records the operator's approval in run state and the operational event log — the plan file itself stays frozen. A missing or unclear flag cannot be approved away; that is a planning defect to fix in the plan (which then requires a fresh `init`, using `--assume-complete` to adopt slices already completed under the previous run).
 
@@ -302,9 +309,39 @@ The model-supervised transition adds these durable concepts without changing det
 
 The model-supervised primitives are `observe`, `send`, `wait`, `pause-until`, `start-slice`, `finalize-slice`, and `stop-with-evidence`. They must not accept work by interpreting natural-language output; they only provide operational control and evidence capture before deterministic gates run.
 
-## Safe Local Trial
+## Privacy and Data Flows
 
-Use a temporary git repo and a small plan before supervising real work. The local harness below writes the same structured artifacts expected from an AI orchestrator, commits only the authorized file, and then waits long enough for MC to capture the tmux pane:
+Everything MC produces is local: run state, artifacts, transcripts, and worker evidence live under `.ai-mc/` in the target repository, MC's deterministic tools make no network calls, and there is no telemetry. What leaves the machine is determined entirely by which models sit in which seats:
+
+| Seat | Sees | Leaves the machine when |
+|---|---|---|
+| Slice orchestrator | The full repository, the plan, embedded skill instructions | Its model is a hosted API or subscription service |
+| Worker | The files named in its request, plus embedded worker/skill instructions | Its model is hosted |
+| Supervising model | `observe`/`wait`/`summarize` output: pane excerpts, operational hints, flagged worker-output tails — **which can include fragments of the code under work** | It is a hosted assistant |
+| MC deterministic tools | Local git, tmux, and files | Never |
+
+The supervising seat is the one people forget: running local orchestrator and worker models but driving MC from a hosted assistant still sends code fragments to that assistant's provider through observation evidence. Two configurations keep everything on-machine:
+
+1. **Fully local supervision** — local models in all three seats (for example a local-model harness as orchestrator and worker, with a local model driving MC's commands).
+2. **No supervising model** — run the unattended batch style (`run --scope remaining`) from a shell; only the orchestrator and worker seats then matter, and you are the fallback when it fail-closed stops.
+
+Artifact sensitivity, for cleanup and sharing decisions (per-slice under `.ai-mc/runs/<run-id>/slices/<slice>/`):
+
+| Artifact | Contains |
+|---|---|
+| `pane-capture*.txt`, `transcript.txt` | Full session output: code, diffs, command output |
+| `git-diff.patch` | The complete code change |
+| `worker-runs/` | Worker prompts and outputs, including code and embedded instructions |
+| `validation-summary.md`, `drift-audit.md`, `code-review.md` | Code excerpts and findings |
+| `prompt.md`, `orchestrator-result.json`, `git-status-*.txt` | Plan text, file paths, verdicts, commit hashes |
+| `tool-homes/`, `codex-home/`, `copilot-home/` | **Seeded worker credentials** — marked sensitive; move them out of a finished run with `archive-sensitive` |
+| `../operational-events.jsonl` (per run) | Operational events with pane-excerpt evidence fields |
+
+`init` writes a self-ignoring `.ai-mc/.gitignore` so none of this — credentials and transcripts included — can be staged by a stray `git add -A`.
+
+## Verify Your Setup (Safe Local Trial)
+
+This is the "verify your setup" step the top-level README's Quickstart points at. Use a temporary git repo and a small plan before supervising real work. The local harness below writes the same structured artifacts expected from an AI orchestrator, commits only the authorized file, and then waits long enough for MC to capture the tmux pane:
 
 ```bash
 tmp="$(mktemp -d)"

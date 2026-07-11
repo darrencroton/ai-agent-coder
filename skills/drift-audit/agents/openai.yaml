@@ -1,3 +1,7 @@
+# Codex CLI skill-interface stub: Codex reads agents/openai.yaml from a skill
+# directory to display and launch the skill. Optional per skill — SKILL.md
+# remains the source of truth for behavior; this file only affects how Codex
+# surfaces the skill in its UI.
 interface:
   display_name: "Drift Audit"
   short_description: "Audit scope drift before code review"

@@ -6,6 +6,7 @@ import sys
 from .commands import (
     approve_slice,
     archive_sensitive,
+    check_plan,
     finalize_slice,
     init_run,
     list_profiles,
@@ -92,6 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="record policy commit_required=false so slices are gated without requiring a commit",
     )
     init.set_defaults(func=init_run)
+
+    check_parser = subparsers.add_parser(
+        "check-plan",
+        help="sanity-check a whole implementation plan before initializing an MC run",
+    )
+    check_parser.add_argument("--plan", required=True, help="implementation plan markdown file")
+    check_parser.set_defaults(func=check_plan)
 
     approve = subparsers.add_parser("approve", help="record operator approval for one approval-gated slice")
     add_repo_run_args(approve)

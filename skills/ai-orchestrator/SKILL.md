@@ -5,7 +5,7 @@ description: Routes coding and analysis tasks to external AI CLI tools (e.g. Cla
 
 # AI Orchestrator
 
-Only the assistant directly handling the user's request may act as the orchestrator and use this skill for delegation. Delegated workers are never orchestrators. If the current assistant is not marked as orchestrator-capable in the model table below, it must not orchestrate with this skill.
+Only the assistant directly handling the user's request may act as the orchestrator and use this skill for delegation (standalone, this is the *orchestrating assistant*; inside a Master Controller run, the per-slice session — the *slice orchestrator* — fills the same seat for one slice, with MC as its boss; see "Under Master Controller" below). Delegated workers are never orchestrators. If the current assistant is not marked as orchestrator-capable in the model table below, it must not orchestrate with this skill.
 
 The orchestrator owns context, planning, delegation, verification, testing, and final responsibility. It delegates selectively when a worker will improve quality, speed, independence, or context management. It keeps work local when the slice is small, prompt construction would cost more than the task, delegation would weaken correctness, or the orchestrator needs to preserve tight control of the acceptance boundary. The orchestrator is the finisher: workers produce inputs, evidence, drafts, and implementation, but the orchestrator must retain the final user-facing deliverable, authorization decisions, accept-or-reject decisions, and correctness-critical judgment.
 
@@ -70,9 +70,8 @@ Core local skill map:
 | `handoff` | Preserve task state for another chat or agent, including frozen contract and authorization gate status |
 | `commit` | Only after explicit user approval to commit; prepare/stage/commit with the required message discipline |
 | `report` | Optional final human-facing synthesis across evidence or worker outputs; not planning, implementation receipts, authorization gates, quality review, handoff, MC summaries, or commit messages |
-| `summarise-paper` | Science paper summaries only when specifically requested |
-| `openai-docs` | Current official OpenAI product/API guidance when OpenAI docs or model/product details are requested |
-| `skill-creator` | Create or update skills, including this orchestration skill |
+
+Any other locally installed skill can be named in `required_skills` the same way — the launcher embeds whatever named skill (and its linked Markdown resources) it finds installed, and rejects the launch when one is missing.
 
 Tool responsibilities:
 
@@ -118,9 +117,19 @@ Every worker request must be self-contained. Encode the role template's semantic
 For implementation work, include the frozen contract: intended slice, allowed files/functions, expected tests, explicit non-goals, risky surfaces, and validation plan. Workers may implement inside the contract or audit against it, but they must not expand it or approve drift.
 For correctness-critical investigations, explicitly name the evidence scope the worker must check before concluding: the files, directories, docs, configs, schemas, or artifacts that materially affect the answer.
 
-Every delegated prompt must also place the receiver in worker mode: it is not the orchestrator, it must not invoke `ai-orchestrator`, and it must not re-delegate to another model. If blocked, it should report the blocker instead of bouncing the task onward. Under Master Controller supervision this boundary is also mechanical: workers own no acceptance gates and never create the slice commit — those belong to the orchestrator, and MC verifies them (including mechanical evidence that a required worker actually ran).
+Every delegated prompt must also place the receiver in worker mode: it is not the orchestrator, it must not invoke `ai-orchestrator`, and it must not re-delegate to another model. If blocked, it should report the blocker instead of bouncing the task onward. (Under Master Controller this boundary is also mechanical — see "Under Master Controller" below.)
 If two workers must edit overlapping files, serialise them or refactor the scope split — do not run them in parallel.
 Use absolute file paths when practical. For analysis and investigation prompts, require `path:line` evidence for every material claim. Inside shell-quoted prompts, use `SECTION: NAME` markers rather than Markdown headings that start with `#`. Keep worker outputs compact and high-signal.
+
+## Under Master Controller
+
+When this skill runs inside a Master Controller slice session, that session is the *slice orchestrator*: the same discipline as the standalone orchestrating assistant, with MC holding the gates. Everything in this section is verified mechanically by MC, not just expected by convention:
+
+- `worker-policy.json`, written by MC, is authoritative for run/slice identity, the frozen plan digest, repository, worker artifact root, required tools, model, effort, permitted roles/access, and authorized files. Copy `slice_id` and `plan_sha256` from it into every request; never infer or retype them.
+- Every tool in the policy's `required_tools` must complete through its own validated launch before the slice can pass. Configured tools are requirements, not alternatives.
+- Workers own no acceptance gates and never create the slice commit — those belong to the slice orchestrator, and MC verifies them, including mechanical evidence that each required worker actually ran (validated contract matching MC's stored policy, real process, real artifacts, successful completion).
+- MC's worker gate is process-level; semantic verification of worker output is the orchestrator's job. A worker that exited cleanly without its contracted output — a refusal, a question instead of an answer, a missing `RESULT:`/`SECTION:` marker — is an incomplete delegation: write a corrected follow-up request with an `-rN` label and relaunch through the same contract. Never cite the failed attempt as worker evidence.
+- MC sets the worker artifact root, slice temp directory, and tool-home environment for the slice. Use them as given; never set, unset, or redirect tool home or credential variables yourself, and report worker authentication failures as blockers instead of working around them.
 
 ## Workflow
 
@@ -132,7 +141,7 @@ Each new task requires a fresh role selection decision — do not carry forward 
 4. **Checklist** — write a short execution checklist with worker labels, launch/extract steps, drift-audit handoff, any promised follow-up reviewer, and the final synthesis step
 5. **Select role and model** — use the role matrix, model table, and any user directive
 6. **Load contract** — read [references/worker-contract.md](references/worker-contract.md), [references/templates.md](references/templates.md), and the selected model reference for capability guidance
-7. **Write request** — write a semantic `worker-request.json` carrying the task, role, access, files, constraints, required skills, context, and output contract. Under MC, copy slice identity and plan digest from `worker-policy.json`; do not infer them
+7. **Write request** — write a semantic `worker-request.json` carrying the task, role, access, files, constraints, required skills, context, and output contract (under MC, copy identity fields from the policy — see "Under Master Controller")
 8. **Run** — invoke `worker_jobs.py launch` with the policy and request. The helper validates policy, embeds complete required-skill bundles, composes the harness command, forces the child working directory to the policy repository, and records launch evidence. If rejected, read `<label>-request-feedback.md`, correct only the named request fields, and retry; never bypass rejection with a raw command
 9. **Monitor** — use a calm cadence. For senior tasks, wait 5 minutes, then run `worker_jobs.py activity --run-dir "$run_dir" --label <label> --max-idle 900` and re-check every 3 minutes. For simpler tasks, wait 3 minutes then re-check every 2 minutes. Three rules govern the cancellation decision: (1) `healthy=yes` → keep waiting; (2) `healthy=no` + process still running → re-check, do not cancel; require at least 3 consecutive `healthy=no` readings before considering early termination, and only when there is no prior evidence of work at all; (3) `healthy=no` + process not running → check status and extract. Do not infer failure from empty stdout/stderr alone while the process is running — a worker may produce no output for 10–15 minutes while thinking or running tools. Any worker with prior evidence of work may run up to 30 minutes before being treated as hung.
 10. **Stay in role** — while workers run, do orchestration-only work such as monitoring status, updating the checklist, preparing the synthesis shell, or drafting a follow-up review prompt. Do not independently re-read or solve the same delegated investigation in parallel. A targeted local tie-break read is allowed only after worker outputs are back and there is a real conflict or missing evidence that materially affects the synthesis.

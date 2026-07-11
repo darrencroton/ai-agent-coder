@@ -1,45 +1,16 @@
 # AI Engineering Skills
 
-Reusable skills for disciplined AI-assisted software engineering.
+**An autonomy system for AI-assisted software engineering: one safety chain, applied at increasing levels of agent independence.**
 
-This repository provides modular skills for planning, scoped implementation, review, orchestration, handoff, reporting, and delivery. Each skill can be used independently, combined manually, or composed into higher-level workflows such as `ai-orchestrator` and `master-controller`.
+AI coding agents are strong implementers and unreliable narrators: left unsupervised they expand scope, grade their own work generously, and report success that can diverge from what actually happened in the repository. This repository moves trust out of the model and into contracts, evidence, and role separation. What "authorized" means is frozen before coding; authorization is audited separately from quality; and acceptance rests on repository evidence, never on the agent's say-so. The agent moves fast inside the lane — it just doesn't get to redraw it.
 
-The workflows stay narrow, auditable, and under your control. Each run implements one small slice, proves it stayed inside the agreed boundaries, and asks before committing. The agent moves fast inside the lane — it just doesn't get to redraw it.
+The system is graduated: use one skill standalone (a single code review), run a plan slice-by-slice with checkpoints, or hand a whole plan to an external supervisor and come back to committed, verified slices. The safety chain — **plan → scoped implementation → validation → drift audit → code review → commit** — never changes; only who holds the gates does.
 
-## What you can do with this
-
-Use these skills when you want AI to help you implement features and fix bugs without losing track of what changed and why.
-
-**Stay in the loop as work progresses.** Plan the work upfront, then run one slice at a time with checkpoints between them. The agent pauses before risky changes, surfaces drift and review findings, and asks for your approval before committing. Good when the work touches sensitive surfaces or you want a clear record of each decision.
-
-**Hand it over and come back when it's done.** Give the agent a complete plan and let it run all remaining slices on its own — implementing, auditing scope, reviewing quality, and committing each slice that passes all gates. It stops if it hits a slice you've flagged for human approval or a problem it can't resolve within the agreed contract. Good when the plan is well-isolated and the cost of an error is low.
-
-**Supervise the run with MC.** Use `master-controller` when you want the gatekeeper outside the slice orchestrator. In model-supervised mode, the MC model stays in the loop while deterministic tools start slices, observe tmux state, preserve artifacts, and enforce gates. In deterministic batch mode, MC runs fail-closed without live model judgment. Both modes accept work only from local evidence: authorized files, validation, drift audit, code review, commit ancestry, and clean git state.
-
-All paths use the same underlying skill chain. They differ in who holds the gates, how much state is captured mechanically, and when handoff happens.
-
-## Skills
-
-This README is the maintained human-facing skill index. Each skill's own `SKILL.md` remains the source of truth for trigger conditions, detailed workflow, and output format.
-
-| Skill | What it does |
-|-------|-------------|
-| [`implementation-plan`](skills/implementation-plan/) | Breaks a request into auditable slices, with optional batches when stronger implementers can safely combine related slices. Each slice gets acceptance criteria, an authorized surface, validation, risk flags, and a copyable prompt for the next chat. |
-| [`master-controller`](skills/master-controller/) | Supervises execution of an existing implementation plan one slice at a time. Creates durable run state, checks slice eligibility, launches tmux-backed harness sessions, captures artifacts, and verifies gates without becoming a planner. |
-| [`scoped-implementation`](skills/scoped-implementation/) | Implements one frozen slice without expanding scope. Restates the authorized surface before coding, stays inside approved files, and prepares a receipt for drift audit. |
-| [`drift-audit`](skills/drift-audit/) | Answers one question: was the implementation authorized? Compares actual changes against the frozen contract before any quality review. |
-| [`code-review`](skills/code-review/) | Performs a senior-level review after drift audit passes. Covers correctness, edge cases, tests, error handling, maintainability, and domain-specific risks. |
-| [`ai-orchestrator`](skills/ai-orchestrator/) | Manages delegation to external AI tools when independence, parallel work, or context economy helps. Owns planning, verification, and final responsibility. |
-| [`code-simplifier`](skills/code-simplifier/) | Refines working code for clarity and maintainability without changing behaviour. A separate cleanup pass, not part of the default implementation flow. |
-| [`handoff`](skills/handoff/) | Writes a compact handoff file when continuing in another chat. Captures current status, what's left, blockers, and the single best next action. |
-| [`commit`](skills/commit/) | Stages and commits specific files by name, never skips hooks, and writes a message that lists changed files with reasons. Only called after explicit approval. |
-| [`report`](skills/report/) | Produces concise evidence-backed written synthesis when explicitly requested. Optional; not part of the default implementation gate chain. |
+Why it exists, who it serves, and the principles that govern design decisions live in [`docs/VISION.md`](docs/VISION.md).
 
 ## Installation
 
 Each skill is a self-contained directory under [`skills/`](skills/) with a standard `SKILL.md` entry point, so any coding-agent harness that supports skill directories (Claude Code, Codex CLI, OpenCode, GitHub Copilot CLI, …) can use them.
-
-Options, from simplest to most structured:
 
 - **Copy or symlink individual skills** into your harness's skills directory (for example `~/.claude/skills/<skill-name>`). Skills are modular — take only what you use.
 - **Clone the repo and symlink every skill:**
@@ -51,101 +22,103 @@ Options, from simplest to most structured:
   done
   ```
 
-- **Compose through a bootstrap repo.** If you maintain a private agent-home repo that composes skills from several sources into one canonical catalogue (and points every harness at that single catalogue), register this repo there and let its setup script clone it and create the symlinks.
+- **Compose through a bootstrap repo.** If you maintain a private agent-home repo that composes skills from several sources into one canonical catalogue, register this repo there and let its setup script clone it and create the symlinks.
 
-## Workflow
+The atomic skills need nothing beyond the Markdown files. Supervised autonomy (Mode C) additionally needs `python3`, `git`, `tmux`, and at least one supported coding CLI on the machine that runs Master Controller.
 
-The default flow for feature or bug work:
+## Quickstart
 
-1. **Plan** — call the `implementation-plan` skill. Define slices, freeze contracts, flag risky surfaces.
-2. **Implement** — new chat, call the `scoped-implementation` skill with the slice receipt. One slice per chat.
-3. **Audit scope** — call the `drift-audit` skill. Was what happened authorized?
-4. **Review quality** — call the `code-review` skill after drift audit passes.
-5. **Simplify** (optional) — call the `code-simplifier` skill if you want a cleanup pass over working code.
-6. **Hand off** (if needed) — call the `handoff` skill before ending a session that isn't finished.
-7. **Commit** — call the `commit` skill only after you approve.
+Three entry points, smallest first. Each is independent — start wherever your task is.
 
-Use `ai-orchestrator` when delegation improves quality, speed, or context management, such as independent review, plan critique, codebase mapping, or long-running validation. Use `master-controller` when you want the same plan execution guarded by durable state and external gate verification.
+**1. Review a change (standalone skill, no setup beyond installation).**
+In your coding assistant: *"Use the code-review skill on the diff on this branch."* You get a senior-level, severity-ranked review with `file:line` findings and an explicit verdict. Every skill works this way — `drift-audit`, `commit`, `handoff`, and the rest are one explicit request each.
+
+**2. Implement a feature with checkpoints (Mode A).**
+- Chat 1: *"Use the implementation-plan skill: <describe the change>."* You get a plan with frozen slices and a copyable launcher prompt at the end.
+- Chat 2: paste the launcher into a fresh session. The agent implements one slice, audits its own authorization, reviews quality, and asks you before committing. Repeat per slice.
+
+**3. Run a whole plan unattended (Mode C).**
+- Verify your machine once with the tmux-backed trial in [`skills/master-controller/README.md`](skills/master-controller/README.md) → "Verify Your Setup".
+- Sanity-check the plan: `python3 skills/master-controller/scripts/mc.py check-plan --plan <plan.md>` (also runs automatically at `init` — a defective plan stops before any harness launches).
+- Start the run with the Mode C launcher in [`skills/master-controller/SKILL.md`](skills/master-controller/SKILL.md) → "Launcher". MC executes slice after slice in fresh sessions, verifies every gate from local evidence, repairs bounded gaps, and stops for you on anything outside policy.
+
+## The Autonomy Ladder
+
+All rungs run the same skill chain; each rung moves the gatekeeper further from the keyboard.
+
+**Rung 0 — Standalone skills.** Every skill is independently useful in any harness with no infrastructure. This is the entry point and the graceful-degradation floor.
+
+**Mode A — Assisted.** You supervise an orchestrated run slice by slice: the agent restates each frozen contract, implements, audits, and reviews; you approve risky slices before coding and every commit after gates pass. Launcher: [`skills/implementation-plan/SKILL.md`](skills/implementation-plan/SKILL.md) → "Next Chat Prompt Format".
+
+**Mode B — Autonomous session.** One agent session runs all remaining slices and holds its own gates, delegating independent drift audits and code reviews, stopping on anything approval-gated. Right when the plan is straightforward, the implementing and reviewing models are strong, and you don't want to stand up an external supervisor. Its gates are promises kept in-session — disciplined, but not externally verified. Launcher: same file as Mode A.
+
+**Mode C — Supervised autonomy (Master Controller).** The gatekeeper moves outside the implementing agent. MC keeps durable run state, sanity-checks the whole plan before starting, launches a fresh session per slice (the context reset that makes long plans tractable), verifies gates from git and artifact evidence, steers bounded repairs, and stops for a human on anything outside policy. Supervision is a dial, not a fork: by default a supervising model stays in the loop for operational judgment (usage resets, stalls, transient interruptions); if you can't or don't want to provide one, MC's fail-closed batch style runs unattended and stops at the first ambiguity. Launcher and details: [`skills/master-controller/SKILL.md`](skills/master-controller/SKILL.md).
+
+Choosing a rung is about the task, not your skill level:
+
+| Situation | Use |
+|---|---|
+| One-off review, audit, commit, or handoff | Rung 0 — call the skill directly |
+| Risky or unfamiliar surfaces; you want a checkpoint between slices | Mode A |
+| Straightforward plan, strong models, fits in one session, no third model available to supervise | Mode B |
+| Long plan, unattended time, weaker/cheaper/local models, or you want external verification and a durable audit trail | Mode C |
+
+## Skills
+
+This README is the maintained human-facing skill index. Each skill's own `SKILL.md` remains the source of truth for trigger conditions, detailed workflow, and output format.
+
+| Skill | What it does |
+|-------|-------------|
+| [`implementation-plan`](skills/implementation-plan/) | Breaks a request into auditable slices with frozen contracts: acceptance criteria, authorized surface, validation, risk flags, and a copyable launcher for the next chat. |
+| [`master-controller`](skills/master-controller/) | Supervises execution of an existing plan one slice at a time: durable run state, whole-plan sanity check, fresh tmux-backed session per slice, evidence-based gates, bounded repair loop. |
+| [`scoped-implementation`](skills/scoped-implementation/) | Implements one frozen slice without expanding scope; prepares the receipt for drift audit. |
+| [`drift-audit`](skills/drift-audit/) | Answers one question: was the implementation authorized? Runs before any quality review. |
+| [`code-review`](skills/code-review/) | Senior-level quality review after drift audit passes: correctness, edge cases, tests, error handling, domain-specific risks. |
+| [`ai-orchestrator`](skills/ai-orchestrator/) | Manages delegation to external AI CLI workers through a validated semantic contract; the orchestrator retains planning, verification, and final responsibility. |
+| [`code-simplifier`](skills/code-simplifier/) | Behaviour-preserving clarity pass over working code; a separate cleanup step, not part of the default chain. |
+| [`handoff`](skills/handoff/) | Compact continuation state for the next session: status, blockers, frozen contract, exact next action. |
+| [`commit`](skills/commit/) | Disciplined commits: stage by name, never skip hooks, message lists every file with reasons. |
+| [`report`](skills/report/) | Evidence-backed written synthesis when explicitly requested; optional, outside the gate chain. |
 
 Use explicit skill calls. Do not rely on the model to guess which workflow applies.
 
-### Running A Plan
+## The Workflow Chain
 
-The plan outputs a `Next Chat Prompt`. Paste it into a fresh session. Choose which version fits your situation:
+The default flow for feature or bug work, at every rung:
 
-**Mode A — Stay in the loop.** You approve before risky slices and before each commit. One slice, a few tightly-coupled slices, or a named batch per chat, then a handoff to the next session.
+1. **Plan** — `implementation-plan`: define slices, freeze contracts, flag risky surfaces.
+2. **Implement** — `scoped-implementation` against one frozen slice, in a fresh session.
+3. **Audit scope** — `drift-audit`: was what happened authorized? Always before quality review.
+4. **Review quality** — `code-review` after the authorization gate passes.
+5. **Simplify** (optional) — `code-simplifier` as a separate pass over working code.
+6. **Hand off** (if needed) — `handoff` before ending an unfinished session.
+7. **Commit** — `commit`, only with explicit approval (yours in Mode A; the plan's standing authorization in Modes B and C after all gates pass).
 
-**Mode B — Step away.** The agent runs all remaining slices, gates each one, and comes back with a summary. It stops on any approval-gated slice or unresolvable problem.
+Each launcher template lives in exactly one place: Modes A and B in `implementation-plan`'s SKILL.md, Mode C in `master-controller`'s SKILL.md, and the handoff resume prompt derives from the Mode A launcher as described in `handoff`'s SKILL.md. Generated plans end with the right launcher already filled in.
 
-The copyable Mode A and Mode B launcher templates live in [`skills/implementation-plan/SKILL.md`](skills/implementation-plan/SKILL.md) (section "Next Chat Prompt Format") — that file is the single source for them; every generated plan already ends with the right one filled in.
+## Privacy and Data Flows
 
-**Mode C — Run through MC.** Use `master-controller` when the plan is complete and you want the Mode A slice-by-slice workflow managed by an outside controller instead of by repeated human prompts. MC keeps durable state, starts each eligible slice in a fresh harness session, verifies the gates from outside that session, commits only slices that pass validation, drift audit, and code review, and stops for you on approval-gated work or anything outside policy.
+Everything the system produces — run state, artifacts, transcripts, worker evidence — stays on your machine, and local/self-hosted models are first-class citizens at every rung. What leaves the machine is determined entirely by which models you place in which seats; the per-mode breakdown, the fully-local configurations, and the artifact sensitivity map are in [`skills/master-controller/README.md`](skills/master-controller/README.md) → "Privacy and Data Flows".
 
-Mode C has two variants:
+## How This Repository Is Validated
 
-- **Mode C1 — Model-supervised MC.** Use this when nuanced operational supervision matters. The MC model remains active, reads pane/log/json evidence, decides whether a live interruption is recoverable, and invokes deterministic MC tools for state transitions. Rolling 5-hour usage windows or temporary service interruptions can be bounded pauses when the pane evidence is clear and the harness session is still resumable. Weekly, monthly, account, billing, credential, trust, permission, dependency/license, remote-side-effect, destructive-action, or ambiguous conditions are user stops.
-- **Mode C2 — Deterministic batch MC.** Use this for simple unattended runs where fail-closed behavior is enough. MC can run `run --scope remaining`, but it should stop rather than interpret unclear operational text. This remains the compatibility path for straightforward plans.
+Beyond the unit suites (CI runs them on every push), the system is exercised end-to-end against a private fixture repository: complete plans run through MC with real harnesses and deliberately mixed model strengths — including weak local models chosen to stress role boundaries. Each round attacks a specific question (can the orchestrator be steered off contract? does a refused delegation surface? does the repair loop stop at its budget?), and every defect found becomes a contract-layer fix plus a regression test, verified to hold in later rounds. The tmux-backed "Verify Your Setup" trial in the master-controller README is a public, reproducible slice of the same method.
 
-Mode C1 launcher:
+## Glossary
 
-```md
-Plan file: <path>
-Target repo: <path>
-Scope: <next slice, or all remaining slices>
-Harness: codex unless I specify otherwise. (claude, copilot, and opencode are also validated MC orchestrator harnesses — name one explicitly to use it.)
-Worker tools: <omit unless the plan requires external workers, e.g. copilot or opencode>
-
-Use master-controller as the supervising skill for this run in model-supervised Mode C.
-
-Read the full plan file first. If the plan is incomplete, ambiguous, not an implementation-plan output, or needs material editing, stop and report instead of improvising.
-
-Use the current feature branch unless I explicitly name another branch. Confirm the target repo, plan file, branch, scope, harness, and worker tools before starting runtime execution.
-
-Initialize or reuse the MC run for this repo and plan, then run preflight and dry-run the next slice. Use MC profiles for normal local execution; do not ask me to hand-compose Codex or Claude sandbox flags.
-
-For each eligible slice, keep the MC model in the loop. Start the slice through MC, observe pane/log/json/git evidence on a calm cadence, and let deterministic MC commands preserve artifacts and enforce state transitions. If a structured result appears, finalize the slice through MC gates before advancing.
-
-Use the model-supervised primitive loop rather than `run --scope remaining`: `start-slice`, then repeated `observe` or bounded `wait`, then exactly one of `pause-until`, `send`, `finalize-slice`, or `stop-with-evidence` based on the evidence. After `finalize-slice` passes, dry-run or start the next eligible slice. Keep all acceptance decisions inside MC's deterministic gates; pane text can justify operational wait/resume/stop decisions only.
-
-Recover only bounded operational interruptions that are clearly transient and do not expand the slice contract. A rolling 5-hour usage window with a parseable reset can be paused until reset plus buffer when the harness process is alive; after re-observing for hard-stop prompts, send a continuation prompt such as `You were interrupted. Review what you were doing then continue.` If the process exited before writing a result, restart only from a clean authorized state; otherwise stop with evidence.
-
-Stop and report for any approval-gated slice, missing evidence, validation failure, drift, review failure, unauthorized file change, dirty post-commit state, branch or plan mismatch, weekly/monthly/account/billing cap, credential/trust/permission prompt, requested external side effect, destructive action, dependency/license change, harness failure, ambiguous operational state, or blocker outside the frozen contract. Do not self-approve human-gated work.
-
-When the requested scope stops or completes, summarize the MC run: slices attempted, slices committed, gate result for each slice, operational stop or recovery evidence if any, artifact location, current git status, and the next action needed from me.
-```
-
-Mode C2 deterministic batch launcher:
-
-```md
-Plan file: <path>
-Target repo: <path>
-Scope: <next slice, or all remaining slices>
-Harness: codex unless I specify otherwise. (claude, copilot, and opencode are also validated MC orchestrator harnesses — name one explicitly to use it.)
-Worker tools: <omit unless the plan requires external workers, e.g. copilot or opencode>
-
-Use master-controller as the supervising skill for this run.
-
-Read the full plan file first. If the plan is incomplete, ambiguous, not an implementation-plan output, or needs material editing, stop and report instead of improvising.
-
-Use the current feature branch unless I explicitly name another branch. Confirm the target repo, plan file, branch, scope, harness, and worker tools before starting runtime execution.
-
-Initialize or reuse the MC run for this repo and plan, then run preflight, dry-run the next slice, and run the requested scope. Use MC profiles for normal local execution; do not ask me to hand-compose Codex or Claude sandbox flags.
-
-For each eligible slice, let MC launch a fresh orchestrator session, enforce the frozen authorized surface, require validation, drift-audit, code-review, and commit evidence, and advance only when all gates pass.
-
-Stop and report for any approval-gated slice, missing evidence, validation failure, drift, review failure, unauthorized file change, dirty post-commit state, harness failure, branch or plan mismatch, requested external side effect, or blocker outside the frozen contract. Do not self-approve human-gated work.
-
-When the requested scope stops or completes, summarize the MC run: slices attempted, slices committed, gate result for each slice, stop reason if any, artifact location, current git status, and the next action needed from me.
-```
-
-Mode C is the right family when you want the work to keep moving without manually reprompting each slice, but still want the safety boundary held outside the implementing agent. Use C1 when operational judgment matters; use C2 when a conservative batch run is enough. MC is not a planner; create or repair the plan first with `implementation-plan`, then hand the complete plan to MC.
-
-Mode C operational notes:
-
-- MC runs atomic slices only; plan batches (Batch A/B groupings) apply to Modes A and B, not Mode C. MC's scope selector is the next eligible slice or all remaining slices, in plan order.
-- MC's blocking commands outlive assistant tool-call limits: run `run --scope remaining` in the background and poll `status`, and in C1 use repeated bounded `wait` calls rather than one long wait (see `master-controller/SKILL.md` → "Long-Running Command Discipline").
-- For C1 on subscription harnesses, run the MC model on a different provider than the orchestrator harness so one usage window cannot stall the supervisor and the supervised session together.
-- When MC stops on an approval-gated slice and you approve it, record the approval with `mc.py approve --slice "<Slice N>" --reason "<why>"` and rerun — do not edit the plan's approval flag (that breaks the frozen digest). If a plan must genuinely be revised mid-run, re-`init` with `--assume-complete` naming the already-committed slices so the new run resumes in the right place.
+- **Slice** — the unit of work: one narrow, independently reviewable change with its own frozen contract.
+- **Frozen contract** — a slice's authorization, fixed before coding: acceptance criteria, authorized surface, non-goals, validation plan, rollback path.
+- **Authorized surface** — the files (and functions/tests) a slice may touch; everything else is drift.
+- **Drift audit** — the authorization gate: compares actual changes against the frozen contract, before any quality judgment.
+- **Gate** — a check that must pass before work advances: validation, drift audit, code review, commit evidence, clean worktree.
+- **Harness** — a coding-agent CLI (Codex CLI, Claude Code, OpenCode, Copilot CLI, …) that MC or you run a session in.
+- **Orchestrating assistant** — the human-facing agent that owns a task end-to-end and delegates through `ai-orchestrator`.
+- **Slice orchestrator** — the per-slice session MC launches and supervises; same discipline, no final authority.
+- **Worker** — a bounded, single-purpose helper launched through a validated contract; owns no gates, never commits, never re-delegates.
+- **Supervising model** — in Mode C, the model that drives MC's commands and handles operational judgment; it never decides acceptance.
+- **Master Controller (MC)** — the deterministic supervisor: run state, gates, repair loop, stop authority.
+- **Repair loop** — MC's bounded self-correction: a fixable gate failure is steered back into the live session and re-verified at full rigor; budgets and a circuit breaker cap it.
+- **Run state** — durable JSON plus per-slice artifacts under `.ai-mc/` in the target repo; the audit trail.
 
 ## License
 

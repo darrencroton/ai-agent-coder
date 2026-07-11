@@ -6,7 +6,15 @@ from pathlib import Path
 from typing import Any
 
 from .models import McError, PlanSlice
-from .constants import COMPLETED_SLICE_STATUSES
+from .constants import (
+    BROAD_SURFACE_ENTRIES,
+    COMPLETED_SLICE_STATUSES,
+    DEPENDENCY_SURFACE_BASENAMES,
+    DEPENDENCY_SURFACE_PREFIXES,
+    DEPENDENCY_SURFACE_SUFFIXES,
+    LICENSE_SURFACE_PREFIXES,
+)
+from .git_ops import normalize_authorized_entry
 
 
 def plan_digest(path: Path) -> str:
@@ -117,3 +125,93 @@ def plan_slice_by_id(slices: list[PlanSlice], slice_id: str) -> PlanSlice | None
         if plan_slice.slice_id == slice_id:
             return plan_slice
     return None
+
+
+def surface_lint(entry: str) -> str | None:
+    normalized = normalize_authorized_entry(entry)
+    if not normalized:
+        return None
+    if normalized in BROAD_SURFACE_ENTRIES:
+        return f"entry {normalized!r} authorizes the entire repository, which defeats a frozen surface"
+    basename = normalized.rstrip("/").rsplit("/", 1)[-1].lower()
+    if (
+        basename in DEPENDENCY_SURFACE_BASENAMES
+        or basename.startswith(DEPENDENCY_SURFACE_PREFIXES)
+        or basename.endswith(DEPENDENCY_SURFACE_SUFFIXES)
+    ):
+        return (
+            f"entry {normalized!r} looks dependency-shaped; MC's dependency stop is heuristic "
+            "(pane markers, prompt prohibitions), not diff inspection — approval-gate this slice "
+            "or keep dependency manifests out of unattended surfaces"
+        )
+    if basename.startswith(LICENSE_SURFACE_PREFIXES):
+        return (
+            f"entry {normalized!r} looks license-shaped; license changes are a stop condition MC "
+            "cannot mechanically inspect — approval-gate this slice or narrow the surface"
+        )
+    return None
+
+
+def plan_check_report(path: Path) -> dict[str, Any]:
+    """Whole-plan pre-run sanity check.
+
+    Validates every slice contract up front so a plan defect surfaces before
+    any harness launches, instead of mid-run at whichever slice carries it.
+    Errors are conditions that would block a slice or hide work (missing
+    sections, empty authorized surface, unclear approval flags, duplicate
+    numbers): init fails closed on them. Warnings are lint for conditions MC
+    cannot mechanically guard against mid-run (heuristic stop surfaces,
+    mode-dependent plan features): the operator should resolve them or
+    consciously accept them before starting.
+    """
+    text = path.read_text(encoding="utf-8")
+    slices = parse_plan(path)
+    errors: list[str] = []
+    warnings: list[str] = []
+    approval_gated: list[str] = []
+
+    if not slices:
+        errors.append("plan contains no slices (no '## Slice <N>: <name>' headings found)")
+    duplicates = duplicate_slice_numbers(slices)
+    if duplicates:
+        errors.append(
+            "plan has duplicate slice numbers: "
+            + ", ".join(str(number) for number in duplicates)
+            + " (each slice number must be unique so completion tracking cannot silently skip work)"
+        )
+
+    for plan_slice in sorted(slices, key=lambda item: item.number):
+        prefix = f"{plan_slice.slice_id} ({plan_slice.title})"
+        missing = plan_slice.missing_sections
+        if missing:
+            errors.append(f"{prefix}: missing required sections: {', '.join(missing)}")
+        if not plan_slice.authorized_files:
+            errors.append(f"{prefix}: authorized surface has no files allowed to change")
+        approval = plan_slice.approval_needed
+        if approval is None:
+            errors.append(
+                f"{prefix}: 'Approval needed before implementation:' must be exactly 'yes' or 'no' "
+                "(an unclear value stops the run and cannot be approved away at runtime)"
+            )
+        elif approval:
+            approval_gated.append(plan_slice.slice_id)
+        for raw_entry in plan_slice.authorized_files:
+            lint = surface_lint(raw_entry)
+            if lint:
+                warnings.append(f"{prefix}: {lint}")
+
+    if re.search(r"^#{2,3}\s*Slice Batches\b", text, flags=re.MULTILINE) or re.search(
+        r"^\s*-\s*Batch\s+\S+\s*:\s*Slices?\b", text, flags=re.MULTILINE
+    ):
+        warnings.append(
+            "plan defines slice batches: batches apply to Mode A/B sessions only — MC runs atomic "
+            "slices in plan order and ignores batch groupings"
+        )
+
+    return {
+        "plan_path": str(path),
+        "slice_count": len(slices),
+        "errors": errors,
+        "warnings": warnings,
+        "approval_gated": approval_gated,
+    }

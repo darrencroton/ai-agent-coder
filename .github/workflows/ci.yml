@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Runtime tests drive tmux-backed sessions with fake harnesses injected
+      # via --harness-command; no real coding CLI is needed. Tests that require
+      # tmux self-skip when it is absent, so installing it here runs the full
+      # suite rather than a subset.
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Git identity for test commits
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "CI"
+
+      - name: Compile check
+        run: |
+          python3 -m py_compile skills/master-controller/scripts/mc.py skills/master-controller/scripts/mc_lib/*.py
+          python3 -m py_compile skills/ai-orchestrator/scripts/worker_contract.py skills/ai-orchestrator/scripts/worker_jobs.py
+
+      - name: Master Controller tests
+        run: python3 -m unittest discover -s skills/master-controller/tests -p 'test_*.py'
+
+      - name: AI Orchestrator tests
+        run: python3 -m unittest discover -s skills/ai-orchestrator/tests -p 'test_*.py'

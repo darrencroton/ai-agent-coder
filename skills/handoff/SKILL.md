@@ -53,34 +53,13 @@ When all of the following are true, populate `Resume Prompt` using the full next
 - you just finished implementing one or more slices or a named batch from that plan
 - you are stopping at a slice or batch boundary so the user can review before the next session begins (i.e. you are **not** running all remaining slices autonomously without user checkpoints)
 
-Fill in the plan file path and set `Slices or batch this session` to the next unstarted slice, slice range, or named batch. The next chat must read **both** the plan file **and** `HANDOFF.md` — the handoff is now part of the run contract and records what has been committed and what remains.
+Build the resume prompt from the Mode A launcher in `implementation-plan`'s `SKILL.md` → "Next Chat Prompt Format" — that file is the single source for launcher text; do not reproduce a stale copy from memory. Copy the launcher, then make exactly these handoff-specific modifications:
 
-```md
-## Resume Prompt
-Plan file: <path>
-Slices or batch this session: <next slice, slice range, or batch>
+1. Set `Plan file:` and set `Slices or batch this session:` to the next unstarted slice, slice range, or named batch.
+2. Extend the "Read the full plan file first" line to require reading **both** the plan file **and** `HANDOFF.md`, stating that the handoff is part of the run contract and records what has been committed and what remains.
+3. Add `HANDOFF.md read` to the final "Confirm before starting" list.
 
-Read the full plan file first AND read HANDOFF.md — the handoff is part of the contract for this run and records committed state. If either is unclear or the plan state is ambiguous, stop and tell me before coding.
-
-Work on the current feature branch for this plan; if none exists, create one and tell me the name.
-
-Use ai-orchestrator as the controlling skill. Keep the implementation local; delegate per that skill's guidance when independence or context economy helps — primarily the hostile drift-audit skill, an independent code-review skill pass, and long-running tests.
-
-For each selected slice or batch, in plan order:
-1. Restate the frozen contract (authorized surface + non-goals) from the plan.
-2. If any included slice's Risk Flags mark approval-needed, stop and get my approval before coding.
-3. apply the scoped-implementation skill against the selected contract.
-4. apply the drift-audit skill. Report the authorization gate result before any quality review.
-5. If the gate passes, apply the code-review skill. If it fails, fix the drift and re-audit.
-6. Surface drift and review findings to me, fix them, then re-run the relevant gate. If consecutive reviews return only minor findings and have clearly converged record residuals in the slice summary and proceed.
-7. Ask me before committing. On my approval, commit the selected slice or batch with the commit skill.
-
-After the selected slice(s) or batch are committed, use the handoff skill to record state and the next slice or batch to resume from. Do not continue past the selected scope.
-
-Confirm before starting: plan file read, HANDOFF.md read, selected slice(s) or batch, branch, and the first slice.
-```
-
-For all other handoffs — including autonomous full-plan runs and non-plan work — omit the Resume Prompt section entirely.
+For all other handoffs — including autonomous full-plan runs, Mode C/MC runs (MC's own run state is the continuation record), and non-plan work — omit the Resume Prompt section entirely.
 
 ## Template
 
@@ -132,7 +111,7 @@ Use this structure. For Quick Mode, omit sections that do not apply.
 - The exact first thing the next agent should do.
 
 ## Resume Prompt
-*(Only when handing off at a slice or batch boundary with user checkpoints between sessions — use the full launcher format from the Plan Workflow Handoff section above. Omit this section for all other handoffs.)*
+*(Only when handing off at a slice or batch boundary with user checkpoints between sessions — build it as described in the Plan Workflow Handoff section above. Omit this section for all other handoffs.)*
 ```
 
 ## Next Action Standard
