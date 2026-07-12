@@ -298,7 +298,7 @@ def start_model_supervised_slice(
             result_path.unlink()
         adapter.start(repo, session_name, slice_artifact_dir, run_json, Path(state["plan_path"]), plan_slice)
         adapter.send_prompt(session_name, prompt_path)
-    except Exception:
+    except Exception as exc:
         _capture_failure_evidence(
             adapter,
             session_name=session_name,
@@ -311,7 +311,8 @@ def start_model_supervised_slice(
         )
         adapter.force_stop(session_name)
         state["current_slice"] = None
-        update_state_for_stop(run_json, state, "failed", "failed to start model-supervised slice")
+        detail = str(exc).strip() or repr(exc)
+        update_state_for_stop(run_json, state, "failed", f"failed to start model-supervised slice: {detail}")
         raise
 
     return {

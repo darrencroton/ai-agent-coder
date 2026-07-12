@@ -26,7 +26,10 @@ Notable changes to this repository. Format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
-- Flaky runtime-test fixture: the hard-prompt-at-repair fake harness now waits for MC's initial prompt injection before showing its trust prompt, removing a startup race with MC's readiness check (which correctly refuses to paste into a visible hard prompt) that could time the test out under system load.
+- Flaky runtime-test fixture: the hard-prompt-at-repair fake harness now exposes a Codex-ready marker after terminal setup and waits for MC's initial prompt injection before showing its trust prompt, removing a startup race that could time the test out under system load.
+- `check-plan` now rejects malformed slice-like headings instead of silently omitting their work, and rejects authorized entries that cannot match repository-relative git paths.
+- CI now declares a read-only token boundary and does not persist checkout credentials; MC's Python 3.13 minimum is documented consistently with the version CI validates.
+- Model-supervised startup failures now retain the underlying exception in run state instead of recording only a generic launch failure.
 
 ## [0.1.0] — 2026-07-10
 

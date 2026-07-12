@@ -24,7 +24,7 @@ Each skill is a self-contained directory under [`skills/`](skills/) with a stand
 
 - **Compose through a bootstrap repo.** If you maintain a private agent-home repo that composes skills from several sources into one canonical catalogue, register this repo there and let its setup script clone it and create the symlinks.
 
-The atomic skills need nothing beyond the Markdown files. Supervised autonomy (Mode B) additionally needs `python3`, `git`, `tmux`, and at least one supported coding CLI on the machine that runs Master Controller.
+The atomic skills need nothing beyond the Markdown files. Supervised autonomy (Mode B) additionally needs Python 3.13 or newer, `git`, `tmux`, and at least one supported coding CLI on the machine that runs Master Controller.
 
 ## Quickstart
 

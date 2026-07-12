@@ -217,6 +217,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.version_info < (3, 13):
+        print("mc: Python 3.13 or newer is required", file=sys.stderr)
+        return 1
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

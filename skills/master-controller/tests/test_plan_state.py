@@ -4,6 +4,11 @@ from mc_test_helpers import *  # noqa: F401,F403 — shared fixtures, fake harne
 
 
 class PlanStateTests(McTestCase):
+    def test_cli_rejects_unsupported_python_before_parsing(self):
+        with mock.patch.object(sys, "version_info", (3, 12)), contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(mc.main([]), 1)
+        self.assertIn("Python 3.13 or newer is required", err.getvalue())
+
     def test_check_plan_passes_clean_plan(self):
         report = mc.plan_check_report(self.plan)
         self.assertEqual(report["errors"], [])
@@ -41,6 +46,53 @@ class PlanStateTests(McTestCase):
         self.assertEqual(report["errors"], [])
         self.assertEqual(report["approval_gated"], ["Slice 1"])
 
+    def test_check_plan_rejects_malformed_slice_heading_that_would_hide_work(self):
+        for malformed in [
+            "## Slice 2 - Second Slice",
+            "### Slice 2: Second Slice",
+            "## slice 2: Second Slice",
+            "## Slice2: Second Slice",
+            "  ## Slice 2 - Second Slice",
+            "## Slice two: Second Slice",
+            "## Slice: Second Slice",
+            "## Slice Setup",
+        ]:
+            with self.subTest(malformed=malformed):
+                write_plan(self.plan)
+                self.plan.write_text(
+                    self.plan.read_text(encoding="utf-8").replace("## Slice 2: Second Slice", malformed),
+                    encoding="utf-8",
+                )
+
+                report = mc.plan_check_report(self.plan)
+
+                self.assertEqual(report["slice_count"], 1)
+                self.assertTrue(report["errors"])
+                self.assertIn(f"malformed slice heading {malformed!r}", "\n".join(report["errors"]))
+
+        write_plan(self.plan)
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8") + "\n## Slice Batches\n\n## Slice-Level Design\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(mc.plan_check_report(self.plan)["errors"], [])
+
+    def test_check_plan_rejects_authorized_entries_that_match_no_git_path(self):
+        for entry in [".", "./", "/", "``", "../outside.md", "docs//file.md", "docs\\file.md"]:
+            with self.subTest(entry=entry):
+                write_plan(self.plan)
+                self.plan.write_text(
+                    self.plan.read_text(encoding="utf-8").replace("  - README.md", f"  - {entry}"),
+                    encoding="utf-8",
+                )
+
+                report = mc.plan_check_report(self.plan)
+                runnable, reasons = mc.eligibility(mc.parse_plan(self.plan)[0])
+
+                self.assertIn("invalid authorized surface", "\n".join(report["errors"]))
+                self.assertFalse(runnable)
+                self.assertIn("invalid authorized surface", "\n".join(reasons))
+
     def test_check_plan_warns_on_dependency_and_license_surfaces(self):
         text = self.plan.read_text(encoding="utf-8").replace(
             "- Files allowed to change:\n  - CHANGELOG.md",
@@ -65,6 +117,18 @@ class PlanStateTests(McTestCase):
         joined = "\n".join(report["warnings"])
         self.assertIn("authorizes the entire repository", joined)
         self.assertIn("batches bind in Mode A sessions only", joined)
+        self.assertIn("matches top-level paths only", mc.surface_lint("*"))
+
+    def test_check_plan_does_not_lint_an_invalid_authorized_entry(self):
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace("  - README.md", "  - /abs/package.json"),
+            encoding="utf-8",
+        )
+
+        report = mc.plan_check_report(self.plan)
+
+        self.assertIn("invalid authorized surface", "\n".join(report["errors"]))
+        self.assertNotIn("package.json", "\n".join(report["warnings"]))
 
     def test_init_fails_closed_on_plan_sanity_errors_in_any_slice(self):
         # The defect is in Slice 2, not the next runnable slice: init must

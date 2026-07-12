@@ -33,7 +33,7 @@ Each skill's `SKILL.md` is the source of truth for its own triggers, workflow, a
 
 - Master Controller: `python3 -m unittest discover -s skills/master-controller/tests -p 'test_*.py'`. Tests needing `tmux` self-skip when it is absent; no test needs a real coding CLI (runtime tests inject fake harnesses). Themed modules and what belongs where: see `skills/master-controller/AGENTS.md` → "Test Matrix".
 - AI Orchestrator: `python3 -m unittest discover -s skills/ai-orchestrator/tests -p 'test_*.py'`.
-- CI runs both suites plus compile checks on every push and pull request. Keep them green; never weaken a failing test to make it pass — a failing test is evidence of a real problem.
+- CI runs both suites plus compile checks on every push and pull request using the minimum supported MC runtime, Python 3.13. Keep them green; never weaken a failing test to make it pass — a failing test is evidence of a real problem.
 - New behavior lands with a regression test pinned beside it. Keep tests boundary-focused rather than permutation-heavy.
 
 ## Change Conventions

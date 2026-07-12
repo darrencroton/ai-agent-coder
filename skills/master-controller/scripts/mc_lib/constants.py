@@ -171,10 +171,11 @@ DEPENDENCY_SURFACE_BASENAMES = {
 DEPENDENCY_SURFACE_PREFIXES = ("requirements",)
 DEPENDENCY_SURFACE_SUFFIXES = (".lock", "-lock.json", "-lock.yaml", "-lock.yml")
 LICENSE_SURFACE_PREFIXES = ("license", "copying", "notice", "patents")
-# Entries that authorize the entire repository defeat the point of a frozen
-# surface; check-plan warns rather than blocks so a deliberate whole-repo
-# doc-sweep slice remains possible, but never silently.
-BROAD_SURFACE_ENTRIES = {"*", "**", "**/*", ".", "./", "/"}
+# These recursive globs match every repository-relative path under the
+# segment-aware authorization matcher. Root-like entries such as '.', './',
+# and '/' match no changed path and are rejected as invalid plan input instead.
+BROAD_SURFACE_ENTRIES = {"**", "**/*"}
+TOP_LEVEL_ONLY_SURFACE_ENTRIES = {"*"}
 
 # Worker-tool home directories are not interchangeable. Copilot's real GitHub
 # credential lives outside ~/.copilot (gh CLI config / OS keychain), so

@@ -373,7 +373,9 @@ def wait_for_initial_prompt(deadline_seconds=20):
         chunk = os.read(sys.stdin.fileno(), 4096).decode(errors="ignore")
         if chunk:
             seen += chunk
-        if "slice orchestrator" in seen:
+        if slice_id in seen:
+            # The frozen slice id is part of every rendered prompt, so this
+            # proves prompt injection without coupling to explanatory prose.
             return True
         time.sleep(0.05)
     return False
@@ -485,9 +487,11 @@ def write_hard_prompt_at_repair_harness(path):
     # refuse and stop the run with evidence. Waiting for injection first is
     # load-bearing — see wait_for_initial_prompt in the preamble.
     path.write_text(
-        _STDIN_RAW_PREAMBLE
+        "#!/usr/bin/env python3\n"
+        + _STDIN_RAW_PREAMBLE
         + textwrap.dedent(
             """
+            print("OpenAI Codex ›", flush=True)
             if not wait_for_initial_prompt():
                 raise SystemExit(3)
             print("Do you trust the files in this folder?", flush=True)
@@ -499,6 +503,7 @@ def write_hard_prompt_at_repair_harness(path):
         + "\n",
         encoding="utf-8",
     )
+    path.chmod(0o755)
 
 
 def write_wrong_slice_id_harness(path):

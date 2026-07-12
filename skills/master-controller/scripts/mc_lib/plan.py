@@ -13,8 +13,17 @@ from .constants import (
     DEPENDENCY_SURFACE_PREFIXES,
     DEPENDENCY_SURFACE_SUFFIXES,
     LICENSE_SURFACE_PREFIXES,
+    TOP_LEVEL_ONLY_SURFACE_ENTRIES,
 )
 from .git_ops import normalize_authorized_entry
+
+
+SLICE_HEADING_RE = re.compile(r"^## Slice\s+(?P<number>\d+):\s*(?P<title>.+?)\s*$", flags=re.MULTILINE)
+SLICE_LIKE_HEADING_RE = re.compile(
+    r"^[ ]{0,3}#{1,6}\s+Slice(?:\s|:|\d|$)[^\n]*$",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+SLICE_BATCH_HEADING_RE = re.compile(r"^[ ]{0,3}#{1,6}\s+Slice Batches\b", flags=re.IGNORECASE)
 
 
 def plan_digest(path: Path) -> str:
@@ -51,7 +60,7 @@ def verify_plan_unchanged(state: dict[str, Any], plan_path: Path) -> None:
 
 def parse_plan(path: Path) -> list[PlanSlice]:
     text = path.read_text(encoding="utf-8")
-    headers = list(re.finditer(r"^## Slice\s+(?P<number>\d+):\s*(?P<title>.+?)\s*$", text, flags=re.MULTILINE))
+    headers = list(SLICE_HEADING_RE.finditer(text))
     slices: list[PlanSlice] = []
     for index, header in enumerate(headers):
         start = header.end()
@@ -108,8 +117,13 @@ def eligibility(plan_slice: PlanSlice, approved_slice_ids: frozenset[str] | set[
     missing = plan_slice.missing_sections
     if missing:
         reasons.append(f"missing required sections: {', '.join(missing)}")
-    if not plan_slice.authorized_files:
+    authorized_files = plan_slice.authorized_files
+    if not authorized_files:
         reasons.append("authorized surface has no files allowed to change")
+    else:
+        invalid_entries = [error for entry in authorized_files if (error := authorized_entry_error(entry))]
+        if invalid_entries:
+            reasons.append("invalid authorized surface: " + "; ".join(invalid_entries))
     approval = plan_slice.approval_needed
     if approval is True and plan_slice.slice_id not in approved_slice_ids:
         reasons.append("slice is approval-needed (record operator approval with the approve command to run it)")
@@ -127,12 +141,43 @@ def plan_slice_by_id(slices: list[PlanSlice], slice_id: str) -> PlanSlice | None
     return None
 
 
+def authorized_entry_error(entry: str) -> str | None:
+    normalized = normalize_authorized_entry(entry)
+    if not normalized:
+        return f"entry {entry!r} is empty after normalization"
+    if normalized.startswith("/"):
+        return f"entry {normalized!r} is absolute; authorized paths must be repository-relative"
+    if normalized.startswith("./"):
+        return f"entry {normalized!r} has a redundant './' prefix that matches no git path"
+    if "\\" in normalized:
+        return f"entry {normalized!r} uses a backslash; authorized git paths must use '/' separators"
+    if "//" in normalized:
+        return f"entry {normalized!r} contains an empty path segment"
+    parts = normalized.rstrip("/").split("/")
+    if any(part in {".", ".."} for part in parts):
+        return f"entry {normalized!r} contains a '.' or '..' path segment that matches no authorized git path"
+    return None
+
+
+def malformed_slice_headings(text: str) -> list[str]:
+    malformed: list[str] = []
+    for match in SLICE_LIKE_HEADING_RE.finditer(text):
+        heading = match.group(0)
+        if SLICE_BATCH_HEADING_RE.match(heading):
+            continue
+        if not SLICE_HEADING_RE.fullmatch(heading):
+            malformed.append(heading)
+    return malformed
+
+
 def surface_lint(entry: str) -> str | None:
     normalized = normalize_authorized_entry(entry)
     if not normalized:
         return None
     if normalized in BROAD_SURFACE_ENTRIES:
         return f"entry {normalized!r} authorizes the entire repository, which defeats a frozen surface"
+    if normalized in TOP_LEVEL_ONLY_SURFACE_ENTRIES:
+        return f"entry {normalized!r} matches top-level paths only; use '**/*' if recursive authorization is intended"
     basename = normalized.rstrip("/").rsplit("/", 1)[-1].lower()
     if (
         basename in DEPENDENCY_SURFACE_BASENAMES
@@ -170,6 +215,12 @@ def plan_check_report(path: Path) -> dict[str, Any]:
     warnings: list[str] = []
     approval_gated: list[str] = []
 
+    malformed_headings = malformed_slice_headings(text)
+    for heading in malformed_headings:
+        errors.append(
+            f"malformed slice heading {heading!r}; slice headings must be exactly "
+            "'## Slice <N>: <name>' so planned work cannot be silently skipped"
+        )
     if not slices:
         errors.append("plan contains no slices (no '## Slice <N>: <name>' headings found)")
     duplicates = duplicate_slice_numbers(slices)
@@ -185,8 +236,18 @@ def plan_check_report(path: Path) -> dict[str, Any]:
         missing = plan_slice.missing_sections
         if missing:
             errors.append(f"{prefix}: missing required sections: {', '.join(missing)}")
-        if not plan_slice.authorized_files:
+        authorized_files = plan_slice.authorized_files
+        if not authorized_files:
             errors.append(f"{prefix}: authorized surface has no files allowed to change")
+        else:
+            for raw_entry in authorized_files:
+                entry_error = authorized_entry_error(raw_entry)
+                if entry_error:
+                    errors.append(f"{prefix}: invalid authorized surface: {entry_error}")
+                    continue
+                lint = surface_lint(raw_entry)
+                if lint:
+                    warnings.append(f"{prefix}: {lint}")
         approval = plan_slice.approval_needed
         if approval is None:
             errors.append(
@@ -195,11 +256,6 @@ def plan_check_report(path: Path) -> dict[str, Any]:
             )
         elif approval:
             approval_gated.append(plan_slice.slice_id)
-        for raw_entry in plan_slice.authorized_files:
-            lint = surface_lint(raw_entry)
-            if lint:
-                warnings.append(f"{prefix}: {lint}")
-
     if re.search(r"^#{2,3}\s*Slice Batches\b", text, flags=re.MULTILINE) or re.search(
         r"^\s*-\s*Batch\s+\S+\s*:\s*Slices?\b", text, flags=re.MULTILINE
     ):

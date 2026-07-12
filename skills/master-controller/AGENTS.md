@@ -25,6 +25,7 @@ This directory defines the `master-controller` skill: deterministic supervision 
 
 ## Test Matrix
 
+- Python 3.13 is the minimum supported runtime and the CI test version; authorization glob matching relies on `PurePath.full_match`.
 - `python3 -m unittest discover -s tests -p 'test_*.py'` runs everything. Tests marked `@unittest.skipUnless(shutil.which("tmux"), ...)` need `tmux` on PATH; the rest are pure-Python and safe anywhere. No test needs a real coding CLI — runtime tests inject fake harnesses via `--harness-command`.
 - Themed modules: `test_plan_state.py` (parsing, eligibility, approval, init, check-plan, run state), `test_prompts.py` (prompt/repair-prompt rendering), `test_harness_adapters.py` (tmux adapter, profiles, readiness, preflight, credentials), `test_observation_hints.py` (observe/send, operational hints, hard prompts), `test_gates_verification.py` (gates and worker evidence), `test_runtime_batch.py` (run-next/run-remaining/reconcile), `test_supervision_repair.py` (model-supervised primitives, repair state).
 - Add regression tests beside the behavior they pin; keep them boundary-focused rather than permutation-heavy.

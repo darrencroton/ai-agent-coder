@@ -4,6 +4,23 @@ from mc_test_helpers import *  # noqa: F401,F403 — shared fixtures, fake harne
 
 
 class RuntimeBatchTests(McTestCase):
+    @unittest.skipUnless(shutil.which("tmux"), "tmux is required for runtime test")
+    def test_run_next_records_model_supervised_start_failure_detail(self):
+        self.prepare_committed_repo()
+        harness = Path(self.tmp.name) / "fake.py"
+        write_hanging_harness(harness)
+        args = argparse.Namespace(repo=str(self.repo), plan=str(self.plan), harness="codex", worktree_root=None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mc.init_run(args), 0)
+
+        with mock.patch.object(mc.TmuxHarnessAdapter, "send_prompt", side_effect=mc.McError("injected send failure")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(mc.run_next(self._run_next_args(harness)), 2)
+
+        state = json.loads(((self.repo / ".ai-mc" / "current").resolve() / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("failed to start model-supervised slice: injected send failure", state["stop_reason"])
+
     def test_reconcile_repairs_failed_slice_after_commit_hash_evidence_mismatch(self):
         self.prepare_committed_repo()
         state = self.init_run()
@@ -334,13 +351,18 @@ class RuntimeBatchTests(McTestCase):
     @unittest.skipUnless(shutil.which("tmux"), "tmux is required for runtime test")
     def test_run_next_stops_with_evidence_when_repair_delivery_hits_hard_prompt(self):
         self.prepare_committed_repo()
-        harness = Path(self.tmp.name) / "hard_prompt_at_repair.py"
+        # Name and launch this executable as `codex` so MC waits for the fake
+        # Codex ready banner before prompt injection. The test is about a hard
+        # prompt appearing at repair delivery, not custom-command startup.
+        harness = Path(self.tmp.name) / "codex"
         write_hard_prompt_at_repair_harness(harness)
         args = argparse.Namespace(repo=str(self.repo), plan=str(self.plan), harness="codex", worktree_root=None)
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(mc.init_run(args), 0)
+        run_args = self._run_next_args(harness)
+        run_args.harness_command = shlex.quote(str(harness))
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(mc.run_next(self._run_next_args(harness)), 2)
+            self.assertEqual(mc.run_next(run_args), 2)
         run_dir = (self.repo / ".ai-mc" / "current").resolve()
         state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
         slice_dir = run_dir / "slices" / "slice-001"

@@ -6,6 +6,8 @@ The three roles: **MC** is the deterministic supervisor — it owns run state, w
 
 MC is one mode with a supervision dial, not two modes. Model-supervised operation is the default: the MC model stays in the loop for live operational judgment while deterministic commands own state transitions and gates. The fail-closed `run-next` and `run --scope remaining` paths are the unattended batch style — the fallback when no supervising model is available or a short conservative run is enough; they stop at the first operational ambiguity by design. Acceptance gates are identical in both styles. The current implementation provides contract docs, whole-plan sanity checking, durable run state, conservative plan discovery, tmux-backed slice execution, model-supervised observe/send/start/wait/pause/finalize/stop primitives, structured result capture, fail-closed gate verification, looping over remaining slices, cancellation, and summaries.
 
+Runtime requirement: Python 3.13 or newer. MC uses Python 3.13's segment-aware `pathlib` glob matching for its authorization gate.
+
 ## What MC Owns
 
 - Creating `.ai-mc/runs/<timestamp>/run.json` under the target repo.
@@ -286,7 +288,7 @@ MC expects implementation-plan slice sections with these headings:
 - `### Validation Plan`
 - `### Rollback Path`
 
-The parser fails closed when a required section is missing, when no files are listed under `Files allowed to change`, or when `Approval needed before implementation` is anything other than an exact `no` (a prefix like "not yet decided" or "none" is treated as unresolved, not as "no", and stops the run). `check-plan` applies these checks to every slice at once — plus surface lint for dependency/license-shaped files, whole-repo globs, and batch groupings — so a defect in slice 5 stops the operator at init, not twenty minutes into the run.
+The parser fails closed when a slice-like heading is malformed, when a required section is missing, when no usable repository-relative paths are listed under `Files allowed to change`, or when `Approval needed before implementation` is anything other than an exact `no` (a prefix like "not yet decided" or "none" is treated as unresolved, not as "no", and stops the run). Heading text beginning with the standalone word `Slice` is reserved for machine-consumed slice headings, except `Slice Batches`. `check-plan` applies these checks to every slice at once — plus surface lint for dependency/license-shaped files, whole-repo globs, top-level-only `*`, and batch groupings — so a defect in slice 5 stops the operator at init, not twenty minutes into the run.
 
 An explicit `yes` approval flag can be cleared at runtime with `approve --slice "<Slice N>" --reason "<why>"`, which records the operator's approval in run state and the operational event log — the plan file itself stays frozen. A missing or unclear flag cannot be approved away; that is a planning defect to fix in the plan (which then requires a fresh `init`, using `--assume-complete` to adopt slices already completed under the previous run).
 
