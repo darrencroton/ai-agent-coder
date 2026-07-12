@@ -667,7 +667,7 @@ def render_orchestrator_prompt(
         "worker_policy_path": str(slice_artifact_dir / "worker-policy.json"),
         "worker_request_example": json.dumps(request_example, indent=2, sort_keys=True),
         "ai_orchestrator_embedded_instructions": ai_orchestrator_embedded_instructions(),
-        "worker_tools": ", ".join(worker_tools) if worker_tools else "none configured for this run",
+        "worker_tools": ", ".join(worker_tools) if worker_tools else "none available for this run",
         "worker_model": worker_model or "default",
         "worker_effort": worker_effort or "default",
         "slice_id": plan_slice.slice_id,

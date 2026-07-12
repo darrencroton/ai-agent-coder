@@ -414,7 +414,10 @@ def summarize(args: argparse.Namespace) -> int:
                 or worker["state"] != "completed"
                 or worker["returncode"] != 0
             ]
-            print(f"  workers: {len(overview)} launched, {len(flagged)} flagged")
+            print(
+                f"  workers: {len(overview)} launched, {len(flagged)} flagged "
+                "(informational; blocks acceptance only on slices marked 'Independent audit required: yes')"
+            )
             for worker in flagged:
                 tail = f' | last output: "{worker["output_tail"]}"' if worker.get("output_tail") else ""
                 print(
@@ -982,6 +985,15 @@ def preflight(args: argparse.Namespace) -> int:
             check("git directory writable", False, str(exc))
 
     worker_tools = parse_worker_tools(args.worker_tools)
+    if candidate is not None and candidate.independent_audit_required and not worker_tools:
+        # Fail fast at setup: an opt-in slice's mechanical independence gate
+        # cannot be satisfied with no worker available. Catch it here rather
+        # than at the finalize gate after a full slice has run.
+        check(
+            "independent-audit worker available",
+            False,
+            f"{candidate.slice_id} is marked 'Independent audit required: yes' but no --worker-tools was configured",
+        )
     if worker_tools:
         unsupported = [tool for tool in worker_tools if tool not in HARNESS_PROFILES]
         check("worker profiles known", not unsupported, ", ".join(unsupported) if unsupported else ", ".join(worker_tools))

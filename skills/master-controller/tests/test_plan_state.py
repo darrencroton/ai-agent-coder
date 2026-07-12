@@ -472,6 +472,32 @@ Continue later.
         write_plan(self.plan, approval="no")
         self.assertFalse(mc.parse_plan(self.plan)[0].approval_needed)
 
+    def _slice_with_risk_flags(self, risk_flags: str) -> "mc.PlanSlice":
+        return mc.PlanSlice(1, "t", "", {"Risk Flags": risk_flags})
+
+    def test_independent_audit_required_exact_yes_arms_gate(self):
+        plan_slice = self._slice_with_risk_flags(
+            "- Approval needed before implementation: no\n- Independent audit required: yes"
+        )
+        self.assertTrue(plan_slice.independent_audit_required)
+
+    def test_independent_audit_required_exact_no_leaves_gate_off(self):
+        plan_slice = self._slice_with_risk_flags(
+            "- Approval needed before implementation: no\n- Independent audit required: no"
+        )
+        self.assertFalse(plan_slice.independent_audit_required)
+
+    def test_independent_audit_required_absent_defaults_off(self):
+        plan_slice = self._slice_with_risk_flags("- Approval needed before implementation: no")
+        self.assertFalse(plan_slice.independent_audit_required)
+
+    def test_independent_audit_required_unclear_defaults_off(self):
+        # Fails closed to off, unlike approval_needed which blocks on unclear:
+        # independence is a degradable preference, so ambiguity means "not armed".
+        for value in ["maybe", "not yet", "", "true", "required"]:
+            plan_slice = self._slice_with_risk_flags(f"- Independent audit required: {value}")
+            self.assertFalse(plan_slice.independent_audit_required, value)
+
     def test_authorized_files_ignores_stray_bullet(self):
         plan_slice = mc.PlanSlice(
             1,

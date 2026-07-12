@@ -383,6 +383,33 @@ class HarnessAdapterProfileTests(McTestCase):
                 mc.preflight(preflight_args)
         self.assertNotIn("codex worker credential source", output.getvalue())
 
+    def test_preflight_fails_when_opt_in_slice_has_no_worker(self):
+        # An opt-in slice ("Independent audit required: yes") with no
+        # --worker-tools configured must fail at preflight, so the operator
+        # learns at setup time instead of only at the finalize gate.
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- Approval needed before implementation: no.",
+                "- Approval needed before implementation: no.\n- Independent audit required: yes.",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        self.prepare_committed_repo()
+        self.init_run()
+        preflight_args = argparse.Namespace(
+            repo=str(self.repo),
+            run="current",
+            harness_command=None,
+            worker_tools="",
+            allow_profile_command=True,
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = mc.preflight(preflight_args)
+        self.assertEqual(result, 2)
+        self.assertIn("independent-audit worker available", output.getvalue())
+
 
     # --- Review fixes: fail-closed parsing -------------------------------
 

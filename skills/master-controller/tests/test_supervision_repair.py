@@ -407,6 +407,18 @@ class SupervisionRepairTests(McTestCase):
         # finalize-slice is a separate invocation that may not re-supply
         # --worker-tools: the worker-evidence gate must still fire from the
         # requirement persisted in current_slice at start-slice time.
+        # Mark Slice 1 opt-in ("Independent audit required: yes") so its worker
+        # requirement arms the gate; by default worker delegation is
+        # reporting-only. Edit before prepare_committed_repo so the flag is
+        # committed with the plan and the worktree stays clean for the gate.
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace(
+                "- Approval needed before implementation: no.",
+                "- Approval needed before implementation: no.\n- Independent audit required: yes.",
+                1,
+            ),
+            encoding="utf-8",
+        )
         self.prepare_committed_repo()
         state = self.init_run()
         run_dir = (self.repo / ".ai-mc" / "current").resolve()

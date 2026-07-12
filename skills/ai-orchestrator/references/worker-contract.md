@@ -6,7 +6,7 @@ Inspect machine-readable role/access capabilities with `python3 scripts/worker_j
 
 ## Policy
 
-Master Controller writes `worker-policy.json` for an MC slice. A standalone ai-orchestrator may write an equivalent policy from the user's authorization and frozen contract. The policy is the authority for run/slice identity, the frozen plan digest, repository, worker artifact root, required tools, model, effort, permitted roles and access modes, and authorized files. When the plan explicitly requires a read-only worker, MC restricts `allowed_access` to `read-only`. Under MC, every tool in `required_tools` must produce its own validated successful run before the slice can pass.
+Master Controller writes `worker-policy.json` for an MC slice. A standalone ai-orchestrator may write an equivalent policy from the user's authorization and frozen contract. The policy is the authority for run/slice identity, the frozen plan digest, repository, worker artifact root, required tools, model, effort, permitted roles and access modes, and authorized files. When the plan explicitly requires a read-only worker, MC restricts `allowed_access` to `read-only`. Under MC, worker delegation is a degradable preference by default — a locally self-audited slice is a valid pass and MC only reports delegation — except on a slice marked `Independent audit required: yes`, where every tool in `required_tools` must produce its own validated successful run before the slice can pass.
 
 ```json
 {
@@ -70,4 +70,4 @@ python3 scripts/worker_jobs.py launch \
 
 Do not bypass a rejected request by invoking `claude`, `codex`, `copilot`, or `opencode` directly. Read `<label>-request-feedback.md`, correct only the named fields, and launch again. Feedback is deliberately specific so even a weak orchestrator can self-correct without redoing the slice.
 
-Successful launches preserve request, policy, rendered prompt, resolved command, normalized contract, enforced working directory, process status, stdout, and stderr in the worker run directory. A named required skill or linked Markdown resource that cannot be embedded rejects the launch before process creation. Under MC, final acceptance requires this validated launch evidence, an exact match to MC's stored policy snapshot, and successful completion for every configured worker tool.
+Successful launches preserve request, policy, rendered prompt, resolved command, normalized contract, enforced working directory, process status, stdout, and stderr in the worker run directory. A named required skill or linked Markdown resource that cannot be embedded rejects the launch before process creation. Under MC, a slice marked `Independent audit required: yes` requires this validated launch evidence, an exact match to MC's stored policy snapshot, and successful completion for every available worker tool; a default slice reports delegation but accepts a local self-audit.

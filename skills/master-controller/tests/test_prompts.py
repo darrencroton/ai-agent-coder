@@ -25,16 +25,44 @@ class PromptRenderingTests(McTestCase):
         self.assertIn("Embedded ai-orchestrator instructions:", prompt)
         self.assertIn("Deterministic Worker Contract", prompt)
         self.assertIn("worker-evidence.md", prompt)
-        self.assertIn("Required worker tool(s) for this run: none configured for this run", prompt)
+        self.assertIn("Available worker tool(s) for this run: none available for this run", prompt)
 
-    def test_prompt_rendering_states_configured_worker_tools_authoritatively(self):
+    def test_prompt_rendering_states_available_worker_tools_for_delegation(self):
         state = self.init_run()
         run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"
         plan_slice = mc.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
         prompt = mc.render_orchestrator_prompt(state, plan_slice, slice_artifact_dir, run_json, ("codex",))
-        self.assertIn("Required worker tool(s) for this run: codex", prompt)
-        self.assertIn("Every configured tool is required to complete", prompt)
+        self.assertIn("Available worker tool(s) for this run: codex", prompt)
+        self.assertIn("which worker MC has made available for delegation", prompt)
+
+    def test_prompt_mirrors_mode_a_delegate_for_independence_with_local_fallback(self):
+        # The Mode B per-slice prompt must read like the Mode A launcher: prefer
+        # delegating the drift-audit and code-review to a separate model for
+        # independence, fall back to a local self-audit when no worker is
+        # available (a valid accepted outcome), and always keep the gate with
+        # the orchestrator. It must also name the opt-in independence gate.
+        state = self.init_run()
+        run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"
+        plan_slice = mc.parse_plan(self.plan)[0]
+        slice_artifact_dir = run_json.parent / "slices" / "slice-001"
+        prompt = mc.render_orchestrator_prompt(state, plan_slice, slice_artifact_dir, run_json, ("codex",))
+        self.assertIn("Mode B counterpart of the Mode A", prompt)
+        self.assertIn("Prefer delegating this as a hostile, independent audit to the available worker", prompt)
+        self.assertIn("Prefer delegating this as an independent review to the available worker", prompt)
+        self.assertIn("perform the drift-audit locally yourself", prompt)
+        self.assertIn("perform the review locally yourself", prompt)
+        self.assertIn("You still hold every gate", prompt)
+        self.assertIn("Independent audit required: yes", prompt)
+
+    def test_prompt_local_audit_is_valid_when_no_worker_available(self):
+        state = self.init_run()
+        run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"
+        plan_slice = mc.parse_plan(self.plan)[0]
+        slice_artifact_dir = run_json.parent / "slices" / "slice-001"
+        prompt = mc.render_orchestrator_prompt(state, plan_slice, slice_artifact_dir, run_json)
+        self.assertIn("none available for this run", prompt)
+        self.assertIn("that is a valid, accepted outcome, not a failure", prompt)
 
     def test_prompt_rendering_states_worker_model_and_effort(self):
         state = self.init_run()
@@ -50,8 +78,8 @@ class PromptRenderingTests(McTestCase):
             "gpt-5.5",
             "low",
         )
-        self.assertIn("Required worker model for this run: gpt-5.5", prompt)
-        self.assertIn("Required worker effort for this run: low", prompt)
+        self.assertIn("Available worker model for this run: gpt-5.5", prompt)
+        self.assertIn("Available worker effort for this run: low", prompt)
         self.assertIn('"model": "gpt-5.5"', prompt)
         self.assertIn('"effort": "low"', prompt)
         self.assertIn("Do not construct or invoke a worker harness command yourself", prompt)
@@ -238,7 +266,7 @@ class PromptRenderingTests(McTestCase):
         artifact_dir = Path("/tmp/artifacts")
         run_json = Path("/tmp/run.json")
         prompt = mc.render_orchestrator_prompt(state, plan_slice, artifact_dir, run_json, ("claude",))
-        self.assertIn("Required worker tool(s) for this run: claude", prompt)
+        self.assertIn("Available worker tool(s) for this run: claude", prompt)
         self.assertIn("Worker auth policy:", prompt)
         self.assertIn("MC does not set CLAUDE_CONFIG_DIR", prompt)
         self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", prompt)

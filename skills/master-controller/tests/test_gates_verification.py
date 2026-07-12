@@ -322,6 +322,63 @@ class GateVerificationTests(McTestCase):
         self.assertEqual(decision.status, "needs-human")
         self.assertEqual(decision.signature, "")
 
+    def _opt_in_slice(self):
+        # Return Slice 1 with the opt-in "Independent audit required: yes" flag
+        # set, so MC's worker-launch verification is armed as a blocking gate.
+        # By default (without this flag) worker delegation is reporting-only and
+        # never blocks acceptance.
+        base = mc.parse_plan(self.plan)[0]
+        sections = dict(base.sections)
+        sections["Risk Flags"] = sections.get("Risk Flags", "") + "\n- Independent audit required: yes"
+        return mc.PlanSlice(base.number, base.title, base.body, sections)
+
+    def test_gate_default_slice_accepts_without_worker_evidence(self):
+        # Default posture: a slice not marked "Independent audit required: yes"
+        # is accepted even when a worker was made available but no genuine worker
+        # evidence exists — a locally self-audited slice is a valid outcome, and
+        # worker delegation is reporting-only, not a gate.
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-mc" / "runs" / "test" / "slices" / "slice-001"
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after)
+        self.write_worker_policy(artifact)
+        state = self.init_run()
+        self.attach_worker_policy_snapshot(state, artifact)
+        default_slice = mc.parse_plan(self.plan)[0]
+        self.assertFalse(default_slice.independent_audit_required)
+
+        decision = mc.verify_gate(
+            self.repo, state, default_slice, artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+        )
+
+        self.assertEqual(decision.status, "pass")
+
+    def test_gate_opt_in_without_available_worker_stops_terminally(self):
+        # An opt-in slice with no worker made available is an operator/plan
+        # config mismatch the orchestrator cannot repair, so it fails closed
+        # terminally (needs-human) rather than burning the repair budget.
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-mc" / "runs" / "test" / "slices" / "slice-001"
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after)
+        state = self.init_run()
+
+        decision = mc.verify_gate(
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ()
+        )
+
+        self.assertEqual(decision.status, "needs-human")
+        self.assertEqual(decision.signature, "worker-unavailable")
+        self.assertIn("no worker tool was made available", decision.reason)
+
     def test_gate_blocks_pass_when_required_worker_never_launched(self):
         self.prepare_committed_repo()
         before = git(self.repo, "rev-parse", "HEAD")
@@ -336,7 +393,7 @@ class GateVerificationTests(McTestCase):
         self.attach_worker_policy_snapshot(state, artifact)
 
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
         )
 
         self.assertEqual(decision.status, "repairable")
@@ -367,7 +424,7 @@ class GateVerificationTests(McTestCase):
         self.attach_worker_policy_snapshot(state, artifact)
 
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
         )
 
         self.assertEqual(decision.status, "repairable")
@@ -392,7 +449,7 @@ class GateVerificationTests(McTestCase):
         self.attach_worker_policy_snapshot(state, artifact)
 
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
         )
 
         self.assertEqual(decision.status, "pass")
@@ -452,7 +509,7 @@ class GateVerificationTests(McTestCase):
         self.attach_worker_policy_snapshot(state, artifact)
 
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
         )
 
         self.assertEqual(decision.status, "repairable")
@@ -479,7 +536,7 @@ class GateVerificationTests(McTestCase):
         policy_path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
         )
 
         self.assertEqual(decision.status, "repairable")
@@ -528,7 +585,7 @@ class GateVerificationTests(McTestCase):
         self.attach_worker_policy_snapshot(state, artifact)
 
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode", "codex")
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode", "codex")
         )
 
         self.assertEqual(decision.status, "repairable")
@@ -559,7 +616,7 @@ class GateVerificationTests(McTestCase):
         state = self.init_run()
         self.attach_worker_policy_snapshot(state, artifact)
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
         )
         self.assertEqual(decision.status, "repairable")
         self.assertEqual(decision.signature, "worker-evidence")
@@ -599,7 +656,7 @@ class GateVerificationTests(McTestCase):
         self.attach_worker_policy_snapshot(state, artifact)
 
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
         )
 
         self.assertEqual(decision.status, "repairable")
@@ -833,7 +890,7 @@ class GateVerificationTests(McTestCase):
         state = self.init_run()
         self.attach_worker_policy_snapshot(state, artifact)
         decision = mc.verify_gate(
-            self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
+            self.repo, state, self._opt_in_slice(), artifact, before, after, mc.git_status_text(self.repo), ("opencode",)
         )
         self.assertEqual(decision.status, "repairable")
         self.assertEqual(decision.signature, "worker-evidence")
