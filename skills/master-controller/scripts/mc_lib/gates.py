@@ -436,16 +436,35 @@ def verify_gate(
     if not artifact_exists(repo, slice_artifact_dir, result, "code_review", "code-review.md"):
         return gate_failure("review", "code review artifact is missing", result, changed_evidence)
 
-    current = state.get("current_slice") if isinstance(state.get("current_slice"), dict) else None
-    expected_snapshot = current.get("worker_policy") if current and current.get("slice_id") == plan_slice.slice_id else None
-    if not isinstance(expected_snapshot, dict):
-        for entry in reversed(state.get("slices", [])):
-            if isinstance(entry, dict) and entry.get("slice_id") == plan_slice.slice_id and isinstance(entry.get("worker_policy"), dict):
-                expected_snapshot = entry["worker_policy"]
-                break
-    worker_failure = worker_evidence_failure(slice_artifact_dir, worker_tools, expected_snapshot)
-    if worker_failure:
-        return gate_failure("worker-evidence", worker_failure, result, changed_evidence)
+    # Independence (delegating drift-audit and code-review to a separate model)
+    # is a degradable *preference* by default: a slice audited locally by a
+    # single model is a valid accepted outcome, so worker delegation is reported
+    # for visibility (see `summarize`) but does not gate acceptance. A slice may
+    # opt in to mechanical enforcement with `Independent audit required: yes` in
+    # its Risk Flags, which re-arms the worker-launch verification below as a
+    # blocking gate for that slice only.
+    if plan_slice.independent_audit_required:
+        if not worker_tools:
+            # The plan demands mechanical proof of an independent audit, but the
+            # operator made no worker available this run, so MC cannot verify
+            # one. Fail closed rather than silently accepting a local self-audit.
+            return gate_failure(
+                "worker-evidence",
+                "slice marks 'Independent audit required: yes' but no worker tool was made available for this run "
+                "(configure --worker-tools); MC cannot verify an independent audit",
+                result,
+                changed_evidence,
+            )
+        current = state.get("current_slice") if isinstance(state.get("current_slice"), dict) else None
+        expected_snapshot = current.get("worker_policy") if current and current.get("slice_id") == plan_slice.slice_id else None
+        if not isinstance(expected_snapshot, dict):
+            for entry in reversed(state.get("slices", [])):
+                if isinstance(entry, dict) and entry.get("slice_id") == plan_slice.slice_id and isinstance(entry.get("worker_policy"), dict):
+                    expected_snapshot = entry["worker_policy"]
+                    break
+        worker_failure = worker_evidence_failure(slice_artifact_dir, worker_tools, expected_snapshot)
+        if worker_failure:
+            return gate_failure("worker-evidence", worker_failure, result, changed_evidence)
 
     commit = result.get("commit") if isinstance(result.get("commit"), dict) else {}
     if state.get("policy", {}).get("commit_required", True):

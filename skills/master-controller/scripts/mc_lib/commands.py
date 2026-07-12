@@ -414,7 +414,10 @@ def summarize(args: argparse.Namespace) -> int:
                 or worker["state"] != "completed"
                 or worker["returncode"] != 0
             ]
-            print(f"  workers: {len(overview)} launched, {len(flagged)} flagged")
+            print(
+                f"  workers: {len(overview)} launched, {len(flagged)} flagged "
+                "(informational; blocks acceptance only on slices marked 'Independent audit required: yes')"
+            )
             for worker in flagged:
                 tail = f' | last output: "{worker["output_tail"]}"' if worker.get("output_tail") else ""
                 print(
