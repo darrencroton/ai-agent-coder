@@ -521,6 +521,49 @@ Continue later.
         self.assertTrue(mc.is_authorized_path("src/a.py", ["src/*.py"]))
         self.assertFalse(mc.is_authorized_path("src/deep/a.py", ["src/*.py"]))
 
+    def test_authorized_matcher_parity_with_worker_contract(self):
+        # The authorized-surface matcher exists twice on purpose: MC's gate in
+        # mc_lib/git_ops.py and the launcher-side copy in ai-orchestrator's
+        # worker_contract.py (which cannot import from MC without breaking the
+        # atomic-skill boundary). This fixture table pins the two copies
+        # together: if either normalization or matching drifts, the launcher's
+        # workspace-write file authorization would silently diverge from the
+        # gate MC recomputes.
+        contract_path = MC_PATH.parents[2] / "ai-orchestrator" / "scripts" / "worker_contract.py"
+        spec = importlib.util.spec_from_file_location("parity_worker_contract", contract_path)
+        worker_contract = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        # dataclass processing looks the module up in sys.modules by name.
+        sys.modules[spec.name] = worker_contract
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(worker_contract)
+
+        fixtures = [
+            ("README.md", ["README.md"], True),
+            ("README.md", ["CHANGELOG.md"], False),
+            ("docs/a.md", ["docs/"], True),
+            ("docs/a.md", ["docs"], False),
+            ("docs2/a.md", ["docs/"], False),
+            ("a.md", ["*.md"], True),
+            ("deep/a.md", ["*.md"], False),
+            ("deep/a.md", ["**/*.md"], True),
+            ("src/a.py", ["src/*.py"], True),
+            ("src/deep/a.py", ["src/*.py"], False),
+            ("file1.py", ["file?.py"], True),
+            ("nilakantha.py", ["`nilakantha.py` (new file)"], True),
+            ("other.py", ["`nilakantha.py` (new file)"], False),
+        ]
+        for path, entries, expected in fixtures:
+            with self.subTest(path=path, entries=entries):
+                self.assertEqual(mc.is_authorized_path(path, entries), expected)
+                self.assertEqual(worker_contract._authorized(path, entries), expected)
+        for raw in ["`a b.py` (note)", "  plain.py  ", "`*.md`", "docs/", "trail.py."]:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    mc.normalize_authorized_entry(raw),
+                    worker_contract._normalize_authorized_entry(raw),
+                )
+
     def test_normalize_authorized_entry_strips_backtick_with_trailing_annotation(self):
         # Regression: entries like "`file.py` (new file)" were previously
         # normalized to "file.py` (new file)" because str.strip("`") only
