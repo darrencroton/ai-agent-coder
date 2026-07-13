@@ -59,6 +59,21 @@ class PromptRenderingTests(McTestCase):
         self.assertIn("final code-review verdict to be exactly `PASS`", prompt)
         self.assertIn("residual_findings", prompt)
 
+    def test_prompt_states_audit_skill_reminder_only_on_opt_in_slice(self):
+        state = self.init_run()
+        run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"
+        base = mc.parse_plan(self.plan)[0]
+        slice_artifact_dir = run_json.parent / "slices" / "slice-001"
+        default_prompt = mc.render_orchestrator_prompt(state, base, slice_artifact_dir, run_json)
+        self.assertNotIn("never `[]` and never both skills in one request", default_prompt)
+
+        sections = dict(base.sections)
+        sections["Risk Flags"] = sections.get("Risk Flags", "") + "\n- Independent audit required: yes"
+        opt_in_slice = mc.PlanSlice(base.number, base.title, base.body, sections)
+        opt_in_prompt = mc.render_orchestrator_prompt(state, opt_in_slice, slice_artifact_dir, run_json)
+        self.assertIn('exactly `["drift-audit"]` or exactly `["code-review"]`', opt_in_prompt)
+        self.assertIn("never `[]` and never both skills in one request", opt_in_prompt)
+
     def test_prompt_local_audit_is_valid_when_no_worker_available(self):
         state = self.init_run()
         run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"

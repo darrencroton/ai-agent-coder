@@ -441,6 +441,30 @@ class SupervisionRepairTests(McTestCase):
         policy = json.loads(policy_path.read_text(encoding="utf-8"))
         self.assertEqual(policy["allowed_access"], ["read-only"])
 
+    def test_worker_policy_reserves_audit_skill_sets_only_on_opt_in_slice(self):
+        # Regression: MC Test 2 found an orchestrator could launch a
+        # required-audit worker with an empty required_skills. worker-policy.json
+        # now carries the exact reserved combinations on an opt-in slice, and
+        # none on a default slice, so the launcher's pre-launch check has
+        # something to enforce against.
+        state = self.init_run()
+        run_dir = (self.repo / ".ai-mc" / "current").resolve()
+        base = mc.parse_plan(self.plan)[0]
+        artifact = run_dir / "slices" / "slice-001"
+        artifact.mkdir(parents=True)
+
+        default_policy_path = mc.write_worker_policy(state, base, artifact, ("opencode",), "model", None)
+        default_policy = json.loads(default_policy_path.read_text(encoding="utf-8"))
+        self.assertEqual(default_policy["reserved_skill_sets"], [])
+
+        sections = dict(base.sections)
+        sections["Risk Flags"] = sections.get("Risk Flags", "") + "\n- Independent audit required: yes"
+        opt_in_slice = mc.PlanSlice(base.number, base.title, base.body, sections)
+        self.assertTrue(opt_in_slice.independent_audit_required)
+        opt_in_policy_path = mc.write_worker_policy(state, opt_in_slice, artifact, ("opencode",), "model", None)
+        opt_in_policy = json.loads(opt_in_policy_path.read_text(encoding="utf-8"))
+        self.assertEqual(opt_in_policy["reserved_skill_sets"], [["drift-audit"], ["code-review"]])
+
     def test_stop_with_evidence_records_terminal_slice_attempt(self):
         self.prepare_committed_repo()
         state = self.init_run()

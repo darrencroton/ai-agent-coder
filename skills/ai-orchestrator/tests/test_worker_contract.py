@@ -137,6 +137,97 @@ class WorkerContractTests(unittest.TestCase):
         self.assertIn("Rewrite the request for Slice 1", issues["slice-mismatch"].correction)
         self.assertIn("provider/model", issues["model-mismatch"].correction)
 
+    def test_reserved_skill_sets_rejects_mixed_request(self):
+        # Regression: MC Test 2 found an orchestrator could draft a worker
+        # request with required_skills mixing a reserved audit skill with
+        # another value (or the other audit skill) instead of naming exactly
+        # one. The policy-declared reserved_skill_sets rejects this before
+        # any process starts.
+        self.policy["reserved_skill_sets"] = [["drift-audit"], ["code-review"]]
+        self.request["required_skills"] = ["drift-audit", "code-review"]
+        with self.assertRaises(worker_contract.WorkerContractError) as raised:
+            worker_contract.validate_contract(self.policy, self.request, self.run_dir)
+        issues = {issue.code: issue for issue in raised.exception.issues}
+        self.assertIn("reserved-skill-mismatch", issues)
+        self.assertIn('["code-review"]', issues["reserved-skill-mismatch"].correction)
+        self.assertIn('["drift-audit"]', issues["reserved-skill-mismatch"].correction)
+
+    def test_reserved_skill_sets_accepts_exact_match(self):
+        self.policy["reserved_skill_sets"] = [["drift-audit"], ["code-review"]]
+        self.request["required_skills"] = ["drift-audit"]
+        contract = worker_contract.validate_contract(self.policy, self.request, self.run_dir)
+        self.assertEqual(contract["required_skills"], ["drift-audit"])
+
+    def test_reserved_skill_sets_rejects_case_variant(self):
+        # Regression: an independent review of this change found that the
+        # intersection check compared skill names case-sensitively, so
+        # required_skills: ["Drift-Audit"] matched neither the reserved-name
+        # overlap test nor the exact-set match and silently passed pre-launch
+        # validation instead of being rejected.
+        self.policy["reserved_skill_sets"] = [["drift-audit"], ["code-review"]]
+        self.request["required_skills"] = ["Drift-Audit"]
+        with self.assertRaises(worker_contract.WorkerContractError) as raised:
+            worker_contract.validate_contract(self.policy, self.request, self.run_dir)
+        issues = {issue.code: issue for issue in raised.exception.issues}
+        self.assertIn("reserved-skill-mismatch", issues)
+
+    def test_reserved_skill_sets_does_not_block_unrelated_empty_request(self):
+        # An empty required_skills is the valid shape for a bounded ad hoc
+        # worker task unrelated to either audit; reserved_skill_sets must not
+        # block it, since the pre-launch layer cannot distinguish that from a
+        # misdrafted audit request (the finalize-time gate is the backstop
+        # for that case).
+        self.policy["reserved_skill_sets"] = [["drift-audit"], ["code-review"]]
+        self.request["required_skills"] = []
+        contract = worker_contract.validate_contract(self.policy, self.request, self.run_dir)
+        self.assertEqual(contract["required_skills"], [])
+
+    def test_reserved_skill_sets_fails_closed_on_malformed_top_level_value(self):
+        # Regression: an independent review found that a malformed
+        # reserved_skill_sets (wrong top-level type, e.g. corrupted policy
+        # data) silently disabled the reservation entirely instead of
+        # failing closed, since the old code only acted when the value was
+        # already a well-formed list.
+        self.policy["reserved_skill_sets"] = "drift-audit"
+        self.request["required_skills"] = []
+        with self.assertRaises(worker_contract.WorkerContractError) as raised:
+            worker_contract.validate_contract(self.policy, self.request, self.run_dir)
+        issues = {issue.code: issue for issue in raised.exception.issues}
+        self.assertIn("policy-reserved-skill-sets-malformed", issues)
+
+    def test_reserved_skill_sets_fails_closed_on_malformed_group(self):
+        self.policy["reserved_skill_sets"] = [["drift-audit"], "code-review"]
+        self.request["required_skills"] = []
+        with self.assertRaises(worker_contract.WorkerContractError) as raised:
+            worker_contract.validate_contract(self.policy, self.request, self.run_dir)
+        issues = {issue.code: issue for issue in raised.exception.issues}
+        self.assertIn("policy-reserved-skill-sets-malformed", issues)
+
+    def test_reserved_skill_sets_rejection_propagates_through_launch_boundary(self):
+        # Regression: prior tests only proved validate_contract rejects a
+        # mismatched reserved-skill request directly; this proves the
+        # rejection also propagates through worker_jobs.py's launch command
+        # so no process is ever started, mirroring
+        # test_rejected_launch_writes_feedback_and_starts_nothing.
+        worker_jobs = load_worker_jobs()
+        self.policy["reserved_skill_sets"] = [["drift-audit"], ["code-review"]]
+        self.request["required_skills"] = ["drift-audit", "code-review"]
+        policy_path = self.repo / "worker-policy.json"
+        request_path = self.repo / "worker-request.json"
+        policy_path.write_text(json.dumps(self.policy), encoding="utf-8")
+        request_path.write_text(json.dumps(self.request), encoding="utf-8")
+        worker_jobs.ensure_manifest(self.run_dir)
+        args = mock.Mock(run_dir=str(self.run_dir), policy=str(policy_path), request=str(request_path), depends_on=None)
+        with mock.patch.dict(os.environ, {worker_jobs.ARTIFACT_ROOT_ENV: str(self.artifact_root)}), mock.patch.object(
+            worker_jobs, "start_tracked_worker"
+        ) as start:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(worker_jobs.command_launch(args), 2)
+        start.assert_not_called()
+        feedback = json.loads((self.run_dir / f"{self.request['label']}-request-feedback.json").read_text())
+        self.assertEqual(feedback["status"], "rejected")
+        self.assertEqual(feedback["issues"][0]["code"], "reserved-skill-mismatch")
+
     def test_copilot_read_only_fails_closed(self):
         self.policy["required_tools"] = ["copilot"]
         self.policy["required_model"] = "default"

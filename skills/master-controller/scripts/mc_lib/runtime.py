@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .constants import SENSITIVE_ARTIFACT_NAMES, WORKER_CREDENTIAL_HOMES
+from .constants import REQUIRED_AUDIT_SKILLS, SENSITIVE_ARTIFACT_NAMES, WORKER_CREDENTIAL_HOMES
 from .git_ops import meaningful_status_lines, normalize_authorized_entry, unauthorized_files
 from .models import GateDecision, McError, PlanSlice
 
@@ -531,6 +531,13 @@ def write_worker_policy(
         "allowed_access": allowed_access,
         "allowed_roles": ["junior-worker", "senior-worker"],
         "authorized_files": [normalize_authorized_entry(entry) for entry in plan_slice.authorized_files],
+        # Pre-launch companion to gates.py's finalize-time exact-match check:
+        # any request whose required_skills touches drift-audit or code-review
+        # must equal exactly one of these sets, not a mix or an empty list. An
+        # empty required_skills stays valid (a legitimate ad hoc worker task
+        # unrelated to either audit), so this cannot catch every misdraft —
+        # only a request that already names a reserved skill incorrectly.
+        "reserved_skill_sets": [[skill] for skill in REQUIRED_AUDIT_SKILLS] if plan_slice.independent_audit_required else [],
     }
     policy_path.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return policy_path
@@ -672,6 +679,13 @@ def render_orchestrator_prompt(
         "worker_auth_policy": worker_auth_policy_text(worker_tools),
         "worker_policy_path": str(slice_artifact_dir / "worker-policy.json"),
         "worker_request_example": json.dumps(request_example, indent=2, sort_keys=True),
+        "audit_skill_reminder": (
+            "This slice is opt-in (`Independent audit required: yes`): the drift-audit and code-review requests "
+            "must each set `required_skills` to exactly `[\"drift-audit\"]` or exactly `[\"code-review\"]` — never "
+            "`[]` and never both skills in one request. A mismatched or mixed value is rejected before launch."
+            if plan_slice.independent_audit_required
+            else ""
+        ),
         "ai_orchestrator_embedded_instructions": ai_orchestrator_embedded_instructions(),
         "worker_tools": ", ".join(worker_tools) if worker_tools else "none available for this run",
         "worker_model": worker_model or "default",

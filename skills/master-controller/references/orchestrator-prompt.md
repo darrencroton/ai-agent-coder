@@ -79,6 +79,7 @@ Worker helper sequence (use when you delegate — e.g. the drift-audit and code-
 - Write a semantic request JSON under the slice temp directory. Start from this shape and replace every placeholder with task-specific content:
 
 {worker_request_example}
+{audit_skill_reminder}
 
 - Launch the request through the deterministic policy boundary:
 

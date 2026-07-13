@@ -331,6 +331,36 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
     context = str(request.get("context") or "").strip()
     expected_output = _required_string(request, "expected_output", issues)
     skills = _string_list(request, "required_skills", issues, required=True)
+    reserved_sets_raw = policy.get("reserved_skill_sets")
+    if reserved_sets_raw is not None:
+        # A malformed reserved_skill_sets (wrong top-level type, or a
+        # non-list group) must fail closed rather than silently disabling
+        # the reservation it exists to enforce — an absent key or an empty
+        # list are the only shapes that legitimately mean "no reservation".
+        if not isinstance(reserved_sets_raw, list) or any(not isinstance(group, list) for group in reserved_sets_raw):
+            issues.append(
+                ContractIssue(
+                    "policy-reserved-skill-sets-malformed",
+                    "reserved_skill_sets",
+                    f"policy reserved_skill_sets is malformed: {reserved_sets_raw!r}; expected a list of skill-name lists such as [[\"drift-audit\"], [\"code-review\"]]",
+                    "Fix the policy before launching; a malformed reserved_skill_sets must not silently disable the reservation.",
+                )
+            )
+        elif reserved_sets_raw:
+            normalized_reserved_sets = [
+                sorted(name.strip() for name in group if isinstance(name, str) and name.strip()) for group in reserved_sets_raw
+            ]
+            reserved_names_lower = {name.lower() for group in normalized_reserved_sets for name in group}
+            if {name.lower() for name in skills}.intersection(reserved_names_lower) and sorted(skills) not in normalized_reserved_sets:
+                allowed_text = " or ".join(json.dumps(group) for group in normalized_reserved_sets)
+                issues.append(
+                    ContractIssue(
+                        "reserved-skill-mismatch",
+                        "required_skills",
+                        f"required_skills {skills!r} mixes or misnames a policy-reserved skill; policy requires exactly one of: {allowed_text}",
+                        f"Set required_skills to exactly one of {allowed_text} — launch one separate request per reserved skill.",
+                    )
+                )
     files = _string_list(request, "files", issues, required=True)
     constraints = _string_list(request, "constraints", issues, required=True)
     resolved_files = [path for index, value in enumerate(files) if (path := _resolve_repo_file(repo, value, f"files[{index}]", issues))]

@@ -192,3 +192,9 @@ TOP_LEVEL_ONLY_SURFACE_ENTRIES = {"*"}
 WORKER_CREDENTIAL_HOMES: dict[str, tuple[str, str, str]] = {
     "codex": ("CODEX_HOME", ".codex", "auth.json"),
 }
+
+# The two skills an opt-in ("Independent audit required: yes") slice must
+# delegate as separate, exactly-one-skill worker requests (see gates.py's
+# finalize-time enforcement and worker_contract.py's reserved_skill_sets
+# pre-launch check). Single source of truth so the two layers cannot drift.
+REQUIRED_AUDIT_SKILLS = ("drift-audit", "code-review")

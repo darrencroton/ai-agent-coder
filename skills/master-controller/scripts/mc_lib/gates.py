@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .constants import ORCHESTRATOR_STATUSES, SCHEMA_VERSION
+from .constants import ORCHESTRATOR_STATUSES, REQUIRED_AUDIT_SKILLS, SCHEMA_VERSION
 from .git_ops import (
     changed_files_between,
     commit_is_descendant,
@@ -214,7 +214,7 @@ def worker_evidence_failure(
     matched_tools: set[str] = set()
     contracted_tools: set[str] = set()
     successful_tools: set[str] = set()
-    required_audits = {"drift-audit", "code-review"}
+    required_audits = set(REQUIRED_AUDIT_SKILLS)
     contracted_audits: set[str] = set()
     successful_audits: set[str] = set()
     for run in runs:

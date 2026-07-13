@@ -21,9 +21,12 @@ Master Controller writes `worker-policy.json` for an MC slice. A standalone ai-o
   "required_effort": "default",
   "allowed_access": ["read-only", "workspace-write"],
   "allowed_roles": ["junior-worker", "senior-worker"],
-  "authorized_files": ["pi_calculator.py"]
+  "authorized_files": ["pi_calculator.py"],
+  "reserved_skill_sets": []
 }
 ```
+
+`reserved_skill_sets` is optional (an absent or empty value imposes no extra constraint). When present, it is a list of exact-match skill combinations — for example `[["drift-audit"], ["code-review"]]` — and any request whose `required_skills` names one of those skills must match one of the listed combinations exactly (case-insensitively); a request unrelated to any reserved skill is unaffected. MC sets this on a slice marked `Independent audit required: yes` so a malformed or mixed audit request (e.g. `["drift-audit", "code-review"]` in one launch) is rejected before any process starts, rather than only caught by MC's finalize-time check. A malformed `reserved_skill_sets` itself (not a list, or containing a non-list group) fails the launch closed rather than silently disabling the reservation. It cannot catch an empty `required_skills` meant for one of the reserved skills, since an empty list is also the valid shape for an unrelated bounded task — the caller's own finalize-time evidence check (for example Master Controller's) is the backstop for that gap.
 
 ## Access Modes
 
