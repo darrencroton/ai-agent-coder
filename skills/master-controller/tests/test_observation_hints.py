@@ -43,6 +43,9 @@ class ObservationHintTests(McTestCase):
             "started_at": mc.utc_now(),
             "before_head": "a" * 40,
             "pause": None,
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
 
@@ -84,6 +87,9 @@ class ObservationHintTests(McTestCase):
             "started_at": mc.utc_now(),
             "before_head": "a" * 40,
             "pause": None,
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -126,6 +132,9 @@ class ObservationHintTests(McTestCase):
             "started_at": mc.utc_now(),
             "before_head": "a" * 40,
             "pause": None,
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -349,6 +358,9 @@ class ObservationHintTests(McTestCase):
             "started_at": mc.utc_now(),
             "before_head": "a" * 40,
             "pause": None,
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()

@@ -33,7 +33,6 @@ from .state import (
     idle_status_after_pass,
     load_run,
     normalize_stop_status,
-    previous_completed_head,
     relative_artifact_path,
     repair_state,
     reset_slice_pause_counters,
@@ -361,9 +360,7 @@ def _finalize_terminal(
         terminal_gate,
         before_head,
         worker_tools,
-        # Only a slice that actually consumed repair rounds records them; a
-        # first-attempt terminal keeps the pre-repair-loop entry shape.
-        repair=dict(repair) if repair["round"] else None,
+        repair=dict(repair),
         worker_policy=(state.get("current_slice") or {}).get("worker_policy"),
     )
     state["slices"].append(entry)
@@ -406,12 +403,11 @@ def finalize_model_supervised_slice(
         getattr(args, "allow_unattended_default", False),
         parse_worker_tools(getattr(args, "worker_tools", None)),
     )
-    before_head = str(current.get("before_head") or "") or previous_completed_head(state, plan_slice.slice_id)
+    before_head = str(current["before_head"])
     started_at = str(current.get("started_at") or utc_now())
     # Recovered from persisted current_slice state rather than args.worker_tools:
     # this is a separate invocation and may not re-supply --worker-tools.
-    current_worker_tools = current.get("worker_tools")
-    worker_tools = tuple(current_worker_tools) if isinstance(current_worker_tools, list) else ()
+    worker_tools = tuple(current["worker_tools"])
 
     adapter.capture(session_name, slice_artifact_dir / f"pane-capture-attempt-{attempt}.txt")
     attempt_capture = slice_artifact_dir / f"pane-capture-attempt-{attempt}.txt"

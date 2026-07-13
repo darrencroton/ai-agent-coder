@@ -143,7 +143,7 @@ def write_fake_harness(path):
             (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "code-review.md").write_text("PASS\\n", encoding="utf-8")
             result = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": slice_id,
                 "status": "pass",
                 "summary": f"{slice_id} done",
@@ -236,7 +236,7 @@ def write_usage_limit_resume_harness(path):
             (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "code-review.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "orchestrator-result.json").write_text(json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": slice_id,
                 "status": "pass",
                 "summary": "resumed after rolling limit",
@@ -273,7 +273,7 @@ def write_repairable_then_pass_harness(path):
             if not marker.exists():
                 marker.write_text("seen\\n", encoding="utf-8")
                 (artifact / "orchestrator-result.json").write_text(json.dumps({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "slice_id": slice_id,
                     "status": "repairable",
                     "summary": "retry",
@@ -297,7 +297,7 @@ def write_repairable_then_pass_harness(path):
             (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "code-review.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "orchestrator-result.json").write_text(json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": slice_id,
                 "status": "pass",
                 "summary": "repaired",
@@ -338,7 +338,7 @@ termios.tcsetattr(sys.stdin, termios.TCSANOW, attrs)
 
 def write_failing_validation_result():
     (artifact / "orchestrator-result.json").write_text(json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "slice_id": slice_id,
         "status": "pass",
         "summary": "no validation yet",
@@ -405,7 +405,7 @@ def write_in_session_repair_harness(path):
             (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "code-review.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "orchestrator-result.json").write_text(json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": slice_id,
                 "status": "pass",
                 "summary": "repaired in session",
@@ -457,7 +457,7 @@ def write_alternating_failure_harness(path):
                 (artifact / "validation-summary.md").write_text("PASS\\n", encoding="utf-8")
                 (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
                 (artifact / "orchestrator-result.json").write_text(json.dumps({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "slice_id": slice_id,
                     "status": "pass",
                     "summary": "review failed",
@@ -526,7 +526,7 @@ def write_wrong_slice_id_harness(path):
 
             artifact = Path(os.environ["MC_SLICE_ARTIFACT_DIR"])
             (artifact / "orchestrator-result.json").write_text(json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": "Slice 99",
                 "status": "pass",
                 "summary": "worked the wrong slice",
@@ -566,6 +566,43 @@ class McTestCase(unittest.TestCase):
         current = self.repo / ".ai-mc" / "current"
         self.assertTrue(current.is_symlink())
         return json.loads((current.resolve() / "run.json").read_text(encoding="utf-8"))
+
+    def terminal_slice_entry(
+        self,
+        state,
+        *,
+        slice_id="Slice 1",
+        title="First Slice",
+        status="pass",
+        artifact_dir=None,
+        before_head=None,
+        commit=None,
+    ):
+        """Return a complete schema-v2 terminal entry for state-focused tests."""
+        ordinal = int(slice_id.rsplit(" ", 1)[-1])
+        return {
+            "slice_id": slice_id,
+            "title": title,
+            "status": status,
+            "started_at": "2026-01-01T00:00:00Z",
+            "completed_at": "2026-01-01T00:01:00Z",
+            "artifact_dir": artifact_dir or f".ai-mc/runs/{state['run_id']}/slices/slice-{ordinal:03d}",
+            "before_head": before_head or "a" * 40,
+            "changed_files": [],
+            "summary": "",
+            "validation": [],
+            "drift_audit": {"verdict": None, "path": ""},
+            "code_review": {"verdict": None, "path": ""},
+            "commit": commit or {"requested": False, "created": False, "hash": None},
+            "next_action": "",
+            "blockers": [],
+            "residual_findings": [],
+            "gate_reason": "test fixture",
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
+            "slice_summary": f".ai-mc/runs/{state['run_id']}/slices/slice-{ordinal:03d}/slice-summary.md",
+        }
 
     def write_worker_policy(self, artifact, *, tool="opencode"):
         artifact.mkdir(parents=True, exist_ok=True)
@@ -659,7 +696,7 @@ class McTestCase(unittest.TestCase):
         (artifact / "drift-audit.md").write_text("drift\n", encoding="utf-8")
         (artifact / "code-review.md").write_text("review\n", encoding="utf-8")
         result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "slice_id": "Slice 1",
             "status": "pass",
             "summary": "",
@@ -692,7 +729,7 @@ class McTestCase(unittest.TestCase):
         (artifact / "orchestrator-result.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "slice_id": slice_id,
                     "status": "pass",
                     "summary": "",
@@ -722,9 +759,9 @@ class McTestCase(unittest.TestCase):
             "before_head": git(self.repo, "rev-parse", "HEAD"),
             "worker_tools": [],
             "pause": None,
+            "repair": dict(repair) if repair is not None else mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
-        if repair is not None:
-            current["repair"] = repair
         state["status"] = "running"
         state["supervision"]["mode"] = "model-supervised"
         state["current_slice"] = current

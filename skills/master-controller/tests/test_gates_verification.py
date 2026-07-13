@@ -75,7 +75,7 @@ class GateVerificationTests(McTestCase):
         self.write_gate_result_data(
             artifact,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": "Slice 1",
                 "status": "pass",
                 "summary": "",
@@ -109,7 +109,7 @@ class GateVerificationTests(McTestCase):
         self.write_gate_result_data(
             artifact,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": "Slice 1",
                 "status": "pass",
                 "summary": "",
@@ -272,7 +272,7 @@ class GateVerificationTests(McTestCase):
         self.assertEqual(decision.signature, "result-malformed")
         self.assertIn("schema_version", decision.reason)
 
-        self.write_gate_result_data(artifact, {"schema_version": 1, "slice_id": "Slice 1", "status": "victory"})
+        self.write_gate_result_data(artifact, {"schema_version": 2, "slice_id": "Slice 1", "status": "victory"})
         decision = mc.verify_gate(self.repo, state, plan_slice, artifact, before, before, mc.git_status_text(self.repo))
         self.assertEqual(decision.status, "repairable")
         self.assertEqual(decision.signature, "result-malformed")
@@ -298,7 +298,7 @@ class GateVerificationTests(McTestCase):
         self.prepare_committed_repo()
         before = git(self.repo, "rev-parse", "HEAD")
         artifact = self.repo / ".ai-mc" / "runs" / "test" / "slices" / "slice-001"
-        self.write_gate_result_data(artifact, {"schema_version": 1, "slice_id": "Slice 2", "status": "pass"})
+        self.write_gate_result_data(artifact, {"schema_version": 2, "slice_id": "Slice 2", "status": "pass"})
         state = self.init_run()
 
         decision = mc.verify_gate(self.repo, state, mc.parse_plan(self.plan)[0], artifact, before, before, mc.git_status_text(self.repo))
@@ -314,12 +314,12 @@ class GateVerificationTests(McTestCase):
         state = self.init_run()
         plan_slice = mc.parse_plan(self.plan)[0]
 
-        self.write_gate_result_data(artifact, {"schema_version": 1, "slice_id": "Slice 1", "status": "repairable"})
+        self.write_gate_result_data(artifact, {"schema_version": 2, "slice_id": "Slice 1", "status": "repairable"})
         decision = mc.verify_gate(self.repo, state, plan_slice, artifact, before, before, mc.git_status_text(self.repo))
         self.assertEqual(decision.status, "repairable")
         self.assertEqual(decision.signature, "orchestrator-repairable")
 
-        self.write_gate_result_data(artifact, {"schema_version": 1, "slice_id": "Slice 1", "status": "needs-human"})
+        self.write_gate_result_data(artifact, {"schema_version": 2, "slice_id": "Slice 1", "status": "needs-human"})
         decision = mc.verify_gate(self.repo, state, plan_slice, artifact, before, before, mc.git_status_text(self.repo))
         self.assertEqual(decision.status, "needs-human")
         self.assertEqual(decision.signature, "")
@@ -412,7 +412,15 @@ class GateVerificationTests(McTestCase):
         )
         self.assertEqual(decision.status, "pass")
 
-        entry = mc.slice_entry_from_gate(self.repo, plan_slice, artifact, mc.utc_now(), decision, before)
+        entry = mc.slice_entry_from_gate(
+            self.repo,
+            plan_slice,
+            artifact,
+            mc.utc_now(),
+            decision,
+            before,
+            worker_policy={"sha256": "a" * 64, "policy": {}},
+        )
         self.assertEqual(entry["residual_findings"], [finding])
         slice_summary = artifact / "slice-summary.md"
         self.assertIn("Legacy helper could be clarified later", slice_summary.read_text(encoding="utf-8"))
@@ -885,7 +893,7 @@ class GateVerificationTests(McTestCase):
         self.write_gate_result_data(
             artifact,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": "Slice 1",
                 "status": "pass",
                 "summary": "",
@@ -912,7 +920,7 @@ class GateVerificationTests(McTestCase):
         self.write_gate_result_data(
             artifact,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "slice_id": "Slice 1",
                 "status": "pass",
                 "summary": "",

@@ -4,12 +4,15 @@ Notable changes to this repository. Format follows [Keep a Changelog](https://ke
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-13
+
 ### Added
 
 - Mode B residual-finding propagation: every passing orchestrator result carries a structured `residual_findings` ledger, MC writes a per-slice `slice-summary.md`, and every run-state update refreshes an aggregate `run-report.md` so non-blocking post-plan considerations survive fresh sessions and repair rounds.
 
 ### Changed
 
+- **Breaking:** Master Controller durable state and orchestrator results now use schema version 2. MC supports only the current complete state shape; runs missing the frozen plan digest, supervision/event state, repair state, worker posture, or recorded Git boundary must be reinitialized instead of being inferred or migrated.
 - MC opt-in independent audits now require separate validated worker contracts for `drift-audit` and `code-review`; prompts require the drift verdict before code review launches and preserve the original delegation posture during repair.
 - MC slice prompts embed a compact 615-word delegation contract instead of the full transitive `ai-orchestrator` skill and every harness reference.
 - Mode A handoff/final-report guidance and Mode B reporting now preserve the same residual post-plan considerations without using a repo-root `HANDOFF.md` as Mode B continuation state.
@@ -28,7 +31,7 @@ Notable changes to this repository. Format follows [Keep a Changelog](https://ke
 - `skills/master-controller/AGENTS.md`: maintainer guide with file roles, working rules, test matrix, and change checklists.
 - CI (GitHub Actions): compile checks plus both unit suites, including tmux-backed runtime tests with fake harnesses.
 - `CONTRIBUTING.md`: source-of-truth map, test matrix, and change conventions.
-- `docs/repo-review-vision-rubric-20260712.md`: repository-wide code-review and simplification assessment measured against the vision's eight design principles.
+- `archive/docs/pre-schema-v2-20260713/repo-review-vision-rubric-20260712.md`: repository-wide code-review and simplification assessment measured against the vision's eight design principles (archived after the schema-v2 reset).
 
 ### Changed
 

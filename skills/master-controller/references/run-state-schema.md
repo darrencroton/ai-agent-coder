@@ -1,12 +1,12 @@
 # Run State Schema
 
-MC writes durable JSON state under `.ai-mc/runs/<run-id>/run.json` in the target repository. The schema is intentionally explicit so a stopped run can be audited or resumed without reading chat history.
+MC writes durable JSON state under `.ai-mc/runs/<run-id>/run.json` in the target repository. The schema is intentionally explicit so a stopped run can be audited or resumed without reading chat history. MC supports only the complete current schema and performs no migration or compatibility backfill; an older or incomplete run must be archived and reinitialized.
 
 ## `run.json`
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "run_id": "20260704T013000Z",
   "created_at": "2026-07-04T01:30:00Z",
   "updated_at": "2026-07-04T01:30:00Z",
@@ -19,9 +19,11 @@ MC writes durable JSON state under `.ai-mc/runs/<run-id>/run.json` in the target
     "name": "codex",
     "adapter": null,
     "preflight": {
+      "platform": "macOS-15.5-arm64-arm-64bit",
       "git": "/usr/bin/git",
       "tmux": "/usr/bin/tmux",
-      "python": "/usr/bin/python3"
+      "python": "/usr/bin/python3",
+      "python_version": "3.13.5"
     }
   },
   "policy": {
@@ -32,7 +34,7 @@ MC writes durable JSON state under `.ai-mc/runs/<run-id>/run.json` in the target
   },
   "plan": {
     "slice_count": 4,
-    "parser": "implementation-plan-markdown-v1",
+    "parser": "implementation-plan-markdown-v2",
     "sha256": "<hex digest of the plan file at init>"
   },
   "current_slice": {
@@ -116,9 +118,9 @@ Allowed run `status` values:
 
 - `plan.sha256` freezes the plan file at init. Before each slice, MC re-hashes
   the plan and stops with an error if it changed, so a mid-run plan edit cannot
-  silently alter authorization, ordering, or approval flags. A revised plan
-  requires a fresh `init`. Runs created before digests were recorded have no
-  baseline and skip this check.
+  silently alter authorization, ordering, or approval flags. The digest is
+  mandatory in schema v2; a revised plan or incomplete state requires a fresh
+  `init`.
 - Slice numbers must be unique; `init` fails closed on a duplicate `## Slice N:`
   because completion tracking keys on the slice id.
 - A revised plan requires a fresh `init`. When earlier slices were already
@@ -157,11 +159,11 @@ Pause budget fields:
 - `pause_counters.consecutive_pauses_current_slice`: count for the active slice
 - `pause_counters.cumulative_pause_seconds_run`: total paused seconds for the run
 
-Existing run files without `supervision` or `operational_events_path` load with these defaults. Loading defaults must remain backwards-compatible and must not mark old completed slice entries incomplete.
+`supervision` and `operational_events_path` are required schema-v2 fields. MC does not synthesize them when state is incomplete.
 
 ## Operational Events
 
-`operational_events_path` points at an append-only JSONL file. Model-supervised primitives append observations, waits, sends, pauses, resumes, retries, hard-stop detections, approvals, finalization attempts, and stop-with-evidence records there. Event ids come from a sidecar `.counter` file maintained under the same lock (seeded by a one-time line count for runs created before the counter existed). During `wait`/`pause-until` polling, observation events are recorded on decision-relevant change or on a 60-second floor — not on every poll — plus always for the final snapshot, so a multi-hour pause does not flood the log with identical entries.
+`operational_events_path` points at an append-only JSONL file. Model-supervised primitives append observations, waits, sends, pauses, resumes, retries, hard-stop detections, approvals, finalization attempts, and stop-with-evidence records there. Event ids come from a sidecar `.counter` file maintained under the same lock; if that sidecar is lost, MC reconstructs it once from the JSONL log as current-state recovery. During `wait`/`pause-until` polling, observation events are recorded on decision-relevant change or on a 60-second floor — not on every poll — plus always for the final snapshot, so a multi-hour pause does not flood the log with identical entries.
 
 Example line:
 
@@ -244,9 +246,9 @@ Hard-stop hints are deterministic guards, not just advice. `send`, `pause-until`
 
 Every repair is re-verified by the complete, unrelaxed gate against the slice starting commit, so a `repairable` classification can only grant another chance to satisfy the identical gate — it can never accept a bad slice. Repairable signatures are `validation`, `drift`, `review`, `worker-evidence`, `unauthorized-files` (restore-only), `changed-files-mismatch`, `result-malformed`, `commit-missing`, `dirty-worktree`, and `orchestrator-repairable`. Terminal `needs-human` signatures are `integrity-head` and `slice-id-mismatch` — integrity/trust breaches are never steered, because continuing to reason from a context that already holds a false belief about reality is itself the risk. The `integrity-head` gate validates HEAD advance and descent from the slice starting commit on git evidence alone, before any comparison with the self-reported hash, so a truthful report of a reset-to-unrelated HEAD still fails. A missing `orchestrator-result.json` stays terminal `blocked` (a dead or unresponsive session is a runner condition, not a steerable content defect).
 
-Readers must tolerate a missing `repair` key (runs created before the repair loop) by defaulting to round 0; `normalize_run_state` deliberately does not backfill it.
+`repair` and all four of its fields are required on every active and terminal slice in schema v2. A first attempt records the explicit round-zero value rather than relying on a missing-field default.
 
-Both execution paths drive the identical loop from this state — by construction: the deterministic-batch path (`run-next` / `run --scope remaining`) is an in-process driver over the same start/wait/finalize primitives with a fixed no-judgment policy. The batch driver never interrupts a wait for hard-prompt or hard-stop-hint heuristics (their markers are broad substring matches that routinely occur in harness output; the unconditional safety boundary is the send-time refusal to type into a session showing a hard prompt, and the signals are still observed and recorded); it delivers in-session repair prompts itself, immediately; and it converts timeout, interrupt, and unexpected exception into forced fail-closed terminal entries. Batch runs therefore also record `observation` operational events during polling, refresh `observation-latest.json`, may briefly show run status `resuming` while an in-session repair round is live, and reap stale run sessions at slice start. The model-supervised path spreads the same loop across separate invocations: on a repairable gate with budget remaining, `finalize-slice` does **not** force-stop the session, appends **no** slice entry, keeps `current_slice` populated (so `start-slice` still refuses a concurrent second attempt), records the new repair state, and returns `"finalized": false, "status": "repairable"` with a `mode` field. For `"mode": "in-session"` it also returns `send_text` — a single-line pointer to the rendered `repair-prompt-repair-<round>.md` — and sets run status to `resuming` (send-eligible); the MC model delivers `send_text` with `send`, `wait`s for a fresh result, and finalizes again. For `"mode": "fresh-session"` (circuit-breaker escalation) or `"mode": "relaunch"` (dead session), `finalize-slice` has already force-stopped the old session and launched a new one itself with the original frozen prompt — `start-slice` cannot be used because it refuses while `current_slice` is populated, and clearing `current_slice` would drop the breaker state — leaving status `running`; the MC model just `wait`s and re-finalizes. `current_slice.before_head` never changes across rounds or relaunches, so verification stays cumulative. `current_slice.worker_tools` keeps the all-configured-tools worker gate enforced across invocations, while `current_slice.worker_policy` preserves the exact MC-generated digest and normalized policy used to detect later mutation. The relaunch composes its harness launch from the current `finalize-slice` invocation's flags, so invoke `finalize-slice` with the same `--harness-command`/`--allow-profile-command`/model/effort flags used at `start-slice`. On budget exhaustion, a tripped breaker, or an integrity gate, `finalize-slice` force-stops, appends the terminal entry, clears `current_slice`, and stops for a human as before. `run-next` and `run --scope remaining` refuse to start while any `current_slice` is populated, so a batch command cannot orphan a live model-supervised repair session.
+Both execution paths drive the identical loop from this state — by construction: the deterministic-batch path (`run-next` / `run --scope remaining`) is an in-process driver over the same start/wait/finalize primitives with a fixed no-judgment policy. The batch driver never interrupts a wait for hard-prompt or hard-stop-hint heuristics (their markers are broad substring matches that routinely occur in harness output; the unconditional safety boundary is the send-time refusal to type into a session showing a hard prompt, and the signals are still observed and recorded); it delivers in-session repair prompts itself, immediately; and it converts timeout, interrupt, and unexpected exception into forced fail-closed terminal entries. Batch runs therefore also record `observation` operational events during polling, refresh `observation-latest.json`, may briefly show run status `resuming` while an in-session repair round is live, and reap stale run sessions at slice start. The model-supervised path spreads the same loop across separate invocations: on a repairable gate with budget remaining, `finalize-slice` does **not** force-stop the session, appends **no** slice entry, keeps `current_slice` populated (so `start-slice` still refuses a concurrent second attempt), records the new repair state, and returns `"finalized": false, "status": "repairable"` with a `mode` field. For `"mode": "in-session"` it also returns `send_text` — a single-line pointer to the rendered `repair-prompt-repair-<round>.md` — and sets run status to `resuming` (send-eligible); the MC model delivers `send_text` with `send`, `wait`s for a fresh result, and finalizes again. For `"mode": "fresh-session"` (circuit-breaker escalation) or `"mode": "relaunch"` (dead session), `finalize-slice` has already force-stopped the old session and launched a new one itself with the frozen prompt, targeted repair instructions, archived-result paths, and the cumulative recovered residual-findings ledger — `start-slice` cannot be used because it refuses while `current_slice` is populated, and clearing `current_slice` would drop the breaker state — leaving status `running`; the MC model just `wait`s and re-finalizes. `current_slice.before_head` never changes across rounds or relaunches, so verification stays cumulative. `current_slice.worker_tools` keeps the all-configured-tools worker gate enforced across invocations, while `current_slice.worker_policy` preserves the exact MC-generated digest and normalized policy used to detect later mutation. The relaunch composes its harness launch from the current `finalize-slice` invocation's flags, so invoke `finalize-slice` with the same `--harness-command`/`--allow-profile-command`/model/effort flags used at `start-slice`. On budget exhaustion, a tripped breaker, or an integrity gate, `finalize-slice` force-stops, appends the terminal entry, clears `current_slice`, and stops for a human as before. `run-next` and `run --scope remaining` refuse to start while any `current_slice` is populated, so a batch command cannot orphan a live model-supervised repair session.
 
 `current_slice.pause` is either `null` or:
 
@@ -270,7 +272,7 @@ Runtime slices append entries to `slices`:
   "started_at": "2026-07-04T01:35:00Z",
   "completed_at": "2026-07-04T01:42:00Z",
   "artifact_dir": ".ai-mc/runs/20260704T013000Z/slices/slice-001",
-  "before_head": "<commit HEAD immediately before this slice ran, or null>",
+  "before_head": "<full commit HEAD immediately before this slice ran>",
   "changed_files": ["<repo-relative path string, not an object>"],
   "summary": "Concise slice outcome",
   "validation": [],
@@ -306,9 +308,9 @@ Runtime slices append entries to `slices`:
 }
 ```
 
-`repair` is present only when the slice actually consumed repair rounds and records the final repair-loop state for the attempt that produced this entry; a slice accepted on its first attempt (and every entry written before the repair loop existed) keeps the exact pre-repair-loop entry shape without it.
+`repair` is always present and records the final repair-loop state for the attempt that produced the entry. A slice accepted on its first attempt records the explicit round-zero state.
 
-Completed statuses for slice selection are `pass`, `committed`, `complete`, and `assumed-complete` (the last written only by `init --assume-complete` as an operator attestation). Any other status is treated as not completed unless a future policy explicitly says otherwise.
+Completed statuses for slice selection are `pass` and `assumed-complete` (the latter written only by `init --assume-complete` as an operator attestation). Any other status is not completed. Only an `assumed-complete` entry has null `before_head` and `artifact_dir` fields and omits runtime-only `worker_policy` and `slice_summary` evidence; every slice MC actually runs records those fields.
 
 Each slice artifact directory contains the rendered `prompt.md`, authoritative `worker-policy.json`, `activity-attempt-<n>.jsonl`, `pane-capture.txt`, `pane-capture-live-latest.txt` when live pane text was observed, `observation-latest.json` when `observe`, `wait`, or batch polling has run, `git-status-before.txt`, `git-status-after.txt`, `git-diff.patch`, `validation-summary.md`, `drift-audit.md`, `code-review.md`, MC-generated `slice-summary.md`, optional `worker-evidence.md`, optional `worker-runs-summary.json`, optional `mc-reconciliation.json` / `mc-reconciliation.md`, and `orchestrator-result.json` when the orchestrator reaches the structured result stage. Repair rounds add `repair-prompt-repair-<n>.md` and archived `orchestrator-result-repair-<n>.json` evidence; a relaunched harness receives `fresh-session-prompt-repair-<n>.md`, which combines the frozen prompt, targeted repair, and the cumulative residual-findings ledger recovered from archived results. The run directory also contains an MC-generated `run-report.md`, refreshed with every run-state write, that aggregates slice gates, commits, blockers, next actions, and residual findings for both partial and complete runs. Worker run directories preserve the semantic request, copied policy, complete embedded skill prompt, normalized launch contract, resolved argv, enforced repository working directory, process status, stdout, stderr, and actionable rejection feedback when validation fails. Timeout and failure paths preserve whatever capture and git evidence is available. Each activity log line is a JSON object with `checked_at`, `running`, and `active` fields.
 
@@ -339,7 +341,7 @@ Every orchestrator session must write this file in the slice artifact directory:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "slice_id": "Slice 1",
   "status": "pass",
   "summary": "",

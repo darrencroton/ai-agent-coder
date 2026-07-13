@@ -44,12 +44,11 @@ def verify_plan_unchanged(state: dict[str, Any], plan_path: Path) -> None:
     A "frozen" contract that is silently re-read on every slice is not frozen:
     editing the plan mid-run (renumbering slices, widening an authorized
     surface, flipping an approval flag) would otherwise be honored on the next
-    slice. Runs created before digests were recorded have no baseline and are
-    skipped for backward compatibility.
+    slice. Schema-v2 runs must always carry this baseline.
     """
     recorded = state.get("plan", {}).get("sha256")
     if not recorded:
-        return
+        raise McError("run state has no frozen plan digest; initialize a new MC run")
     current = plan_digest(plan_path)
     if current != recorded:
         raise McError(

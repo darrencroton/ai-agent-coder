@@ -121,6 +121,9 @@ class SupervisionRepairTests(McTestCase):
             "started_at": mc.utc_now(),
             "before_head": git(self.repo, "rev-parse", "HEAD"),
             "pause": None,
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -243,7 +246,18 @@ class SupervisionRepairTests(McTestCase):
         # attempt's own session and artifact names.
         self.prepare_committed_repo()
         state = self.init_run()
-        state["slices"].append({"slice_id": "Slice 1", "status": "failed"})
+        state["slices"].append(
+            mc.slice_entry_from_gate(
+                self.repo,
+                mc.parse_plan(self.plan)[0],
+                (self.repo / ".ai-mc" / "current").resolve() / "slices" / "slice-001",
+                mc.utc_now(),
+                mc.GateDecision("failed", "prior attempt", {"changed_files": []}, ()),
+                git(self.repo, "rev-parse", "HEAD"),
+                repair=mc_state.default_repair_state(),
+                worker_policy={"sha256": "a" * 64, "policy": {}},
+            )
+        )
         run_dir = (self.repo / ".ai-mc" / "current").resolve()
         plan_slice = mc.parse_plan(self.plan)[0]
         fake_adapter = mock.Mock()
@@ -272,8 +286,7 @@ class SupervisionRepairTests(McTestCase):
         # A repairable MC gate with budget remaining must not tear the session
         # down: no force_stop, no slice entry, current_slice kept, status set
         # to the send-eligible `resuming`, and the repair prompt surfaced. The
-        # current_slice here has NO repair key, proving the round-0 default
-        # for runs created before the repair loop existed.
+        # current slice carries the required explicit round-zero repair state.
         self.prepare_committed_repo()
         state = self.init_run()
         run_dir = (self.repo / ".ai-mc" / "current").resolve()
@@ -424,7 +437,15 @@ class SupervisionRepairTests(McTestCase):
         (self.repo / "README.md").write_text("unaccepted work\n", encoding="utf-8")
         state["status"] = "running"
         state["current_slice"] = mc.current_slice_state(
-            self.repo.resolve(), plan_slice, artifact, "mc_test_slice-001_a1", 1, mc.utc_now(), before, worker_tools=("opencode",)
+            self.repo.resolve(),
+            plan_slice,
+            artifact,
+            "mc_test_slice-001_a1",
+            1,
+            mc.utc_now(),
+            before,
+            worker_tools=("opencode",),
+            worker_policy={"sha256": "a" * 64, "policy": {}},
         )
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -468,7 +489,14 @@ class SupervisionRepairTests(McTestCase):
         before = git(self.repo, "rev-parse", "HEAD")
         state["status"] = "running"
         state["current_slice"] = mc.current_slice_state(
-            self.repo.resolve(), plan_slice, artifact, "mc_test_slice-001_a1", 1, mc.utc_now(), before
+            self.repo.resolve(),
+            plan_slice,
+            artifact,
+            "mc_test_slice-001_a1",
+            1,
+            mc.utc_now(),
+            before,
+            worker_policy={"sha256": "a" * 64, "policy": {}},
         )
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         self.plan.write_text(self.plan.read_text(encoding="utf-8") + "\nEdited mid-run.\n", encoding="utf-8")
@@ -529,6 +557,8 @@ class SupervisionRepairTests(McTestCase):
             "before_head": before,
             "worker_tools": ["opencode"],
             "pause": None,
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -573,6 +603,8 @@ class SupervisionRepairTests(McTestCase):
             "before_head": before,
             "worker_tools": [],
             "pause": None,
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -615,7 +647,7 @@ class SupervisionRepairTests(McTestCase):
         self.assertIn("slice_id does not match", state["stop_reason"])
         self.assertIsNone(state["current_slice"])
         self.assertEqual(len(state["slices"]), 1)
-        self.assertNotIn("repair", state["slices"][0])
+        self.assertEqual(state["slices"][0]["repair"], mc_state.default_repair_state())
         self.assertFalse((artifact / "repair-prompt.md").exists())
 
     def test_finalize_budget_exhaustion_is_terminal(self):
@@ -647,18 +679,16 @@ class SupervisionRepairTests(McTestCase):
         self.assertEqual(len(state["slices"]), 1)
         self.assertEqual(state["slices"][0]["repair"]["round"], 3)
 
-    def test_repair_state_defaults_when_absent(self):
-        # Codex #8: runs created before the repair loop have no
-        # current_slice.repair and must load with a round-0 default;
-        # normalize_run_state deliberately does not backfill it.
+    def test_repair_state_requires_complete_schema_v2_state(self):
+        with self.assertRaisesRegex(mc.McError, "missing required repair state"):
+            mc_state.repair_state(None)
+        with self.assertRaisesRegex(mc.McError, "missing required repair state"):
+            mc_state.repair_state({"slice_id": "Slice 1"})
         self.assertEqual(
-            mc_state.repair_state(None),
-            {"round": 0, "last_signature": "", "signature_streak": 0, "session_generation": 1},
-        )
-        self.assertEqual(mc_state.repair_state({"slice_id": "Slice 1"})["round"], 0)
-        self.assertEqual(
-            mc_state.repair_state({"repair": {"round": 2, "last_signature": "drift"}}),
-            {"round": 2, "last_signature": "drift", "signature_streak": 0, "session_generation": 1},
+            mc_state.repair_state(
+                {"repair": {"round": 2, "last_signature": "drift", "signature_streak": 1, "session_generation": 3}}
+            ),
+            {"round": 2, "last_signature": "drift", "signature_streak": 1, "session_generation": 3},
         )
 
     @unittest.skipUnless(shutil.which("tmux"), "tmux is required for runtime test")
@@ -816,6 +846,9 @@ class SupervisionRepairTests(McTestCase):
             "started_at": mc.utc_now(),
             "before_head": "a" * 40,
             "pause": None,
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -857,6 +890,9 @@ class SupervisionRepairTests(McTestCase):
             "started_at": mc.utc_now(),
             "before_head": "a" * 40,
             "pause": None,
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -898,6 +934,9 @@ class SupervisionRepairTests(McTestCase):
             "started_at": mc.utc_now(),
             "before_head": "a" * 40,
             "pause": None,
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         state["supervision"]["max_single_pause_seconds"] = 0
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")

@@ -265,7 +265,7 @@ class PlanStateTests(McTestCase):
 
     def test_run_state_creation(self):
         state = self.init_run()
-        self.assertEqual(state["schema_version"], 1)
+        self.assertEqual(state["schema_version"], 2)
         self.assertEqual(state["repo_path"], str(self.repo.resolve()))
         self.assertEqual(state["plan_path"], str(self.plan.resolve()))
         self.assertEqual(state["harness"]["name"], "codex")
@@ -322,18 +322,85 @@ class PlanStateTests(McTestCase):
         with self.assertRaisesRegex(mc.McError, "dirty worktree"):
             mc.init_run(args)
 
-    def test_old_run_state_loads_with_supervision_defaults(self):
+    def test_run_state_rejects_unsupported_schema_and_missing_required_fields(self):
         state = self.init_run()
         run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"
-        state.pop("supervision")
-        state.pop("operational_events_path")
+        state["schema_version"] = 1
         run_json.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(mc.McError, "unsupported run-state schema"):
+            mc.load_run(run_json)
 
-        loaded = mc.load_run(run_json)
+        state["schema_version"] = 2
+        state.pop("supervision")
+        run_json.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(mc.McError, "missing required field.*supervision"):
+            mc.load_run(run_json)
 
-        self.assertEqual(loaded["supervision"]["mode"], "deterministic-batch")
-        self.assertEqual(loaded["supervision"]["max_consecutive_pauses_per_slice"], 2)
-        self.assertEqual(loaded["operational_events_path"], f".ai-mc/runs/{state['run_id']}/operational-events.jsonl")
+        state = self.init_run()
+        state["supervision"]["pause_counters"].pop("cumulative_pause_seconds_run")
+        run_json.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(mc.McError, "supervision.pause_counters missing required field"):
+            mc.load_run(run_json)
+
+    def test_run_state_rejects_incomplete_or_unsafe_nested_schema_v2_state(self):
+        base = self.init_run()
+        run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"
+        cases = (
+            ("harness object", lambda state: state.__setitem__("harness", None), "harness must be an object"),
+            ("policy object", lambda state: state.__setitem__("policy", None), "policy must be an object"),
+            ("approvals object", lambda state: state.__setitem__("approvals", None), "approvals must be an object"),
+            (
+                "complete plan",
+                lambda state: state.__setitem__("plan", {"sha256": state["plan"]["sha256"]}),
+                "plan missing required field.*parser.*slice_count",
+            ),
+            (
+                "current parser",
+                lambda state: state["plan"].__setitem__("parser", "implementation-plan-markdown-v1"),
+                "plan.parser must be 'implementation-plan-markdown-v2'",
+            ),
+            ("run status", lambda state: state.__setitem__("status", "committed"), "unsupported run status"),
+            (
+                "repair budget",
+                lambda state: state["policy"].__setitem__("max_repair_attempts", -1),
+                "policy.max_repair_attempts must be an integer >= 0",
+            ),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                state = json.loads(json.dumps(base))
+                mutate(state)
+                run_json.write_text(json.dumps(state), encoding="utf-8")
+                with self.assertRaisesRegex(mc.McError, expected):
+                    mc.load_run(run_json)
+
+        state = json.loads(json.dumps(base))
+        state["slices"].append(self.terminal_slice_entry(state))
+        state["slices"][0]["repair"]["round"] = -100
+        run_json.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(mc.McError, r"slices\[0\].repair.round must be an integer >= 0"):
+            mc.load_run(run_json)
+
+        state = json.loads(json.dumps(base))
+        state["slices"].append(self.terminal_slice_entry(state))
+        state["slices"][0]["repair"]["signature_streak"] = 3
+        run_json.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(mc.McError, r"slices\[0\].repair.signature_streak must be an integer between 0 and 2"):
+            mc.load_run(run_json)
+
+        state = json.loads(json.dumps(base))
+        state["slices"].append(self.terminal_slice_entry(state))
+        state["slices"][0]["repair"]["round"] = state["policy"]["max_repair_attempts"] + 1
+        run_json.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(mc.McError, r"slices\[0\].repair.round exceeds policy budget"):
+            mc.load_run(run_json)
+
+        state = json.loads(json.dumps(base))
+        state["slices"].append(self.terminal_slice_entry(state))
+        state["slices"][0].pop("worker_policy")
+        run_json.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(mc.McError, r"slices\[0\].worker_policy must be an object"):
+            mc.load_run(run_json)
 
     def test_append_operational_event_does_not_rewrite_run_json(self):
         state = self.init_run()
@@ -362,6 +429,7 @@ class PlanStateTests(McTestCase):
             1,
             "2026-01-01T00:00:00Z",
             "a" * 40,
+            worker_policy={"sha256": "b" * 64, "policy": {}},
         )
 
         self.assertEqual(state["before_head"], "a" * 40)
@@ -380,7 +448,14 @@ class PlanStateTests(McTestCase):
             "attempt": 1,
             "started_at": "2026-01-01T00:00:00Z",
             "before_head": "b" * 40,
-            "pause": {"paused_until": "2026-01-01T01:00:00Z", "reason": "rolling usage limit reset"},
+            "pause": {
+                "paused_until": "2026-01-01T01:00:00Z",
+                "reason": "rolling usage limit reset",
+                "evidence_event_id": "op-0001",
+            },
+            "worker_tools": [],
+            "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "c" * 64, "policy": {}},
         }
         run_json.write_text(json.dumps(state), encoding="utf-8")
         output = io.StringIO()
@@ -422,24 +497,6 @@ class PlanStateTests(McTestCase):
         run_json.write_text(json.dumps(state), encoding="utf-8")
         slices = mc.parse_plan(self.plan)
         self.assertEqual(mc.next_slice(slices, state).slice_id, "Slice 2")
-
-    def test_previous_completed_head_returns_prior_completed_commit(self):
-        state = {
-            "slices": [
-                {
-                    "slice_id": "Slice 1",
-                    "status": "pass",
-                    "commit": {"hash": "a" * 40},
-                },
-                {
-                    "slice_id": "Slice 2",
-                    "status": "fail",
-                    "commit": {"hash": "b" * 40},
-                },
-            ],
-        }
-
-        self.assertEqual(mc.previous_completed_head(state, "Slice 2"), "a" * 40)
 
     def test_final_slice_stops_before_future_work(self):
         self.plan.write_text(

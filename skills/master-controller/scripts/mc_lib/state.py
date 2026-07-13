@@ -7,8 +7,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .constants import COMPLETED_SLICE_STATUSES, DEFAULT_SUPERVISION, OPERATIONAL_EVENTS_FILENAME, RUN_STOP_STATUSES
-from .git_ops import git_result
+from .constants import (
+    DEFAULT_SUPERVISION,
+    FULL_COMMIT_RE,
+    PARSER_NAME,
+    RUN_ACTIVE_STATUSES,
+    RUN_STOP_STATUSES,
+    SCHEMA_VERSION,
+)
 from .models import GateDecision, McError, PlanSlice
 from .plan import completed_slice_ids
 from .runtime import relative_artifact_path
@@ -29,11 +35,12 @@ def load_run(run_path: Path) -> dict[str, Any]:
         raise McError(f"run.json not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise McError(f"invalid run.json: {path}: {exc}") from exc
-    return normalize_run_state(state, path.parent)
+    return validate_run_state(state, path)
 
 
 def write_run(path: Path, state: dict[str, Any]) -> None:
     state["updated_at"] = utc_now()
+    validate_run_state(state, path)
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (path.parent / "run-report.md").write_text(render_run_report(state), encoding="utf-8")
 
@@ -180,35 +187,259 @@ def run_json_path(run_path: Path) -> Path:
     return path / "run.json" if path.is_dir() else path
 
 
-def _merge_missing(base: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(base)
-    for key, value in defaults.items():
-        if key not in merged:
-            merged[key] = copy.deepcopy(value)
-        elif isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _merge_missing(merged[key], value)
-    return merged
+_RUN_FIELDS = {
+    "schema_version",
+    "run_id",
+    "created_at",
+    "updated_at",
+    "status",
+    "repo_path",
+    "plan_path",
+    "worktree_root",
+    "branch",
+    "harness",
+    "policy",
+    "plan",
+    "current_slice",
+    "supervision",
+    "operational_events_path",
+    "approvals",
+    "slices",
+    "stop_reason",
+}
+_CURRENT_SLICE_FIELDS = {
+    "slice_id",
+    "title",
+    "artifact_dir",
+    "tmux_session",
+    "attempt",
+    "started_at",
+    "before_head",
+    "pause",
+    "worker_tools",
+    "repair",
+    "worker_policy",
+}
+_SLICE_ENTRY_FIELDS = {
+    "slice_id",
+    "title",
+    "status",
+    "started_at",
+    "completed_at",
+    "artifact_dir",
+    "before_head",
+    "changed_files",
+    "summary",
+    "validation",
+    "drift_audit",
+    "code_review",
+    "commit",
+    "next_action",
+    "blockers",
+    "residual_findings",
+    "gate_reason",
+    "worker_tools",
+    "repair",
+}
+_REPAIR_FIELDS = {"round", "last_signature", "signature_streak", "session_generation"}
+_HARNESS_FIELDS = {"name", "adapter", "preflight"}
+_PREFLIGHT_FIELDS = {"platform", "python", "python_version", "git", "tmux"}
+_POLICY_FIELDS = {"dirty_state", "approval_gated_slices", "max_repair_attempts", "commit_required"}
+_PLAN_FIELDS = {"slice_count", "parser", "sha256"}
+_WORKER_POLICY_FIELDS = {"sha256", "policy"}
+_PAUSE_FIELDS = {"paused_until", "reason", "evidence_event_id"}
+_APPROVAL_FIELDS = {"approved_at", "reason", "approved_by"}
+_RUN_STATUSES = RUN_ACTIVE_STATUSES | RUN_STOP_STATUSES | {"complete"}
+_SLICE_STATUSES = {"pass", "assumed-complete", "needs-human", "blocked", "fail", "failed", "cancelled"}
 
 
-def default_operational_events_path(state: dict[str, Any], run_dir: Path) -> str:
-    repo_path = state.get("repo_path")
-    if repo_path:
-        repo = Path(str(repo_path))
-        try:
-            return relative_artifact_path(repo, run_dir / OPERATIONAL_EVENTS_FILENAME)
-        except ValueError:
-            pass
-    return str((run_dir / OPERATIONAL_EVENTS_FILENAME).resolve())
+def _require_fields(value: dict[str, Any], required: set[str], label: str, path: Path) -> None:
+    missing = sorted(required - value.keys())
+    if missing:
+        raise McError(f"invalid schema-v2 run state at {path}: {label} missing required field(s): {', '.join(missing)}")
 
 
-def normalize_run_state(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
-    """Apply backwards-compatible defaults to loaded run state."""
-    normalized = dict(state)
-    supervision = normalized.get("supervision")
-    normalized["supervision"] = _merge_missing(supervision if isinstance(supervision, dict) else {}, DEFAULT_SUPERVISION)
-    if not normalized.get("operational_events_path"):
-        normalized["operational_events_path"] = default_operational_events_path(normalized, run_dir)
-    return normalized
+def _require_mapping_shape(value: Any, template: dict[str, Any], label: str, path: Path) -> None:
+    if not isinstance(value, dict):
+        raise McError(f"invalid schema-v2 run state at {path}: {label} must be an object")
+    _require_fields(value, set(template), label, path)
+    for key, expected in template.items():
+        if isinstance(expected, dict):
+            _require_mapping_shape(value[key], expected, f"{label}.{key}", path)
+
+
+def _require_string(value: Any, label: str, path: Path, *, allow_empty: bool = False) -> None:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        qualifier = "a string" if allow_empty else "a non-empty string"
+        raise McError(f"invalid schema-v2 run state at {path}: {label} must be {qualifier}")
+
+
+def _require_integer(value: Any, label: str, path: Path, *, minimum: int = 0, maximum: int | None = None) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or (maximum is not None and value > maximum):
+        requirement = f"between {minimum} and {maximum}" if maximum is not None else f">= {minimum}"
+        raise McError(f"invalid schema-v2 run state at {path}: {label} must be an integer {requirement}")
+
+
+def _require_string_list(value: Any, label: str, path: Path) -> None:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise McError(f"invalid schema-v2 run state at {path}: {label} must be a list of strings")
+
+
+def _validate_digest(value: Any, label: str, path: Path) -> None:
+    if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise McError(f"invalid schema-v2 run state at {path}: {label} must be a 64-character lowercase hex digest")
+
+
+def _validate_commit_hash(value: Any, label: str, path: Path) -> None:
+    if not isinstance(value, str) or not FULL_COMMIT_RE.fullmatch(value):
+        raise McError(f"invalid schema-v2 run state at {path}: {label} must be a full lowercase Git commit hash")
+
+
+def _validate_repair(value: Any, label: str, path: Path) -> None:
+    if not isinstance(value, dict):
+        raise McError(f"invalid schema-v2 run state at {path}: {label} must be an object")
+    _require_fields(value, _REPAIR_FIELDS, label, path)
+    _require_integer(value["round"], f"{label}.round", path)
+    _require_string(value["last_signature"], f"{label}.last_signature", path, allow_empty=True)
+    _require_integer(value["signature_streak"], f"{label}.signature_streak", path, maximum=2)
+    _require_integer(value["session_generation"], f"{label}.session_generation", path, minimum=1)
+
+
+def _validate_worker_policy(value: Any, label: str, path: Path) -> None:
+    if not isinstance(value, dict):
+        raise McError(f"invalid schema-v2 run state at {path}: {label} must be an object")
+    _require_fields(value, _WORKER_POLICY_FIELDS, label, path)
+    _validate_digest(value["sha256"], f"{label}.sha256", path)
+    if not isinstance(value["policy"], dict):
+        raise McError(f"invalid schema-v2 run state at {path}: {label}.policy must be an object")
+
+
+def validate_run_state(state: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Validate the one supported durable run-state shape without migration."""
+    if not isinstance(state, dict):
+        raise McError(f"invalid schema-v2 run state at {path}: run must be an object")
+    if state.get("schema_version") != SCHEMA_VERSION:
+        raise McError(
+            f"unsupported run-state schema at {path}: expected {SCHEMA_VERSION}, found {state.get('schema_version')!r}; "
+            "initialize a new MC run"
+        )
+    _require_fields(state, _RUN_FIELDS, "run", path)
+    for field in ("run_id", "created_at", "updated_at", "repo_path", "plan_path", "branch"):
+        _require_string(state[field], field, path)
+    if state["worktree_root"] is not None:
+        _require_string(state["worktree_root"], "worktree_root", path)
+    if state["stop_reason"] is not None:
+        _require_string(state["stop_reason"], "stop_reason", path)
+    if not isinstance(state["status"], str) or state["status"] not in _RUN_STATUSES:
+        raise McError(f"invalid schema-v2 run state at {path}: unsupported run status {state['status']!r}")
+
+    harness = state["harness"]
+    if not isinstance(harness, dict):
+        raise McError(f"invalid schema-v2 run state at {path}: harness must be an object")
+    _require_fields(harness, _HARNESS_FIELDS, "harness", path)
+    _require_string(harness["name"], "harness.name", path)
+    if harness["adapter"] is not None:
+        _require_string(harness["adapter"], "harness.adapter", path)
+    if not isinstance(harness["preflight"], dict):
+        raise McError(f"invalid schema-v2 run state at {path}: harness.preflight must be an object")
+    _require_fields(harness["preflight"], _PREFLIGHT_FIELDS, "harness.preflight", path)
+    for field in _PREFLIGHT_FIELDS:
+        value = harness["preflight"][field]
+        if value is not None:
+            _require_string(value, f"harness.preflight.{field}", path)
+
+    policy = state["policy"]
+    if not isinstance(policy, dict):
+        raise McError(f"invalid schema-v2 run state at {path}: policy must be an object")
+    _require_fields(policy, _POLICY_FIELDS, "policy", path)
+    if policy["dirty_state"] != "clean-required" or policy["approval_gated_slices"] != "stop":
+        raise McError(f"invalid schema-v2 run state at {path}: policy contains unsupported enforcement values")
+    _require_integer(policy["max_repair_attempts"], "policy.max_repair_attempts", path)
+    if not isinstance(policy["commit_required"], bool):
+        raise McError(f"invalid schema-v2 run state at {path}: policy.commit_required must be a boolean")
+
+    plan = state["plan"]
+    if not isinstance(plan, dict):
+        raise McError(f"invalid schema-v2 run state at {path}: plan must be an object")
+    _require_fields(plan, _PLAN_FIELDS, "plan", path)
+    _require_integer(plan["slice_count"], "plan.slice_count", path, minimum=1)
+    if plan["parser"] != PARSER_NAME:
+        raise McError(f"invalid schema-v2 run state at {path}: plan.parser must be {PARSER_NAME!r}")
+    _validate_digest(plan["sha256"], "plan.sha256", path)
+
+    approvals = state["approvals"]
+    if not isinstance(approvals, dict):
+        raise McError(f"invalid schema-v2 run state at {path}: approvals must be an object")
+    for slice_id, approval in approvals.items():
+        _require_string(slice_id, "approvals key", path)
+        if not isinstance(approval, dict):
+            raise McError(f"invalid schema-v2 run state at {path}: approvals[{slice_id!r}] must be an object")
+        _require_fields(approval, _APPROVAL_FIELDS, f"approvals[{slice_id!r}]", path)
+        for field in _APPROVAL_FIELDS:
+            _require_string(approval[field], f"approvals[{slice_id!r}].{field}", path)
+
+    _require_mapping_shape(state["supervision"], DEFAULT_SUPERVISION, "supervision", path)
+    if not isinstance(state["supervision"]["mode"], str) or state["supervision"]["mode"] not in {
+        "deterministic-batch",
+        "model-supervised",
+    }:
+        raise McError(f"invalid schema-v2 run state at {path}: supervision.mode is unsupported")
+    _require_string(state["supervision"]["default_resume_prompt"], "supervision.default_resume_prompt", path)
+    if state["supervision"]["pause_policy"] != DEFAULT_SUPERVISION["pause_policy"]:
+        raise McError(f"invalid schema-v2 run state at {path}: supervision.pause_policy is unsupported")
+    for field in (
+        "default_reset_buffer_seconds",
+        "max_single_pause_seconds",
+        "max_consecutive_pauses_per_slice",
+        "max_cumulative_pause_seconds_per_run",
+        "max_transient_retries_per_slice",
+    ):
+        _require_integer(state["supervision"][field], f"supervision.{field}", path)
+    for field in DEFAULT_SUPERVISION["pause_counters"]:
+        _require_integer(state["supervision"]["pause_counters"][field], f"supervision.pause_counters.{field}", path)
+    if not isinstance(state["operational_events_path"], str) or not state["operational_events_path"]:
+        raise McError(f"invalid schema-v2 run state at {path}: operational_events_path must be a non-empty string")
+    if not isinstance(state["slices"], list):
+        raise McError(f"invalid schema-v2 run state at {path}: slices must be a list")
+    for index, entry in enumerate(state["slices"]):
+        if not isinstance(entry, dict):
+            raise McError(f"invalid schema-v2 run state at {path}: slices[{index}] must be an object")
+        _require_fields(entry, _SLICE_ENTRY_FIELDS, f"slices[{index}]", path)
+        if not isinstance(entry["status"], str) or entry["status"] not in _SLICE_STATUSES:
+            raise McError(f"invalid schema-v2 run state at {path}: unsupported slices[{index}] status {entry['status']!r}")
+        _validate_repair(entry["repair"], f"slices[{index}].repair", path)
+        if entry["repair"]["round"] > policy["max_repair_attempts"]:
+            raise McError(f"invalid schema-v2 run state at {path}: slices[{index}].repair.round exceeds policy budget")
+        _require_string_list(entry["worker_tools"], f"slices[{index}].worker_tools", path)
+        if entry["status"] == "assumed-complete":
+            if entry["before_head"] is not None or entry["artifact_dir"] is not None:
+                raise McError(f"invalid schema-v2 run state at {path}: assumed-complete slice boundaries must be null")
+        else:
+            _validate_commit_hash(entry["before_head"], f"slices[{index}].before_head", path)
+            _require_string(entry["artifact_dir"], f"slices[{index}].artifact_dir", path)
+            _require_string(entry.get("slice_summary"), f"slices[{index}].slice_summary", path)
+            _validate_worker_policy(entry.get("worker_policy"), f"slices[{index}].worker_policy", path)
+    current = state["current_slice"]
+    if current is not None:
+        if not isinstance(current, dict):
+            raise McError(f"invalid schema-v2 run state at {path}: current_slice must be an object or null")
+        _require_fields(current, _CURRENT_SLICE_FIELDS, "current_slice", path)
+        _validate_repair(current["repair"], "current_slice.repair", path)
+        if current["repair"]["round"] > policy["max_repair_attempts"]:
+            raise McError(f"invalid schema-v2 run state at {path}: current_slice.repair.round exceeds policy budget")
+        _validate_commit_hash(current["before_head"], "current_slice.before_head", path)
+        _require_string_list(current["worker_tools"], "current_slice.worker_tools", path)
+        _validate_worker_policy(current["worker_policy"], "current_slice.worker_policy", path)
+        _require_integer(current["attempt"], "current_slice.attempt", path, minimum=1)
+        for field in ("slice_id", "title", "artifact_dir", "tmux_session", "started_at"):
+            _require_string(current[field], f"current_slice.{field}", path)
+        if current["pause"] is not None:
+            if not isinstance(current["pause"], dict):
+                raise McError(f"invalid schema-v2 run state at {path}: current_slice.pause must be an object or null")
+            _require_fields(current["pause"], _PAUSE_FIELDS, "current_slice.pause", path)
+            for field in _PAUSE_FIELDS:
+                _require_string(current["pause"][field], f"current_slice.pause.{field}", path)
+    return state
 
 
 def update_run_locked(run_json: Path, mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
@@ -226,11 +457,7 @@ def update_run_locked(run_json: Path, mutate: Callable[[dict[str, Any]], None]) 
 
 
 def operational_events_file(repo: Path, state: dict[str, Any]) -> Path:
-    value = str(state.get("operational_events_path") or "")
-    if not value:
-        path = Path(default_operational_events_path(state, repo / ".ai-mc" / "runs" / str(state.get("run_id", ""))))
-        return path if path.is_absolute() else repo / path
-    path = Path(value)
+    path = Path(state["operational_events_path"])
     return path if path.is_absolute() else repo / path
 
 
@@ -240,7 +467,7 @@ def _next_event_number(event_path: Path) -> int:
     Counting lines on every append is O(n) per event and O(n^2) over a run —
     a multi-hour pause at a 2s poll cadence produces thousands of events. The
     counter file lives beside the log and is read/written under the same lock.
-    A run created before the counter existed seeds it by counting once.
+    If the counter sidecar is lost, it is reconstructed by counting once.
     """
     counter_path = event_path.with_name(event_path.name + ".counter")
     if counter_path.exists():
@@ -320,21 +547,15 @@ def default_repair_state() -> dict[str, Any]:
 
 
 def repair_state(current: dict[str, Any] | None) -> dict[str, Any]:
-    """Read `current_slice.repair`, defaulting to round 0 when absent.
-
-    Runs created before the repair loop existed have no `repair` key, and
-    `normalize_run_state` deliberately does not backfill it (`_merge_missing`
-    covers only `supervision`), so every reader must tolerate absence.
-    """
-    repair = (current or {}).get("repair")
-    if not isinstance(repair, dict):
-        return default_repair_state()
-    defaults = default_repair_state()
+    """Read the required schema-v2 repair state."""
+    if not isinstance(current, dict) or not isinstance(current.get("repair"), dict):
+        raise McError("schema-v2 current slice is missing required repair state")
+    repair = current["repair"]
     return {
-        "round": int(repair.get("round") or 0),
-        "last_signature": str(repair.get("last_signature") or ""),
-        "signature_streak": int(repair.get("signature_streak") or 0),
-        "session_generation": int(repair.get("session_generation") or defaults["session_generation"]),
+        "round": int(repair["round"]),
+        "last_signature": str(repair["last_signature"]),
+        "signature_streak": int(repair["signature_streak"]),
+        "session_generation": int(repair["session_generation"]),
     }
 
 
@@ -351,6 +572,10 @@ def current_slice_state(
     repair: dict[str, Any] | None = None,
     worker_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if not before_head:
+        raise McError("cannot start a schema-v2 slice without a recorded before_head")
+    if worker_policy is None:
+        raise McError("cannot start a schema-v2 slice without a worker-policy snapshot")
     state = {
         "slice_id": plan_slice.slice_id,
         "title": plan_slice.title,
@@ -370,11 +595,10 @@ def current_slice_state(
         # decisions are driven from this persisted state, not from counting
         # appended slice entries (in-session repairs append none).
         "repair": dict(repair) if repair is not None else default_repair_state(),
+        "worker_policy": copy.deepcopy(worker_policy),
     }
     if orchestrator_session_id:
         state["orchestrator_session_id"] = orchestrator_session_id
-    if worker_policy is not None:
-        state["worker_policy"] = copy.deepcopy(worker_policy)
     return state
 
 
@@ -415,10 +639,7 @@ def slice_entry_from_gate(
         # requirement for this attempt without a fresh --worker-tools flag.
         "worker_tools": list(worker_tools),
     }
-    # Recorded only when repair rounds were actually used, so a slice that
-    # passes first-attempt keeps the exact pre-repair-loop entry shape.
-    if repair is not None:
-        entry["repair"] = dict(repair)
+    entry["repair"] = dict(repair) if repair is not None else default_repair_state()
     if worker_policy is not None:
         entry["worker_policy"] = copy.deepcopy(worker_policy)
     slice_summary_path = slice_artifact_dir / "slice-summary.md"
@@ -426,15 +647,3 @@ def slice_entry_from_gate(
     entry["slice_summary"] = relative_artifact_path(repo, slice_summary_path)
     slice_summary_path.write_text(render_slice_summary(entry), encoding="utf-8")
     return entry
-
-
-def previous_completed_head(state: dict[str, Any], slice_id: str) -> str | None:
-    previous: str | None = None
-    for entry in state.get("slices", []):
-        if entry.get("slice_id") == slice_id:
-            return previous
-        if str(entry.get("status", "")).lower() in COMPLETED_SLICE_STATUSES:
-            commit = entry.get("commit") if isinstance(entry.get("commit"), dict) else {}
-            if commit.get("hash"):
-                previous = str(commit["hash"])
-    return previous

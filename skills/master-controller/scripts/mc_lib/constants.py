@@ -5,8 +5,8 @@ import shlex
 from typing import Any
 
 
-SCHEMA_VERSION = 1
-PARSER_NAME = "implementation-plan-markdown-v1"
+SCHEMA_VERSION = 2
+PARSER_NAME = "implementation-plan-markdown-v2"
 FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUIRED_SECTIONS = (
     "Intended Change",
@@ -21,7 +21,7 @@ REQUIRED_SECTIONS = (
 # attestation that a slice was already completed (and committed) before this
 # run existed, e.g. under a previous run whose plan was edited to clear an
 # approval gate. MC never assigns it from gate verification.
-COMPLETED_SLICE_STATUSES = {"pass", "committed", "complete", "assumed-complete"}
+COMPLETED_SLICE_STATUSES = {"pass", "assumed-complete"}
 ORCHESTRATOR_STATUSES = {"pass", "repairable", "needs-human", "fail", "blocked"}
 RUN_ACTIVE_STATUSES = {"initialized", "running", "paused", "resuming", "partial"}
 RUN_STOP_STATUSES = {"needs-human", "blocked", "failed", "cancelled"}

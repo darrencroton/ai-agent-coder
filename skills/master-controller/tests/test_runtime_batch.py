@@ -32,24 +32,21 @@ class RuntimeBatchTests(McTestCase):
         after = git(self.repo, "rev-parse", "HEAD")
         artifact = run_dir / "slices" / "slice-001"
         self.write_gate_result(artifact, changed_files=["README.md"], commit_hash="0" * 40)
-        state["slices"].append(
-            {
-                "slice_id": "Slice 1",
-                "title": "First Slice",
-                "status": "fail",
-                "started_at": "2026-01-01T00:00:00Z",
-                "artifact_dir": str(artifact.relative_to(self.repo.resolve())),
-                "changed_files": ["README.md"],
-                "validation": [{"command": "test", "result": "pass", "notes": ""}],
-                "drift_audit": {"verdict": "PASS", "path": "drift-audit.md"},
-                "code_review": {"verdict": "PASS", "path": "code-review.md"},
-                "commit": {"requested": True, "created": True, "hash": "0" * 40},
-                "next_action": "",
-                "blockers": [],
-                "residual_findings": [],
-                "gate_reason": "reported commit is not the current HEAD",
-            }
+        entry = self.terminal_slice_entry(
+            state,
+            status="fail",
+            artifact_dir=str(artifact.relative_to(self.repo.resolve())),
+            before_head=before,
+            commit={"requested": True, "created": True, "hash": "0" * 40},
         )
+        entry.update(
+            changed_files=["README.md"],
+            validation=[{"command": "test", "result": "pass", "notes": ""}],
+            drift_audit={"verdict": "PASS", "path": "drift-audit.md"},
+            code_review={"verdict": "PASS", "path": "code-review.md"},
+            gate_reason="reported commit is not the current HEAD",
+        )
+        state["slices"].append(entry)
         state["status"] = "failed"
         state["stop_reason"] = "reported commit is not the current HEAD"
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
@@ -94,7 +91,7 @@ class RuntimeBatchTests(McTestCase):
         activity = json.loads(activity_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(set(activity), {"active", "checked_at", "running"})
         # First-attempt-pass guardrail: exactly one session, no repair
-        # artifacts, and the pre-repair-loop slice-entry shape.
+        # artifacts, and the explicit round-zero slice-entry shape.
         self.assertFalse((slice_dir / "activity-attempt-2.jsonl").exists())
         self.assertFalse((slice_dir / "repair-prompt.md").exists())
         self.assertFalse((slice_dir / "repair-prompt-repair-1.md").exists())
@@ -106,7 +103,7 @@ class RuntimeBatchTests(McTestCase):
                 "slice_id", "title", "status", "started_at", "completed_at", "artifact_dir",
                 "before_head", "changed_files", "summary", "validation", "drift_audit", "code_review",
                 "commit", "next_action", "blockers", "gate_reason", "worker_tools", "worker_policy",
-                "residual_findings", "slice_summary",
+                "repair", "residual_findings", "slice_summary",
             },
         )
 
@@ -409,7 +406,7 @@ class RuntimeBatchTests(McTestCase):
         slice_dir = run_dir / "slices" / "slice-001"
         self.assertEqual(state["status"], "needs-human")
         self.assertIn("slice_id does not match", state["stop_reason"])
-        self.assertNotIn("repair", state["slices"][0])
+        self.assertEqual(state["slices"][0]["repair"], mc_state.default_repair_state())
         self.assertFalse((slice_dir / "repair-prompt-repair-1.md").exists())
         self.assertFalse((slice_dir / "orchestrator-result-repair-1.json").exists())
         self.assertFalse((slice_dir / "activity-attempt-2.jsonl").exists())
@@ -422,7 +419,7 @@ class RuntimeBatchTests(McTestCase):
         )
         self.plan.write_text(text, encoding="utf-8")
         state = self.init_run()
-        state["slices"].append({"slice_id": "Slice 1", "status": "pass"})
+        state["slices"].append(self.terminal_slice_entry(state))
         run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"
         run_json.write_text(json.dumps(state), encoding="utf-8")
         run_args = argparse.Namespace(
@@ -452,7 +449,7 @@ class RuntimeBatchTests(McTestCase):
     def test_run_remaining_verifies_plan_before_completion_check(self):
         state = self.init_run()
         run_json = (self.repo / ".ai-mc" / "current").resolve() / "run.json"
-        state["slices"].append({"slice_id": "Slice 1", "status": "pass"})
+        state["slices"].append(self.terminal_slice_entry(state))
         run_json.write_text(json.dumps(state), encoding="utf-8")
         self.plan.write_text(self.plan.read_text(encoding="utf-8") + "\n<!-- edited -->\n", encoding="utf-8")
         args = argparse.Namespace(
@@ -473,14 +470,11 @@ class RuntimeBatchTests(McTestCase):
         artifact = run_dir / "slices" / "slice-001"
         artifact.mkdir(parents=True)
         state["slices"].append(
-            {
-                "slice_id": "Slice 1",
-                "title": "First Slice",
-                "status": "fail",
-                "started_at": "2026-01-01T00:00:00Z",
-                "artifact_dir": str(artifact.relative_to(self.repo.resolve())),
-                "before_head": None,
-            }
+            self.terminal_slice_entry(
+                state,
+                status="fail",
+                artifact_dir=str(artifact.relative_to(self.repo.resolve())),
+            )
         )
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         self.plan.write_text(self.plan.read_text(encoding="utf-8") + "\n<!-- edited -->\n", encoding="utf-8")
@@ -519,15 +513,13 @@ class RuntimeBatchTests(McTestCase):
         artifact = run_dir / "slices" / "slice-001"
         artifact.mkdir(parents=True)
         state["slices"].append(
-            {
-                "slice_id": "Slice 1",
-                "title": "First Slice",
-                "status": "fail",
-                "started_at": "2026-01-01T00:00:00Z",
-                "artifact_dir": str(artifact.relative_to(self.repo.resolve())),
-                "before_head": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-                "commit": {"requested": True, "created": True, "hash": "0" * 40},
-            }
+            self.terminal_slice_entry(
+                state,
+                status="fail",
+                artifact_dir=str(artifact.relative_to(self.repo.resolve())),
+                before_head="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                commit={"requested": True, "created": True, "hash": "0" * 40},
+            )
         )
         state["status"] = "failed"
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
@@ -610,10 +602,11 @@ class RuntimeBatchTests(McTestCase):
             "tmux_session": "mc_no_such_session_xyz",
             "attempt": 1,
             "started_at": mc.utc_now(),
-            "before_head": None,
+            "before_head": git(self.repo, "rev-parse", "HEAD"),
             "pause": None,
             "worker_tools": [],
             "repair": mc_state.default_repair_state(),
+            "worker_policy": {"sha256": "a" * 64, "policy": {}},
         }
         (run_dir / "run.json").write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         buffer = io.StringIO()

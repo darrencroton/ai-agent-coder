@@ -71,11 +71,11 @@ from .runner import _capture_git_evidence, execute_slice, finalize_model_supervi
 from .state import (
     append_operational_event,
     approved_slice_ids,
+    default_repair_state,
     idle_status_after_pass,
     load_run,
     normalize_stop_status,
     operational_events_file,
-    previous_completed_head,
     relative_artifact_path,
     render_run_report,
     repair_state,
@@ -211,6 +211,7 @@ def init_run(args: argparse.Namespace) -> int:
                 "artifact_dir": None,
                 "before_head": None,
                 "changed_files": [],
+                "summary": "",
                 "validation": [],
                 "drift_audit": {"verdict": None, "path": ""},
                 "code_review": {"verdict": None, "path": ""},
@@ -220,6 +221,7 @@ def init_run(args: argparse.Namespace) -> int:
                 "residual_findings": [],
                 "gate_reason": "operator attested completion at init (--assume-complete); not verified by MC gates",
                 "worker_tools": [],
+                "repair": default_repair_state(),
             }
             for slice_id in assumed_ids
         ],
@@ -734,7 +736,7 @@ def stop_with_evidence(args: argparse.Namespace) -> int:
             terminal,
             before_head,
             tuple(str(tool) for tool in current.get("worker_tools") or ()),
-            repair=dict(repair_state(current)) if repair_state(current)["round"] else None,
+            repair=dict(repair_state(current)),
             worker_policy=current.get("worker_policy") if isinstance(current.get("worker_policy"), dict) else None,
         )
     )
@@ -835,22 +837,16 @@ def reconcile(args: argparse.Namespace) -> int:
     artifact_dir = Path(artifact_dir_value)
     if not artifact_dir.is_absolute():
         artifact_dir = repo / artifact_dir
-    # Prefer the boundary the slice actually recorded; only fall back to
-    # inference for entries written before before_head was tracked. Guessing
-    # HEAD^ misses a slice's earlier commits and can let an unauthorized file
-    # from a first commit escape the changed-file check.
-    before_head = entry.get("before_head") or previous_completed_head(state, slice_id)
-    if before_head is None:
-        parent = git_result(repo, "rev-parse", "HEAD^")
-        before_head = parent.stdout.strip() if parent.returncode == 0 else None
+    before_head = entry["before_head"]
+    if not before_head:
+        raise McError(f"failed slice has no recorded before_head: {slice_id}")
     after_head = git_head(repo)
     after_status = git_status_text(repo)
     capture_worker_runs_summary(artifact_dir)
     # Recovered from the entry this reconcile call is replacing, not a fresh
     # --worker-tools flag: reconcile is a separate invocation and the original
     # slice attempt's worker requirement must not be lost on reconciliation.
-    entry_worker_tools = entry.get("worker_tools")
-    worker_tools = tuple(entry_worker_tools) if isinstance(entry_worker_tools, list) else ()
+    worker_tools = tuple(entry["worker_tools"])
     gate = verify_gate(repo, state, plan_slice, artifact_dir, before_head, after_head, after_status, worker_tools)
     reconciled_entry = slice_entry_from_gate(
         repo,
@@ -860,7 +856,7 @@ def reconcile(args: argparse.Namespace) -> int:
         gate,
         before_head,
         worker_tools,
-        repair=entry.get("repair") if isinstance(entry.get("repair"), dict) else None,
+        repair=dict(entry["repair"]),
         worker_policy=entry.get("worker_policy") if isinstance(entry.get("worker_policy"), dict) else None,
     )
     state["slices"][entry_index] = reconciled_entry
