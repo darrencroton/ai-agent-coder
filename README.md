@@ -1,6 +1,6 @@
 # AI Engineering Skills
 
-**An autonomy system for AI-assisted software engineering: one safety chain, applied at increasing levels of agent independence.**
+**One safety chain for AI coding agents, applied at increasing levels of independence — from a single standalone review to a fully unattended multi-slice run.**
 
 AI coding agents are strong implementers and unreliable narrators: left unsupervised they expand scope, grade their own work generously, and report success that can diverge from what actually happened in the repository. This repository moves trust out of the model and into contracts, evidence, and role separation. What "authorized" means is frozen before coding; authorization is audited separately from quality; and acceptance rests on repository evidence, never on the agent's say-so. The agent moves fast inside the lane — it just doesn't get to redraw it.
 
@@ -26,31 +26,25 @@ Each skill is a self-contained directory under [`skills/`](skills/) with a stand
 
 The atomic skills need nothing beyond the Markdown files. Supervised autonomy (Mode B) additionally needs Python 3.13 or newer, `git`, `tmux`, and at least one supported coding CLI on the machine that runs Master Controller.
 
-## Quickstart
-
-Three entry points, smallest first. Each is independent — start wherever your task is.
-
-**1. Review a change (standalone skill, no setup beyond installation).**
-In your coding assistant: *"Use the code-review skill on the diff on this branch."* You get a senior-level, severity-ranked review with `file:line` findings and an explicit verdict. Every skill works this way — `drift-audit`, `commit`, `handoff`, and the rest are one explicit request each.
-
-**2. Implement a feature with checkpoints (Mode A).**
-- Chat 1: *"Use the implementation-plan skill: <describe the change>."* You get a plan with frozen slices and a copyable launcher prompt at the end.
-- Chat 2: paste the launcher into a fresh session. The agent implements one slice, audits its own authorization, reviews quality, and asks you before committing. Repeat per slice. (For a straightforward plan with strong models, the same mode has an autonomous alternate usage that loops through all remaining slices in one session — both launchers live in `implementation-plan`'s SKILL.md.)
-
-**3. Run a whole plan unattended (Mode B).**
-- Verify your machine once with the tmux-backed trial in [`skills/master-controller/README.md`](skills/master-controller/README.md) → "Verify Your Setup".
-- Sanity-check the plan: `python3 skills/master-controller/scripts/mc.py check-plan --plan <plan.md>` (also runs automatically at `init` — a defective plan stops before any harness launches).
-- Start the run with the Mode B launcher in [`skills/master-controller/SKILL.md`](skills/master-controller/SKILL.md) → "Launcher". MC executes slice after slice in fresh sessions, verifies every gate from local evidence, repairs bounded gaps, and stops for you on anything outside policy.
-
 ## The Autonomy Ladder
 
-Three rungs, one skill chain; each rung moves the gatekeeper further from the keyboard.
+Three rungs, one skill chain; each rung moves the gatekeeper further from the keyboard. Each rung is independent — start wherever your task is.
 
 **Rung 0 — Standalone skills.** Every skill is independently useful in any harness with no infrastructure. This is the entry point and the graceful-degradation floor.
 
-**Mode A — Assisted (one agent session).** You supervise an orchestrated run slice by slice: the agent restates each frozen contract, implements, audits, and reviews; you approve risky slices before coding and every commit after gates pass. The same mode has an **autonomous alternate usage**: pointed at all remaining slices with standing authorization to commit whatever clears every gate, it loops through the plan in one session — right when the plan is straightforward, the models are strong, and you don't want to stand up an external supervisor. In that usage the gates are promises kept in-session: disciplined, but not externally verified. Both launchers: [`skills/implementation-plan/SKILL.md`](skills/implementation-plan/SKILL.md) → "Next Chat Prompt Format".
+In your coding assistant: *"Use the code-review skill on the diff on this branch."* You get a senior-level, severity-ranked review with `file:line` findings and an explicit verdict. Every skill works this way — `drift-audit`, `commit`, `handoff`, and the rest are one explicit request each.
 
-**Mode B — Supervised autonomy (Master Controller).** The gatekeeper moves outside the implementing agent. MC keeps durable run state, sanity-checks the whole plan before starting, launches a fresh session per slice (the context reset that makes long plans tractable), verifies gates from git and artifact evidence, steers bounded repairs, and stops for a human on anything outside policy. Supervision is a dial, not a fork: by default a supervising model stays in the loop for operational judgment (usage resets, stalls, transient interruptions); if you can't or don't want to provide one, MC's fail-closed batch style runs unattended and stops at the first ambiguity. Launcher and details: [`skills/master-controller/SKILL.md`](skills/master-controller/SKILL.md).
+**Mode A — Assisted (one agent session).** You supervise an orchestrated run slice by slice: the agent restates each frozen contract, implements, audits, and reviews; you approve risky slices before coding and every commit after gates pass. The same mode has an **autonomous alternate usage**: pointed at all remaining slices with standing authorization to commit whatever clears every gate, it loops through the plan in one session — right when the plan is straightforward, the models are strong, and you don't want to stand up an external supervisor. In that usage the gates are promises kept in-session: disciplined, but not externally verified.
+
+- Chat 1: *"Use the implementation-plan skill: <describe the change>."* You get a plan with frozen slices and a copyable launcher prompt at the end.
+- Chat 2: paste the launcher into a fresh session. The agent implements one slice, audits its own authorization, reviews quality, and asks you before committing. Repeat per slice.
+- Both launchers (checkpointed and autonomous): [`skills/implementation-plan/SKILL.md`](skills/implementation-plan/SKILL.md) → "Next Chat Prompt Format".
+
+**Mode B — Supervised autonomy (Master Controller).** The gatekeeper moves outside the implementing agent. MC keeps durable run state, sanity-checks the whole plan before starting, launches a fresh session per slice (the context reset that makes long plans tractable), verifies gates from git and artifact evidence, steers bounded repairs, and stops for a human on anything outside policy. Supervision is a dial, not a fork: by default a supervising model stays in the loop for operational judgment (usage resets, stalls, transient interruptions); if you can't or don't want to provide one, MC's fail-closed batch style runs unattended and stops at the first ambiguity.
+
+- Verify your machine once with the tmux-backed trial in [`skills/master-controller/README.md`](skills/master-controller/README.md) → "Verify Your Setup".
+- Sanity-check the plan: `python3 skills/master-controller/scripts/mc.py check-plan --plan <plan.md>` (also runs automatically at `init` — a defective plan stops before any harness launches).
+- Start the run with the Mode B launcher in [`skills/master-controller/SKILL.md`](skills/master-controller/SKILL.md) → "Launcher".
 
 Choosing a rung is about the task, not your skill level:
 
@@ -97,10 +91,6 @@ Each launcher template lives in exactly one place: both Mode A launchers (checkp
 ## Privacy and Data Flows
 
 Everything the system produces — run state, artifacts, transcripts, worker evidence — stays on your machine, and local/self-hosted models are first-class citizens at every rung. What leaves the machine is determined entirely by which models you place in which seats; the per-mode breakdown, the fully-local configurations, and the artifact sensitivity map are in [`skills/master-controller/README.md`](skills/master-controller/README.md) → "Privacy and Data Flows".
-
-## How This Repository Is Validated
-
-Beyond the unit suites (CI runs them on every push), the system is exercised end-to-end against a private fixture repository: complete plans run through MC with real harnesses and deliberately mixed model strengths — including weak local models chosen to stress role boundaries. Each round attacks a specific question (can the orchestrator be steered off contract? does a refused delegation surface? does the repair loop stop at its budget?), and every defect found becomes a contract-layer fix plus a regression test, verified to hold in later rounds. The tmux-backed "Verify Your Setup" trial in the master-controller README is a public, reproducible slice of the same method.
 
 ## Glossary
 
