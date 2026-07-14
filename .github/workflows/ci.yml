@@ -34,11 +34,11 @@ jobs:
 
       - name: Compile check
         run: |
-          python3 -m py_compile skills/master-controller/scripts/mc.py skills/master-controller/scripts/mc_lib/*.py
+          python3 -m py_compile skills/project-manager/scripts/pm.py skills/project-manager/scripts/pm_lib/*.py
           python3 -m py_compile skills/orchestrator/scripts/reviewer_contract.py skills/orchestrator/scripts/reviewer_sessions.py skills/orchestrator/scripts/reviewer_jobs.py
 
-      - name: Master Controller tests
-        run: python3 -m unittest discover -s skills/master-controller/tests -p 'test_*.py'
+      - name: Project Manager tests
+        run: python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'
 
       - name: Orchestrator tests
         run: python3 -m unittest discover -s skills/orchestrator/tests -p 'test_*.py'

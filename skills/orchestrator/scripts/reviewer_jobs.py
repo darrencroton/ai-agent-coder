@@ -61,7 +61,7 @@ LABEL_RE = re.compile(r"^\d{2}-[a-z0-9]+-[a-z0-9]+(?:-[a-z0-9]+)*(?:-r\d+)?$")
 # Match line-based SECTION headers even when a model prefixes them with Markdown.
 SECTION_RE = re.compile(r"^\s*(?:#+\s*)?SECTION:\s*([A-Za-z0-9_ -]+)\s*$", re.MULTILINE)
 AUDIT_VERDICT_RE = re.compile(
-    r"^MC_AUDIT_VERDICT:\s*(PASS WITH RISKS|PASS|FAIL|BLOCKED)\s*$",
+    r"^PM_AUDIT_VERDICT:\s*(PASS WITH RISKS|PASS|FAIL|BLOCKED)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
 _LIBRARY_WRAPPERS: dict[int, subprocess.Popen[bytes]] = {}
@@ -678,7 +678,7 @@ def start_tracked_reviewer(
             close_fds=True,
         )
         if __name__ != "__main__":
-            # Library callers (principally tests and MC utilities) keep the
+            # Library callers (principally tests and PM utilities) keep the
             # Popen handle so they can reap it after an external cancel.
             _LIBRARY_WRAPPERS[process.pid] = process
 
@@ -790,7 +790,7 @@ def command_launch(args: argparse.Namespace) -> int:
         "effort": contract["effort"],
         "role": contract["role"],
         "access": contract["access"],
-        # Preserve the validated semantic purpose of the launch. MC uses this
+        # Preserve the validated semantic purpose of the launch. PM uses this
         # to distinguish independent drift-audit evidence from code-review
         # evidence instead of accepting any successful reviewer process as proof
         # that both gates were delegated.
@@ -1192,7 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"artifact root (override with {ARTIFACT_ROOT_ENV})."
         ),
     )
-    launch_parser.add_argument("--policy", required=True, help="MC/Developer reviewer-policy.json path.")
+    launch_parser.add_argument("--policy", required=True, help="PM/Developer reviewer-policy.json path.")
     launch_parser.add_argument("--request", required=True, help="Semantic reviewer-request.json path.")
     launch_parser.add_argument(
         "--depends-on",

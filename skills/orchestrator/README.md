@@ -18,7 +18,7 @@ Reviewer self-audit fallback is allowed on default slices and must be reported a
 - `SKILL.md` — workflow and role contract
 - `references/reviewer-contract.md` — schema-v2 policy/request contract
 - `references/templates.md` — semantic request examples
-- `references/mc-slice-contract.md` — Master Controller integration
+- `references/pm-slice-contract.md` — Project Manager integration
 - `references/{claude,codex,copilot,opencode}.md` — harness mechanics and enforcement notes
 - `scripts/reviewer_contract.py` — validation, prompt rendering, and command composition
 - `scripts/reviewer_jobs.py` — tracked Reviewer lifecycle

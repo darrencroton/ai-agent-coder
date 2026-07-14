@@ -296,14 +296,14 @@ class ReviewerContractTests(unittest.TestCase):
         prompt = reviewer_contract.render_reviewer_prompt(
             reviewer_contract.validate_contract(self.policy, self.request, self.run_dir)
         )
-        self.assertIn("MC_AUDIT_VERDICT: PASS | PASS WITH RISKS | FAIL | BLOCKED", prompt)
+        self.assertIn("PM_AUDIT_VERDICT: PASS | PASS WITH RISKS | FAIL | BLOCKED", prompt)
         self.assertEqual(
-            reviewer_jobs.audit_skill_verdicts(["code-review"], "report\nMC_AUDIT_VERDICT: PASS\n"),
+            reviewer_jobs.audit_skill_verdicts(["code-review"], "report\nPM_AUDIT_VERDICT: PASS\n"),
             {"code-review": "PASS"},
         )
         self.assertEqual(
             reviewer_jobs.audit_skill_verdicts(
-                ["drift-audit"], "MC_AUDIT_VERDICT: FAIL\nMC_AUDIT_VERDICT: PASS\n"
+                ["drift-audit"], "PM_AUDIT_VERDICT: FAIL\nPM_AUDIT_VERDICT: PASS\n"
             ),
             {"drift-audit": None},
         )
@@ -337,7 +337,7 @@ class ReviewerContractTests(unittest.TestCase):
         self.assertEqual(
             reviewer_jobs.audit_skill_verdicts(
                 ["drift-audit"],
-                "MC_AUDIT_VERDICT: FAIL\nMC_AUDIT_VERDICT: PASS\n",
+                "PM_AUDIT_VERDICT: FAIL\nPM_AUDIT_VERDICT: PASS\n",
             ),
             {"drift-audit": None},
         )

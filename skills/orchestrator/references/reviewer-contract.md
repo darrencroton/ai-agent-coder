@@ -16,7 +16,7 @@ These values are launcher-owned. A request containing `role` or `access` is reje
 
 ## Policy
 
-Master Controller writes `reviewer-policy.json` for a slice. A standalone Developer may write the same shape from the chosen plan or launcher prompt.
+Project Manager writes `reviewer-policy.json` for a slice. A standalone Developer may write the same shape from the chosen plan or launcher prompt.
 
 ```json
 {
@@ -88,6 +88,6 @@ Rejected requests create `<label>-request-feedback.{json,md}` and start no proce
 
 Successful launches preserve the schema-v2 request, policy, rendered prompt, resolved command, normalized role/access, hashes, working directory, process status, stdout, and stderr. Required skills and linked Markdown resources must embed successfully before process creation.
 
-When `required_skills` contains `drift-audit` or `code-review`, the Reviewer must end with exactly one `MC_AUDIT_VERDICT: PASS | PASS WITH RISKS | FAIL | BLOCKED` line. Missing or duplicate sentinels record a null verdict.
+When `required_skills` contains `drift-audit` or `code-review`, the Reviewer must end with exactly one `PM_AUDIT_VERDICT: PASS | PASS WITH RISKS | FAIL | BLOCKED` line. Missing or duplicate sentinels record a null verdict.
 
 Default slices may fall back to a documented Developer self-audit. `Independent audit required: yes` requires separate validated Reviewer launches for drift audit and code review with exact `PASS` evidence.

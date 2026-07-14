@@ -8,7 +8,7 @@ This package defines the `orchestrator` skill. The Developer owns implementation
 
 - `SKILL.md`: generic Developer/Reviewer workflow and audit provenance
 - `references/reviewer-contract.md`: authoritative schema-v2 policy/request contract
-- `references/mc-slice-contract.md`: compact Master Controller integration contract
+- `references/pm-slice-contract.md`: compact Project Manager integration contract
 - `references/templates.md`: semantic Reviewer request shapes
 - model references: harness command mechanics and factual read-only enforcement only
 - `scripts/reviewer_contract.py`: schema validation, skill embedding, prompt rendering, command composition

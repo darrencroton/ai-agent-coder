@@ -60,7 +60,7 @@ Build the resume prompt from the Mode A launcher in `implementation-plan`'s `SKI
 2. Extend the "Read the full plan file first" line to require reading **both** the plan file **and** `HANDOFF.md`, stating that the handoff is part of the run contract and records what has been committed and what remains.
 3. Add `HANDOFF.md read` to the final "Confirm before starting" list.
 
-For all other handoffs — including autonomous Mode A full-plan runs, Mode B/MC runs (MC's own run state is the continuation record), and non-plan work — omit the Resume Prompt section entirely.
+For all other handoffs — including autonomous Mode A full-plan runs, Mode B/PM runs (PM's own run state is the continuation record), and non-plan work — omit the Resume Prompt section entirely.
 
 ## Template
 

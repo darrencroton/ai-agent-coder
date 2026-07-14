@@ -233,7 +233,7 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
                 "artifact-root-mismatch",
                 "run_dir",
                 f"run directory {run_dir} is outside policy reviewer_artifact_root {artifact_root}",
-                "Initialize the run through reviewer_jobs.py with the MC-provided artifact root, then retry.",
+                "Initialize the run through reviewer_jobs.py with the PM-provided artifact root, then retry.",
             )
         )
 
@@ -253,7 +253,7 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
             ContractIssue(
                 "plan-digest-mismatch",
                 "plan_sha256",
-                "reviewer request plan digest does not match the frozen MC policy",
+                "reviewer request plan digest does not match the frozen PM policy",
                 f"Copy the exact plan_sha256 from the current reviewer policy ({plan_sha256}).",
             )
         )
@@ -284,7 +284,7 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
                 "unsupported-tool",
                 "tool",
                 f"no deterministic reviewer profile exists for {tool!r}",
-                "Use a supported tool or add and test its profile before authorizing it in MC.",
+                "Use a supported tool or add and test its profile before authorizing it in PM.",
             )
         )
 
@@ -480,7 +480,7 @@ RETURN:
         prompt += (
             "\nMACHINE-READABLE AUDIT VERDICT (required):\n"
             "After the skill's normal report, end with exactly one final line in this form:\n"
-            "MC_AUDIT_VERDICT: PASS | PASS WITH RISKS | FAIL | BLOCKED\n"
+            "PM_AUDIT_VERDICT: PASS | PASS WITH RISKS | FAIL | BLOCKED\n"
             "Use the verdict you actually reached; do not change it merely to satisfy the caller.\n"
         )
     return prompt

@@ -14,7 +14,7 @@ venv/
 
 # Local runtime artefacts written by skills during use
 .orchestrator/
-.ai-mc/
+.ai-pm/
 .claude/
 
 # Archived/superseded content (never deleted, not tracked by default)
@@ -25,4 +25,4 @@ archive/
 *.tmp
 
 # Other
-mc-test/
+pm-test/

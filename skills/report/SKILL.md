@@ -1,6 +1,6 @@
 ---
 name: report
-description: Create a concise evidence-backed written synthesis when the user explicitly asks for a report, assessment, investigation summary, comparison memo, status note, or final summary. Do not use for implementation planning, scoped implementation receipts, drift audits, code reviews, handoffs, MC run summaries, or commit messages.
+description: Create a concise evidence-backed written synthesis when the user explicitly asks for a report, assessment, investigation summary, comparison memo, status note, or final summary. Do not use for implementation planning, scoped implementation receipts, drift audits, code reviews, handoffs, PM run summaries, or commit messages.
 
 ---
 
@@ -17,7 +17,7 @@ Prefer the more specific skill whenever one applies:
 - Use `drift-audit` for authorization gates.
 - Use `code-review` for quality findings and review verdicts.
 - Use `handoff` when the goal is to preserve continuation state for another chat or agent.
-- Use `master-controller` summaries and artifacts for MC run status.
+- Use `project-manager` summaries and artifacts for PM run status.
 - Use `commit` for commit messages and staging discipline.
 
 `report` may summarize outputs from those skills after they have done their jobs, but it must not redefine their contracts or invent replacement sections.

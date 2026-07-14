@@ -48,7 +48,7 @@ Equal eligibility does not imply identical enforcement. Read the selected tool r
 | GitHub Copilot CLI | Prompt-enforced read-only behavior | [references/copilot.md](references/copilot.md) |
 | OpenCode CLI | Plan agent denies edit tools; shell discipline remains prompt-enforced | [references/opencode.md](references/opencode.md) |
 
-Harness enforcement is evidence, not model-ranking policy. The Developer and, under Master Controller, repository mutation gates remain the backstop.
+Harness enforcement is evidence, not model-ranking policy. The Developer and, under Project Manager, repository mutation gates remain the backstop.
 
 ## Skill and Tool Coordination
 
@@ -100,7 +100,7 @@ Prefer an independent Reviewer for drift audit and code review. If no Reviewer i
 
 A slice marked `Independent audit required: yes` never permits self-audit. It requires separate validated Reviewer launches for `drift-audit` and `code-review`, in that order, with exact `PASS` verdict evidence.
 
-Under Master Controller, follow [references/mc-slice-contract.md](references/mc-slice-contract.md). MC validates process evidence and mutation gates; the Developer remains responsible for semantic sufficiency and the final gate decision.
+Under Project Manager, follow [references/pm-slice-contract.md](references/pm-slice-contract.md). PM validates process evidence and mutation gates; the Developer remains responsible for semantic sufficiency and the final gate decision.
 
 ## Reviewer Summary
 

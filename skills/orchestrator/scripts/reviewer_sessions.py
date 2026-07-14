@@ -6,7 +6,7 @@ that locates a reviewer's session file from its recorded launch command, reads
 lightweight activity signals from it, and extracts the final answer when the
 outfile alone is not enough. reviewer_jobs.py imports from here; the split keeps
 the launcher/lifecycle logic and the vendor transcript knowledge in separate
-files. Master Controller reuses `claude_project_root` through reviewer_jobs.
+files. Project Manager reuses `claude_project_root` through reviewer_jobs.
 """
 
 from __future__ import annotations
@@ -222,8 +222,8 @@ def infer_project_dirs(command: list[str], tool: str) -> list[Path]:
 def claude_project_root(project_dir: Path) -> Path:
     # Claude Code's own project-slug algorithm replaces every
     # non-alphanumeric character (not just the path separator) with "-", e.g.
-    # "/Users/x/Documents/AI Tools/mc-test" -> "-Users-x-Documents-AI-Tools-
-    # mc-test". Verified against a real session's recorded cwd; replacing
+    # "/Users/x/Documents/AI Tools/pm-test" -> "-Users-x-Documents-AI-Tools-
+    # pm-test". Verified against a real session's recorded cwd; replacing
     # only os.sep silently missed any project path containing a space, dot,
     # or other separator and made session lookups fail for such paths.
     normalized = re.sub(r"[^A-Za-z0-9]", "-", str(project_dir))
