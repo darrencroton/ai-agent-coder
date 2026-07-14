@@ -6,7 +6,14 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .constants import DEVELOPER_STATUSES, REQUIRED_AUDIT_SKILLS, SCHEMA_VERSION
+from .constants import (
+    CONTINUATION_NOTE_CATEGORIES,
+    DEVELOPER_STATUSES,
+    MAX_CONTINUATION_FIELD_CHARS,
+    MAX_CONTINUATION_NOTES,
+    REQUIRED_AUDIT_SKILLS,
+    SCHEMA_VERSION,
+)
 from .git_ops import (
     changed_files_between,
     commit_is_descendant,
@@ -40,6 +47,7 @@ REPAIRABLE_SIGNATURES = frozenset(
         "commit-missing",
         "dirty-worktree",
         "developer-repairable",
+        "context-budget",
     }
 )
 TERMINAL_SIGNATURES = frozenset(
@@ -582,6 +590,43 @@ def _residual_findings_status(findings: Any) -> str | None:
     return None
 
 
+def _continuation_notes_status(notes: Any) -> str | None:
+    """Validate knowledge intentionally passed to later planned slices."""
+    if not isinstance(notes, list):
+        return "continuation_notes is missing or malformed (expected a list, using [] when none)"
+    if len(notes) > MAX_CONTINUATION_NOTES:
+        return f"continuation_notes exceeds the maximum of {MAX_CONTINUATION_NOTES} entries"
+    required_fields = ("category", "summary", "rationale", "applies_to")
+    for index, note in enumerate(notes):
+        if not isinstance(note, dict):
+            return f"continuation_notes[{index}] is malformed (expected an object)"
+        unknown = set(note) - {*required_fields, "location"}
+        if unknown:
+            return f"continuation_notes[{index}] contains unsupported field(s): {', '.join(sorted(unknown))}"
+        for field in required_fields:
+            if not isinstance(note.get(field), str) or not str(note[field]).strip():
+                return f"continuation_notes[{index}].{field} must be a non-empty string"
+            if len(note[field]) > MAX_CONTINUATION_FIELD_CHARS:
+                return (
+                    f"continuation_notes[{index}].{field} exceeds the maximum of "
+                    f"{MAX_CONTINUATION_FIELD_CHARS} characters"
+                )
+        if note["category"] not in CONTINUATION_NOTE_CATEGORIES:
+            return (
+                f"continuation_notes[{index}].category is invalid: {note['category']!r}; "
+                f"expected one of {', '.join(sorted(CONTINUATION_NOTE_CATEGORIES))}"
+            )
+        if "location" in note:
+            if not isinstance(note["location"], str):
+                return f"continuation_notes[{index}].location must be a string when present"
+            if len(note["location"]) > MAX_CONTINUATION_FIELD_CHARS:
+                return (
+                    f"continuation_notes[{index}].location exceeds the maximum of "
+                    f"{MAX_CONTINUATION_FIELD_CHARS} characters"
+                )
+    return None
+
+
 def _artifact_has_unledgered_finding_shape(path: Path) -> bool:
     """Detect narrow Markdown shapes that visibly claim non-empty findings.
 
@@ -689,6 +734,12 @@ def verify_gate(
     status_value = str(result.get("status", "")).lower()
     if status_value not in DEVELOPER_STATUSES:
         return gate_failure("result-malformed", f"developer result status is invalid: {result.get('status')}", result)
+    residual_failure = _residual_findings_status(result.get("residual_findings"))
+    if residual_failure:
+        return gate_failure("result-malformed", residual_failure, result)
+    continuation_failure = _continuation_notes_status(result.get("continuation_notes"))
+    if continuation_failure:
+        return gate_failure("result-malformed", continuation_failure, result)
     if status_value != "pass":
         # The developer's own self-report is respected as-is: its
         # `repairable` earns a repair round, and its considered stops
@@ -733,9 +784,6 @@ def verify_gate(
     if not artifact_exists(repo, slice_artifact_dir, result, "code_review", "code-review.md"):
         return gate_failure("review", "code review artifact is missing", result, changed_evidence)
 
-    residual_failure = _residual_findings_status(result.get("residual_findings"))
-    if residual_failure:
-        return gate_failure("result-malformed", residual_failure, result, changed_evidence)
     if not result.get("residual_findings") and (
         _artifact_has_unledgered_finding_shape(slice_artifact_dir / "drift-audit.md")
         or _artifact_has_unledgered_finding_shape(slice_artifact_dir / "code-review.md")

@@ -104,7 +104,7 @@ class RuntimeBatchTests(PmTestCase):
                 "before_head", "changed_files", "summary", "validation", "drift_audit", "code_review",
                 "audit_provenance",
                 "commit", "next_action", "blockers", "gate_reason", "reviewer_tools", "reviewer_policy",
-                "repair", "residual_findings", "slice_summary",
+                "repair", "residual_findings", "continuation_notes", "slice_summary",
             },
         )
         self.assertEqual(state["slices"][0]["audit_provenance"]["drift-audit"]["performed_by"], "developer-self-audit")
@@ -134,7 +134,7 @@ class RuntimeBatchTests(PmTestCase):
             pm.run_remaining(run_args)
 
     @unittest.skipUnless(shutil.which("tmux"), "tmux is required for runtime test")
-    def test_run_remaining_completes_two_toy_slices(self):
+    def test_run_remaining_regenerates_cumulative_context_for_each_slice(self):
         self.prepare_committed_repo()
         harness = Path(self.tmp.name) / "fake_harness.py"
         write_fake_harness(harness)
@@ -155,6 +155,45 @@ class RuntimeBatchTests(PmTestCase):
         state = json.loads(((self.repo / ".ai-pm" / "current").resolve() / "run.json").read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "complete")
         self.assertEqual([entry["status"] for entry in state["slices"]], ["pass", "pass"])
+        run_dir = (self.repo / ".ai-pm" / "current").resolve()
+        first_context = (run_dir / "slices" / "slice-001" / "prior-slice-context.md").read_text(encoding="utf-8")
+        second_context = (run_dir / "slices" / "slice-002" / "prior-slice-context.md").read_text(encoding="utf-8")
+        self.assertIn("No prior completed slices are recorded", first_context)
+        self.assertIn("### Slice 1 — First Slice", second_context)
+        self.assertIn("Slice 1 done", second_context)
+        self.assertNotIn("### Slice 2 — Second Slice", second_context)
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux is required for runtime test")
+    def test_run_next_launches_with_only_authoritative_assumed_prior_outcome(self):
+        self.prepare_committed_repo()
+        harness = Path(self.tmp.name) / "fake_harness.py"
+        write_fake_harness(harness)
+        args = argparse.Namespace(
+            repo=str(self.repo), plan=str(self.plan), harness="codex", worktree_root=None,
+            assume_complete="Slice 1",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(pm.init_run(args), 0)
+        run_dir = (self.repo / ".ai-pm" / "current").resolve()
+        run_json = run_dir / "run.json"
+        state = json.loads(run_json.read_text(encoding="utf-8"))
+        assumed = state["slices"][0]
+        superseded_pass = self.terminal_slice_entry(state)
+        superseded_pass["summary"] = "SUPERSEDED PASS"
+        superseded_blocked = self.terminal_slice_entry(state, status="blocked")
+        superseded_blocked["summary"] = "SUPERSEDED BLOCKED"
+        state["slices"] = [superseded_pass, superseded_blocked, assumed]
+        pm.write_run(run_json, state)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(pm.run_next(self._run_next_args(harness)), 0)
+
+        context = (run_dir / "slices" / "slice-002" / "prior-slice-context.md").read_text(encoding="utf-8")
+        self.assertIn("### Slice 1 — First Slice", context)
+        self.assertIn("assumed-complete", context)
+        self.assertIn("operator-attested", context)
+        self.assertNotIn("SUPERSEDED PASS", context)
+        self.assertNotIn("SUPERSEDED BLOCKED", context)
 
     @unittest.skipUnless(shutil.which("tmux"), "tmux is required for runtime test")
     def test_run_next_blocks_when_session_exits_without_result(self):
@@ -610,6 +649,9 @@ class RuntimeBatchTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(
+                run_dir / "slices" / "slice-001"
+            ),
         }
         (run_dir / "run.json").write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         buffer = io.StringIO()

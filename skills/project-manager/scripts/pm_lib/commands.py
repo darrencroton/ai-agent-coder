@@ -244,6 +244,7 @@ def init_run(args: argparse.Namespace) -> int:
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
                 "gate_reason": "operator attested completion at init (--assume-complete); not verified by PM gates",
                 "reviewer_tools": [],
                 "repair": default_repair_state(),

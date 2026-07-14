@@ -182,6 +182,7 @@ class SupervisionRepairTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -394,7 +395,7 @@ class SupervisionRepairTests(PmTestCase):
         self.assertEqual(repair_events[0]["signature"], "validation")
         self.assertEqual(repair_events[0]["round"], 1)
 
-    def test_fresh_session_repair_prompt_preserves_archived_residual_findings(self):
+    def test_fresh_session_repair_prompt_preserves_archived_context_ledgers(self):
         self.prepare_committed_repo()
         state = self.init_run()
         run_dir = (self.repo / ".ai-pm" / "current").resolve()
@@ -411,10 +412,17 @@ class SupervisionRepairTests(PmTestCase):
             "rationale": "The warning predates this slice and does not affect its acceptance criteria.",
             "suggested_follow_up": "Review the warning after the plan completes.",
         }
+        note = {
+            "category": "validation-lesson",
+            "summary": "The targeted validator emits a harmless pre-existing warning.",
+            "rationale": "Later slices should distinguish it from a new regression.",
+            "applies_to": "remaining validation slices",
+        }
         self._write_failing_validation_result(artifact)
         result_path = artifact / "developer-result.json"
         result = json.loads(result_path.read_text(encoding="utf-8"))
         result["residual_findings"] = [finding]
+        result["continuation_notes"] = [note]
         result_path.write_text(json.dumps(result), encoding="utf-8")
 
         fake_adapter = mock.Mock()
@@ -437,7 +445,9 @@ class SupervisionRepairTests(PmTestCase):
         prompt_text = fresh_prompt.read_text(encoding="utf-8")
         self.assertIn("developer-result-repair-2.json", prompt_text)
         self.assertIn(finding["summary"], prompt_text)
+        self.assertIn(note["summary"], prompt_text)
         self.assertIn("must retain every item", prompt_text)
+        self.assertIn("Retain these decisions and lessons", prompt_text)
         fake_adapter.send_prompt.assert_called_once_with(finalized["tmux_session"], fresh_prompt)
 
     def test_start_slice_persists_reviewer_tools_for_later_finalize(self):
@@ -569,6 +579,7 @@ class SupervisionRepairTests(PmTestCase):
             before,
             reviewer_tools=("opencode",),
             reviewer_policy={"sha256": "a" * 64, "policy": {}},
+            prior_slice_context=self.prior_context_metadata(artifact),
         )
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -619,6 +630,7 @@ class SupervisionRepairTests(PmTestCase):
             pm.utc_now(),
             git(self.repo, "rev-parse", "HEAD"),
             reviewer_policy={"sha256": "a" * 64, "policy": {}},
+            prior_slice_context=self.prior_context_metadata(artifact),
         )
         pm.activate_controller_state(run_dir / "run.json", state)
         (run_dir / "run.json").write_text("{corrupted", encoding="utf-8")
@@ -713,6 +725,7 @@ class SupervisionRepairTests(PmTestCase):
             pm.utc_now(),
             before,
             reviewer_policy={"sha256": "a" * 64, "policy": {}},
+            prior_slice_context=self.prior_context_metadata(artifact),
         )
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         self.plan.write_text(self.plan.read_text(encoding="utf-8") + "\nEdited mid-run.\n", encoding="utf-8")
@@ -776,6 +789,7 @@ class SupervisionRepairTests(PmTestCase):
             "pause": None,
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -822,6 +836,7 @@ class SupervisionRepairTests(PmTestCase):
             "pause": None,
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -840,6 +855,44 @@ class SupervisionRepairTests(PmTestCase):
         self.assertEqual(state["status"], "partial")
         self.assertIsNone(state["current_slice"])
         self.assertEqual(state["slices"][0]["status"], "pass")
+
+    def test_finalize_routes_oversized_projected_context_into_repair_before_acceptance(self):
+        self.prepare_committed_repo()
+        state = self.init_run()
+        run_dir = (self.repo / ".ai-pm" / "current").resolve()
+        artifact = self._model_supervised_current_slice(state, run_dir)
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after)
+        fake_adapter = mock.Mock()
+        fake_adapter.session_exists.return_value = True
+
+        def fake_capture(session_name, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("pane\n", encoding="utf-8")
+
+        fake_adapter.capture.side_effect = fake_capture
+        with mock.patch.object(pm_runner, "TmuxHarnessAdapter", return_value=fake_adapter):
+            with mock.patch.object(
+                pm_runner,
+                "projected_prior_slice_context_budget_failure",
+                return_value="accepted reporting would exceed the next context budget",
+            ):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(pm.finalize_slice(self._finalize_args()), 0)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["status"], "repairable")
+        self.assertEqual(result["repair"]["last_signature"], "context-budget")
+        fake_adapter.force_stop.assert_not_called()
+        updated = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(updated["status"], "resuming")
+        self.assertIsNotNone(updated["current_slice"])
+        self.assertEqual(updated["slices"], [])
+        self.assertIn("cumulative context too large", (artifact / "repair-prompt-repair-1.md").read_text(encoding="utf-8"))
 
     def test_finalize_integrity_gate_is_terminal_without_repair(self):
         self.prepare_committed_repo()
@@ -865,6 +918,33 @@ class SupervisionRepairTests(PmTestCase):
         self.assertIsNone(state["current_slice"])
         self.assertEqual(len(state["slices"]), 1)
         self.assertEqual(state["slices"][0]["repair"], pm_state.default_repair_state())
+        self.assertFalse((artifact / "repair-prompt.md").exists())
+
+    def test_finalize_rejects_tampered_prior_slice_context_without_repair(self):
+        self.prepare_committed_repo()
+        state = self.init_run()
+        run_dir = (self.repo / ".ai-pm" / "current").resolve()
+        artifact = self._model_supervised_current_slice(state, run_dir)
+        self._write_failing_validation_result(artifact)
+        (artifact / "prior-slice-context.md").write_text("tampered context\n", encoding="utf-8")
+        fake_adapter = mock.Mock()
+        fake_adapter.session_exists.return_value = True
+
+        def fake_capture(session_name, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("pane\n", encoding="utf-8")
+
+        fake_adapter.capture.side_effect = fake_capture
+        with mock.patch.object(pm_runner, "TmuxHarnessAdapter", return_value=fake_adapter):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(pm.finalize_slice(self._finalize_args()), 2)
+
+        fake_adapter.force_stop.assert_called_once()
+        updated = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(updated["status"], "needs-human")
+        self.assertIn("prior-slice context SHA-256 mismatch", updated["stop_reason"])
+        self.assertIsNone(updated["current_slice"])
+        self.assertEqual(updated["slices"][0]["status"], "needs-human")
         self.assertFalse((artifact / "repair-prompt.md").exists())
 
     def test_finalize_budget_exhaustion_is_terminal(self):
@@ -1066,6 +1146,7 @@ class SupervisionRepairTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -1110,6 +1191,7 @@ class SupervisionRepairTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -1154,6 +1236,7 @@ class SupervisionRepairTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         state["supervision"]["max_single_pause_seconds"] = 0
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")

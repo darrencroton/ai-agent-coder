@@ -44,7 +44,7 @@ def verify_plan_unchanged(state: dict[str, Any], plan_path: Path) -> None:
     A "frozen" contract that is silently re-read on every slice is not frozen:
     editing the plan mid-run (renumbering slices, widening an authorized
     surface, flipping an approval flag) would otherwise be honored on the next
-    slice. Schema-v3 runs must always carry this baseline.
+    slice. Schema-v4 runs must always carry this baseline.
     """
     recorded = state.get("plan", {}).get("sha256")
     if not recorded:
@@ -94,14 +94,26 @@ def parse_sections(slice_body: str) -> dict[str, str]:
     return sections
 
 
-def completed_slice_ids(state: dict[str, Any]) -> set[str]:
-    complete: set[str] = set()
+def authoritative_slice_entries(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the latest recorded outcome for each slice in first-seen order."""
+    order: list[str] = []
+    latest: dict[str, dict[str, Any]] = {}
     for entry in state.get("slices", []):
-        if str(entry.get("status", "")).lower() in COMPLETED_SLICE_STATUSES:
-            slice_id = entry.get("slice_id")
-            if slice_id:
-                complete.add(str(slice_id))
-    return complete
+        if not isinstance(entry, dict) or not entry.get("slice_id"):
+            continue
+        slice_id = str(entry["slice_id"])
+        if slice_id not in latest:
+            order.append(slice_id)
+        latest[slice_id] = entry
+    return [latest[slice_id] for slice_id in order]
+
+
+def completed_slice_ids(state: dict[str, Any]) -> set[str]:
+    return {
+        str(entry["slice_id"])
+        for entry in authoritative_slice_entries(state)
+        if str(entry.get("status", "")).lower() in COMPLETED_SLICE_STATUSES
+    }
 
 
 def next_slice(slices: list[PlanSlice], state: dict[str, Any]) -> PlanSlice | None:

@@ -118,6 +118,7 @@ class ObservationHintTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
 
@@ -162,6 +163,7 @@ class ObservationHintTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -207,6 +209,7 @@ class ObservationHintTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()
@@ -458,6 +461,7 @@ class ObservationHintTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         fake_adapter = mock.Mock()

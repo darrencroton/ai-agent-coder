@@ -134,6 +134,10 @@ def write_fake_harness(path):
 
             artifact = Path(os.environ["PM_SLICE_ARTIFACT_DIR"])
             slice_id = os.environ["PM_SLICE_ID"]
+            prior_context = Path(os.environ["PM_PRIOR_SLICE_CONTEXT_PATH"])
+            if not prior_context.is_file():
+                raise SystemExit("PM_PRIOR_SLICE_CONTEXT_PATH does not name a file")
+            prior_context.read_text(encoding="utf-8")
             target = "README.md" if slice_id == "Slice 1" else "CHANGELOG.md"
             Path(target).write_text(f"{slice_id} completed\\n", encoding="utf-8")
             subprocess.run(["git", "add", target], check=True)
@@ -143,7 +147,7 @@ def write_fake_harness(path):
             (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "code-review.md").write_text("PASS\\n", encoding="utf-8")
             result = {
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": slice_id,
                 "status": "pass",
                 "summary": f"{slice_id} done",
@@ -155,6 +159,7 @@ def write_fake_harness(path):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             }
             (artifact / "developer-result.json").write_text(json.dumps(result), encoding="utf-8")
             time.sleep(5)
@@ -236,7 +241,7 @@ def write_usage_limit_resume_harness(path):
             (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "code-review.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "developer-result.json").write_text(json.dumps({
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": slice_id,
                 "status": "pass",
                 "summary": "resumed after rolling limit",
@@ -248,6 +253,7 @@ def write_usage_limit_resume_harness(path):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             }), encoding="utf-8")
             time.sleep(2)
             """
@@ -273,7 +279,7 @@ def write_repairable_then_pass_harness(path):
             if not marker.exists():
                 marker.write_text("seen\\n", encoding="utf-8")
                 (artifact / "developer-result.json").write_text(json.dumps({
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "slice_id": slice_id,
                     "status": "repairable",
                     "summary": "retry",
@@ -285,6 +291,7 @@ def write_repairable_then_pass_harness(path):
                     "next_action": "retry",
                     "blockers": [],
                     "residual_findings": [],
+                    "continuation_notes": [],
                 }), encoding="utf-8")
                 time.sleep(1)
                 raise SystemExit(0)
@@ -297,7 +304,7 @@ def write_repairable_then_pass_harness(path):
             (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "code-review.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "developer-result.json").write_text(json.dumps({
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": slice_id,
                 "status": "pass",
                 "summary": "repaired",
@@ -309,6 +316,7 @@ def write_repairable_then_pass_harness(path):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             }), encoding="utf-8")
             time.sleep(1)
             """
@@ -338,7 +346,7 @@ termios.tcsetattr(sys.stdin, termios.TCSANOW, attrs)
 
 def write_failing_validation_result():
     (artifact / "developer-result.json").write_text(json.dumps({
-        "schema_version": 3,
+        "schema_version": 4,
         "slice_id": slice_id,
         "status": "pass",
         "summary": "no validation yet",
@@ -350,6 +358,7 @@ def write_failing_validation_result():
         "next_action": "",
         "blockers": [],
         "residual_findings": [],
+        "continuation_notes": [],
     }), encoding="utf-8")
 
 
@@ -405,7 +414,7 @@ def write_in_session_repair_harness(path):
             (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "code-review.md").write_text("PASS\\n", encoding="utf-8")
             (artifact / "developer-result.json").write_text(json.dumps({
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": slice_id,
                 "status": "pass",
                 "summary": "repaired in session",
@@ -417,6 +426,7 @@ def write_in_session_repair_harness(path):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             }), encoding="utf-8")
             time.sleep(2)
             """
@@ -457,7 +467,7 @@ def write_alternating_failure_harness(path):
                 (artifact / "validation-summary.md").write_text("PASS\\n", encoding="utf-8")
                 (artifact / "drift-audit.md").write_text("PASS\\n", encoding="utf-8")
                 (artifact / "developer-result.json").write_text(json.dumps({
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "slice_id": slice_id,
                     "status": "pass",
                     "summary": "review failed",
@@ -469,6 +479,7 @@ def write_alternating_failure_harness(path):
                     "next_action": "",
                     "blockers": [],
                     "residual_findings": [],
+                    "continuation_notes": [],
                 }), encoding="utf-8")
 
             round_index = 0
@@ -526,7 +537,7 @@ def write_wrong_slice_id_harness(path):
 
             artifact = Path(os.environ["PM_SLICE_ARTIFACT_DIR"])
             (artifact / "developer-result.json").write_text(json.dumps({
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": "Slice 99",
                 "status": "pass",
                 "summary": "worked the wrong slice",
@@ -538,6 +549,7 @@ def write_wrong_slice_id_harness(path):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             }), encoding="utf-8")
             time.sleep(5)
             """
@@ -578,7 +590,7 @@ class PmTestCase(unittest.TestCase):
         before_head=None,
         commit=None,
     ):
-        """Return a complete schema-v3 terminal entry for state-focused tests."""
+        """Return a complete schema-v4 terminal entry for state-focused tests."""
         ordinal = int(slice_id.rsplit(" ", 1)[-1])
         return {
             "slice_id": slice_id,
@@ -606,11 +618,21 @@ class PmTestCase(unittest.TestCase):
             "next_action": "",
             "blockers": [],
             "residual_findings": [],
+            "continuation_notes": [],
             "gate_reason": "test fixture",
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
             "slice_summary": f".ai-pm/runs/{state['run_id']}/slices/slice-{ordinal:03d}/slice-summary.md",
+        }
+
+    def prior_context_metadata(self, artifact, text="test prior context\n"):
+        artifact.mkdir(parents=True, exist_ok=True)
+        context_path = artifact / "prior-slice-context.md"
+        context_path.write_text(text, encoding="utf-8")
+        return {
+            "path": str(context_path.resolve().relative_to(self.repo.resolve())),
+            "sha256": hashlib.sha256(context_path.read_bytes()).hexdigest(),
         }
 
     def write_reviewer_policy(self, artifact, *, tool="opencode"):
@@ -705,13 +727,14 @@ class PmTestCase(unittest.TestCase):
         review="PASS",
         commit_hash=None,
         residual_findings=None,
+        continuation_notes=None,
     ):
         artifact.mkdir(parents=True, exist_ok=True)
         (artifact / "validation-summary.md").write_text("validation\n", encoding="utf-8")
         (artifact / "drift-audit.md").write_text("drift\n", encoding="utf-8")
         (artifact / "code-review.md").write_text("review\n", encoding="utf-8")
         result = {
-            "schema_version": 3,
+            "schema_version": 4,
             "slice_id": "Slice 1",
             "status": "pass",
             "summary": "",
@@ -723,6 +746,7 @@ class PmTestCase(unittest.TestCase):
             "next_action": "",
             "blockers": [],
             "residual_findings": list(residual_findings or []),
+            "continuation_notes": list(continuation_notes or []),
         }
         (artifact / "developer-result.json").write_text(json.dumps(result), encoding="utf-8")
 
@@ -744,7 +768,7 @@ class PmTestCase(unittest.TestCase):
         (artifact / "developer-result.json").write_text(
             json.dumps(
                 {
-                    "schema_version": 3,
+                    "schema_version": 4,
                     "slice_id": slice_id,
                     "status": "pass",
                     "summary": "",
@@ -756,6 +780,7 @@ class PmTestCase(unittest.TestCase):
                     "next_action": "",
                     "blockers": [],
                     "residual_findings": [],
+                    "continuation_notes": [],
                 }
             ),
             encoding="utf-8",
@@ -776,6 +801,7 @@ class PmTestCase(unittest.TestCase):
             "pause": None,
             "repair": dict(repair) if repair is not None else pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "a" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(artifact),
         }
         state["status"] = "running"
         state["supervision"]["mode"] = "model-supervised"

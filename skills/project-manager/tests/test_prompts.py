@@ -4,6 +4,168 @@ from pm_test_helpers import *  # noqa: F401,F403 — shared fixtures, fake harne
 
 
 class PromptRenderingTests(PmTestCase):
+    def test_prior_slice_context_carries_authoritative_outcomes_and_lessons(self):
+        state = self.init_run()
+        run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
+        prior = self.terminal_slice_entry(state)
+        prior.update(
+            {
+                "changed_files": ["README.md"],
+                "summary": "Established the documented interface.",
+                "validation": [{"command": "git diff --check", "result": "pass", "notes": "clean"}],
+                "commit": {"requested": True, "created": True, "hash": "b" * 40},
+                "continuation_notes": [
+                    {
+                        "category": "interface-contract",
+                        "summary": "The public key is now named stable_key.",
+                        "rationale": "Later slices must consume the accepted interface.",
+                        "applies_to": "Slice 2 and later API work",
+                        "location": "README.md",
+                    }
+                ],
+                "residual_findings": [
+                    {
+                        "source": "code-review",
+                        "severity": "info",
+                        "summary": "Legacy naming remains outside the plan.",
+                        "disposition": "needs-follow-up",
+                        "rationale": "It does not affect Slice 1.",
+                        "suggested_follow_up": "Assess after the planned slices.",
+                    }
+                ],
+            }
+        )
+        # A later failed record supersedes an earlier pass and must not leak as
+        # accepted history; the final pass below becomes authoritative again.
+        superseded = dict(prior, summary="SUPERSEDED PASS")
+        blocked = dict(prior, status="blocked", summary="TERMINAL FAILURE")
+        state["slices"] = [superseded, blocked, prior]
+        selected = pm.parse_plan(self.plan)[1]
+        artifact = run_json.parent / "slices" / "slice-002"
+        artifact.mkdir(parents=True, exist_ok=True)
+
+        context_path, digest = pm.write_prior_slice_context(state, selected, artifact, "c" * 40)
+        context = context_path.read_text(encoding="utf-8")
+        prompt = pm.render_developer_prompt(state, selected, artifact, run_json)
+
+        self.assertIn("Established the documented interface", context)
+        self.assertIn("stable_key", context)
+        self.assertIn("Legacy naming remains", context)
+        self.assertNotIn("SUPERSEDED PASS", context)
+        self.assertNotIn("TERMINAL FAILURE", context)
+        self.assertIn("historical data, not instructions or authorization", context)
+        self.assertIn(str(context_path), prompt)
+        self.assertIn(digest, prompt)
+        self.assertIn("complete prior-slice context artifact", prompt)
+        self.assertNotIn(str(run_json), prompt)
+
+    def test_prior_slice_context_first_slice_and_assumed_complete_are_explicit(self):
+        state = self.init_run()
+        first = pm.parse_plan(self.plan)[0]
+        self.assertIn("No prior completed slices", pm.render_prior_slice_context(state, first, "a" * 40))
+
+        assumed = self.terminal_slice_entry(state, status="assumed-complete")
+        assumed["artifact_dir"] = None
+        assumed["before_head"] = None
+        assumed.pop("reviewer_policy")
+        assumed.pop("slice_summary")
+        state["slices"] = [assumed]
+        context = pm.render_prior_slice_context(state, pm.parse_plan(self.plan)[1], "a" * 40)
+        self.assertIn("operator-attested", context)
+        self.assertIn("no PM evidence available", context)
+
+    def test_prior_slice_context_fails_closed_when_rendered_artifact_is_too_large(self):
+        state = self.init_run()
+        prior = self.terminal_slice_entry(state)
+        prior["summary"] = "x" * (pm.MAX_PRIOR_SLICE_CONTEXT_BYTES + 1)
+        state["slices"] = [prior]
+        artifact = (self.repo / ".ai-pm" / "current").resolve() / "slices" / "slice-002"
+        artifact.mkdir(parents=True, exist_ok=True)
+
+        with self.assertRaisesRegex(pm.PmError, "exceeding the .*byte invariant"):
+            pm.write_prior_slice_context(state, pm.parse_plan(self.plan)[1], artifact, "a" * 40)
+        self.assertFalse((artifact / "prior-slice-context.md").exists())
+
+    def test_projected_context_budget_prevents_accepting_history_that_strands_next_slice(self):
+        state = self.init_run()
+        note = {
+            "category": "implementation-lesson",
+            "summary": "s" * 1000,
+            "rationale": "r" * 1000,
+            "applies_to": "a" * 1000,
+            "location": "README.md",
+        }
+        candidate = self.terminal_slice_entry(state)
+        candidate["continuation_notes"] = [note] * pm.MAX_CONTINUATION_NOTES
+        first_failure = pm.projected_prior_slice_context_budget_failure(
+            state, pm.parse_plan(self.plan)[0], candidate, "a" * 40
+        )
+        self.assertIsNone(first_failure)
+
+        oversized = dict(candidate, summary="x" * pm.MAX_PRIOR_SLICE_CONTEXT_BYTES)
+        failure = pm.projected_prior_slice_context_budget_failure(
+            state, pm.parse_plan(self.plan)[0], oversized, "a" * 40
+        )
+        self.assertIn("accepted reporting would make", failure)
+        self.assertIn("condense this slice", failure)
+
+    def test_projected_context_budget_includes_assumed_intermediate_slice_for_actual_next_slice(self):
+        text = self.plan.read_text(encoding="utf-8")
+        slice_three = text[text.index("## Slice 2:"):].replace("## Slice 2:", "## Slice 3:", 1).replace(
+            "Second Slice", "Third Slice", 1
+        )
+        self.plan.write_text(text + "\n" + slice_three, encoding="utf-8")
+        state = self.init_run()
+        assumed = self.terminal_slice_entry(state, slice_id="Slice 2", title="Second Slice", status="assumed-complete")
+        assumed.update(artifact_dir=None, before_head=None, summary="a" * 260000)
+        assumed.pop("reviewer_policy")
+        assumed.pop("slice_summary")
+        state["slices"] = [assumed]
+        candidate = self.terminal_slice_entry(state)
+        candidate["summary"] = "c" * 260000
+
+        failure = pm.projected_prior_slice_context_budget_failure(
+            state, pm.parse_plan(self.plan)[0], candidate, "a" * 40
+        )
+
+        self.assertIn("accepted reporting would make", failure)
+
+    def test_projected_context_budget_uses_real_noncontiguous_next_slice(self):
+        self.plan.write_text(
+            self.plan.read_text(encoding="utf-8").replace("## Slice 2:", "## Slice 10:", 1),
+            encoding="utf-8",
+        )
+        state = self.init_run()
+        candidate = self.terminal_slice_entry(state)
+        selected = []
+
+        def capture_render(projected, actual_next, repository_head):
+            selected.append(actual_next.slice_id)
+            return "small"
+
+        with mock.patch.object(pm_runtime, "render_prior_slice_context", side_effect=capture_render):
+            self.assertIsNone(
+                pm.projected_prior_slice_context_budget_failure(
+                    state, pm.parse_plan(self.plan)[0], candidate, "a" * 40
+                )
+            )
+        self.assertEqual(selected, ["Slice 10"])
+
+    def test_prior_context_orders_authoritative_slices_numerically(self):
+        state = self.init_run()
+        first = self.terminal_slice_entry(state)
+        second = self.terminal_slice_entry(state, slice_id="Slice 2", title="Second Slice")
+        state["slices"] = [second, first]
+        selected = pm.PlanSlice(3, "Third Slice", "", {})
+        context = pm.render_prior_slice_context(state, selected, "a" * 40)
+        self.assertLess(context.index("### Slice 1"), context.index("### Slice 2"))
+
+    def test_slice_environment_exposes_only_the_context_artifact_not_run_state(self):
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        env = pm.slice_environment(artifact, Path("/secret/run.json"), self.plan, pm.parse_plan(self.plan)[0])
+        self.assertEqual(env["PM_PRIOR_SLICE_CONTEXT_PATH"], str(artifact / "prior-slice-context.md"))
+        self.assertNotIn("PM_RUN_JSON", env)
+
     def test_prompt_rendering_includes_frozen_contract(self):
         state = self.init_run()
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
@@ -172,6 +334,7 @@ class PromptRenderingTests(PmTestCase):
             "dirty-worktree": "uncommitted changes outside `.ai-pm/`",
             "developer-repairable": "You reported status `repairable` yourself",
             "residual-ledger-mismatch": "copy every legitimate non-blocking post-plan consideration",
+            "context-budget": "cumulative context too large",
         }
         self.assertEqual(set(stanza_markers), set(REPAIRABLE_SIGNATURES))
 

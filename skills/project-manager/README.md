@@ -19,7 +19,8 @@ Runtime requirement: Python 3.13 or newer. PM uses Python 3.13's segment-aware `
 - Reporting the next eligible slice in `run-next --dry-run`.
 - Running one eligible slice with `run-next`.
 - Running eligible slices sequentially with `run --scope remaining`.
-- Capturing prompt, pane output, git status, git diff, validation, drift audit, code review, structured residual findings, per-slice summaries, and the aggregate run report.
+- Generating a bounded, read-only `prior-slice-context.md` before every slice so a fresh Developer receives authoritative accepted outcomes, repository effects, validation and audit history, structured decisions and lessons, failed approaches, interface/tooling discoveries, risks, and residual findings from earlier slices.
+- Capturing prompt, pane output, git status, git diff, validation, drift audit, code review, structured continuation notes and residual findings, per-slice summaries, and the aggregate run report.
 - Writing `reviewer-policy.json`, embedding the orchestrator contract into the slice prompt, and verifying validated reviewer-launch evidence without composing reviewer harness commands itself.
 - Recording supervision state and append-only operational event logs for model-supervised runs.
 - Verifying developer claims against git evidence, classifying every non-pass gate outcome with a stable failure signature as repairable or terminal.
@@ -91,7 +92,7 @@ python3 skills/project-manager/scripts/pm.py status --repo /path/to/repo
 python3 skills/project-manager/scripts/pm.py summarize --repo /path/to/repo
 ```
 
-Every run-state write refreshes `.ai-pm/current/run-report.md`. Each terminal slice also gets `slice-summary.md`. These deterministic reports carry gate results, commits, blockers, next actions, residual findings, and PM-derived provenance for each audit: `reviewer` with the successful tool/label, `developer-self-audit` only when the Developer result and non-empty in-slice audit artifact prove it occurred, or `not-observed` when neither evidence path exists (including timeouts, missing results, pre-audit stops, and operator-attested pre-run completion). While a harness is live, the outside-worktree copy is Mode B's controller authority and `.ai-pm/current/run.json` is its auditable mirror; a mismatch fails normal commands closed, while `stop-with-evidence` can recover from the isolated copy. This protects against normal workspace edits and weak-model corruption, not a same-user unsandboxed process deliberately searching outside the worktree.
+Every run-state write refreshes `.ai-pm/current/run-report.md`. Each terminal slice also gets `slice-summary.md`. These deterministic reports carry gate results, commits, blockers, next actions, continuation notes, residual findings, and PM-derived provenance for each audit: `reviewer` with the successful tool/label, `developer-self-audit` only when the Developer result and non-empty in-slice audit artifact prove it occurred, or `not-observed` when neither evidence path exists (including timeouts, missing results, pre-audit stops, and operator-attested pre-run completion). Before a later slice starts, PM selects only the latest authoritative outcome for each earlier slice, orders it numerically, and renders its accepted history into that new slice's `prior-slice-context.md`; superseded or terminal outcomes are retained for audit but are not presented as accepted implementation truth. Each slice gets a newly rendered, launch-time cumulative snapshot rather than a shared mutable file. PM protects its path and digest in `current_slice`, reverifies it before finalization, and limits the artifact to 512 KiB; continuation reporting is limited to 100 notes with 4,000 characters per field. Before accepting a non-final slice, PM projects the exact next cumulative artifact and makes an oversized result repairable, preventing immutable accepted history from stranding later work. While a harness is live, the outside-worktree copy is Mode B's controller authority and `.ai-pm/current/run.json` is its auditable mirror; a mismatch fails normal commands closed, while `stop-with-evidence` can recover from the isolated copy. This protects against normal workspace edits and weak-model corruption, not a same-user unsandboxed process deliberately searching outside the worktree.
 
 Repeated terminal outcomes for the same slice are grouped together in the run report. Earlier outcomes remain visible as superseded evidence and the final recorded outcome is marked authoritative; aggregate residual findings, blockers, and next actions come from the authoritative outcome.
 
@@ -266,6 +267,7 @@ State is stored under the target repository:
           tmp/
           tool-homes/
           copilot-home/
+          prior-slice-context.md
           git-status-before.txt
           git-status-after.txt
           git-diff.patch
@@ -280,11 +282,11 @@ PM does not edit the project's own `.gitignore`. Instead, `init` writes a self-i
 
 Each `activity-attempt-<n>.jsonl` line records `checked_at`, `running`, and `active` fields from the tmux pane activity check. `pane-capture-live-latest.txt` preserves the last live pane text seen during polling, which is useful when the final pane capture is unavailable after a fast harness exit. Batch polling also records `observation` operational events to `operational-events.jsonl` (on state change, with a 60-second floor while nothing changes) and refreshes `observation-latest.json` — the same evidence the model-supervised `observe`/`wait` primitives produce.
 
-`run.json` includes a required `supervision` object with pause/retry policy, pause budgets, and the default continuation prompt. PM supports only the complete current schema-v3 shape and fails closed with a fresh-init instruction when durable state is missing or uses another version. High-frequency model-supervised observations and actions belong in `operational-events.jsonl`, an append-only log, rather than repeated `run.json` rewrites.
+`run.json` includes a required `supervision` object with pause/retry policy, pause budgets, and the default continuation prompt. PM supports only the complete current schema-v4 shape and fails closed with a fresh-init instruction when durable state is missing or uses another version. High-frequency model-supervised observations and actions belong in `operational-events.jsonl`, an append-only log, rather than repeated `run.json` rewrites.
 
 While a slice is running, `current_slice` records the slice id, title, artifact directory, tmux session, attempt, start time, `before_head`, a `repair` object ({round, last_signature, signature_streak, session_generation} — the persisted repair-loop and circuit-breaker state), an optional `developer_session_id` for transcript lookup, and an optional `pause` object. Persisting `before_head` is required for model-supervised finalization because changed-file verification must compare against the real slice start, not guess `HEAD^`; it stays fixed across repair rounds and relaunches so verification remains cumulative. Repair rounds add per-round artifacts (`developer-result-repair-<n>.json`, `repair-prompt-repair-<n>.md`, `pane-capture-repair-<n>.txt`, `git-status-repair-<n>.txt`) beside the standard slice artifacts. See `references/run-state-schema.md` for the full semantics.
 
-Reviewer state and temporary files should stay under the slice artifact directory. PM exports fixed paths for reviewer runs, temporary files, and tool-specific home directories so developers do not have to invent locations.
+Reviewer state and temporary files should stay under the slice artifact directory. PM exports fixed paths for reviewer runs, prior-slice context, temporary files, and tool-specific home directories so developers do not have to invent locations. Historical context is explicitly data rather than instruction: the current frozen contract always wins, the artifact cannot expand scope, and Developer-authored lessons are labelled separately from PM-verified repository and gate facts.
 
 ## Plan Eligibility
 
@@ -411,7 +413,7 @@ commit_hash = subprocess.run(["git", "rev-parse", "HEAD"], check=True, text=True
 (artifact / "drift-audit.md").write_text("PASS\n", encoding="utf-8")
 (artifact / "code-review.md").write_text("PASS\n", encoding="utf-8")
 (artifact / "developer-result.json").write_text(json.dumps({
-    "schema_version": 3,
+    "schema_version": 4,
     "slice_id": "Slice 1",
     "status": "pass",
     "summary": "toy slice complete",
@@ -422,7 +424,8 @@ commit_hash = subprocess.run(["git", "rev-parse", "HEAD"], check=True, text=True
     "commit": {"requested": True, "created": True, "hash": commit_hash},
     "next_action": "",
     "blockers": [],
-    "residual_findings": []
+    "residual_findings": [],
+    "continuation_notes": []
 }), encoding="utf-8")
 time.sleep(5)
 PY
@@ -473,7 +476,7 @@ commit_hash = subprocess.run(["git", "rev-parse", "HEAD"], check=True, text=True
 (artifact / "drift-audit.md").write_text("PASS\n", encoding="utf-8")
 (artifact / "code-review.md").write_text("PASS\n", encoding="utf-8")
 (artifact / "developer-result.json").write_text(json.dumps({
-    "schema_version": 3,
+    "schema_version": 4,
     "slice_id": "Slice 1",
     "status": "pass",
     "summary": "resumed after rolling limit",
@@ -484,7 +487,8 @@ commit_hash = subprocess.run(["git", "rev-parse", "HEAD"], check=True, text=True
     "commit": {"requested": True, "created": True, "hash": commit_hash},
     "next_action": "",
     "blockers": [],
-    "residual_findings": []
+    "residual_findings": [],
+    "continuation_notes": []
 }), encoding="utf-8")
 time.sleep(2)
 PY

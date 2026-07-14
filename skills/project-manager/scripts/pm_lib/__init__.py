@@ -34,6 +34,10 @@ from .commands import (
 )
 from .constants import (
     COMPLETED_SLICE_STATUSES,
+    CONTINUATION_NOTE_CATEGORIES,
+    MAX_CONTINUATION_FIELD_CHARS,
+    MAX_CONTINUATION_NOTES,
+    MAX_PRIOR_SLICE_CONTEXT_BYTES,
     DEFAULT_SUPERVISION,
     DEFAULT_POLL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
@@ -82,6 +86,7 @@ from .git_ops import (
 from .models import CommandResult, GateDecision, PmError, PlanSlice
 from .observation import build_observation, idle_stall_due, record_observation, wait_observing
 from .plan import (
+    authoritative_slice_entries,
     completed_slice_ids,
     duplicate_slice_numbers,
     eligibility,
@@ -127,6 +132,9 @@ from .runtime import (
     real_tool_home,
     relative_artifact_path,
     render_developer_prompt,
+    render_prior_slice_context,
+    prior_slice_context_integrity_failure,
+    projected_prior_slice_context_budget_failure,
     orchestrator_embedded_instructions,
     result_schema_path,
     seed_reviewer_credentials,
@@ -143,6 +151,7 @@ from .runtime import (
     reviewer_jobs_path,
     write_reviewer_policy,
     reviewer_policy_snapshot,
+    write_prior_slice_context,
 )
 from .state import (
     activate_controller_state,
@@ -173,6 +182,10 @@ __all__ = [
     "HARD_PROMPT_MARKERS",
     "TmuxHarnessAdapter",
     "COMPLETED_SLICE_STATUSES",
+    "CONTINUATION_NOTE_CATEGORIES",
+    "MAX_CONTINUATION_FIELD_CHARS",
+    "MAX_CONTINUATION_NOTES",
+    "MAX_PRIOR_SLICE_CONTEXT_BYTES",
     "CommandResult",
     "DEFAULT_SUPERVISION",
     "DEFAULT_POLL_SECONDS",
@@ -196,6 +209,7 @@ __all__ = [
     "approve_slice",
     "approved_slice_ids",
     "archive_sensitive",
+    "authoritative_slice_entries",
     "append_operational_event",
     "artifact_exists",
     "reviewer_audit_provenance",
@@ -268,6 +282,9 @@ __all__ = [
     "record_observation",
     "relative_artifact_path",
     "render_developer_prompt",
+    "render_prior_slice_context",
+    "prior_slice_context_integrity_failure",
+    "projected_prior_slice_context_budget_failure",
     "orchestrator_embedded_instructions",
     "require_clean_worktree",
     "reset_slice_pause_counters",
@@ -314,6 +331,7 @@ __all__ = [
     "reviewer_jobs_module",
     "reviewer_jobs_path",
     "write_reviewer_policy",
+    "write_prior_slice_context",
     "reviewer_policy_snapshot",
     "wait",
     "wait_observing",

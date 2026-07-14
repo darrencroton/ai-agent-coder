@@ -6,9 +6,12 @@ Notable changes to this repository. Format follows [Keep a Changelog](https://ke
 
 ### Changed
 
+- **Breaking:** Project Manager state/results now use schema version 4. Passing slice results require a structured `continuation_notes` ledger for decisions, implementation and interface lessons, failed approaches, validation/tooling knowledge, risks, and later-slice guidance; older runs must be reinitialized.
+- Mode B now generates a hash-addressed, provenance-labelled `prior-slice-context.md` for every slice from the authoritative accepted outcomes of earlier slices. Fresh Developers must read this bounded history alongside the plan and current frozen contract, while controller state, raw transcripts, superseded outcomes, and authorization remain isolated.
+- Slice completion now follows the latest authoritative outcome consistently across selection, reports, and cross-slice context; a superseded earlier pass no longer keeps a slice marked complete after a later terminal outcome.
 - **Breaking:** renamed the `master-controller` skill and MC identity to `project-manager` and PM. Active CLI/package paths, runtime state, environment variables, session prefixes, cross-skill contracts, tests, CI, and documentation now use PM terminology without compatibility aliases; existing `.ai-mc/` runs remain historical evidence and new runs initialize under `.ai-pm/`.
 - **Breaking:** renamed the `ai-orchestrator` skill to `orchestrator`, renamed the executing agent role to Developer, and replaced the Senior/Junior worker roles with one read-only Reviewer role. All supported harnesses are equally eligible for either role; harness-specific read-only enforcement differences are reported as facts rather than used as eligibility policy.
-- **Breaking:** Project Manager state/results now use schema version 3 and the Reviewer contract uses schema version 2. The CLI uses `--reviewer-*`, runtime state lives under `.orchestrator/`, and Developer/Reviewer fields and artifacts replace their former role-shaped names without compatibility aliases.
+- **Breaking:** the Reviewer contract uses schema version 2. The CLI uses `--reviewer-*`, runtime state lives under `.orchestrator/`, and Developer/Reviewer fields and artifacts replace their former role-shaped names without compatibility aliases.
 - Audit provenance now records Reviewer execution or explicit Developer self-audit in slice summaries, run reports, and summaries. Default slices may self-audit when no Reviewer is configured or available; independent-audit slices still require separate validated Reviewer runs.
 
 ## [0.5.0] — 2026-07-13

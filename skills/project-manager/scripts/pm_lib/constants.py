@@ -5,7 +5,7 @@ import shlex
 from typing import Any
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 PARSER_NAME = "implementation-plan-markdown-v2"
 FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUIRED_SECTIONS = (
@@ -23,6 +23,20 @@ REQUIRED_SECTIONS = (
 # approval gate. PM never assigns it from gate verification.
 COMPLETED_SLICE_STATUSES = {"pass", "assumed-complete"}
 DEVELOPER_STATUSES = {"pass", "repairable", "needs-human", "fail", "blocked"}
+CONTINUATION_NOTE_CATEGORIES = {
+    "decision",
+    "implementation-lesson",
+    "failed-approach",
+    "interface-contract",
+    "validation-lesson",
+    "environment-tooling",
+    "reviewer-lesson",
+    "risk-warning",
+    "future-slice-guidance",
+}
+MAX_CONTINUATION_NOTES = 100
+MAX_CONTINUATION_FIELD_CHARS = 4000
+MAX_PRIOR_SLICE_CONTEXT_BYTES = 524288
 RUN_ACTIVE_STATUSES = {"initialized", "running", "paused", "resuming", "partial"}
 RUN_STOP_STATUSES = {"needs-human", "blocked", "failed", "cancelled"}
 DEFAULT_TIMEOUT_SECONDS = 1800

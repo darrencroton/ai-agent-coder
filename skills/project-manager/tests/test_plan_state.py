@@ -319,7 +319,7 @@ class PlanStateTests(PmTestCase):
 
     def test_run_state_creation(self):
         state = self.init_run()
-        self.assertEqual(state["schema_version"], 3)
+        self.assertEqual(state["schema_version"], 4)
         self.assertEqual(state["repo_path"], str(self.repo.resolve()))
         self.assertEqual(state["plan_path"], str(self.plan.resolve()))
         self.assertEqual(state["harness"]["name"], "codex")
@@ -328,6 +328,18 @@ class PlanStateTests(PmTestCase):
         self.assertIn("rolling_usage_limit", state["supervision"]["pause_policy"])
         self.assertEqual(state["supervision"]["pause_counters"]["cumulative_pause_seconds_run"], 0)
         self.assertEqual(state["operational_events_path"], f".ai-pm/runs/{state['run_id']}/operational-events.jsonl")
+
+    def test_completed_slice_selection_uses_latest_authoritative_outcome(self):
+        state = self.init_run()
+        passed = self.terminal_slice_entry(state, status="pass")
+        blocked = self.terminal_slice_entry(state, status="blocked")
+        state["slices"] = [passed, blocked]
+        self.assertNotIn("Slice 1", pm.completed_slice_ids(state))
+        self.assertEqual(pm.next_slice(pm.parse_plan(self.plan), state).slice_id, "Slice 1")
+
+        state["slices"].append(passed)
+        self.assertIn("Slice 1", pm.completed_slice_ids(state))
+        self.assertEqual(pm.next_slice(pm.parse_plan(self.plan), state).slice_id, "Slice 2")
 
     def test_init_can_create_and_switch_to_authorized_branch(self):
         self.prepare_committed_repo()
@@ -384,7 +396,7 @@ class PlanStateTests(PmTestCase):
         with self.assertRaisesRegex(pm.PmError, "unsupported run-state schema"):
             pm.load_run(run_json)
 
-        state["schema_version"] = 3
+        state["schema_version"] = 4
         state.pop("supervision")
         run_json.write_text(json.dumps(state), encoding="utf-8")
         with self.assertRaisesRegex(pm.PmError, "missing required field.*supervision"):
@@ -478,6 +490,9 @@ class PlanStateTests(PmTestCase):
             "2026-01-01T00:00:00Z",
             "a" * 40,
             reviewer_policy={"sha256": "b" * 64, "policy": {}},
+            prior_slice_context=self.prior_context_metadata(
+                self.repo / ".ai-pm" / "runs" / base["run_id"] / "slices" / "slice-001"
+            ),
             launch_config=launch_config,
         )
 
@@ -567,11 +582,15 @@ class PlanStateTests(PmTestCase):
             "2026-01-01T00:00:00Z",
             "a" * 40,
             reviewer_policy={"sha256": "b" * 64, "policy": {}},
+            prior_slice_context=self.prior_context_metadata(
+                self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+            ),
         )
 
         self.assertEqual(state["before_head"], "a" * 40)
         self.assertEqual(state["pause"], None)
         self.assertEqual(state["artifact_dir"], ".ai-pm/runs/test/slices/slice-001")
+        self.assertEqual(state["prior_slice_context"]["path"], ".ai-pm/runs/test/slices/slice-001/prior-slice-context.md")
 
     def test_status_displays_paused_current_slice_fields(self):
         state = self.init_run()
@@ -593,6 +612,9 @@ class PlanStateTests(PmTestCase):
             "reviewer_tools": [],
             "repair": pm_state.default_repair_state(),
             "reviewer_policy": {"sha256": "c" * 64, "policy": {}},
+            "prior_slice_context": self.prior_context_metadata(
+                self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+            ),
         }
         run_json.write_text(json.dumps(state), encoding="utf-8")
         output = io.StringIO()

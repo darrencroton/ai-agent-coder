@@ -147,7 +147,7 @@ class GateVerificationTests(PmTestCase):
             "blocked",
             "Developer stopped before audit stage",
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": "Slice 1",
                 "status": "blocked",
                 "summary": "stopped before audit",
@@ -157,6 +157,7 @@ class GateVerificationTests(PmTestCase):
                 "next_action": "",
                 "blockers": ["pre-audit stop"],
                 "residual_findings": [],
+                "continuation_notes": [],
             },
         )
 
@@ -241,7 +242,7 @@ class GateVerificationTests(PmTestCase):
         self.write_gate_result_data(
             artifact,
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": "Slice 1",
                 "status": "pass",
                 "summary": "",
@@ -253,6 +254,7 @@ class GateVerificationTests(PmTestCase):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             },
         )
         state = self.init_run()
@@ -275,7 +277,7 @@ class GateVerificationTests(PmTestCase):
         self.write_gate_result_data(
             artifact,
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": "Slice 1",
                 "status": "pass",
                 "summary": "",
@@ -287,6 +289,7 @@ class GateVerificationTests(PmTestCase):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             },
         )
         state = self.init_run()
@@ -438,7 +441,7 @@ class GateVerificationTests(PmTestCase):
         self.assertEqual(decision.signature, "result-malformed")
         self.assertIn("schema_version", decision.reason)
 
-        self.write_gate_result_data(artifact, {"schema_version": 3, "slice_id": "Slice 1", "status": "victory"})
+        self.write_gate_result_data(artifact, {"schema_version": 4, "slice_id": "Slice 1", "status": "victory"})
         decision = pm.verify_gate(self.repo, state, plan_slice, artifact, before, before, pm.git_status_text(self.repo))
         self.assertEqual(decision.status, "repairable")
         self.assertEqual(decision.signature, "result-malformed")
@@ -464,7 +467,7 @@ class GateVerificationTests(PmTestCase):
         self.prepare_committed_repo()
         before = git(self.repo, "rev-parse", "HEAD")
         artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
-        self.write_gate_result_data(artifact, {"schema_version": 3, "slice_id": "Slice 2", "status": "pass"})
+        self.write_gate_result_data(artifact, {"schema_version": 4, "slice_id": "Slice 2", "status": "pass"})
         state = self.init_run()
 
         decision = pm.verify_gate(self.repo, state, pm.parse_plan(self.plan)[0], artifact, before, before, pm.git_status_text(self.repo))
@@ -480,15 +483,42 @@ class GateVerificationTests(PmTestCase):
         state = self.init_run()
         plan_slice = pm.parse_plan(self.plan)[0]
 
-        self.write_gate_result_data(artifact, {"schema_version": 3, "slice_id": "Slice 1", "status": "repairable"})
+        self.write_gate_result_data(artifact, {
+            "schema_version": 4, "slice_id": "Slice 1", "status": "repairable",
+            "residual_findings": [], "continuation_notes": [],
+        })
         decision = pm.verify_gate(self.repo, state, plan_slice, artifact, before, before, pm.git_status_text(self.repo))
         self.assertEqual(decision.status, "repairable")
         self.assertEqual(decision.signature, "developer-repairable")
 
-        self.write_gate_result_data(artifact, {"schema_version": 3, "slice_id": "Slice 1", "status": "needs-human"})
+        self.write_gate_result_data(artifact, {
+            "schema_version": 4, "slice_id": "Slice 1", "status": "needs-human",
+            "residual_findings": [], "continuation_notes": [],
+        })
         decision = pm.verify_gate(self.repo, state, plan_slice, artifact, before, before, pm.git_status_text(self.repo))
         self.assertEqual(decision.status, "needs-human")
         self.assertEqual(decision.signature, "")
+
+        self.write_gate_result_data(artifact, {
+            "schema_version": 4,
+            "slice_id": "Slice 1",
+            "status": "blocked",
+            "residual_findings": [],
+            "continuation_notes": [{"category": "broken"}],
+        })
+        decision = pm.verify_gate(self.repo, state, plan_slice, artifact, before, before, pm.git_status_text(self.repo))
+        self.assertEqual(decision.status, "repairable")
+        self.assertEqual(decision.signature, "result-malformed")
+        entry = pm.slice_entry_from_gate(
+            self.repo,
+            plan_slice,
+            artifact,
+            pm.utc_now(),
+            pm.GateDecision("needs-human", decision.reason, decision.result),
+            before,
+            reviewer_policy={"sha256": "a" * 64, "policy": {}},
+        )
+        self.assertEqual(entry["continuation_notes"], [])
 
     def _opt_in_slice(self):
         # Return Slice 1 with the opt-in "Independent audit required: yes" flag
@@ -559,6 +589,61 @@ class GateVerificationTests(PmTestCase):
         self.assertEqual(decision.status, "repairable")
         self.assertEqual(decision.signature, "result-malformed")
         self.assertIn("residual_findings is missing", decision.reason)
+
+    def test_gate_requires_and_preserves_structured_continuation_notes(self):
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        note = {
+            "category": "implementation-lesson",
+            "summary": "The parser requires normalized paths.",
+            "rationale": "Later slices share the same parser.",
+            "applies_to": "Slices 2-3",
+            "location": "README.md",
+        }
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after, continuation_notes=[note])
+        state = self.init_run()
+        plan_slice = pm.parse_plan(self.plan)[0]
+        decision = pm.verify_gate(
+            self.repo, state, plan_slice, artifact, before, after, pm.git_status_text(self.repo)
+        )
+        self.assertEqual(decision.status, "pass")
+        entry = pm.slice_entry_from_gate(
+            self.repo, plan_slice, artifact, pm.utc_now(), decision, before,
+            reviewer_policy={"sha256": "a" * 64, "policy": {}},
+        )
+        self.assertEqual(entry["continuation_notes"], [note])
+        self.assertIn("parser requires normalized paths", (artifact / "slice-summary.md").read_text(encoding="utf-8"))
+
+        malformed = json.loads((artifact / "developer-result.json").read_text(encoding="utf-8"))
+        malformed["continuation_notes"] = [{"category": "mystery", "summary": "x", "rationale": "y", "applies_to": "z"}]
+        (artifact / "developer-result.json").write_text(json.dumps(malformed), encoding="utf-8")
+        decision = pm.verify_gate(
+            self.repo, state, plan_slice, artifact, before, after, pm.git_status_text(self.repo)
+        )
+        self.assertEqual(decision.signature, "result-malformed")
+        self.assertIn("continuation_notes[0].category is invalid", decision.reason)
+
+        too_many = [note] * (pm.MAX_CONTINUATION_NOTES + 1)
+        malformed["continuation_notes"] = too_many
+        (artifact / "developer-result.json").write_text(json.dumps(malformed), encoding="utf-8")
+        decision = pm.verify_gate(
+            self.repo, state, plan_slice, artifact, before, after, pm.git_status_text(self.repo)
+        )
+        self.assertEqual(decision.signature, "result-malformed")
+        self.assertIn("exceeds the maximum", decision.reason)
+
+        malformed["continuation_notes"] = [dict(note, summary="x" * (pm.MAX_CONTINUATION_FIELD_CHARS + 1))]
+        (artifact / "developer-result.json").write_text(json.dumps(malformed), encoding="utf-8")
+        decision = pm.verify_gate(
+            self.repo, state, plan_slice, artifact, before, after, pm.git_status_text(self.repo)
+        )
+        self.assertEqual(decision.signature, "result-malformed")
+        self.assertIn("exceeds the maximum", decision.reason)
 
     def test_gate_repairs_empty_residual_ledger_when_review_lists_observation(self):
         self.prepare_committed_repo()
@@ -675,6 +760,7 @@ class GateVerificationTests(PmTestCase):
                     "status": "pass",
                     "commit": {"hash": "a" * 40},
                     "residual_findings": [],
+                    "continuation_notes": [],
                 },
             ],
         }
@@ -1262,7 +1348,7 @@ class GateVerificationTests(PmTestCase):
         self.write_gate_result_data(
             artifact,
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": "Slice 1",
                 "status": "pass",
                 "summary": "",
@@ -1274,6 +1360,7 @@ class GateVerificationTests(PmTestCase):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             },
         )
         state = self.init_run()
@@ -1289,7 +1376,7 @@ class GateVerificationTests(PmTestCase):
         self.write_gate_result_data(
             artifact,
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "slice_id": "Slice 1",
                 "status": "pass",
                 "summary": "",
@@ -1301,6 +1388,7 @@ class GateVerificationTests(PmTestCase):
                 "next_action": "",
                 "blockers": [],
                 "residual_findings": [],
+                "continuation_notes": [],
             },
         )
         state = self.init_run()

@@ -29,10 +29,13 @@ from .runtime import (
     extract_operational_hints,
     render_developer_prompt,
     render_repair_prompt,
+    prior_slice_context_integrity_failure,
+    projected_prior_slice_context_budget_failure,
     slice_dir_name,
     tmux_session_name,
     write_reviewer_policy,
     reviewer_policy_snapshot,
+    write_prior_slice_context,
 )
 from .state import (
     activate_controller_state,
@@ -320,6 +323,8 @@ def start_model_supervised_slice(
         + "\n",
         encoding="utf-8",
     )
+    before_head = git_head(repo)
+    prior_context_path, prior_context_sha256 = write_prior_slice_context(state, plan_slice, slice_artifact_dir, before_head)
     prompt_path = slice_artifact_dir / "prompt.md"
     prompt_path.write_text(
         render_developer_prompt(
@@ -353,7 +358,6 @@ def start_model_supervised_slice(
     _announce_launch(adapter, args)
 
     started_at = utc_now()
-    before_head = git_head(repo)
     before_status = git_status_text(repo)
     (slice_artifact_dir / f"git-status-before-attempt-{attempt}.txt").write_text(before_status, encoding="utf-8")
     (slice_artifact_dir / "git-status-before.txt").write_text(before_status, encoding="utf-8")
@@ -381,6 +385,10 @@ def start_model_supervised_slice(
         configured_reviewer_tools,
         initial_repair,
         reviewer_policy_snapshot(policy_path),
+        prior_slice_context={
+            "path": relative_artifact_path(repo, prior_context_path),
+            "sha256": prior_context_sha256,
+        },
         launch_config={
             "harness_command": getattr(args, "harness_command", None),
             "harness_model": getattr(args, "harness_model", None),
@@ -522,7 +530,32 @@ def finalize_model_supervised_slice(
     capture_developer_transcript(harness_name, repo, str(developer_session_id) if developer_session_id else None, slice_artifact_dir)
     capture_reviewer_runs_summary(slice_artifact_dir)
     after_head, after_status = _capture_git_evidence(repo, slice_artifact_dir, attempt, before_head)
-    gate = verify_gate(repo, state, plan_slice, slice_artifact_dir, before_head, after_head, after_status, reviewer_tools)
+    context_failure = prior_slice_context_integrity_failure(repo, current)
+    gate = (
+        GateDecision("needs-human", context_failure, signature="prior-context-integrity")
+        if context_failure
+        else verify_gate(repo, state, plan_slice, slice_artifact_dir, before_head, after_head, after_status, reviewer_tools)
+    )
+    if gate.status == "pass":
+        projected_entry = slice_entry_from_gate(
+            repo,
+            plan_slice,
+            slice_artifact_dir,
+            started_at,
+            gate,
+            before_head,
+            reviewer_tools,
+            repair=repair_state(current),
+            reviewer_policy=current.get("reviewer_policy"),
+            write_summary=False,
+        )
+        budget_failure = projected_prior_slice_context_budget_failure(
+            state, plan_slice, projected_entry, after_head or before_head or "unknown"
+        )
+        if budget_failure:
+            gate = GateDecision(
+                "repairable", budget_failure, gate.result, gate.actual_changed_files, "context-budget"
+            )
     if gate.status in {"blocked", "fail"}:
         # Use only the fresh current-attempt pane tail. A cumulative session
         # transcript can retain an already-recovered outage from an earlier
@@ -933,8 +966,9 @@ def _fresh_session_repair_prompt(
     slice_artifact_dir: Path,
     round_number: int,
 ) -> str:
-    """Carry repair context and every archived residual into a new session."""
+    """Carry repair context and every archived continuation ledger into a new session."""
     residual_findings: list[dict[str, Any]] = []
+    continuation_notes: list[dict[str, Any]] = []
     archived_results: list[str] = []
     for archived_path in sorted(slice_artifact_dir.glob("developer-result-repair-*.json")):
         archived_results.append(str(archived_path))
@@ -942,16 +976,21 @@ def _fresh_session_repair_prompt(
             archived = json.loads(archived_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        findings = archived.get("residual_findings") if isinstance(archived, dict) else None
-        if not isinstance(findings, list):
-            continue
-        for finding in findings:
-            if isinstance(finding, dict) and finding not in residual_findings:
-                residual_findings.append(finding)
+        for field, destination in (
+            ("residual_findings", residual_findings),
+            ("continuation_notes", continuation_notes),
+        ):
+            items = archived.get(field) if isinstance(archived, dict) else None
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if isinstance(item, dict) and item not in destination:
+                    destination.append(item)
 
     original_prompt = original_prompt_path.read_text(encoding="utf-8")
     archives = "\n".join(f"- `{path}`" for path in archived_results) or "- none"
     ledger = json.dumps(residual_findings, indent=2, sort_keys=True)
+    continuation_ledger = json.dumps(continuation_notes, indent=2, sort_keys=True)
     return (
         original_prompt.rstrip()
         + "\n\n---\n\n"
@@ -966,6 +1005,11 @@ def _fresh_session_repair_prompt(
         + "Your next `developer-result.json` must retain every item in this recovered ledger, merging any newly discovered "
         + "post-plan considerations and avoiding exact duplicates. Do not erase an item merely because this repair round is clean, "
         + "and do not move a material slice-caused defect into the ledger.\n\n"
+        + "PM also recovered the following cumulative `continuation_notes` ledger:\n\n"
+        + "```json\n"
+        + continuation_ledger
+        + "\n```\n\n"
+        + "Retain these decisions and lessons in the next result, merging useful new repair knowledge and avoiding exact duplicates.\n\n"
         + repair_prompt_text.rstrip()
         + "\n"
     )
