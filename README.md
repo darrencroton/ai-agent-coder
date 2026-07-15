@@ -30,17 +30,17 @@ The atomic skills need nothing beyond the Markdown files. Supervised autonomy (M
 
 Three rungs, one skill chain; each rung moves the gatekeeper further from the keyboard. Each rung is independent — start wherever your task is.
 
-**Rung 0 — Standalone skills.** Every skill is independently useful in any harness with no infrastructure. This is the entry point and the graceful-degradation floor.
+**1. Standalone skills.** Every skill is independently useful in any harness with no infrastructure. This is the entry point and the graceful-degradation floor.
 
 In your coding assistant: *"Use the code-review skill on the diff on this branch."* You get a senior-level, severity-ranked review with `file:line` findings and an explicit verdict. Every skill works this way — `drift-audit`, `commit`, `handoff`, and the rest are one explicit request each.
 
-**Rung 1 (Mode A) — Assisted (one agent session).** You supervise an orchestrated run slice by slice: the agent restates each frozen contract, implements, audits, and reviews; you approve risky slices before coding and every commit after gates pass. The same mode has an **autonomous alternate usage**: pointed at all remaining slices with standing authorization to commit whatever clears every gate, it loops through the plan in one session — right when the plan is straightforward, the models are strong, and you don't want to stand up an external supervisor. In that usage the gates are promises kept in-session: disciplined, but not externally verified.
+**2. Mode A — Assisted (one agent session).** You supervise an orchestrated run slice by slice: the agent restates each frozen contract, implements, audits, and reviews; you approve risky slices before coding and every commit after gates pass. The same mode has an **autonomous alternate usage**: pointed at all remaining slices with standing authorization to commit whatever clears every gate, it loops through the plan in one session — right when the plan is straightforward, the models are strong, and you don't want to stand up an external supervisor. In that usage the gates are promises kept in-session: disciplined, but not externally verified.
 
 - Chat 1: *"Use the implementation-plan skill: <describe the change>."* You get a plan with frozen slices and a copyable launcher prompt at the end.
 - Chat 2: paste the launcher into a fresh session. The agent implements one slice, audits its own authorization, reviews quality, and asks you before committing. Repeat per slice.
 - Both launchers (checkpointed and autonomous): [`skills/implementation-plan/SKILL.md`](skills/implementation-plan/SKILL.md) → "Next Chat Prompt Format".
 
-**Rung 2 (Mode B) — Supervised autonomy (Project Manager).** The gatekeeper moves outside the implementing agent. PM keeps durable run state, sanity-checks the whole plan before starting, launches a fresh session per slice (the context reset that makes long plans tractable), verifies gates from git and artifact evidence, steers bounded repairs, and stops for a human on anything outside policy. Supervision is a dial, not a fork: by default a supervising model stays in the loop for operational judgment (usage resets, stalls, transient interruptions); if you can't or don't want to provide one, PM's fail-closed batch style runs unattended and stops at the first ambiguity.
+**3. Mode B — Supervised autonomy (Project Manager).** The gatekeeper moves outside the implementing agent. PM keeps durable run state, sanity-checks the whole plan before starting, launches a fresh session per slice (the context reset that makes long plans tractable), verifies gates from git and artifact evidence, steers bounded repairs, and stops for a human on anything outside policy. Supervision is a dial, not a fork: by default a supervising model stays in the loop for operational judgment (usage resets, stalls, transient interruptions); if you can't or don't want to provide one, PM's fail-closed batch style runs unattended and stops at the first ambiguity.
 
 - Verify your machine once with the tmux-backed trial in [`skills/project-manager/README.md`](skills/project-manager/README.md) → "Verify Your Setup".
 - Sanity-check the plan: `python3 skills/project-manager/scripts/pm.py check-plan --plan <plan.md>` (also runs automatically at `init` — a defective plan stops before any harness launches).
@@ -50,10 +50,10 @@ Choosing a rung is about the task, not your skill level:
 
 | Situation | Use |
 |---|---|
-| One-off review, audit, commit, or handoff | Rung 0 — call the skill directly |
-| Risky or unfamiliar surfaces; you want a checkpoint between slices | Rung 1 (Mode A) — checkpointed |
-| Straightforward plan, strong models, fits in one session, no third model available to supervise | Rung 1 (Mode A) — autonomous usage |
-| Long plan, unattended time, weaker/cheaper/local models, or you want external verification and a durable audit trail | Rung 2 (Mode B) — Project Manager |
+| One-off review, audit, commit, or handoff | Call the skill directly |
+| Risky or unfamiliar surfaces; you want a checkpoint between slices | Mode A — checkpointed |
+| Straightforward plan, strong models, fits in one session, no third model available to supervise | Mode A — autonomous usage |
+| Long plan, unattended time, weaker/cheaper/local models, or you want external verification and a durable audit trail | Mode B — Project Manager |
 
 ## Skills
 
