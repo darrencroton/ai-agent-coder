@@ -989,6 +989,15 @@ def _repair_stanza(
             "slice state from the frozen prompt and repository evidence, continue the interrupted work, and write "
             "the normal structured result only after every unchanged gate has completed."
         )
+    if signature == "ledger-retention":
+        return (
+            "The named archived ledger item (quoted in the gate reason above) is missing from your fresh "
+            "`residual_findings` or `continuation_notes` in `developer-result.json`. Do not re-implement the slice: "
+            "restore that exact item by merging it back into the ledger alongside anything you added this round — "
+            "do not erase it and do not weaken any verdict to make room for it. Only remove an archived item if it "
+            "actually named a material slice-caused defect, in which case fix that defect instead and leave it out "
+            "of the ledger. Then rewrite `developer-result.json` reporting this same slice honestly."
+        )
     raise PmError(f"no repair stanza defined for gate signature: {signature!r}")
 
 

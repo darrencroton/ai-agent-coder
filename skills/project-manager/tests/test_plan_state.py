@@ -521,6 +521,27 @@ class PlanStateTests(PmTestCase):
         with self.assertRaisesRegex(pm.PmError, r"slices\[0\].reviewer_policy must be an object"):
             pm.load_run(run_json)
 
+    def test_run_state_rejects_malformed_continuation_note_with_derived_label_prefix(self):
+        # state._validate_continuation_notes now delegates to
+        # gates.continuation_notes_status; this pins that the delegated
+        # message still carries the caller's structural label
+        # (slices[0].continuation_notes...) rather than the gates module's own
+        # bare "continuation_notes..." prefix, and that a malformed note is
+        # still rejected for the same reason (invalid category).
+        base = self.init_run()
+        run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
+        state = json.loads(json.dumps(base))
+        entry = self.terminal_slice_entry(state)
+        entry["continuation_notes"] = [
+            {"category": "mystery", "summary": "x", "rationale": "y", "applies_to": "z"}
+        ]
+        state["slices"].append(entry)
+        run_json.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(
+            pm.PmError, r"slices\[0\]\.continuation_notes\[0\]\.category is invalid"
+        ):
+            pm.load_run(run_json)
+
     def test_run_state_rejects_retired_extra_fields_at_every_schema_level(self):
         base = self.init_run()
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"

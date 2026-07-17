@@ -56,8 +56,11 @@ from .constants import (
 )
 from .gates import (
     artifact_exists,
+    continuation_notes_status,
+    gate_failure,
     load_developer_result,
     object_field,
+    residual_findings_status,
     reviewer_audit_provenance,
     verify_gate,
     write_developer_result,
@@ -212,6 +215,9 @@ __all__ = [
     "authoritative_slice_entries",
     "append_operational_event",
     "artifact_exists",
+    "continuation_notes_status",
+    "gate_failure",
+    "residual_findings_status",
     "reviewer_audit_provenance",
     "build_parser",
     "build_observation",

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .constants import DEFAULT_MAX_REPAIR_ATTEMPTS, KNOWN_UNATTENDED_HARNESS_COMMANDS, RUN_STOP_STATUSES
-from .gates import verify_gate
+from .gates import gate_failure, verify_gate
 from .git_ops import git, git_head, git_status_text, require_clean_worktree, write_git_diff
 from .models import GateDecision, PmError, PlanSlice
 from .observation import _current_adapter, _slice_artifact_dir, wait_observing
@@ -200,13 +200,12 @@ def reclassify_high_confidence_transient_stop(gate: GateDecision, hints: list[di
     )
     if not matched:
         return gate
-    return GateDecision(
-        "repairable",
+    return gate_failure(
+        "transient-service-unavailable",
         f"developer reported {gate.status}, but current-attempt evidence shows a high-confidence transient "
         "service-unavailable condition",
         gate.result,
         gate.actual_changed_files,
-        "transient-service-unavailable",
     )
 
 
@@ -706,10 +705,25 @@ def finalize_model_supervised_slice(
     capture_reviewer_runs_summary(slice_artifact_dir)
     after_head, after_status = _capture_git_evidence(repo, slice_artifact_dir, attempt, before_head)
     context_failure = prior_slice_context_integrity_failure(repo, current)
+    # Recovered from persisted current_slice.repair, not a local computed just
+    # for this call: it is the same repair-round record the circuit breaker
+    # below reads, so the ledger-retention exemption sees the identical round
+    # that produced the archived results being checked.
+    last_repair_signature = repair_state(current)["last_signature"] or None
     gate = (
-        GateDecision("needs-human", context_failure, signature="prior-context-integrity")
+        gate_failure("prior-context-integrity", context_failure)
         if context_failure
-        else verify_gate(repo, state, plan_slice, slice_artifact_dir, before_head, after_head, after_status, reviewer_tools)
+        else verify_gate(
+            repo,
+            state,
+            plan_slice,
+            slice_artifact_dir,
+            before_head,
+            after_head,
+            after_status,
+            reviewer_tools,
+            last_repair_signature=last_repair_signature,
+        )
     )
     # Built once here (write_summary=False) and reused as the persisted entry
     # below: gate verification, the budget projection, and the durable record
@@ -898,10 +912,9 @@ def handle_idle_stall(
     harness_name = state["harness"]["name"]
     adapter = _current_adapter(args, repo, state)
     repair = repair_state(current)
-    gate = GateDecision(
-        "repairable",
+    gate = gate_failure(
+        "idle-no-progress",
         "harness made no visible progress across the configured observation ceiling",
-        signature="idle-no-progress",
     )
     mode, terminal_gate = resolve_repair_action(
         repair,

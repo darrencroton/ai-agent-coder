@@ -22,7 +22,7 @@ from .constants import (
     RUN_STOP_STATUSES,
     SCHEMA_VERSION,
 )
-from .gates import verify_gate
+from .gates import gate_failure, verify_gate
 from .git_ops import (
     changed_files_between,
     git,
@@ -976,10 +976,24 @@ def reconcile(args: argparse.Namespace) -> int:
     # an oversized reconciled result skip the projection that keeps the next
     # slice's launch from wedging.
     context_failure = prior_slice_context_integrity_failure(repo, entry)
+    # entry["repair"]["last_signature"] (not a repair_state() call): this
+    # replaces a terminal slice entry, whose repair dict is already validated
+    # current-schema state, not a live current_slice.
+    last_repair_signature = entry["repair"]["last_signature"] or None
     gate = (
-        GateDecision("needs-human", context_failure, signature="prior-context-integrity")
+        gate_failure("prior-context-integrity", context_failure)
         if context_failure
-        else verify_gate(repo, state, plan_slice, artifact_dir, before_head, after_head, after_status, reviewer_tools)
+        else verify_gate(
+            repo,
+            state,
+            plan_slice,
+            artifact_dir,
+            before_head,
+            after_head,
+            after_status,
+            reviewer_tools,
+            last_repair_signature=last_repair_signature,
+        )
     )
     reconciled_entry = slice_entry_from_gate(
         repo,
@@ -1000,6 +1014,11 @@ def reconcile(args: argparse.Namespace) -> int:
         if budget_failure:
             # Reconcile cannot steer a repair; the operator must condense the
             # result and re-run reconcile once it fits the launch budget.
+            # Built as a raw GateDecision, not gate_failure("context-budget", ...):
+            # "context-budget" is registered repairable for the live in-session
+            # loop, but reconcile has no session to steer, so its correct
+            # terminal status here is "blocked", not gate_failure's "repairable"
+            # mapping for that signature.
             gate = GateDecision("blocked", budget_failure, gate.result, gate.actual_changed_files, "context-budget")
             reconciled_entry = slice_entry_from_gate(
                 repo,

@@ -335,6 +335,9 @@ class PromptRenderingTests(PmTestCase):
             "developer-repairable": "You reported status `repairable` yourself",
             "residual-ledger-mismatch": "copy every legitimate non-blocking post-plan consideration",
             "context-budget": "cumulative context too large",
+            "transient-service-unavailable": "Retry the interrupted operation",
+            "idle-no-progress": "Re-establish your current slice state",
+            "ledger-retention": "restore that exact item by merging it back into the ledger",
         }
         self.assertEqual(set(stanza_markers), set(REPAIRABLE_SIGNATURES))
 

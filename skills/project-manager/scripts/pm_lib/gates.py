@@ -49,6 +49,18 @@ REPAIRABLE_SIGNATURES = frozenset(
         "dirty-worktree",
         "developer-repairable",
         "context-budget",
+        # A high-confidence, current-attempt transient-outage signal alongside
+        # a terminal self-report: retrying the same slice in the same session
+        # is the fix, so this is steerable rather than a trust breach.
+        "transient-service-unavailable",
+        # No visible pane progress across the observation ceiling is a stall,
+        # not evidence the developer session did anything wrong — the fix is
+        # a nudge to continue, so it is steerable like any other repair.
+        "idle-no-progress",
+        # A fresh result silently dropping a previously archived ledger item
+        # is a bookkeeping gap the developer can restore without redoing any
+        # already-accepted work.
+        "ledger-retention",
     }
 )
 TERMINAL_SIGNATURES = frozenset(
@@ -60,6 +72,11 @@ TERMINAL_SIGNATURES = frozenset(
         # operator/plan configuration mismatch — so it stops for a human at once
         # rather than burning the repair budget.
         "reviewer-unavailable",
+        # The protected prior-slice context digest no longer matches what was
+        # embedded at launch: reality and the record disagree, so continuing
+        # to steer from that session would build on a false belief rather than
+        # repair a fixable gap.
+        "prior-context-integrity",
     }
 )
 
@@ -618,7 +635,7 @@ _RESIDUAL_DISPOSITIONS = {
 }
 
 
-def _residual_findings_status(findings: Any) -> str | None:
+def residual_findings_status(findings: Any) -> str | None:
     """Validate the reporting-only post-plan consideration ledger."""
     if not isinstance(findings, list):
         return "residual_findings is missing or malformed (expected a list, using [] when none)"
@@ -644,7 +661,7 @@ def _residual_findings_status(findings: Any) -> str | None:
     return None
 
 
-def _continuation_notes_status(notes: Any) -> str | None:
+def continuation_notes_status(notes: Any) -> str | None:
     """Validate knowledge intentionally passed to later planned slices."""
     if not isinstance(notes, list):
         return "continuation_notes is missing or malformed (expected a list, using [] when none)"
@@ -756,6 +773,70 @@ def _apply_commit_hash_reconciliation(
     return GateDecision("pass", decision_reason, result, actual_changed)
 
 
+_LEDGER_RETENTION_FIELDS = ("residual_findings", "continuation_notes")
+
+
+def _archived_ledger_items(slice_artifact_dir: Path, field: str) -> list[tuple[Path, dict[str, Any]]]:
+    """Recover every well-formed archived item for one ledger field across all repair rounds.
+
+    Tolerance mirrors runner.py's _fresh_session_repair_prompt, which recovers
+    the identical items and re-injects them into the developer's next prompt
+    as an instruction: an unreadable archive or a non-dict item was never a
+    retrievable instruction there either, so this mechanical check must not
+    demand retention of more than the prompt actually asked for.
+    """
+    items: list[tuple[Path, dict[str, Any]]] = []
+    for archived_path in sorted(slice_artifact_dir.glob("developer-result-repair-*.json")):
+        try:
+            archived = json.loads(archived_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(archived, dict):
+            continue
+        entries = archived.get(field)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                items.append((archived_path, entry))
+    return items
+
+
+def _truncate_for_reason(value: Any, limit: int = 120) -> str:
+    text = value if isinstance(value, str) else repr(value)
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _ledger_retention_failure(slice_artifact_dir: Path, result: dict[str, Any]) -> str | None:
+    """Return a gate-failure reason if the fresh pass result drops an archived ledger item.
+
+    Archived repair-round ledgers (`developer-result-repair-<n>.json`) are
+    re-injected into a relaunched session's prompt as *instructions*
+    (`_fresh_session_repair_prompt`), never as anything a gate previously
+    verified — so a repair round could silently drop knowledge the ledger
+    already recorded and nothing would catch it. This makes retention
+    mechanical: every archived `residual_findings`/`continuation_notes` item
+    must still appear, by exact dict equality, in the corresponding fresh
+    ledger. Merging in new items is fine; silently losing an old one is not.
+    """
+    for field in _LEDGER_RETENTION_FIELDS:
+        archived_items = _archived_ledger_items(slice_artifact_dir, field)
+        if not archived_items:
+            continue
+        fresh_value = result.get(field)
+        fresh_list = fresh_value if isinstance(fresh_value, list) else []
+        for archived_path, item in archived_items:
+            if item in fresh_list:
+                continue
+            summary = _truncate_for_reason(item.get("summary"))
+            return (
+                f"{field} dropped an item archived in {archived_path.name}: \"{summary}\" no longer appears in the "
+                f"fresh result's {field} ledger; restore it (merging, not erasing) or, if it names a genuinely "
+                "material defect, fix the defect and move it out of the ledger"
+            )
+    return None
+
+
 def verify_gate(
     repo: Path,
     state: dict[str, Any],
@@ -765,6 +846,8 @@ def verify_gate(
     after_head: str | None,
     after_status: str,
     reviewer_tools: tuple[str, ...] = (),
+    *,
+    last_repair_signature: str | None = None,
 ) -> GateDecision:
     result_path = slice_artifact_dir / "developer-result.json"
     if not result_path.is_file():
@@ -788,10 +871,10 @@ def verify_gate(
     status_value = str(result.get("status", "")).lower()
     if status_value not in DEVELOPER_STATUSES:
         return gate_failure("result-malformed", f"developer result status is invalid: {result.get('status')}", result)
-    residual_failure = _residual_findings_status(result.get("residual_findings"))
+    residual_failure = residual_findings_status(result.get("residual_findings"))
     if residual_failure:
         return gate_failure("result-malformed", residual_failure, result)
-    continuation_failure = _continuation_notes_status(result.get("continuation_notes"))
+    continuation_failure = continuation_notes_status(result.get("continuation_notes"))
     if continuation_failure:
         return gate_failure("result-malformed", continuation_failure, result)
     if status_value != "pass":
@@ -848,6 +931,16 @@ def verify_gate(
             result,
             changed_evidence,
         )
+
+    # EXEMPTION: a context-budget repair explicitly instructs the developer to
+    # condense and reword ledger items so the cumulative context fits the next
+    # planned slice's launch budget (see runtime.py's context-budget repair
+    # stanza); exact-dict retention would wedge that required rewrite, so this
+    # mechanical check does not apply to the round that follows one.
+    if last_repair_signature != "context-budget":
+        retention_failure = _ledger_retention_failure(slice_artifact_dir, result)
+        if retention_failure:
+            return gate_failure("ledger-retention", retention_failure, result, changed_evidence)
 
     # Independence (delegating drift-audit and code-review to a separate model)
     # is a degradable *preference* by default: a slice audited locally by a

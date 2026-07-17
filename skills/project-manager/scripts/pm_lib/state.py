@@ -8,18 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from .constants import (
-    CONTINUATION_NOTE_CATEGORIES,
     DEFAULT_SUPERVISION,
     FULL_COMMIT_RE,
-    MAX_CONTINUATION_FIELD_CHARS,
-    MAX_CONTINUATION_NOTES,
     PARSER_NAME,
     RUN_ACTIVE_STATUSES,
     RUN_STOP_STATUSES,
     SCHEMA_VERSION,
 )
 from .models import GateDecision, PmError, PlanSlice
-from .gates import _continuation_notes_status, _residual_findings_status, reviewer_audit_provenance
+from .gates import continuation_notes_status, residual_findings_status, reviewer_audit_provenance
 from .plan import completed_slice_ids
 from .runtime import relative_artifact_path
 from .utils import utc_now
@@ -488,35 +485,18 @@ def _validate_repair(value: Any, label: str, path: Path) -> None:
 
 
 def _validate_continuation_notes(value: Any, label: str, path: Path) -> None:
-    if not isinstance(value, list):
-        raise PmError(f"{_ERR} at {path}: {label} must be a list")
-    if len(value) > MAX_CONTINUATION_NOTES:
-        raise PmError(
-            f"{_ERR} at {path}: {label} exceeds the maximum of {MAX_CONTINUATION_NOTES} entries"
-        )
-    required = {"category", "summary", "rationale", "applies_to"}
-    for index, note in enumerate(value):
-        note_label = f"{label}[{index}]"
-        if not isinstance(note, dict):
-            raise PmError(f"{_ERR} at {path}: {note_label} must be an object")
-        _require_fields(note, required, note_label, path)
-        _reject_unknown_fields(note, required | {"location"}, note_label, path)
-        for field in required:
-            _require_string(note[field], f"{note_label}.{field}", path)
-            if len(note[field]) > MAX_CONTINUATION_FIELD_CHARS:
-                raise PmError(
-                    f"{_ERR} at {path}: {note_label}.{field} exceeds the maximum of "
-                    f"{MAX_CONTINUATION_FIELD_CHARS} characters"
-                )
-        if note["category"] not in CONTINUATION_NOTE_CATEGORIES:
-            raise PmError(f"{_ERR} at {path}: unsupported {note_label}.category {note['category']!r}")
-        if "location" in note:
-            _require_string(note["location"], f"{note_label}.location", path, allow_empty=True)
-            if len(note["location"]) > MAX_CONTINUATION_FIELD_CHARS:
-                raise PmError(
-                    f"{_ERR} at {path}: {note_label}.location exceeds the maximum of "
-                    f"{MAX_CONTINUATION_FIELD_CHARS} characters"
-                )
+    """Delegate to gates.continuation_notes_status so the rules live in one place.
+
+    gates.continuation_notes_status messages are always prefixed with the
+    literal field name "continuation_notes" (e.g. "continuation_notes[0].category
+    is invalid: ..."); swapping that prefix for this call site's structural
+    label (e.g. "slices[3].continuation_notes") adapts the message without
+    re-deriving any rule a second time.
+    """
+    reason = continuation_notes_status(value)
+    if reason is None:
+        return
+    raise PmError(f"{_ERR} at {path}: {label}{reason.removeprefix('continuation_notes')}")
 
 
 def _validate_reviewer_policy(value: Any, label: str, path: Path) -> None:
@@ -947,10 +927,10 @@ def slice_entry_from_gate(
 ) -> dict[str, Any]:
     result = gate.result or {}
     residual_findings = result.get("residual_findings", [])
-    if _residual_findings_status(residual_findings) is not None:
+    if residual_findings_status(residual_findings) is not None:
         residual_findings = []
     continuation_notes = result.get("continuation_notes", [])
-    if _continuation_notes_status(continuation_notes) is not None:
+    if continuation_notes_status(continuation_notes) is not None:
         continuation_notes = []
     entry = {
         "slice_id": plan_slice.slice_id,

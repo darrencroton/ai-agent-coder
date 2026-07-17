@@ -645,6 +645,153 @@ class GateVerificationTests(PmTestCase):
         self.assertEqual(decision.signature, "result-malformed")
         self.assertIn("exceeds the maximum", decision.reason)
 
+    def test_gate_failure_routes_transient_idle_and_prior_context_signatures(self):
+        for signature, expected_status in (
+            ("transient-service-unavailable", "repairable"),
+            ("idle-no-progress", "repairable"),
+            ("prior-context-integrity", "needs-human"),
+        ):
+            with self.subTest(signature=signature):
+                decision = pm.gate_failure(signature, "reason text")
+                self.assertEqual(decision.status, expected_status)
+                self.assertEqual(decision.signature, signature)
+        with self.assertRaises(pm.PmError):
+            pm.gate_failure("not-a-real-signature", "reason text")
+
+    def _archived_residual_finding(self):
+        return {
+            "source": "validation",
+            "severity": "low",
+            "summary": "Flaky retry needed for the slow CI shard.",
+            "disposition": "deferred-inconsequential",
+            "rationale": "Out of scope for this slice.",
+            "suggested_follow_up": "Track in a later slice.",
+        }
+
+    def _archived_continuation_note(self):
+        return {
+            "category": "risk-warning",
+            "summary": "The shared cache is not thread-safe under this slice's changes.",
+            "rationale": "A later slice adding concurrency must account for this.",
+            "applies_to": "Slices 2-3",
+        }
+
+    def _write_archived_repair_result(self, artifact, round_number, *, residual_findings=(), continuation_notes=()):
+        (artifact / f"developer-result-repair-{round_number}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": pm.SCHEMA_VERSION,
+                    "slice_id": "Slice 1",
+                    "status": "repairable",
+                    "residual_findings": list(residual_findings),
+                    "continuation_notes": list(continuation_notes),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_gate_rejects_pass_result_dropping_archived_residual_finding(self):
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        archived_finding = self._archived_residual_finding()
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after)
+        self._write_archived_repair_result(artifact, 1, residual_findings=[archived_finding])
+        state = self.init_run()
+
+        decision = pm.verify_gate(
+            self.repo, state, pm.parse_plan(self.plan)[0], artifact, before, after, pm.git_status_text(self.repo)
+        )
+
+        self.assertEqual(decision.status, "repairable")
+        self.assertEqual(decision.signature, "ledger-retention")
+        self.assertIn("developer-result-repair-1.json", decision.reason)
+        self.assertIn("Flaky retry needed", decision.reason)
+        self.assertIn("residual_findings", decision.reason)
+
+    def test_gate_rejects_pass_result_dropping_archived_continuation_note(self):
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        archived_note = self._archived_continuation_note()
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after)
+        self._write_archived_repair_result(artifact, 1, continuation_notes=[archived_note])
+        state = self.init_run()
+
+        decision = pm.verify_gate(
+            self.repo, state, pm.parse_plan(self.plan)[0], artifact, before, after, pm.git_status_text(self.repo)
+        )
+
+        self.assertEqual(decision.status, "repairable")
+        self.assertEqual(decision.signature, "ledger-retention")
+        self.assertIn("developer-result-repair-1.json", decision.reason)
+        self.assertIn("thread-safe", decision.reason)
+        self.assertIn("continuation_notes", decision.reason)
+
+    def test_gate_accepts_pass_result_retaining_every_archived_ledger_item(self):
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        archived_finding = self._archived_residual_finding()
+        archived_note = self._archived_continuation_note()
+        self.write_gate_result(
+            artifact,
+            changed_files=["README.md"],
+            commit_hash=after,
+            residual_findings=[archived_finding],
+            continuation_notes=[archived_note],
+        )
+        self._write_archived_repair_result(
+            artifact, 1, residual_findings=[archived_finding], continuation_notes=[archived_note]
+        )
+        state = self.init_run()
+
+        decision = pm.verify_gate(
+            self.repo, state, pm.parse_plan(self.plan)[0], artifact, before, after, pm.git_status_text(self.repo)
+        )
+
+        self.assertEqual(decision.status, "pass")
+
+    def test_gate_ledger_retention_exempts_context_budget_repair_round(self):
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        archived_finding = self._archived_residual_finding()
+        # Fresh result condenses/drops the archived item, as a context-budget
+        # repair explicitly instructs — the exemption must still accept.
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after)
+        self._write_archived_repair_result(artifact, 1, residual_findings=[archived_finding])
+        state = self.init_run()
+
+        decision = pm.verify_gate(
+            self.repo,
+            state,
+            pm.parse_plan(self.plan)[0],
+            artifact,
+            before,
+            after,
+            pm.git_status_text(self.repo),
+            last_repair_signature="context-budget",
+        )
+
+        self.assertEqual(decision.status, "pass")
+
     def test_gate_repairs_empty_residual_ledger_when_review_lists_observation(self):
         self.prepare_committed_repo()
         before = git(self.repo, "rev-parse", "HEAD")

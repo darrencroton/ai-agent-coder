@@ -735,7 +735,7 @@ class RuntimeBatchTests(PmTestCase):
         (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
         captured = {}
 
-        def fake_gate(repo, run_state, plan_slice, art, before, after, status, reviewer_tools=()):
+        def fake_gate(repo, run_state, plan_slice, art, before, after, status, reviewer_tools=(), *, last_repair_signature=None):
             captured["before"] = before
             return pm.GateDecision("fail", "still bad", {"changed_files": []}, ())
 

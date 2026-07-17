@@ -938,6 +938,115 @@ class SupervisionRepairTests(PmTestCase):
         self.assertIsNone(state["current_slice"])
         self.assertEqual(state["slices"][0]["status"], "pass")
 
+    def test_finalize_blocks_pass_result_that_drops_an_archived_ledger_item(self):
+        # finalize_model_supervised_slice must thread current_slice.repair's
+        # last_signature into verify_gate: a fresh pass result that silently
+        # drops a residual finding archived by an earlier repair round is not
+        # accepted, and the run stays live for a targeted repair instead.
+        self.prepare_committed_repo()
+        state = self.init_run()
+        run_dir = (self.repo / ".ai-pm" / "current").resolve()
+        artifact = self._model_supervised_current_slice(state, run_dir)
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after)
+        archived_finding = {
+            "source": "validation",
+            "severity": "low",
+            "summary": "Flaky retry needed for the slow CI shard.",
+            "disposition": "deferred-inconsequential",
+            "rationale": "Out of scope for this slice.",
+            "suggested_follow_up": "Track in a later slice.",
+        }
+        (artifact / "developer-result-repair-1.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": pm.SCHEMA_VERSION,
+                    "slice_id": "Slice 1",
+                    "status": "repairable",
+                    "residual_findings": [archived_finding],
+                    "continuation_notes": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        fake_adapter = mock.Mock()
+        fake_adapter.session_exists.return_value = True
+
+        def fake_capture(session_name, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("pane\n", encoding="utf-8")
+
+        fake_adapter.capture.side_effect = fake_capture
+        output = io.StringIO()
+        with mock.patch.object(pm_runner, "TmuxHarnessAdapter", return_value=fake_adapter):
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(pm.finalize_slice(self._finalize_args()), 0)
+        result = json.loads(output.getvalue())
+        self.assertFalse(result["finalized"])
+        self.assertEqual(result["status"], "repairable")
+        self.assertEqual(result["repair"]["last_signature"], "ledger-retention")
+        fake_adapter.force_stop.assert_not_called()
+        state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "resuming")
+        self.assertIn("Flaky retry needed", (artifact / "repair-prompt-repair-1.md").read_text(encoding="utf-8"))
+
+    def test_finalize_context_budget_repair_round_exempts_ledger_retention(self):
+        # A round that follows a context-budget repair is explicitly instructed
+        # to condense ledger wording; last_repair_signature="context-budget"
+        # must reach verify_gate so that round's ledger drop does not block
+        # acceptance.
+        self.prepare_committed_repo()
+        state = self.init_run()
+        run_dir = (self.repo / ".ai-pm" / "current").resolve()
+        artifact = self._model_supervised_current_slice(
+            state,
+            run_dir,
+            repair={"round": 1, "last_signature": "context-budget", "signature_streak": 1, "session_generation": 1},
+        )
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        self.write_gate_result(artifact, changed_files=["README.md"], commit_hash=after)
+        archived_finding = {
+            "source": "validation",
+            "severity": "low",
+            "summary": "Flaky retry needed for the slow CI shard.",
+            "disposition": "deferred-inconsequential",
+            "rationale": "Out of scope for this slice.",
+            "suggested_follow_up": "Track in a later slice.",
+        }
+        (artifact / "developer-result-repair-1.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": pm.SCHEMA_VERSION,
+                    "slice_id": "Slice 1",
+                    "status": "repairable",
+                    "residual_findings": [archived_finding],
+                    "continuation_notes": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        fake_adapter = mock.Mock()
+        fake_adapter.session_exists.return_value = True
+
+        def fake_capture(session_name, destination):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text("pane\n", encoding="utf-8")
+
+        fake_adapter.capture.side_effect = fake_capture
+        with mock.patch.object(pm_runner, "TmuxHarnessAdapter", return_value=fake_adapter):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(pm.finalize_slice(self._finalize_args()), 0)
+        fake_adapter.force_stop.assert_called_once()
+        state = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        self.assertIsNone(state["current_slice"])
+        self.assertEqual(state["slices"][0]["status"], "pass")
+
     def test_finalize_persists_gate_time_reviewer_provenance_despite_adverse_cancel(self):
         # Finding 17: cancel_run_reviewers refreshes reviewer-runs-summary.json
         # for evidence capture, but it must run only after the slice entry is
