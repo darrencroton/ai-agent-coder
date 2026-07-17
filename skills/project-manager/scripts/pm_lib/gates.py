@@ -831,8 +831,9 @@ def _ledger_retention_failure(slice_artifact_dir: Path, result: dict[str, Any]) 
             summary = _truncate_for_reason(item.get("summary"))
             return (
                 f"{field} dropped an item archived in {archived_path.name}: \"{summary}\" no longer appears in the "
-                f"fresh result's {field} ledger; restore it (merging, not erasing) or, if it names a genuinely "
-                "material defect, fix the defect and move it out of the ledger"
+                f"fresh result's {field} ledger; restore it verbatim (merging, not erasing). Retention is checked "
+                "mechanically, not semantically: if the underlying issue was since resolved, keep the item and "
+                "record the resolution alongside it rather than deleting history"
             )
     return None
 

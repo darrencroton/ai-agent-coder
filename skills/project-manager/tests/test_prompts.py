@@ -337,7 +337,7 @@ class PromptRenderingTests(PmTestCase):
             "context-budget": "cumulative context too large",
             "transient-service-unavailable": "Retry the interrupted operation",
             "idle-no-progress": "Re-establish your current slice state",
-            "ledger-retention": "restore that exact item by merging it back into the ledger",
+            "ledger-retention": "restore that exact item verbatim by merging it back into the ledger",
         }
         self.assertEqual(set(stanza_markers), set(REPAIRABLE_SIGNATURES))
 
