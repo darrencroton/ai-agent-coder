@@ -399,7 +399,7 @@ _SLICE_ENTRY_FIELDS = {
     "repair",
 }
 _SLICE_ENTRY_OPTIONAL_FIELDS = {"reviewer_policy", "slice_summary", "prior_slice_context"}
-_REPAIR_FIELDS = {"round", "last_signature", "signature_streak", "session_generation"}
+_REPAIR_FIELDS = {"round", "last_signature", "signature_streak", "session_generation", "operational_round"}
 _HARNESS_FIELDS = {"name", "adapter", "preflight"}
 _HARNESS_OPTIONAL_FIELDS = {"launch_config", "model_identity", "model_requested", "effort_requested"}
 _PREFLIGHT_FIELDS = {"platform", "python", "python_version", "git", "tmux"}
@@ -482,6 +482,7 @@ def _validate_repair(value: Any, label: str, path: Path) -> None:
     _require_string(value["last_signature"], f"{label}.last_signature", path, allow_empty=True)
     _require_integer(value["signature_streak"], f"{label}.signature_streak", path, maximum=2)
     _require_integer(value["session_generation"], f"{label}.session_generation", path, minimum=1)
+    _require_integer(value["operational_round"], f"{label}.operational_round", path)
 
 
 def _validate_continuation_notes(value: Any, label: str, path: Path) -> None:
@@ -956,7 +957,7 @@ def reset_slice_pause_counters(state: dict[str, Any]) -> None:
 
 
 def default_repair_state() -> dict[str, Any]:
-    return {"round": 0, "last_signature": "", "signature_streak": 0, "session_generation": 1}
+    return {"round": 0, "last_signature": "", "signature_streak": 0, "session_generation": 1, "operational_round": 0}
 
 
 def repair_state(current: dict[str, Any] | None) -> dict[str, Any]:
@@ -969,6 +970,7 @@ def repair_state(current: dict[str, Any] | None) -> dict[str, Any]:
         "last_signature": str(repair["last_signature"]),
         "signature_streak": int(repair["signature_streak"]),
         "session_generation": int(repair["session_generation"]),
+        "operational_round": int(repair["operational_round"]),
     }
 
 

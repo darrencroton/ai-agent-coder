@@ -483,6 +483,7 @@ class SupervisionRepairTests(PmTestCase):
             "last_signature": "validation",
             "signature_streak": 1,
             "session_generation": 1,
+            "operational_round": 0,
         })
         self.assertTrue((artifact / "repair-prompt.md").exists())
         self.assertTrue((artifact / "repair-prompt-repair-1.md").exists())
@@ -569,6 +570,180 @@ class SupervisionRepairTests(PmTestCase):
         for audit in ("drift-audit", "code-review"):
             self.assertNotEqual(provenance[audit]["performed_by"], "reviewer")
 
+    def test_idle_stall_repair_refreshes_reviewer_policy_digest_but_not_round_budget(self):
+        """Test 17 (report-mc-test17-...md): an idle stall's repair round
+        must not compete with a real defect-fixing repair for the same
+        bounded max_repair_attempts budget — the reported harm was the
+        3-round budget being exhausted by pure idle churn unrelated to any
+        implementation defect. But an idle-stall repair prompt explicitly
+        tells the developer to "continue the interrupted work" (prompts.py),
+        which can go on to touch the tree before the next result — so,
+        unlike an earlier draft of this fix, reviewer-policy.json's digest
+        must still be refreshed on every repair round exactly as for any
+        other signature (see test_repair_round_refreshes_reviewer_policy_
+        and_invalidates_stale_evidence above); only the round-budget
+        counter is exempted, not the evidence-invalidation safety
+        invariant. A first orchestrator code review of this fix correctly
+        FAILed a version that skipped the digest refresh."""
+        self.prepare_committed_repo()
+        state = self.init_run()
+        run_dir = (self.repo / ".ai-pm" / "current").resolve()
+        before = git(self.repo, "rev-parse", "HEAD")
+        artifact = run_dir / "slices" / "slice-001"
+        self.write_validated_reviewer_run(artifact, tool="opencode")
+        (artifact / "reviewer-evidence.md").write_text(
+            "# Reviewer Evidence\n- Label: 01-opencode-drift-audit\n- Result summary: reviewer ran.\n",
+            encoding="utf-8",
+        )
+        old_digest = hashlib.sha256((artifact / "reviewer-policy.json").read_bytes()).hexdigest()
+        pre_repair_snapshot = pm_runtime.reviewer_policy_snapshot(artifact / "reviewer-policy.json")
+        # Establish the evidence is genuinely valid before the repair, so the
+        # post-repair assertion below proves invalidation, not merely that
+        # some unrelated mismatch happens to fail the gate.
+        self.assertIsNone(pm_gates.reviewer_evidence_failure(artifact, ("opencode",), pre_repair_snapshot))
+        state["status"] = "running"
+        state["supervision"]["mode"] = "model-supervised"
+        state["current_slice"] = {
+            "slice_id": "Slice 1",
+            "title": "First Slice",
+            "artifact_dir": str(artifact.relative_to(self.repo.resolve())),
+            "tmux_session": "pm_test_slice-001_a1",
+            "attempt": 1,
+            "started_at": pm_utils.utc_now(),
+            "before_head": before,
+            "reviewer_tools": ["opencode"],
+            "pause": None,
+            "repair": pm_state.default_repair_state(),
+            "reviewer_policy": pre_repair_snapshot,
+            "prior_slice_context": self.prior_context_metadata(artifact),
+        }
+        (run_dir / "run.json").write_text(json.dumps(state), encoding="utf-8")
+        fake_adapter = mock.Mock()
+        fake_adapter.session_exists.return_value = True
+        args = self._finalize_args()
+        plan_slice = pm_plan.plan_slice_by_id(pm_plan.parse_plan(self.plan), "Slice 1")
+
+        with mock.patch.object(pm_observation, "TmuxHarnessAdapter", return_value=fake_adapter):
+            result = pm_runner.handle_idle_stall(args, self.repo, state, plan_slice, run_dir)
+
+        self.assertEqual(result["mode"], "in-session")
+        fake_adapter.send_literal.assert_called_once()
+
+        # Safety invariant preserved: the digest still changes every round,
+        # so evidence minted before this repair no longer satisfies the gate
+        # (the developer must relaunch — a real cost, but a safe one).
+        new_digest = hashlib.sha256((artifact / "reviewer-policy.json").read_bytes()).hexdigest()
+        self.assertNotEqual(new_digest, old_digest)
+        state_after = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(state_after["current_slice"]["reviewer_policy"]["sha256"], new_digest)
+        failure = pm_gates.reviewer_evidence_failure(
+            artifact, ("opencode",), state_after["current_slice"]["reviewer_policy"]
+        )
+        self.assertIsNotNone(failure)
+
+        # Budget fix: this idle-stall round left the shared round counter at
+        # its starting value, so it did not consume any of the 3-round
+        # max_repair_attempts budget that a real defect-fixing repair uses.
+        # It did advance the separate operational_round counter instead.
+        self.assertEqual(state_after["current_slice"]["repair"]["round"], 0)
+        self.assertEqual(state_after["current_slice"]["repair"]["operational_round"], 1)
+        self.assertEqual(state_after["current_slice"]["repair"]["last_signature"], "idle-no-progress")
+        self.assertEqual(state_after["current_slice"]["repair"]["signature_streak"], 1)
+
+        # A second, CONSECUTIVE operational refresh must invalidate again
+        # relative to the round-1 refresh above -- not just relative to the
+        # pre-repair fixture (whose policy shape differs from a real
+        # slice-start write and so would trivially differ regardless).
+        # Without operational_round in write_reviewer_policy's digest inputs,
+        # a second in-session operational refresh would write byte-identical
+        # JSON to the first (repair_round and session_generation both stay
+        # frozen across in-session operational repairs), silently making the
+        # "safety invariant preserved" claim above false for any run with
+        # more than one idle-stall in a row. A second orchestrator code
+        # review of this fix correctly FAILed a version that only fixed the
+        # round-0-to-round-1 case. Called directly (bypassing
+        # resolve_repair_action/handle_idle_stall) because a second
+        # same-signature call would escalate to fresh-session mode, which
+        # launches a real session outside this unit test's scope.
+        current_slice = state["current_slice"]
+        current_slice["repair"]["operational_round"] = 2
+        pm_runner._refresh_reviewer_policy_for_repair(
+            args, state, plan_slice, artifact, current_slice, current_slice["repair"]
+        )
+        digest_after_second_repair = hashlib.sha256((artifact / "reviewer-policy.json").read_bytes()).hexdigest()
+        self.assertNotEqual(digest_after_second_repair, new_digest)
+        failure_after_second = pm_gates.reviewer_evidence_failure(
+            artifact, ("opencode",), current_slice["reviewer_policy"]
+        )
+        self.assertIsNotNone(failure_after_second)
+
+    def test_resolve_repair_action_exempts_non_tree_changing_signatures_from_round_budget(self):
+        """Direct unit coverage of the resolve_repair_action change: idle-stall
+        and transient-service-unavailable repairs never advance `round` or
+        trip budget exhaustion, but three consecutive failures of either
+        still hits the same-signature circuit breaker (needs-human) exactly
+        as any other signature would — they are unbounded on the shared
+        budget, not unbounded altogether."""
+        # Control: an ordinary signature exhausts a budget of 1 on its
+        # second call (round 0->1 the first call, then 1 >= 1 the second).
+        control_repair = pm_state.default_repair_state()
+        control_gate = pm_models.GateDecision("repairable", "a real defect", signature="validation")
+        mode, terminal = pm_runner.resolve_repair_action(control_repair, "validation", True, 1, control_gate, "Slice 1")
+        self.assertEqual((mode, terminal), ("in-session", None))
+        mode, terminal = pm_runner.resolve_repair_action(control_repair, "validation", True, 1, control_gate, "Slice 1")
+        self.assertEqual(mode, "terminal")
+        self.assertEqual(terminal.status, "blocked")
+        self.assertIn("repair budget exhausted", terminal.reason)
+
+        for signature in ("idle-no-progress", "transient-service-unavailable"):
+            with self.subTest(signature=signature):
+                # A generous operational budget (5) isolates the
+                # same-signature circuit breaker below from the separate
+                # operational_round budget check exercised afterward — with
+                # budget=1 the operational_round exhaustion would otherwise
+                # fire at the same third call as the circuit breaker.
+                repair = pm_state.default_repair_state()
+                gate = pm_models.GateDecision("repairable", "operational", signature=signature)
+                mode, terminal = pm_runner.resolve_repair_action(repair, signature, True, 5, gate, "Slice 1")
+                self.assertEqual((mode, terminal), ("in-session", None))
+                self.assertEqual(repair["round"], 0)
+                self.assertEqual(repair["operational_round"], 1)
+                # The circuit breaker still fires on a third consecutive
+                # failure of the identical operational signature, well
+                # inside the generous operational budget.
+                mode, terminal = pm_runner.resolve_repair_action(repair, signature, True, 5, gate, "Slice 1")
+                self.assertEqual(mode, "fresh-session")
+                self.assertIsNone(terminal)
+                self.assertEqual(repair["round"], 0)
+                mode, terminal = pm_runner.resolve_repair_action(repair, signature, True, 5, gate, "Slice 1")
+                self.assertEqual(mode, "terminal")
+                self.assertEqual(terminal.status, "needs-human")
+                self.assertIn("circuit breaker", terminal.reason)
+
+                # Separately: the operational_round budget alone (immune to
+                # signature alternation and dead sessions) still bounds a run
+                # that never trips the same-signature streak. Alternating
+                # between the two operational signatures resets `streak` to
+                # 1 every call, and a dead session never touches
+                # last_signature/signature_streak at all -- exactly the two
+                # evasions an earlier draft of this fix was vulnerable to.
+                alternating = pm_state.default_repair_state()
+                other_signature = next(
+                    s for s in ("idle-no-progress", "transient-service-unavailable") if s != signature
+                )
+                alt_gate = pm_models.GateDecision("repairable", "operational", signature=other_signature)
+                sequence = [(signature, gate, True), (other_signature, alt_gate, False)] * 3
+                terminal = None
+                for call_signature, call_gate, session_alive in sequence:
+                    mode, terminal = pm_runner.resolve_repair_action(
+                        alternating, call_signature, session_alive, 3, call_gate, "Slice 1"
+                    )
+                    if terminal is not None:
+                        break
+                self.assertIsNotNone(terminal, "an alternating operational signature must still be bounded")
+                self.assertEqual(terminal.status, "blocked")
+                self.assertIn("operational repair budget exhausted", terminal.reason)
+
     def test_fresh_session_repair_prompt_preserves_archived_context_ledgers(self):
         self.prepare_committed_repo()
         state = self.init_run()
@@ -576,7 +751,13 @@ class SupervisionRepairTests(PmTestCase):
         artifact = self._model_supervised_current_slice(
             state,
             run_dir,
-            repair={"round": 1, "last_signature": "validation", "signature_streak": 1, "session_generation": 1},
+            repair={
+                "round": 1,
+                "last_signature": "validation",
+                "signature_streak": 1,
+                "session_generation": 1,
+                "operational_round": 0,
+            },
         )
         finding = {
             "source": "validation",
@@ -1114,7 +1295,13 @@ class SupervisionRepairTests(PmTestCase):
         artifact = self._model_supervised_current_slice(
             state,
             run_dir,
-            repair={"round": 1, "last_signature": "context-budget", "signature_streak": 1, "session_generation": 1},
+            repair={
+                "round": 1,
+                "last_signature": "context-budget",
+                "signature_streak": 1,
+                "session_generation": 1,
+                "operational_round": 0,
+            },
         )
         (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
         git(self.repo, "add", "README.md")
@@ -1386,7 +1573,13 @@ class SupervisionRepairTests(PmTestCase):
         artifact = self._model_supervised_current_slice(
             state,
             run_dir,
-            repair={"round": 3, "last_signature": "validation", "signature_streak": 1, "session_generation": 1},
+            repair={
+                "round": 3,
+                "last_signature": "validation",
+                "signature_streak": 1,
+                "session_generation": 1,
+                "operational_round": 0,
+            },
         )
         self._write_failing_validation_result(artifact)
         fake_adapter = mock.Mock()
@@ -1415,9 +1608,17 @@ class SupervisionRepairTests(PmTestCase):
             pm_state.repair_state({"slice_id": "Slice 1"})
         self.assertEqual(
             pm_state.repair_state(
-                {"repair": {"round": 2, "last_signature": "drift", "signature_streak": 1, "session_generation": 3}}
+                {
+                    "repair": {
+                        "round": 2,
+                        "last_signature": "drift",
+                        "signature_streak": 1,
+                        "session_generation": 3,
+                        "operational_round": 1,
+                    }
+                }
             ),
-            {"round": 2, "last_signature": "drift", "signature_streak": 1, "session_generation": 3},
+            {"round": 2, "last_signature": "drift", "signature_streak": 1, "session_generation": 3, "operational_round": 1},
         )
 
     @unittest.skipUnless(shutil.which("tmux"), "tmux is required for runtime test")
@@ -1714,7 +1915,16 @@ class SupervisionRepairTests(PmTestCase):
 
         mode, terminal = pm_runner.resolve_repair_action(repair, "validation", True, 3, gate, "Slice 1")
         self.assertEqual((mode, terminal), ("in-session", None))
-        self.assertEqual(repair, {"round": 1, "last_signature": "validation", "signature_streak": 1, "session_generation": 1})
+        self.assertEqual(
+            repair,
+            {
+                "round": 1,
+                "last_signature": "validation",
+                "signature_streak": 1,
+                "session_generation": 1,
+                "operational_round": 0,
+            },
+        )
 
         mode, terminal = pm_runner.resolve_repair_action(repair, "validation", True, 3, gate, "Slice 1")
         self.assertEqual((mode, terminal), ("fresh-session", None))

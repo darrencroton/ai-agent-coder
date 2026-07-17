@@ -284,7 +284,13 @@ class RuntimeBatchTests(PmTestCase):
         self._model_supervised_current_slice(
             state,
             run_dir,
-            repair={"round": 1, "last_signature": "validation", "signature_streak": 1, "session_generation": 1},
+            repair={
+                "round": 1,
+                "last_signature": "validation",
+                "signature_streak": 1,
+                "session_generation": 1,
+                "operational_round": 0,
+            },
         )
         run_args = argparse.Namespace(
             repo=str(self.repo),
@@ -461,6 +467,7 @@ class RuntimeBatchTests(PmTestCase):
             "last_signature": "validation",
             "signature_streak": 1,
             "session_generation": 1,
+            "operational_round": 0,
         })
         self.assertFalse((slice_dir / "activity-attempt-2.jsonl").exists())
         # The stale failing result was archived, not re-read.

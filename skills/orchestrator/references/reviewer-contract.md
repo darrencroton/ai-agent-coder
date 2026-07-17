@@ -32,13 +32,14 @@ Project Manager writes `reviewer-policy.json` for a slice. A standalone Develope
   "reserved_skill_sets": [],
   "before_head": "<slice starting commit>",
   "session_generation": 1,
-  "repair_round": 0
+  "repair_round": 0,
+  "operational_round": 0
 }
 ```
 
 `reserved_skill_sets` is optional. When present, it is a list of exact allowed skill combinations, such as `[["drift-audit"], ["code-review"]]`. A malformed value fails closed. A request that mentions a reserved skill must exactly match one permitted combination.
 
-`before_head`, `session_generation`, and `repair_round` are optional PM-binding fields: Project Manager always writes them so the policy digest binds to one slice attempt and repair round, so a Reviewer PASS from before a tree-changing repair cannot satisfy a later round's gate. A standalone hand-written policy may omit them.
+`before_head`, `session_generation`, `repair_round`, and `operational_round` are optional PM-binding fields: Project Manager always writes them so the policy digest binds to one slice attempt and repair round, so a Reviewer PASS from before a tree-changing repair cannot satisfy a later round's gate. `operational_round` advances separately from `repair_round` on idle-stall/transient-service repair rounds, which deliberately leave `repair_round` unchanged so they don't consume the substantive repair budget — without it, the digest would not change on those rounds and stale evidence could survive them. A standalone hand-written policy may omit all four.
 
 Schema v2 accepts only the documented policy fields. Retired Worker keys, role/access allow-lists, authorized write surfaces, and unknown extension fields are rejected.
 

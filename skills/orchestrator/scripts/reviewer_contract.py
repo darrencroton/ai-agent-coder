@@ -44,6 +44,13 @@ POLICY_FIELDS = {
     "before_head",
     "session_generation",
     "repair_round",
+    # Advances on every idle-stall/transient-service repair round
+    # independently of repair_round (which those signatures deliberately
+    # leave unchanged so they don't consume the substantive repair budget),
+    # so the policy digest still changes on every such round instead of
+    # silently reusing a stale digest. See pm_lib/runtime.py's
+    # write_reviewer_policy.
+    "operational_round",
 }
 REQUEST_FIELDS = {
     "schema_version",

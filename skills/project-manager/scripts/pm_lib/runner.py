@@ -59,6 +59,20 @@ from .state import (
 from .tmux_adapter import TmuxHarnessAdapter
 from .utils import utc_now
 
+# Repair signatures whose repair round never implies the developer changed
+# the tree by itself: an idle stall is a stuck-pane nudge and a transient-
+# service reclassification is a bare retry request. Both still ultimately
+# resume the live session ("continue the interrupted work"), which *can* go
+# on to touch files before the next result — so these must not skip
+# reviewer-policy digest refresh (that stays unconditional on every repair
+# round; see _refresh_reviewer_policy_for_repair) — but they also should not
+# compete with a real defect-fixing repair for the same bounded
+# max_repair_attempts budget. resolve_repair_action exempts them from that
+# budget while leaving them fully bounded by the existing same-signature
+# circuit breaker below (three consecutive failures of the identical
+# signature still escalates to fresh-session then a terminal human stop).
+NON_TREE_CHANGING_REPAIR_SIGNATURES = frozenset({"idle-no-progress", "transient-service-unavailable"})
+
 
 def _capture_git_evidence(repo: Path, slice_artifact_dir: Path, attempt: int, before_head: str | None) -> tuple[str | None, str]:
     after_head = git_head(repo)
@@ -142,17 +156,40 @@ def resolve_repair_action(
     (mode, None) with mode in {"in-session", "fresh-session", "relaunch"}
     after updating `repair` in place:
 
-    - budget exhausted -> terminal blocked.
+    - budget exhausted -> terminal blocked. Signatures in
+      NON_TREE_CHANGING_REPAIR_SIGNATURES never advance the substantive
+      `repair["round"]` counter and so never count toward this budget — they
+      advance a separate `repair["operational_round"]` counter instead,
+      checked against the same `max_repairs` budget. That counter increments
+      unconditionally for every operational-signature call regardless of
+      `session_alive` or whether it matches the previous signature, so it
+      cannot be evaded by alternating between the two operational signatures
+      (which would otherwise keep resetting the same-signature streak below)
+      or by a run of dead-session relaunches (which never touch
+      `last_signature`/`signature_streak`).
     - same signature failing a third consecutive time with a live session ->
       terminal needs-human (in-session nudge, then one fresh session, then a
-      human).
+      human). This still applies to NON_TREE_CHANGING_REPAIR_SIGNATURES, so a
+      run stuck in a genuine repeated stall of the identical signature is
+      bounded even sooner than its separate operational budget.
     - dead session -> "relaunch": consumes a round but is a runner condition,
       not a circuit-breaker step, so the breaker state is untouched.
     - first failure of a signature -> "in-session" nudge into the live session.
     - second consecutive failure of the same signature -> one "fresh-session"
       escalation, on the theory the session is anchored on a wrong premise.
     """
-    if repair["round"] >= max_repairs:
+    operational = signature in NON_TREE_CHANGING_REPAIR_SIGNATURES
+    if operational:
+        if int(repair["operational_round"]) >= max_repairs:
+            return "terminal", GateDecision(
+                "blocked",
+                f"operational repair budget exhausted for {slice_id} "
+                f"({repair['operational_round']}/{max_repairs} idle/transient repairs used); last gate failure: {gate.reason}",
+                gate.result,
+                gate.actual_changed_files,
+                signature,
+            )
+    elif repair["round"] >= max_repairs:
         return "terminal", GateDecision(
             "blocked",
             f"repair budget exhausted for {slice_id} "
@@ -171,14 +208,26 @@ def resolve_repair_action(
             gate.actual_changed_files,
             signature,
         )
-    round_number = int(repair["round"]) + 1
+    round_number = int(repair["round"]) if operational else int(repair["round"]) + 1
+    operational_round_number = int(repair["operational_round"]) + 1 if operational else int(repair["operational_round"])
     if not session_alive:
         repair["round"] = round_number
+        repair["operational_round"] = operational_round_number
         return "relaunch", None
     if streak == 1:
-        repair.update(round=round_number, last_signature=signature, signature_streak=1)
+        repair.update(
+            round=round_number,
+            operational_round=operational_round_number,
+            last_signature=signature,
+            signature_streak=1,
+        )
         return "in-session", None
-    repair.update(round=round_number, last_signature=signature, signature_streak=2)
+    repair.update(
+        round=round_number,
+        operational_round=operational_round_number,
+        last_signature=signature,
+        signature_streak=2,
+    )
     return "fresh-session", None
 
 
@@ -302,6 +351,7 @@ def start_model_supervised_slice(
         before_head=before_head,
         session_generation=attempt,
         repair_round=0,
+        operational_round=0,
     )
     reviewer_identities: dict[str, dict[str, Any]] = {}
     reviewer_model = getattr(args, "reviewer_model", None)
@@ -538,8 +588,9 @@ def _refresh_reviewer_policy_for_repair(
     together, so they always agree, and any launch contract minted under the
     previous digest stops matching with no new gate logic required.
     `before_head` is read from `current` unchanged (the slice-attempt-lineage
-    constant); `session_generation`/`repair_round` come from the live
-    `repair` state, which the caller has already updated for this round.
+    constant); `session_generation`/`repair_round`/`operational_round` come
+    from the live `repair` state, which the caller has already updated for
+    this round.
     """
     reviewer_tools = tuple(str(tool) for tool in current.get("reviewer_tools") or ())
     launch_args = effective_launch_args(args, state)
@@ -553,6 +604,7 @@ def _refresh_reviewer_policy_for_repair(
         before_head=str(current["before_head"]),
         session_generation=int(repair["session_generation"]),
         repair_round=int(repair["round"]),
+        operational_round=int(repair["operational_round"]),
     )
     current["reviewer_policy"] = reviewer_policy_snapshot(policy_path)
 
