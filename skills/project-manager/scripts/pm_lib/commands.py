@@ -22,6 +22,7 @@ from .constants import (
     RUN_STOP_STATUSES,
     SCHEMA_VERSION,
 )
+from .context import prior_slice_context_integrity_failure, projected_prior_slice_context_budget_failure
 from .gates import gate_failure, verify_gate
 from .git_ops import (
     changed_files_between,
@@ -69,8 +70,6 @@ from .runtime import (
     capture_developer_transcript,
     capture_reviewer_runs_summary,
     environment_preflight,
-    prior_slice_context_integrity_failure,
-    projected_prior_slice_context_budget_failure,
     result_schema_path,
     sensitive_artifact_dirs,
     slice_dir_name,

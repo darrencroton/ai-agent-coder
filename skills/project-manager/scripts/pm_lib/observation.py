@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Any
 
 from .git_ops import git_status_text, meaningful_status_lines
+from .hints import extract_operational_hints
 from .models import PmError
 from .profiles import current_allow_unattended_default, parse_reviewer_tools, resolve_current_harness_command
-from .runtime import extract_operational_hints, relative_artifact_path
+from .runtime import relative_artifact_path
 from .state import append_operational_event, load_run, operational_events_file
 from .tmux_adapter import TmuxHarnessAdapter
 from .utils import parse_iso_datetime, utc_now

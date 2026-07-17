@@ -934,7 +934,7 @@ def verify_gate(
 
     # EXEMPTION: a context-budget repair explicitly instructs the developer to
     # condense and reword ledger items so the cumulative context fits the next
-    # planned slice's launch budget (see runtime.py's context-budget repair
+    # planned slice's launch budget (see prompts.py's context-budget repair
     # stanza); exact-dict retention would wedge that required rewrite, so this
     # mechanical check does not apply to the round that follows one.
     if last_repair_signature != "context-budget":

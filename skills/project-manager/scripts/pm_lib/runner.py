@@ -8,8 +8,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .constants import DEFAULT_MAX_REPAIR_ATTEMPTS, KNOWN_UNATTENDED_HARNESS_COMMANDS, RUN_STOP_STATUSES
+from .context import (
+    prior_slice_context_integrity_failure,
+    projected_prior_slice_context_budget_failure,
+    write_prior_slice_context,
+)
 from .gates import gate_failure, verify_gate
 from .git_ops import git, git_head, git_status_text, require_clean_worktree, write_git_diff
+from .hints import extract_operational_hints
 from .models import GateDecision, PmError, PlanSlice
 from .observation import _current_adapter, _slice_artifact_dir, wait_observing
 from .plan import eligibility
@@ -22,21 +28,16 @@ from .profiles import (
     resolve_current_harness_command,
     resolve_harness_command,
 )
+from .prompts import render_developer_prompt, render_repair_prompt
 from .runtime import (
     cancel_run_reviewers,
     capture_developer_transcript,
     capture_reviewer_runs_summary,
     ensure_slice_runtime_dirs,
-    extract_operational_hints,
-    render_developer_prompt,
-    render_repair_prompt,
-    prior_slice_context_integrity_failure,
-    projected_prior_slice_context_budget_failure,
     slice_dir_name,
     tmux_session_name,
     write_reviewer_policy,
     reviewer_policy_snapshot,
-    write_prior_slice_context,
 )
 from .state import (
     activate_controller_state,

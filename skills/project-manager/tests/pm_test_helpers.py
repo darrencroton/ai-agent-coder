@@ -30,6 +30,9 @@ assert SPEC.loader is not None
 sys.modules[SPEC.name] = pm
 SPEC.loader.exec_module(pm)
 from pm_lib import runtime as pm_runtime  # noqa: E402
+from pm_lib import hints as pm_hints  # noqa: E402
+from pm_lib import prompts as pm_prompts  # noqa: E402
+from pm_lib import context as pm_context  # noqa: E402
 from pm_lib import tmux_adapter as pm_tmux_adapter  # noqa: E402
 from pm_lib import commands as pm_commands  # noqa: E402
 from pm_lib import gates as pm_gates  # noqa: E402

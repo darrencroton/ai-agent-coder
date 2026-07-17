@@ -211,7 +211,7 @@ REQUIRED_AUDIT_SKILLS = ("drift-audit", "code-review")
 # Detects "push / create PR / deploy / install dependency / license change"
 # prompts — the external-side-effect stop condition enforced at two layers:
 # tmux_adapter.detect_hard_prompt (send-time guard, whitespace-normalized
-# original-case pane text) and runtime.extract_operational_hints (offline
+# original-case pane text) and hints.extract_operational_hints (offline
 # hint extraction over already-lowercased text). One definition so a pattern
 # fix can't leave either layer silently stale; IGNORECASE makes it correct
 # against both a lowercased string and original-case text.

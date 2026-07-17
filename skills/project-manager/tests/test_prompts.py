@@ -44,9 +44,9 @@ class PromptRenderingTests(PmTestCase):
         artifact = run_json.parent / "slices" / "slice-002"
         artifact.mkdir(parents=True, exist_ok=True)
 
-        context_path, digest = pm_runtime.write_prior_slice_context(state, selected, artifact, "c" * 40)
+        context_path, digest = pm_context.write_prior_slice_context(state, selected, artifact, "c" * 40)
         context = context_path.read_text(encoding="utf-8")
-        prompt = pm_runtime.render_developer_prompt(state, selected, artifact, run_json)
+        prompt = pm_prompts.render_developer_prompt(state, selected, artifact, run_json)
 
         self.assertIn("Established the documented interface", context)
         self.assertIn("stable_key", context)
@@ -62,7 +62,7 @@ class PromptRenderingTests(PmTestCase):
     def test_prior_slice_context_first_slice_and_assumed_complete_are_explicit(self):
         state = self.init_run()
         first = pm_plan.parse_plan(self.plan)[0]
-        self.assertIn("No prior completed slices", pm_runtime.render_prior_slice_context(state, first, "a" * 40))
+        self.assertIn("No prior completed slices", pm_context.render_prior_slice_context(state, first, "a" * 40))
 
         assumed = self.terminal_slice_entry(state, status="assumed-complete")
         assumed["artifact_dir"] = None
@@ -70,7 +70,7 @@ class PromptRenderingTests(PmTestCase):
         assumed.pop("reviewer_policy")
         assumed.pop("slice_summary")
         state["slices"] = [assumed]
-        context = pm_runtime.render_prior_slice_context(state, pm_plan.parse_plan(self.plan)[1], "a" * 40)
+        context = pm_context.render_prior_slice_context(state, pm_plan.parse_plan(self.plan)[1], "a" * 40)
         self.assertIn("operator-attested", context)
         self.assertIn("no PM evidence available", context)
 
@@ -83,7 +83,7 @@ class PromptRenderingTests(PmTestCase):
         artifact.mkdir(parents=True, exist_ok=True)
 
         with self.assertRaisesRegex(pm_models.PmError, "exceeding the .*byte invariant"):
-            pm_runtime.write_prior_slice_context(state, pm_plan.parse_plan(self.plan)[1], artifact, "a" * 40)
+            pm_context.write_prior_slice_context(state, pm_plan.parse_plan(self.plan)[1], artifact, "a" * 40)
         self.assertFalse((artifact / "prior-slice-context.md").exists())
 
     def test_projected_context_budget_prevents_accepting_history_that_strands_next_slice(self):
@@ -97,13 +97,13 @@ class PromptRenderingTests(PmTestCase):
         }
         candidate = self.terminal_slice_entry(state)
         candidate["continuation_notes"] = [note] * pm_constants.MAX_CONTINUATION_NOTES
-        first_failure = pm_runtime.projected_prior_slice_context_budget_failure(
+        first_failure = pm_context.projected_prior_slice_context_budget_failure(
             state, pm_plan.parse_plan(self.plan)[0], candidate, "a" * 40
         )
         self.assertIsNone(first_failure)
 
         oversized = dict(candidate, summary="x" * pm_constants.MAX_PRIOR_SLICE_CONTEXT_BYTES)
-        failure = pm_runtime.projected_prior_slice_context_budget_failure(
+        failure = pm_context.projected_prior_slice_context_budget_failure(
             state, pm_plan.parse_plan(self.plan)[0], oversized, "a" * 40
         )
         self.assertIn("accepted reporting would make", failure)
@@ -124,7 +124,7 @@ class PromptRenderingTests(PmTestCase):
         candidate = self.terminal_slice_entry(state)
         candidate["summary"] = "c" * 260000
 
-        failure = pm_runtime.projected_prior_slice_context_budget_failure(
+        failure = pm_context.projected_prior_slice_context_budget_failure(
             state, pm_plan.parse_plan(self.plan)[0], candidate, "a" * 40
         )
 
@@ -143,9 +143,9 @@ class PromptRenderingTests(PmTestCase):
             selected.append(actual_next.slice_id)
             return "small"
 
-        with mock.patch.object(pm_runtime, "render_prior_slice_context", side_effect=capture_render):
+        with mock.patch.object(pm_context, "render_prior_slice_context", side_effect=capture_render):
             self.assertIsNone(
-                pm_runtime.projected_prior_slice_context_budget_failure(
+                pm_context.projected_prior_slice_context_budget_failure(
                     state, pm_plan.parse_plan(self.plan)[0], candidate, "a" * 40
                 )
             )
@@ -157,7 +157,7 @@ class PromptRenderingTests(PmTestCase):
         second = self.terminal_slice_entry(state, slice_id="Slice 2", title="Second Slice")
         state["slices"] = [second, first]
         selected = pm_models.PlanSlice(3, "Third Slice", "", {})
-        context = pm_runtime.render_prior_slice_context(state, selected, "a" * 40)
+        context = pm_context.render_prior_slice_context(state, selected, "a" * 40)
         self.assertLess(context.index("### Slice 1"), context.index("### Slice 2"))
 
     def test_slice_environment_exposes_only_the_context_artifact_not_run_state(self):
@@ -171,7 +171,7 @@ class PromptRenderingTests(PmTestCase):
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
         plan_slice = pm_plan.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
-        prompt = pm_runtime.render_developer_prompt(state, plan_slice, slice_artifact_dir, run_json)
+        prompt = pm_prompts.render_developer_prompt(state, plan_slice, slice_artifact_dir, run_json)
         self.assertIn("Selected slice: Slice 1 - First Slice", prompt)
         self.assertIn("Authorized surface:", prompt)
         self.assertIn("README.md", prompt)
@@ -197,7 +197,7 @@ class PromptRenderingTests(PmTestCase):
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
         plan_slice = pm_plan.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
-        prompt = pm_runtime.render_developer_prompt(state, plan_slice, slice_artifact_dir, run_json, ("codex",))
+        prompt = pm_prompts.render_developer_prompt(state, plan_slice, slice_artifact_dir, run_json, ("codex",))
         self.assertIn("Available reviewer tool(s) for this run: codex", prompt)
         self.assertIn("which reviewer PM has made available for delegation", prompt)
 
@@ -211,7 +211,7 @@ class PromptRenderingTests(PmTestCase):
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
         plan_slice = pm_plan.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
-        prompt = pm_runtime.render_developer_prompt(state, plan_slice, slice_artifact_dir, run_json, ("codex",))
+        prompt = pm_prompts.render_developer_prompt(state, plan_slice, slice_artifact_dir, run_json, ("codex",))
         self.assertIn("Mode B counterpart of the Mode A", prompt)
         self.assertIn("Prefer delegating this as a hostile, independent audit to the available reviewer", prompt)
         self.assertIn("Prefer delegating code review as an independent review to the available reviewer", prompt)
@@ -229,13 +229,13 @@ class PromptRenderingTests(PmTestCase):
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
         base = pm_plan.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
-        default_prompt = pm_runtime.render_developer_prompt(state, base, slice_artifact_dir, run_json)
+        default_prompt = pm_prompts.render_developer_prompt(state, base, slice_artifact_dir, run_json)
         self.assertNotIn("never `[]` and never both skills in one request", default_prompt)
 
         sections = dict(base.sections)
         sections["Risk Flags"] = sections.get("Risk Flags", "") + "\n- Independent audit required: yes"
         opt_in_slice = pm_models.PlanSlice(base.number, base.title, base.body, sections)
-        opt_in_prompt = pm_runtime.render_developer_prompt(state, opt_in_slice, slice_artifact_dir, run_json)
+        opt_in_prompt = pm_prompts.render_developer_prompt(state, opt_in_slice, slice_artifact_dir, run_json)
         self.assertIn('exactly `["drift-audit"]` or exactly `["code-review"]`', opt_in_prompt)
         self.assertIn("never `[]` and never both skills in one request", opt_in_prompt)
 
@@ -244,7 +244,7 @@ class PromptRenderingTests(PmTestCase):
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
         plan_slice = pm_plan.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
-        prompt = pm_runtime.render_developer_prompt(state, plan_slice, slice_artifact_dir, run_json)
+        prompt = pm_prompts.render_developer_prompt(state, plan_slice, slice_artifact_dir, run_json)
         self.assertIn("none available for this run", prompt)
         self.assertIn("that is a valid, accepted outcome, not a failure", prompt)
 
@@ -254,7 +254,7 @@ class PromptRenderingTests(PmTestCase):
         base = pm_plan.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
 
-        default_prompt = pm_runtime.render_developer_prompt(state, base, slice_artifact_dir, run_json, ("codex",))
+        default_prompt = pm_prompts.render_developer_prompt(state, base, slice_artifact_dir, run_json, ("codex",))
         self.assertIn("cannot launch or cannot honor its authentication, model, or effort contract", default_prompt)
         self.assertIn("preserve the exact failure in `reviewer-evidence.md`", default_prompt)
         self.assertIn("On a default slice, then perform the affected audit(s) locally as Developer self-audit", default_prompt)
@@ -263,7 +263,7 @@ class PromptRenderingTests(PmTestCase):
         sections = dict(base.sections)
         sections["Risk Flags"] = sections.get("Risk Flags", "") + "\n- Independent audit required: yes"
         opt_in_slice = pm_models.PlanSlice(base.number, base.title, base.body, sections)
-        opt_in_prompt = pm_runtime.render_developer_prompt(state, opt_in_slice, slice_artifact_dir, run_json, ("codex",))
+        opt_in_prompt = pm_prompts.render_developer_prompt(state, opt_in_slice, slice_artifact_dir, run_json, ("codex",))
         self.assertIn("do not substitute Developer self-audit", opt_in_prompt)
         self.assertIn("preserve the failure and stop", opt_in_prompt)
         self.assertIn("record the blocker in `developer-result.json` and stop", opt_in_prompt)
@@ -273,7 +273,7 @@ class PromptRenderingTests(PmTestCase):
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
         plan_slice = pm_plan.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
-        prompt = pm_runtime.render_developer_prompt(
+        prompt = pm_prompts.render_developer_prompt(
             state,
             plan_slice,
             slice_artifact_dir,
@@ -293,7 +293,7 @@ class PromptRenderingTests(PmTestCase):
         run_json = (self.repo / ".ai-pm" / "current").resolve() / "run.json"
         plan_slice = pm_plan.parse_plan(self.plan)[0]
         slice_artifact_dir = run_json.parent / "slices" / "slice-001"
-        prompt = pm_runtime.render_developer_prompt(
+        prompt = pm_prompts.render_developer_prompt(
             state,
             plan_slice,
             slice_artifact_dir,
@@ -349,7 +349,7 @@ class PromptRenderingTests(PmTestCase):
                 ("README.md",),
                 signature=signature,
             )
-            prompt = pm_runtime.render_repair_prompt(plan_slice, artifact, gate, before_head="a" * 40)
+            prompt = pm_prompts.render_repair_prompt(plan_slice, artifact, gate, before_head="a" * 40)
             self.assertIn("NOT accepted", prompt, signature)
             self.assertIn(f"gate reason for {signature} with literal {{braces}} kept", prompt)
             self.assertIn(f"category: {signature}", prompt)
@@ -373,7 +373,7 @@ class PromptRenderingTests(PmTestCase):
             ("README.md",),
             signature="reviewer-evidence",
         )
-        prompt = pm_runtime.render_repair_prompt(plan_slice, artifact, gate, before_head="a" * 40)
+        prompt = pm_prompts.render_repair_prompt(plan_slice, artifact, gate, before_head="a" * 40)
         self.assertIn("do NOT re-implement", prompt)
         self.assertIn("reviewer evidence", prompt)
         self.assertIn("were never actually invoked", prompt)
@@ -390,7 +390,7 @@ class PromptRenderingTests(PmTestCase):
             ("EVIL.md", "README.md"),
             signature="unauthorized-files",
         )
-        prompt = pm_runtime.render_repair_prompt(plan_slice, artifact, gate, before_head=before)
+        prompt = pm_prompts.render_repair_prompt(plan_slice, artifact, gate, before_head=before)
         self.assertIn("OUTSIDE your authorized surface: EVIL.md", prompt)
         self.assertIn(f"git checkout {before} -- EVIL.md", prompt)
         self.assertIn("touch nothing else", prompt)
@@ -409,7 +409,7 @@ class PromptRenderingTests(PmTestCase):
             ("bad name.md", "glob*.md"),
             signature="unauthorized-files",
         )
-        prompt = pm_runtime.render_repair_prompt(plan_slice, artifact, gate, before_head=before)
+        prompt = pm_prompts.render_repair_prompt(plan_slice, artifact, gate, before_head=before)
         # Paths with spaces or metacharacters must survive a literal copy of
         # the restore command as single arguments.
         self.assertIn(f"git checkout {before} -- 'bad name.md' 'glob*.md'", prompt)
@@ -425,7 +425,7 @@ class PromptRenderingTests(PmTestCase):
             ("README.md",),
             signature="changed-files-mismatch",
         )
-        prompt = pm_runtime.render_repair_prompt(plan_slice, artifact, gate)
+        prompt = pm_prompts.render_repair_prompt(plan_slice, artifact, gate)
         self.assertIn("No file edits are needed", prompt)
         self.assertIn("exactly match the actual diff: README.md", prompt)
 
@@ -441,7 +441,7 @@ class PromptRenderingTests(PmTestCase):
             ("README.md",),
             signature="dirty-worktree",
         )
-        prompt = pm_runtime.render_repair_prompt(plan_slice, artifact, gate)
+        prompt = pm_prompts.render_repair_prompt(plan_slice, artifact, gate)
         self.assertIn("M  README.md", prompt)
         self.assertNotIn(".ai-pm/scratch.txt", prompt)
 
@@ -461,15 +461,15 @@ class PromptRenderingTests(PmTestCase):
         artifact.mkdir(parents=True, exist_ok=True)
         gate = pm_models.GateDecision("repairable", "reason", None, (), signature="mystery")
         with self.assertRaisesRegex(pm_models.PmError, "no repair stanza"):
-            pm_runtime.render_repair_prompt(plan_slice, artifact, gate)
+            pm_prompts.render_repair_prompt(plan_slice, artifact, gate)
 
     def test_repair_template_does_not_change_main_prompt_template(self):
         # The repair block is a second fenced template in the same reference
         # file; the main loader must still pick the original block.
-        template = pm_runtime.load_prompt_template()
+        template = pm_prompts.load_prompt_template()
         self.assertIn("You are the slice Developer for Project Manager.", template)
         self.assertNotIn("NOT accepted", template)
-        repair = pm_runtime.load_repair_template()
+        repair = pm_prompts.load_repair_template()
         self.assertIn("NOT accepted", repair)
         self.assertNotIn("Reviewer helper sequence", repair)
 
@@ -478,7 +478,7 @@ class PromptRenderingTests(PmTestCase):
         state = self.init_run()
         artifact_dir = Path("/tmp/artifacts")
         run_json = Path("/tmp/run.json")
-        prompt = pm_runtime.render_developer_prompt(state, plan_slice, artifact_dir, run_json, ("claude",))
+        prompt = pm_prompts.render_developer_prompt(state, plan_slice, artifact_dir, run_json, ("claude",))
         self.assertIn("Available reviewer tool(s) for this run: claude", prompt)
         self.assertIn("Reviewer auth policy:", prompt)
         self.assertIn("PM does not set CLAUDE_CONFIG_DIR", prompt)
