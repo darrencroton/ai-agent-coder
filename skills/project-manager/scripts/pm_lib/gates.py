@@ -809,6 +809,51 @@ def _truncate_for_reason(value: Any, limit: int = 120) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _covers(container: dict[str, Any], covered: dict[str, Any]) -> bool:
+    """True if `container` has every key/value pair `covered` has (a field-superset)."""
+    return all(key in container and container[key] == value for key, value in covered.items())
+
+
+def ledger_item_retained(archived_item: dict[str, Any], candidates: list[Any]) -> bool:
+    """True if some candidate item preserves every key/value pair of the archived item.
+
+    Retention requires every key the archived item had to still be present with
+    an unchanged value in some candidate — but tolerates a candidate carrying
+    *additional* keys the archived item didn't have. A Developer legitimately
+    adding a new field (for example a `location` key while rewriting a result
+    to satisfy an unrelated schema-compliance gate) is a strict superset of the
+    archived item, not a loss, and must not itself trip retention. A dropped,
+    changed, or reworded value on any key the archived item did carry still
+    fails, since that is exactly the silent-knowledge-loss this check exists
+    to catch.
+    """
+    return any(isinstance(candidate, dict) and _covers(candidate, archived_item) for candidate in candidates)
+
+
+def merge_maximal_ledger_item(items: list[dict[str, Any]], candidate: dict[str, Any]) -> None:
+    """Insert `candidate` into `items`, keeping only field-maximal items.
+
+    Two archived items can describe the same underlying finding at different
+    completeness (for example a base item and a later round's version with an
+    added `location` field) without either being a verbatim duplicate. Plain
+    "not already present" dedup would keep both, and a single not-retained
+    check applied item-by-item can under-collect: given a base item followed
+    by a fuller version and no fresh coverage, both would independently look
+    "not yet covered" unless earlier insertions are folded in as they arrive.
+    This keeps exactly one, maximal entry per comparable chain: if an existing
+    item already covers `candidate`'s fields, do nothing; otherwise drop every
+    existing item `candidate` covers and append `candidate` once. Items that
+    are incomparable (neither a superset of the other, e.g. two unrelated
+    findings, or two different additive fields on the same base) are both
+    kept.
+    """
+    for existing in items:
+        if _covers(existing, candidate):
+            return
+    items[:] = [existing for existing in items if not _covers(candidate, existing)]
+    items.append(candidate)
+
+
 def _missing_ledger_items(slice_artifact_dir: Path, result: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     """Return every archived ledger item, grouped by field, missing from the fresh result.
 
@@ -817,13 +862,18 @@ def _missing_ledger_items(slice_artifact_dir: Path, result: dict[str, Any]) -> d
     (`_fresh_session_repair_prompt`), never as anything a gate previously
     verified — so a repair round could silently drop knowledge the ledger
     already recorded and nothing would catch it. This makes retention
-    mechanical: every archived `residual_findings`/`continuation_notes` item
-    must still appear, by exact dict equality, in the corresponding fresh
-    ledger. Merging in new items is fine; silently losing an old one is not.
+    mechanical: every archived `residual_findings`/`continuation_notes` item's
+    fields must still appear, unchanged, in some item in the corresponding
+    fresh ledger (see `ledger_item_retained`) — merging in new items, or new
+    fields on a retained item, is fine; silently losing or altering an old
+    field is not.
 
     Collects every gap across both fields in one pass — not just the first —
     so a repair round with multiple omissions gets one complete correction
-    instead of consuming one repair round per item.
+    instead of consuming one repair round per item. Gaps are folded together
+    with `merge_maximal_ledger_item` (not raw append) so that, across several
+    archived rounds, only the fullest version of a repeatedly-refined item is
+    reported missing rather than every intermediate version.
     """
     missing: dict[str, list[dict[str, Any]]] = {}
     for field in _LEDGER_RETENTION_FIELDS:
@@ -834,9 +884,9 @@ def _missing_ledger_items(slice_artifact_dir: Path, result: dict[str, Any]) -> d
         fresh_list = fresh_value if isinstance(fresh_value, list) else []
         field_gaps: list[dict[str, Any]] = []
         for _archived_path, item in archived_items:
-            if item in fresh_list or item in field_gaps:
+            if ledger_item_retained(item, fresh_list) or ledger_item_retained(item, field_gaps):
                 continue
-            field_gaps.append(item)
+            merge_maximal_ledger_item(field_gaps, item)
         if field_gaps:
             missing[field] = field_gaps
     return missing
@@ -966,8 +1016,10 @@ def verify_gate(
     # EXEMPTION: a context-budget repair explicitly instructs the developer to
     # condense and reword ledger items so the cumulative context fits the next
     # planned slice's launch budget (see prompts.py's context-budget repair
-    # stanza); exact-dict retention would wedge that required rewrite, so this
-    # mechanical check does not apply to the round that follows one.
+    # stanza); mechanical retention would wedge that required rewrite even
+    # under field-superset matching (rewording changes existing field values,
+    # not just adding new ones), so this check does not apply to the round
+    # that follows one.
     if last_repair_signature != "context-budget":
         retention_failure = _ledger_retention_failure(slice_artifact_dir, result)
         if retention_failure:

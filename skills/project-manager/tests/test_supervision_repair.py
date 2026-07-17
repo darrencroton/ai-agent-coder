@@ -6,6 +6,110 @@ from pm_test_helpers import *  # noqa: F401,F403 — shared fixtures, fake harne
 
 
 class SupervisionRepairTests(PmTestCase):
+    def test_merge_maximal_ledger_item_keeps_fuller_version_instead_of_duplicating(self):
+        """PM test 16 (report-mc-test16-...md): a later archived round adding a
+        field (e.g. `location`) to an earlier round's item is a superset, not a
+        different item — merging must keep one fuller entry, not both, so a
+        fresh-session prompt doesn't present the Developer with near-duplicate
+        findings for the same underlying issue. `runner.py` and `gates.py` must
+        share one merge routine (`pm_gates.merge_maximal_ledger_item`) rather
+        than each keeping a subtly different local copy."""
+        earlier = {
+            "source": "code-review",
+            "severity": "low",
+            "summary": "Missing input validation on negative terms",
+            "disposition": "deferred-inconsequential",
+        }
+        fuller = dict(earlier, location="algorithms.py:9")
+
+        destination: list = []
+        pm_gates.merge_maximal_ledger_item(destination, earlier)
+        pm_gates.merge_maximal_ledger_item(destination, fuller)
+        self.assertEqual(destination, [fuller])
+
+        destination = []
+        pm_gates.merge_maximal_ledger_item(destination, fuller)
+        pm_gates.merge_maximal_ledger_item(destination, earlier)
+        self.assertEqual(destination, [fuller])
+
+        destination = []
+        pm_gates.merge_maximal_ledger_item(destination, earlier)
+        pm_gates.merge_maximal_ledger_item(destination, earlier)
+        self.assertEqual(destination, [earlier])
+
+        unrelated = {
+            "source": "code-review",
+            "severity": "medium",
+            "summary": "A distinct finding",
+            "disposition": "deferred-inconsequential",
+        }
+        destination = []
+        pm_gates.merge_maximal_ledger_item(destination, earlier)
+        pm_gates.merge_maximal_ledger_item(destination, unrelated)
+        self.assertEqual(destination, [earlier, unrelated])
+
+    def test_merge_maximal_ledger_item_collapses_multiple_incomparable_supersets(self):
+        """Codex review of PM test 16's fix (independent code-review via
+        orchestrator, gpt-5.6-sol/high): a base item followed by two
+        independently-extended, mutually incomparable variants (`+location`
+        and `+ticket`) followed by a version carrying both fields must
+        collapse to the one, fullest entry — not leave an earlier variant
+        behind as a stale duplicate."""
+        base = {
+            "source": "code-review",
+            "severity": "low",
+            "summary": "Missing input validation on negative terms",
+            "disposition": "deferred-inconsequential",
+        }
+        with_location = dict(base, location="algorithms.py:9")
+        with_ticket = dict(base, ticket="PM-42")
+        fullest = dict(base, location="algorithms.py:9", ticket="PM-42")
+
+        destination: list = []
+        for item in (base, with_location, with_ticket, fullest):
+            pm_gates.merge_maximal_ledger_item(destination, item)
+        self.assertEqual(destination, [fullest])
+
+        # Order independence: the fullest version arriving in the middle must
+        # still absorb both partial variants, in either arrival order.
+        destination = []
+        for item in (with_location, fullest, with_ticket):
+            pm_gates.merge_maximal_ledger_item(destination, item)
+        self.assertEqual(destination, [fullest])
+
+    def test_missing_ledger_items_reports_only_fullest_variant_across_rounds(self):
+        """The same multi-variant collapse must hold for the gate's own
+        missing-items accumulation (`gates._missing_ledger_items`), not only
+        for the fresh-session prompt's merge — a base item archived in round 1
+        followed by a fuller `+location` version archived in round 2, with no
+        fresh coverage, must be reported as one missing item, not two."""
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        artifact.mkdir(parents=True, exist_ok=True)
+        base = {
+            "source": "code-review",
+            "severity": "low",
+            "summary": "Missing input validation on negative terms",
+            "disposition": "deferred-inconsequential",
+        }
+        fuller = dict(base, location="algorithms.py:9")
+        for round_number, findings in ((1, [base]), (2, [fuller])):
+            (artifact / f"developer-result-repair-{round_number}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": pm_constants.SCHEMA_VERSION,
+                        "slice_id": "Slice 1",
+                        "status": "repairable",
+                        "residual_findings": findings,
+                        "continuation_notes": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        missing = pm_gates._missing_ledger_items(artifact, {"residual_findings": []})
+
+        self.assertEqual(missing, {"residual_findings": [fuller]})
+
     def test_cancel_run_reviewers_scans_current_and_prior_slice_artifacts(self):
         run_dir = self.repo / ".ai-pm" / "runs" / "test"
         first = run_dir / "slices" / "slice-001"
@@ -994,7 +1098,7 @@ class SupervisionRepairTests(PmTestCase):
         # The rendered in-session repair prompt must carry the full archived
         # item end-to-end (every field, not just the summary a truncated gate
         # reason could carry alone) so a Developer can actually copy it
-        # verbatim, matching the exact-dict-equality check the gate enforces.
+        # verbatim, satisfying the gate's field-retention check.
         repair_prompt_text = (artifact / "repair-prompt-repair-1.md").read_text(encoding="utf-8")
         for field_value in archived_finding.values():
             self.assertIn(field_value, repair_prompt_text, field_value)

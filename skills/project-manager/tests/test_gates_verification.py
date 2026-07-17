@@ -827,6 +827,70 @@ class GateVerificationTests(PmTestCase):
 
         self.assertEqual(decision.status, "pass")
 
+    def test_gate_accepts_archived_item_with_additive_fresh_field(self):
+        """PM test 16 (report-mc-test16-...md): a Developer legitimately adding a
+        new field (e.g. `location`) to an archived item while satisfying an
+        unrelated schema-compliance gate is a strict superset of the archived
+        item, not a loss, and must not itself trip ledger-retention."""
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        archived_finding = self._archived_residual_finding()
+        fresh_finding = dict(archived_finding, location="algorithms.py:13")
+        archived_note = self._archived_continuation_note()
+        fresh_note = dict(archived_note, location="algorithms.py")
+        self.write_gate_result(
+            artifact,
+            changed_files=["README.md"],
+            commit_hash=after,
+            residual_findings=[fresh_finding],
+            continuation_notes=[fresh_note],
+        )
+        self._write_archived_repair_result(
+            artifact, 1, residual_findings=[archived_finding], continuation_notes=[archived_note]
+        )
+        state = self.init_run()
+
+        decision = pm_gates.verify_gate(
+            self.repo, state, pm_plan.parse_plan(self.plan)[0], artifact, before, after, pm_git_ops.git_status_text(self.repo)
+        )
+
+        self.assertEqual(decision.status, "pass")
+
+    def test_gate_rejects_archived_item_with_mutated_fresh_value(self):
+        """Retention tolerates additive fields but must still catch a changed
+        value on a field the archived item already carried — a reworded or
+        weakened finding is exactly the silent-knowledge-loss this check
+        exists to catch, not a benign superset."""
+        self.prepare_committed_repo()
+        before = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "README.md").write_text("ok\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "Good change")
+        after = git(self.repo, "rev-parse", "HEAD")
+        artifact = self.repo / ".ai-pm" / "runs" / "test" / "slices" / "slice-001"
+        archived_finding = self._archived_residual_finding()
+        mutated_finding = dict(archived_finding, rationale="This risk was overstated and no longer applies.")
+        self.write_gate_result(
+            artifact,
+            changed_files=["README.md"],
+            commit_hash=after,
+            residual_findings=[mutated_finding],
+        )
+        self._write_archived_repair_result(artifact, 1, residual_findings=[archived_finding])
+        state = self.init_run()
+
+        decision = pm_gates.verify_gate(
+            self.repo, state, pm_plan.parse_plan(self.plan)[0], artifact, before, after, pm_git_ops.git_status_text(self.repo)
+        )
+
+        self.assertEqual(decision.status, "repairable")
+        self.assertEqual(decision.signature, "ledger-retention")
+
     def test_gate_ledger_retention_exempts_context_budget_repair_round(self):
         self.prepare_committed_repo()
         before = git(self.repo, "rev-parse", "HEAD")

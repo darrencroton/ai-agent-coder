@@ -13,7 +13,7 @@ from .context import (
     projected_prior_slice_context_budget_failure,
     write_prior_slice_context,
 )
-from .gates import gate_failure, verify_gate
+from .gates import gate_failure, merge_maximal_ledger_item, verify_gate
 from .git_ops import git, git_head, git_status_text, require_clean_worktree, write_git_diff
 from .hints import extract_operational_hints
 from .models import GateDecision, PmError, PlanSlice
@@ -1124,8 +1124,8 @@ def _fresh_session_repair_prompt(
             if not isinstance(items, list):
                 continue
             for item in items:
-                if isinstance(item, dict) and item not in destination:
-                    destination.append(item)
+                if isinstance(item, dict):
+                    merge_maximal_ledger_item(destination, item)
 
     original_prompt = original_prompt_path.read_text(encoding="utf-8")
     archives = "\n".join(f"- `{path}`" for path in archived_results) or "- none"
