@@ -170,3 +170,42 @@ class PmTestCase(unittest.TestCase):
             slices=entries,
             run_id=run_id,
         )
+
+    def set_current_slice(
+        self,
+        state: dict,
+        token: str,
+        run_dir: Path,
+        *,
+        slice_id: str,
+        before_head: str | None,
+        artifact_dir: Path | None = None,
+        **overrides,
+    ) -> dict:
+        """Set `state['current_slice']` (Stage 2 floor tests) and persist it.
+
+        `overrides` lets a test add extra current_slice fields (e.g.
+        `attempts`); `before_head` and `artifact_dir` cover the fields the
+        floor reads directly. Returns the freshly loaded, persisted state.
+        """
+        current = {
+            "id": slice_id,
+            "artifact_dir": str(artifact_dir) if artifact_dir is not None else "",
+            "before_head": before_head,
+        }
+        current.update(overrides)
+        updated = dict(state)
+        updated["current_slice"] = current
+        state_mod.save_state(run_dir, updated, token)
+        return state_mod.load_state(run_dir, token)
+
+    def record_approval(
+        self, state: dict, token: str, run_dir: Path, *, slice_id: str, reason: str = "approved for test"
+    ) -> dict:
+        """Record a human approval for `slice_id` (Stage 2 floor tests) and persist it."""
+        updated = dict(state)
+        approvals = dict(updated.get("approvals") or {})
+        approvals[slice_id] = {"at": "2026-01-01T00:00:00Z", "reason": reason}
+        updated["approvals"] = approvals
+        state_mod.save_state(run_dir, updated, token)
+        return state_mod.load_state(run_dir, token)
