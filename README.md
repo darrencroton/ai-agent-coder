@@ -2,9 +2,9 @@
 
 **One safety chain for AI coding agents, applied at increasing levels of independence — from a single standalone review to a fully unattended multi-slice run.**
 
-AI coding agents are strong implementers and unreliable narrators: left unsupervised they expand scope, grade their own work generously, and report success that can diverge from what actually happened in the repository. This repository moves trust out of the model and into contracts, evidence, and role separation. What "authorized" means is frozen before coding; authorization is audited separately from quality; and acceptance rests on repository evidence, never on the agent's say-so. The agent moves fast inside the lane — it just doesn't get to redraw it.
+AI coding agents are strong implementers and unreliable narrators: left unsupervised they expand scope, grade their own work generously, and report success that can diverge from what actually happened in the repository. This repository combines a small mechanical floor of non-negotiable checks — the highest-harm failures (unauthorized surface changes, broken history, self-approved human gates) are made mechanically impossible — with accountable, recorded judgement above it. What "authorized" means is frozen before coding; authorization is audited before quality; and every acceptance rests on repository evidence and is recorded with its reasoning, never accepted on the agent's say-so. The agent moves fast inside the lane — it just doesn't get to redraw it.
 
-The system is graduated: use one skill standalone (a single code review), run a plan slice-by-slice with checkpoints, or hand a whole plan to an external supervisor and come back to committed, verified slices. The safety chain — **plan → scoped implementation → validation → drift audit → code review → commit** — never changes; only who holds the gates does.
+The system is graduated: use one skill standalone (a single code review), run a plan slice-by-slice with checkpoints, or hand a whole plan to an external supervisor and come back to committed, assessed slices. The protected outcomes stay constant at every rung; the process depth scales with risk — a docs slice carries light process, a consequential one carries independent review and human decisions. The skill chain — **plan → scoped implementation → validation → drift audit → code review → commit** — is the shared vocabulary throughout; who holds the gates, and how deep each check goes, is what changes between rungs.
 
 Why it exists, who it serves, and the principles that govern design decisions live in [`docs/VISION.md`](docs/VISION.md).
 
@@ -100,14 +100,14 @@ Everything the system produces — run state, artifacts, transcripts, Reviewer e
 - **Frozen contract** — a slice's authorization, fixed before coding: acceptance criteria, authorized surface, non-goals, validation plan, rollback path.
 - **Authorized surface** — the files (and functions/tests) a slice may touch; everything else is drift.
 - **Drift audit** — the authorization gate: compares actual changes against the frozen contract, before any quality judgment.
-- **Gate** — a check that must pass before work advances: validation, drift audit, code review, commit evidence, clean worktree.
+- **Gate** — a check that must pass before work advances. In Mode A these are the in-session chain steps (validation, drift audit, code review, commit evidence); in Mode B there are exactly three: the mechanical floor, PM assessment, and human approval.
 - **Harness** — a coding-agent CLI (Codex CLI, Claude Code, OpenCode, Copilot CLI, …) that PM or you run a session in.
 - **Orchestrator** — the skill and workflow that coordinates Developer execution with optional read-only Reviewer evidence.
 - **Developer** — the context-rich agent that owns implementation, validation, session management, gates, commits, and delivery. Under PM it is the supervised per-slice session and has no authority above PM.
 - **Reviewer** — a read-only helper for investigation, evidence gathering, drift audit, and code review. It owns no gates, never mutates the repository, never commits, and never re-delegates.
 - **PM seat** — in Mode B, the model that drives Project Manager's commands and judgement; every acceptance is its recorded, accountable decision.
 - **Project Manager (PM)** — the accountable supervisor: a deterministic toolkit owns state, sessions, and the mechanical floor; the PM agent owns assessment, review depth, steering, and stop decisions.
-- **Floor** — the eight mechanical, non-waivable facts checked at finalize (frozen surface, commit ancestry, clean worktree, plan digest, approvals, result identity, hard-stop scan); any failure blocks acceptance.
+- **Floor** — the eight mechanical, non-waivable facts checked at finalize (plan digest, repo/branch identity, approvals, result identity, frozen surface, commit ancestry, clean worktree, hard-stop scan); any failure blocks acceptance.
 - **Run state** — authenticated state and PM-authored originals under the repo's git directory, mirrored with per-slice artifacts under `.pm/` in the target repo; the audit trail.
 
 ## License

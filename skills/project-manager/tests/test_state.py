@@ -296,6 +296,46 @@ class TestAtomicSaveAndLocking(PmTestCase):
 
         self.assertTrue(lock_path.exists())  # never stolen or deleted
 
+    def test_verified_read_pairs_json_and_mac_under_lock(self) -> None:
+        plan_path = self.write_plan()
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+
+        # Part 1: overwrite run.json with different, still valid-shape JSON
+        # bytes directly, without touching the MAC — load_state must catch
+        # the resulting json/mac mismatch and fail closed.
+        raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        raw["stop_reason"] = "tampered-without-resigning"
+        (run_dir / "run.json").write_text(
+            json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with self.assertRaises(IntegrityError):
+            state_mod.load_state(run_dir, token)
+
+        # Part 2: the verified read takes the same advisory lock save_state
+        # holds (so a writer mid-replace of run.json/run.json.mac can never
+        # be read as a mismatched pair) — a concurrent lock holder must
+        # block the read and time out with a PmError naming the lock,
+        # mirroring test_concurrent_lock_holder_blocks_save_state_without_
+        # deleting_lock above. A fresh, correctly-signed run isolates this
+        # from the tamper detection in Part 1.
+        _state2, token2, run_dir2 = self.make_run(plan_path=plan_path, run_id="lock-read-run")
+        lock_path = run_dir2 / ".lock"
+        holder = open(lock_path, "a+")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        original_timeout = state_mod._LOCK_TIMEOUT_SECONDS
+        state_mod._LOCK_TIMEOUT_SECONDS = 0.3
+        try:
+            with self.assertRaises(PmError) as ctx:
+                state_mod.load_state(run_dir2, token2)
+            self.assertNotIsInstance(ctx.exception, IntegrityError)
+            self.assertIn("lock", str(ctx.exception).lower())
+        finally:
+            state_mod._LOCK_TIMEOUT_SECONDS = original_timeout
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+            holder.close()
+
+        self.assertTrue(lock_path.exists())  # never stolen or deleted
+
 
 class TestNewRunIdCollisions(unittest.TestCase):
     def test_new_run_id_bare_call_has_no_suffix(self) -> None:

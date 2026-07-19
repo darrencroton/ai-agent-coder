@@ -51,6 +51,21 @@ _OBSERVE_TAIL_LINES = 40
 # later Developer prompt.
 _NOTES_SIZE_CAP_BYTES = 512 * 1024
 
+# The stop_reason recorded on attempt-budget exhaustion. Load-bearing: the
+# exhaustion guard below matches on it, which is what makes the budget a
+# genuine terminal stop (design §11 "mandatory stop") rather than a status
+# note — after exhaustion, only `finalize --stop` (record the story) and
+# `stop` remain available for the slice.
+_BUDGET_EXHAUSTED_REASON = "attempt budget exhausted"
+
+
+def _refuse_if_budget_exhausted(state: dict[str, Any]) -> None:
+    if state.get("status") == "needs-human" and state.get("stop_reason") == _BUDGET_EXHAUSTED_REASON:
+        raise PmError(
+            "attempt budget exhausted for the current slice; record the outcome with "
+            "finalize --stop (or stop the run) — steering, sending, and acceptance are closed"
+        )
+
 
 # --- Path helpers ------------------------------------------------------------
 
@@ -361,8 +376,12 @@ class StatusResult:
     current_session_alive: bool | None
 
 
-def status(repo: Path, run_dir: Path) -> StatusResult:
-    state = state_mod.load_state(run_dir)
+def status(repo: Path, run_dir: Path, token: str | None = None) -> StatusResult:
+    # Opportunistically MAC-verified when the controller's token is
+    # available: the PM agent acts on status output between mutating
+    # commands, so a tampered state should surface here, not one command
+    # later. Tokenless (human) reads stay unverified, as documented.
+    state = state_mod.load_state(run_dir, token)
     plan_error: str | None = None
     slices: list[plan_mod.PlanSlice] | None = None
     try:
@@ -483,6 +502,15 @@ def start_slice(
     if not relaunch:
         plan_slice = plan_mod.next_slice(slices, state)
         if plan_slice is None:
+            # Design §3.4 (Finish): the run ends honestly with a final state
+            # write and report regeneration — an all-attested run reaches
+            # completion here rather than idling as "active" forever.
+            if state.get("status") != "complete":
+                state["status"] = "complete"
+                state["stop_reason"] = None
+                state_mod.save_state(run_dir, state, token)
+                state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
+                regenerate_report(repo, run_dir, state)
             return StartSliceOutcome(kind="all_complete")
 
     assert plan_slice is not None
@@ -520,11 +548,17 @@ def start_slice(
     if relaunch:
         attempts = int(entry.get("attempts", 0)) + 1
         if attempts > max_attempts:
+            # Exhaustion is a mandatory stop (design §11): kill the live
+            # session so nothing keeps working past the budget; the slice
+            # stays current so finalize --stop can record the full story.
+            session = current.get("tmux_session") if current else None
+            if session:
+                sessions.force_stop(session)
             state["status"] = "needs-human"
-            state["stop_reason"] = "attempt budget exhausted"
+            state["stop_reason"] = _BUDGET_EXHAUSTED_REASON
             state_mod.save_state(run_dir, state, token)
             state_mod.append_event(
-                run_dir, "stop", slice_id=plan_slice.slice_id, note="attempt budget exhausted"
+                run_dir, "stop", slice_id=plan_slice.slice_id, note=_BUDGET_EXHAUSTED_REASON
             )
             return StartSliceOutcome(kind="attempts_exhausted", slice_id=plan_slice.slice_id)
     else:
@@ -636,7 +670,11 @@ def start_slice(
         "wake_at": None,
         "reviewer_pids": [],
     }
-    launch_overrides = {key: value for key, value in (("model", model), ("effort", effort)) if value}
+    launch_overrides: dict[str, Any] = {key: value for key, value in (("model", model), ("effort", effort)) if value}
+    if reviewer_tools:
+        # Recorded per slice (design §8); review._resolve_tool prefers it
+        # over the run-level reviewer configuration.
+        launch_overrides["reviewer_tools"] = list(profiles.parse_reviewer_tools(reviewer_tools))
     if launch_overrides:
         new_current["launch"] = launch_overrides
 
@@ -683,8 +721,9 @@ class ObserveOutcome:
     slice_id: str | None = None
 
 
-def observe(repo: Path, run_dir: Path, *, wait: float | None = None) -> ObserveOutcome:
-    state = state_mod.load_state(run_dir)
+def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str | None = None) -> ObserveOutcome:
+    # Same opportunistic verification as status(): see the comment there.
+    state = state_mod.load_state(run_dir, token)
     current = state.get("current_slice")
     if not current or not current.get("tmux_session"):
         return ObserveOutcome(has_current_slice=False)
@@ -757,6 +796,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None) -> ObserveO
 
 def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> None:
     state = load_writable_state(run_dir, token)
+    _refuse_if_budget_exhausted(state)
     current = state.get("current_slice")
     session = current.get("tmux_session") if current else None
     if not current or not session or not sessions.session_exists(session):
@@ -975,6 +1015,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         )
 
     state = load_writable_state(run_dir, token)
+    _refuse_if_budget_exhausted(state)
     current = state.get("current_slice")
     if not current:
         raise PmError("no current slice to finalize")
@@ -1038,8 +1079,19 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     if session:
         sessions.force_stop(session)
 
+    # Accepting the final undecided slice finishes the run (design §3.4):
+    # the state write below is the final one and the report regeneration is
+    # the closing act.
+    slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
+    run_complete = plan_mod.next_slice(slices, state) is None
+    if run_complete:
+        state["status"] = "complete"
+        state["stop_reason"] = None
+
     state_mod.save_state(run_dir, state, token)
     state_mod.append_event(run_dir, "accept", slice_id=slice_id, note=first_line, evidence=str(assessment_original))
+    if run_complete:
+        state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
     regenerate_report(repo, run_dir, state)
 
     return AcceptOutcome(
@@ -1064,6 +1116,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     """`finalize --steer "correction"`: a corrective nudge into the LIVE
     session, counted against the same attempt budget as a relaunch."""
     state = load_writable_state(run_dir, token)
+    _refuse_if_budget_exhausted(state)
     current = state.get("current_slice")
     if not current:
         raise PmError("no current slice to steer")
@@ -1086,10 +1139,13 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     policy = state.get("policy") or {}
     max_attempts = int(policy.get("max_attempts", 3))
     if attempts > max_attempts:
+        # Mandatory stop, as in start_slice's exhaustion path: the live
+        # session is killed, not left running past the budget.
+        sessions.force_stop(session)
         state["status"] = "needs-human"
-        state["stop_reason"] = "attempt budget exhausted"
+        state["stop_reason"] = _BUDGET_EXHAUSTED_REASON
         state_mod.save_state(run_dir, state, token)
-        state_mod.append_event(run_dir, "stop", slice_id=slice_id, note="attempt budget exhausted")
+        state_mod.append_event(run_dir, "stop", slice_id=slice_id, note=_BUDGET_EXHAUSTED_REASON)
         return SteerOutcome(
             kind="budget_exhausted", slice_id=slice_id, message="attempt budget exhausted; steer refused"
         )

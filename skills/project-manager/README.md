@@ -31,7 +31,7 @@ Exit codes: 0 success; 1 = a `finalize` refusal — a floor fact failed, or `--a
 
 ## Layout: who owns what
 
-- **`<git-dir>/pm/<run-id>/`** — authoritative state and every PM-authored original (assessments, reviews, notes, report). Outside the worktree; HMAC-authenticated; see [references/run-state.md](references/run-state.md).
+- **`<git-dir>/pm/<run-id>/`** — authoritative state (`run.json`, HMAC-authenticated) and every PM-authored original (assessments, reviews, notes, report — plain files, protected by living outside the worktree, not by the MAC). See [references/run-state.md](references/run-state.md).
 - **`<repo>/.pm/runs/<run-id>/`** — the human-facing mirror of PM artifacts plus Developer-authored evidence (`result.json`, `validation.md`, pane captures, diffs, prompts). Self-ignoring via `.pm/.gitignore`. The boundary, precisely: PM's records and decisions live in the controller originals and are never read back from this mirror — but Developer-authored evidence here (`result.json`, `validation.md`) *is* input to the floor and to PM's assessment. Vandalizing it damages the Developer's own case and fails the slice closed (floor fact 4); it can never forge an acceptance or alter PM state.
 - Per slice: `prompt.md` (the rendered authorization), `pane-live.txt`/`pane.txt`, `status-before/after.txt`, `diff.patch`, `validation.md`, `result.json`, `attempt-<n>/` for superseded launches, `assessment.md` + `review-*.md` mirrors.
 
@@ -47,7 +47,8 @@ Everything stays local; the toolkit phones nowhere. But captured artifacts can s
 
 | Artifact | May contain |
 |---|---|
-| `pane*.txt`, `transcript.jsonl` | anything printed in-session: code, env values, echoed secrets |
+| `pane*.txt` | anything printed in-session: code, env values, echoed secrets |
+| harness-side transcripts (e.g. Claude Code's own session files — the toolkit passes `--session-id` but does not copy them into `.pm/`) | full session content, stored under the harness's home directory |
 | `diff.patch`, `review-*.md` | repository code, including sensitive files inside the surface |
 | `validation.md`, `result.json` | command output the Developer chose to record |
 

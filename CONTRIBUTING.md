@@ -1,6 +1,6 @@
 # Contributing
 
-This repository is an autonomy system first (see [`docs/VISION.md`](docs/VISION.md)); its parts are reusable skills. Changes are judged against the vision's principles — most often *one source of truth per contract*, *design for the weakest model in the loop*, and *an honest threat model, stated where it matters*.
+This repository is an autonomy system first (see [`docs/VISION.md`](docs/VISION.md)); its parts are reusable skills. Changes are judged against the vision's principles — most often *one source of truth per contract*, *mechanise the floor; judge the rest*, *minimise the whole system*, and *an honest threat model, stated where it matters*.
 
 ## Vision Governance
 

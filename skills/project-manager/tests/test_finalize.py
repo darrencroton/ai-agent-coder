@@ -613,9 +613,113 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
 # --- 10: stop reaps a hung reviewer -------------------------------------------
 
 
+# --- 11: attempt-budget exhaustion is a mandatory stop that closes send, ----
+# --- steer, and accept, leaving only finalize --stop and stop open ----------
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
+    def test_budget_exhaustion_kills_session_and_closes_steer_send_accept(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "0"])
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        # Attempt 0 (the initial launch) is never budget-checked — only a
+        # relaunch or a steer counts against the budget — so this succeeds
+        # even with max_attempts=0.
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        session = self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+
+        # The steer itself would be attempt 1, over the budget of 0: refused,
+        # and the exhaustion is a mandatory stop that force-kills the session.
+        code, _out, err = self.run_cli_in_repo(
+            ["finalize", "--steer", "fix it please", "--token", token]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertIn("attempt budget exhausted", err)
+
+        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["status"], "needs-human")
+        self.assertEqual(state["stop_reason"], "attempt budget exhausted")
+
+        code, _out, err = self.run_cli_in_repo(
+            ["send", "--text", "hi", "--reason", "nudge", "--token", token]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("attempt budget exhausted", err)
+
+        code, _out, err = self.run_cli_in_repo(
+            ["finalize", "--accept", _LONG_REASONING, "--token", token]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("attempt budget exhausted", err)
+
+        # finalize --stop remains open even after exhaustion — recording the
+        # outcome (floor passing or not) is exactly what a mandatory stop
+        # still permits.
+        code, out, err = self.run_cli_in_repo(
+            ["finalize", "--stop", "human should look at this", "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("STOPPED", out)
+
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        self.assertEqual(entry["status"], "stopped")
+        assessment_path = Path(entry["assessment"])
+        self.assertTrue(assessment_path.is_file())
+        self.assertIn("STOPPED", assessment_path.read_text(encoding="utf-8"))
+
+
+# --- 12: accepting the last undecided slice completes the run ---------------
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestAcceptingFinalSliceCompletesRun(FinalizeTestCase):
+    def test_accepting_final_slice_marks_run_complete(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ACCEPTED", out)
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["status"], "complete")
+        self.assertIsNone(state["stop_reason"])
+
+        report_text = (run_dir / "run-report.md").read_text(encoding="utf-8")
+        self.assertIn("complete", report_text)
+
+        events = state_mod.read_events(run_dir)
+        self.assertTrue(any(event["kind"] == "complete" for event in events))
+
+
 class TestStopReapsHungReviewer(PmTestCase):
     def test_stop_kills_reviewer_process_group(self) -> None:
-        plan_path = self.write_plan(slices=[{"files": ["a.py"]}])
+        # plan.md must live OUTSIDE the worktree: an untracked plan.md inside
+        # the repo is a dirty-tree entry, and `review` now refuses on a dirty
+        # worktree (the pinned-tree guard), which would fail this test before
+        # the reviewer subprocess ever launches.
+        plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
         before_head = self._git("rev-parse", "HEAD").stdout.strip()
         self.set_current_slice(

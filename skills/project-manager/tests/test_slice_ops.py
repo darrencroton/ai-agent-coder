@@ -61,6 +61,7 @@ the retained fake-harness pattern (replacement-ledger §9.1/§9.3). Pins:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -127,8 +128,19 @@ def _idle_script(*, sleep_seconds: float = 30.0) -> str:
     return f"echo FAKE_HARNESS_READY\nsleep {sleep_seconds}"
 
 
-def _credential_prompt_script(*, sleep_seconds: float = 30.0) -> str:
-    return f"echo 'Enter API key to continue'\nsleep {sleep_seconds}"
+def _credential_prompt_script(*, reveal_after: float = 5.0, sleep_seconds: float = 30.0) -> str:
+    """A harness that comes up clean, then reveals a credential prompt only
+    *after* the developer prompt has been injected.
+
+    The pane must be clear of hard-stop markers at injection time —
+    `send_prompt` refuses to paste into a visible credential/approval/side-
+    effect prompt (the launch-time hard-prompt floor), so a harness that
+    printed the marker as its first line would fail `start-slice` itself and
+    never reach the live-session `send`-refusal this scenario exercises.
+    The readiness wait settles on the clean `FAKE_HARNESS_READY` pane and
+    injects; `reveal_after` seconds later the credential prompt appears, and
+    a subsequent `send` is what must refuse."""
+    return f"echo FAKE_HARNESS_READY\nsleep {reveal_after}\necho 'Enter API key to continue'\nsleep {sleep_seconds}"
 
 
 def _dies_quickly_script(*, delay: float = 3.0) -> str:
@@ -371,6 +383,27 @@ class TestTokenGating(SliceOpsTestCase):
         self.assertEqual(code, 0)
         code, _out, _err = self.run_cli_in_repo(["observe"])
         self.assertEqual(code, 0)
+
+    def test_status_verifies_state_when_token_supplied(self) -> None:
+        _state, token, run_dir = self._make_gated_run()
+        current_raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        current_raw["stop_reason"] = "tamper-marker-status"
+        tampered_bytes = json.dumps(current_raw, indent=2, sort_keys=True) + "\n"
+        (run_dir / "run.json").write_text(tampered_bytes, encoding="utf-8")
+
+        code, _out, err = self.run_cli_in_repo(["status", "--token", token])
+        self.assertEqual(code, 2)
+        self.assertIn("INTEGRITY", err)
+
+        # Plain status (no --token, no PM_RUN_TOKEN in env) skips MAC
+        # verification and still succeeds against the same tampered file.
+        previous = os.environ.pop("PM_RUN_TOKEN", None)
+        try:
+            code, _out, _err = self.run_cli_in_repo(["status"])
+            self.assertEqual(code, 0)
+        finally:
+            if previous is not None:
+                os.environ["PM_RUN_TOKEN"] = previous
 
 
 # --- 4. approve -------------------------------------------------------------
@@ -710,6 +743,22 @@ class TestAllSlicesComplete(SliceOpsTestCase):
 
         state = state_mod.load_state(run_dir, token)
         self.assertIsNone(state["current_slice"])
+
+    def test_all_attested_run_transitions_to_complete(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        _state, token, run_dir = self.make_run(plan_path=plan_path, slice_statuses={"Slice 1": "attested"})
+
+        code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self.assertIn("all slices complete", out)
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["status"], "complete")
+
+        events = state_mod.read_events(run_dir)
+        self.assertTrue(any(event["kind"] == "complete" for event in events))
+
+        self.assertTrue((run_dir / "run-report.md").is_file())
 
 
 if __name__ == "__main__":

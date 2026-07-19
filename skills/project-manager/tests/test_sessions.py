@@ -33,8 +33,10 @@ Pins:
 
 from __future__ import annotations
 
+import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -275,6 +277,60 @@ class TestSendLine(TmuxSessionTestCase):
     def test_send_line_refuses_when_session_dead(self) -> None:
         with self.assertRaises(PmError):
             sessions.send_line("pm-test-definitely-not-running-s01a0", "hello")
+
+
+class TestStartSessionStripsInheritedToken(TmuxSessionTestCase):
+    def test_start_session_strips_inherited_run_token(self) -> None:
+        # Two distinct ways a token could leak into a Developer session's
+        # inherited environment: (1) the controller PROCESS's own
+        # os.environ at the moment it shells out to tmux, and (2) the
+        # long-running tmux SERVER's own global environment, which a new
+        # session forked into an *already-running* server inherits instead
+        # of the calling process's current os.environ (verified: a bare
+        # os.environ mutation is invisible to a session created in an
+        # already-running default-socket server). Both are seeded here so
+        # this test actually exercises start_session's "unset
+        # PM_RUN_TOKEN;" prefix rather than passing vacuously because the
+        # var was never inherited in the first place.
+        previous_env = os.environ.get("PM_RUN_TOKEN")
+        os.environ["PM_RUN_TOKEN"] = "secret-inherit-test"
+
+        def _restore_env() -> None:
+            if previous_env is None:
+                os.environ.pop("PM_RUN_TOKEN", None)
+            else:
+                os.environ["PM_RUN_TOKEN"] = previous_env
+
+        self.addCleanup(_restore_env)
+
+        subprocess.run(
+            ["tmux", "set-environment", "-g", "PM_RUN_TOKEN", "secret-inherit-test"], check=False
+        )
+        self.addCleanup(
+            lambda: subprocess.run(["tmux", "set-environment", "-gu", "PM_RUN_TOKEN"], check=False)
+        )
+
+        script_path = self.repo / "fake_harness.sh"
+        _write_fake_harness(script_path, 'echo "TOKEN_IS=${PM_RUN_TOKEN:-ABSENT}"\nsleep 15')
+
+        name = "pm-test-striptoken-s01a0"
+        self._start(name, str(script_path), {})
+        self.assertTrue(self._wait_for(lambda: "TOKEN_IS=" in sessions.pane_text(name)))
+        self.assertIn("TOKEN_IS=ABSENT", sessions.pane_text(name))
+
+
+class TestSendPromptCredentialGuard(TmuxSessionTestCase):
+    def test_send_prompt_refuses_into_visible_credential_prompt(self) -> None:
+        name = "pm-test-sendprompt-credential-s01a0"
+        self._start(name, "bash -c 'echo Enter API key to continue; sleep 30'")
+        self.assertTrue(self._wait_for(lambda: "Enter API key" in sessions.pane_text(name)))
+
+        prompt_path = self.repo / "prompt.txt"
+        prompt_path.write_text("PM_TEST_PROMPT_MARKER\n", encoding="utf-8")
+
+        with self.assertRaises(PmError) as ctx:
+            sessions.send_prompt(name, prompt_path)
+        self.assertIn("credential", str(ctx.exception).lower())
 
 
 class TestWaitUntilReady(TmuxSessionTestCase):

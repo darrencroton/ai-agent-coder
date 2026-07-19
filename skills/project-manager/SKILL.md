@@ -13,7 +13,7 @@ You may: accept a slice (only ever above a passing floor), steer it, or stop it 
 
 You may never: write slice code; author, edit, or expand a plan; waive or soften any floor fact; approve a human-gated slice yourself; push, deploy, or cause external side effects; put `PM_RUN_TOKEN` into a Developer or Reviewer session's environment or prompt.
 
-Evidence rules: the Developer's narration is a pointer, never evidence. Assess from the diff, the commit, `validation.md`, review reports, and git state. Cite what you examined in every assessment. An imperfect `result.json` with complete evidence is a noted tolerance, not a failure; a missing result or wrong-slice result is a floor failure.
+Evidence rules: the Developer's narration is a pointer, never evidence. Assess from the diff, the commit, `validation.md`, review reports, and git state. Cite what you examined in every assessment. An imperfect `result.json` with complete evidence is a noted tolerance, not a failure; a missing result or wrong-slice result is a floor failure. A missing or thin `validation.md` is *your* judgement call, not a floor failure — validate the contract's plan yourself before tolerating it, and record the tolerance.
 
 ## The floor (mechanical, non-waivable)
 
@@ -27,7 +27,7 @@ Two levels. `plan_risk` is derived mechanically at parse time and is immutable. 
 
 1. **Prepare.** `check-plan` (auto at `init`); resolve warnings or accept them consciously. `init --repo … --plan … --harness …` prints the run token once — export it as `PM_RUN_TOKEN` in your own environment only.
 2. **Execute.** `start-slice` launches a fresh session per slice with the frozen contract and your curated notes. `observe [--wait N]` between checks; be patient with local models. Nudge a genuinely idle session with `send` (free); steer corrections with `finalize --steer` (costs an attempt). Relaunch (`start-slice` again) when a session is dead or poisoned (costs an attempt).
-3. **Assess.** When `result.json` appears (or the session dies), run `finalize`. Read the floor output, then the diff against intent and non-goals (authorization before quality, always), then `validation.md` against the contract's validation plan — rerun commands yourself when risk or doubt warrants. Commission reviews as needed. Then record exactly one of:
+3. **Assess.** When `result.json` appears (or the session dies), run `finalize`. Read the floor output, then the diff against intent and non-goals (authorization before quality, always), then `validation.md` against the contract's validation plan — rerun commands yourself when risk or doubt warrants. Before commissioning any review, quiesce the Developer session (it must not be mid-write) — the toolkit refuses `review` on a dirty worktree, and reviews go stale on any tree change. Then record exactly one of:
    - `finalize --accept "<your reasoning>"` — the reasoning is the accountability record: what you checked, what you read, why it satisfies the contract, any tolerance or interpretation you granted, findings worth carrying.
    - `finalize --steer "<written correction from the actual gap>"`
    - `finalize --stop "<why a human is needed>"`

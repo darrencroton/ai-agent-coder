@@ -245,7 +245,19 @@ def load_state(run_dir: Path, token: str | None = None) -> dict[str, Any]:
     run_json = run_dir / "run.json"
     if not run_json.exists():
         raise PmError(f"run state not found: {run_json}")
-    payload = run_json.read_bytes()
+
+    if token is None:
+        payload = run_json.read_bytes()
+    else:
+        # Verified reads take the same advisory lock the writer holds:
+        # save_state replaces run.json and its MAC as two files, so an
+        # unlocked reader could pair new JSON with the old MAC and report a
+        # false — and terminal — integrity breach.
+        with _advisory_lock(run_dir / ".lock"):
+            payload = run_json.read_bytes()
+            mac_path = run_dir / "run.json.mac"
+            recorded_mac = mac_path.read_text(encoding="utf-8").strip() if mac_path.exists() else None
+
     try:
         state = json.loads(payload.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -256,11 +268,9 @@ def load_state(run_dir: Path, token: str | None = None) -> dict[str, Any]:
         recorded_hash = auth.get("token_sha256") if isinstance(auth, dict) else None
         if recorded_hash != token_sha256(token):
             raise PmError("run capability token does not match this run's state")
-        mac_path = run_dir / "run.json.mac"
-        if not mac_path.exists():
-            raise IntegrityError(f"run state MAC missing: {mac_path}")
+        if recorded_mac is None:
+            raise IntegrityError(f"run state MAC missing: {run_dir / 'run.json.mac'}")
         expected = hmac.new(token.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-        recorded_mac = mac_path.read_text(encoding="utf-8").strip()
         if not hmac.compare_digest(expected, recorded_mac):
             raise IntegrityError(f"run state failed MAC verification: {run_json}")
 
@@ -269,16 +279,21 @@ def load_state(run_dir: Path, token: str | None = None) -> dict[str, Any]:
 
 
 def verify_state_mac(run_dir: Path, token: str) -> None:
-    """Explicit MAC check, independent of loading. Raises IntegrityError on any mismatch."""
+    """Explicit MAC check, independent of loading. Raises IntegrityError on any mismatch.
+
+    Locked for the same reason as the verified-read path in load_state: the
+    JSON and its MAC are two files, and only the lock makes them a pair.
+    """
     run_json = run_dir / "run.json"
     if not run_json.exists():
         raise PmError(f"run state not found: {run_json}")
-    mac_path = run_dir / "run.json.mac"
-    if not mac_path.exists():
-        raise IntegrityError(f"run state MAC missing: {mac_path}")
-    payload = run_json.read_bytes()
+    with _advisory_lock(run_dir / ".lock"):
+        mac_path = run_dir / "run.json.mac"
+        if not mac_path.exists():
+            raise IntegrityError(f"run state MAC missing: {mac_path}")
+        payload = run_json.read_bytes()
+        recorded_mac = mac_path.read_text(encoding="utf-8").strip()
     expected = hmac.new(token.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-    recorded_mac = mac_path.read_text(encoding="utf-8").strip()
     if not hmac.compare_digest(expected, recorded_mac):
         raise IntegrityError(f"run state failed MAC verification: {run_json}")
 

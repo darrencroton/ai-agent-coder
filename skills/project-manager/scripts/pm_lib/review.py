@@ -20,6 +20,7 @@ cannot race the reviewer.
 from __future__ import annotations
 
 import hashlib
+import os
 import shlex
 import subprocess
 from dataclasses import dataclass, field
@@ -121,6 +122,14 @@ def _build_reviewer_command(
 def _resolve_tool(state: dict[str, Any], tool_arg: str | None, *, has_override: bool) -> str:
     if tool_arg:
         return tool_arg
+    # A per-slice override recorded by `start-slice --reviewer-tools` wins
+    # over the run-level reviewer configuration (target-design §8: per-slice
+    # overrides live in the slice's launch record).
+    current = state.get("current_slice") or {}
+    launch = current.get("launch") or {}
+    slice_tools = launch.get("reviewer_tools") or []
+    if slice_tools:
+        return slice_tools[0]
     tools = (state.get("reviewer") or {}).get("tools") or []
     if tools:
         return tools[0]
@@ -190,6 +199,18 @@ def run_review(
     if reviewed_head == before_head:
         raise PmError(f"HEAD has not advanced past before_head ({before_head}); nothing to review")
 
+    # The reviewer reads the live checkout, so the tree must actually BE the
+    # pinned committed state when the review starts (target-design §10:
+    # review input is pinned, not live; PM quiesces the Developer first). A
+    # dirty tree means the reviewer would judge uncommitted work the range
+    # does not cover — refuse rather than silently review the wrong tree.
+    dirty = git_ops.meaningful_status_lines(git_ops.git_status_text(repo))
+    if dirty:
+        raise PmError(
+            "worktree is dirty outside .pm/ — a review must run against the pinned committed tree; "
+            "quiesce the Developer session and commit or restore before commissioning: " + "; ".join(dirty)
+        )
+
     run_id = state["run_id"]
     plan_slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
     plan_slice = plan_mod.plan_slice_by_id(plan_slices, slice_id)
@@ -248,9 +269,15 @@ def run_review(
     report_original.parent.mkdir(parents=True, exist_ok=True)
     stderr_path = original_slice_dir / f"review-{seq}-{skill}-{resolved_tool}-stderr.txt"
 
+    # The reviewer process must not inherit the PM run capability token from
+    # the controller's exported environment (target-design §8: the token is
+    # the controller's alone; SKILL.md forbids it in any Reviewer session).
+    reviewer_env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
+
     with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:
         process = subprocess.Popen(
-            command, cwd=str(repo), stdout=stdout_handle, stderr=stderr_handle, start_new_session=True
+            command, cwd=str(repo), stdout=stdout_handle, stderr=stderr_handle,
+            start_new_session=True, env=reviewer_env,
         )
         # start_new_session=True makes the child its own process-group
         # leader, so its pgid equals its pid at creation time — no
@@ -263,19 +290,24 @@ def run_review(
         state_mod.save_state(run_dir, state, token)
         returncode = process.wait()
 
+    # Reload and clear the recorded pgid FIRST, on every exit path: the
+    # process has exited, so a failed review must not leave a stale
+    # process-group id behind for a later `stop` to SIGKILL after PID reuse.
+    # (Re-reading also avoids relying on the in-memory state staying
+    # accurate across the potentially long subprocess wait above.)
+    state = slice_ops.load_writable_state(run_dir, token)
+    current = state.get("current_slice")
+    if current is not None and current.get("reviewer_pids"):
+        current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
+
     if returncode != 0:
+        state_mod.save_state(run_dir, state, token)
         stderr_tail = _tail(stderr_path)
         raise PmError(f"reviewer command failed (exit {returncode}): {stderr_tail}")
 
     report_original = slice_ops.mirror_artifact(repo, run_dir, run_id, report_relative)
     sha256 = _sha256_report(report_original)
 
-    # Reload: nothing else should have written state concurrently (the
-    # token gates writers), but re-reading keeps this append minimal and
-    # avoids relying on the in-memory `state`/`current`/`entry` staying
-    # accurate across the (potentially long) subprocess wait above.
-    state = slice_ops.load_writable_state(run_dir, token)
-    current = state.get("current_slice")
     entry = slice_ops.slice_entry(state, slice_id)
     if entry is not None:
         reviews = list(entry.get("reviews") or [])
@@ -292,8 +324,6 @@ def run_review(
             }
         )
         entry["reviews"] = reviews
-    if current is not None and current.get("reviewer_pids"):
-        current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
 
     state_mod.save_state(run_dir, state, token)
     state_mod.append_event(

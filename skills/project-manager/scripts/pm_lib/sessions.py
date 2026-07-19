@@ -171,18 +171,23 @@ def session_name(run_id: str, slice_number: int, attempt: int) -> str:
 
 
 def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -> None:
-    """`tmux new-session -d -s <session> -c <repo> "<env-prefix> <command>"`.
+    """`tmux new-session -d -s <session> -c <repo> "unset PM_RUN_TOKEN; <env-prefix> <command>"`.
 
     Env values are shell-quoted. The Developer session's environment must
-    never carry the PM run capability token (target-design §8) — this is
-    asserted defensively here, not just upheld by callers.
+    never carry the PM run capability token (target-design §8) — asserted
+    defensively for the explicit map here, AND stripped from the inherited
+    environment: a tmux session inherits the server's (ultimately the
+    controller's) environment, so an exported PM_RUN_TOKEN would otherwise
+    be visible inside every Developer session. The `unset` runs in the
+    session's own shell before anything else.
     """
     if "PM_RUN_TOKEN" in env:
         raise PmError("session environment must never contain PM_RUN_TOKEN")
     if not shutil.which("tmux"):
         raise PmError("tmux is required for runtime execution")
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-    shell_command = f"{env_prefix} {command}".strip() if env_prefix else command
+    payload = f"{env_prefix} {command}".strip() if env_prefix else command
+    shell_command = f"unset PM_RUN_TOKEN; {payload}"
     _tmux_or_raise(["new-session", "-d", "-s", session, "-c", str(repo), shell_command], "tmux start failed")
 
 
@@ -301,7 +306,7 @@ def wait_until_ready(
     harness_executable: str,
     *,
     expected_model_display: str | None = None,
-    deadline_seconds: float = 20.0,
+    deadline_seconds: float = 60.0,
 ) -> None:
     """Dispatch readiness detection on the harness executable's basename.
 
@@ -332,6 +337,14 @@ def wait_until_ready(
 def send_prompt(session: str, prompt_path: Path) -> None:
     """load-buffer/paste-buffer/delete-buffer, then settle-and-double-C-m.
 
+    Refuses outright when any hard-stop marker is visible in the pane at
+    injection time — the initial prompt injection is a send like any other
+    (target-design §3.2's "hard-prompt refusal on any send"), and pasting a
+    multi-KB prompt plus double-Enter into a credential/approval/side-effect
+    dialog would answer it blind. Readiness polling screens only trust
+    prompts (their phrasings are launch-specific); this is the full-set
+    backstop at the moment that matters.
+
     A single C-m sent right after paste-buffer can be consumed finalizing the
     pasted multi-line block instead of submitting it (confirmed by
     reproduction in the old-evidence adapter); a second C-m after the TUI
@@ -339,6 +352,11 @@ def send_prompt(session: str, prompt_path: Path) -> None:
     already exited — a fast-finishing harness can exit before either fires,
     which is a normal completion path, not a send_prompt failure.
     """
+    hard_stop = scan_hard_stop(pane_text(session))
+    if hard_stop["present"]:
+        raise PmError(
+            "refusing to inject the slice prompt into a visible hard prompt: " + ", ".join(hard_stop["kinds"])
+        )
     buffer_name = f"{session}_prompt"
     _tmux_or_raise(["load-buffer", "-b", buffer_name, str(prompt_path)], "tmux prompt load failed")
     _tmux_or_raise(["paste-buffer", "-b", buffer_name, "-t", session], "tmux prompt paste failed")

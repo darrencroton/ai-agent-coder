@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -405,6 +406,133 @@ class TestReviewRefusals(ReviewCommandTestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("no reviewer tool", err.lower())
+
+
+# --- reviewer env sanitization, pgid clearing on failure, dirty worktree ------
+# --- refusal, and the per-slice reviewer-tool override (new production ------
+# --- behaviour pinned here; see module docstring items 6-8 for the ----------
+# --- surrounding contract) ----------------------------------------------------
+
+
+class TestReviewerEnvSanitization(ReviewCommandTestCase):
+    def test_reviewer_env_never_contains_run_token(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+
+        fake = _write_fake_reviewer(
+            self.repo.parent / "fake_reviewer_envcheck.sh",
+            'echo "TOKEN_IS=${PM_RUN_TOKEN:-ABSENT}"\nexit 0',
+        )
+
+        previous = os.environ.get("PM_RUN_TOKEN")
+        os.environ["PM_RUN_TOKEN"] = "should-never-reach-reviewer"
+
+        def _restore() -> None:
+            if previous is None:
+                os.environ.pop("PM_RUN_TOKEN", None)
+            else:
+                os.environ["PM_RUN_TOKEN"] = previous
+
+        self.addCleanup(_restore)
+
+        # The worktree must be clean at review time (a separate, new
+        # requirement pinned by TestReviewDirtyWorktreeRefusal below) — the
+        # helpers above only commit tracked changes, so nothing here leaves
+        # stray untracked files.
+        code, out, err = self.run_cli_in_repo(
+            [
+                "review", "--slice", "Slice 1", "--skill", "code-review",
+                "--tool", "faketool", "--reviewer-command", str(fake),
+                "--token", token,
+            ]
+        )
+        self.assertEqual(code, 0, err)
+
+        reloaded = state_mod.load_state(run_dir, token)
+        entry = reloaded["slices"][0]
+        artifact_path = Path(entry["reviews"][0]["artifact"])
+        self.assertIn("TOKEN_IS=ABSENT", artifact_path.read_text(encoding="utf-8"))
+
+
+class TestReviewerPidsClearedOnFailure(ReviewCommandTestCase):
+    def test_failed_reviewer_clears_recorded_process_group(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+
+        fake = _write_fake_reviewer(
+            self.repo.parent / "fake_reviewer_fail_pgid.sh",
+            'echo "boom" 1>&2\nexit 1',
+        )
+
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "review", "--slice", "Slice 1", "--skill", "code-review",
+                "--tool", "faketool", "--reviewer-command", str(fake),
+                "--token", token,
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("boom", err)
+
+        reloaded = state_mod.load_state(run_dir, token)
+        entry = reloaded["slices"][0]
+        self.assertEqual(entry.get("reviews") or [], [])
+        # The failure path must not leave a stale pgid behind for a later
+        # `stop` to SIGKILL after PID reuse.
+        self.assertEqual(reloaded["current_slice"]["reviewer_pids"], [])
+
+
+class TestReviewDirtyWorktreeRefusal(ReviewCommandTestCase):
+    def test_dirty_worktree_refuses_review(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+
+        # An uncommitted change to a tracked file: HEAD has legitimately
+        # advanced past before_head, but the tree the reviewer would read
+        # is no longer the pinned committed state.
+        (self.repo / "README.md").write_text("dirty content\n", encoding="utf-8")
+
+        code, _out, err = self.run_cli_in_repo(
+            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "faketool", "--token", token]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("dirty", err)
+
+        reloaded = state_mod.load_state(run_dir, token)
+        entry = reloaded["slices"][0]
+        self.assertEqual(entry.get("reviews") or [], [])
+
+
+class TestResolveToolOverride(ReviewCommandTestCase):
+    def test_slice_launch_reviewer_tools_override_wins(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        state, token, run_dir = self.make_run(
+            plan_path=plan_path, reviewer={"tools": ["claude"], "model": None, "effort": None}
+        )
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head,
+            launch={"reviewer_tools": ["opencode"]},
+        )
+        reloaded = state_mod.load_state(run_dir, token)
+
+        # No --tool arg: the slice's launch-time override ("opencode") wins
+        # over the run-level reviewer.tools configuration ("claude").
+        self.assertEqual(review_mod._resolve_tool(reloaded, None, has_override=False), "opencode")
+        # An explicit --tool arg still wins over both.
+        self.assertEqual(review_mod._resolve_tool(reloaded, "codex", has_override=False), "codex")
 
 
 if __name__ == "__main__":

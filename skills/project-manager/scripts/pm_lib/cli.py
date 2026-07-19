@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="Show run status")
     status.add_argument("--report", action="store_true")
     status.add_argument("--run")
+    status.add_argument("--token")
 
     approve = subparsers.add_parser("approve", help="Record a human approval for a gated slice")
     approve.add_argument("--slice", required=True)
@@ -74,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     observe = subparsers.add_parser("observe", help="Show evidence of the live session's progress")
     observe.add_argument("--wait", type=float)
     observe.add_argument("--run")
+    observe.add_argument("--token")
 
     send = subparsers.add_parser("send", help="Steer the live session")
     send.add_argument("--text", required=True)
@@ -195,16 +197,20 @@ def _run_init(args: argparse.Namespace) -> int:
 def _run_status(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
+    # Read-only, so the token is optional — but when present (the PM agent's
+    # own environment) the load is MAC-verified, and report regeneration
+    # never renders from unverified state.
+    token = _resolve_token(args)
 
     if args.report:
-        state = state_mod.load_state(run_dir)
+        state = state_mod.load_state(run_dir, token)
         report_path = slice_ops.regenerate_report(repo, run_dir, state)
         print(f"run report regenerated: {report_path}")
         mirror_path = slice_ops.run_artifact_dir(repo, state["run_id"]) / "run-report.md"
         print(f"mirror: {mirror_path}")
         return 0
 
-    result = slice_ops.status(repo, run_dir)
+    result = slice_ops.status(repo, run_dir, token)
     state = result.state
 
     print(f"run id: {state['run_id']}  status: {state['status']}")
@@ -317,7 +323,7 @@ def _run_start_slice(args: argparse.Namespace) -> int:
 def _run_observe(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
-    outcome = slice_ops.observe(repo, run_dir, wait=args.wait)
+    outcome = slice_ops.observe(repo, run_dir, wait=args.wait, token=_resolve_token(args))
 
     if not outcome.has_current_slice:
         print("no current slice")
