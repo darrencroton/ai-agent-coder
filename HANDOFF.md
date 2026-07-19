@@ -13,17 +13,17 @@
 - [ ] Stage 7 — Run A (killer case, **owner gates**): local pairing qwen3.6-27b Developer / qwen3.6-35b review seat on the `pm-test` fixture's hard 5-slice plan. Bar: ≥ 4/5 slices sound where the four documented baseline runs (Tests 14/16/17/18) got 0/5.
 - [ ] Stage 7 — Run B (strong pairing, **owner gates**): Test 6/12-class pairing. Bar: 5/5 parity with fewer PM interventions and materially fewer model interactions (count from `events.jsonl` vs baseline operational events).
 - [ ] Stage 7 — bookkeeping: record per run slices completed, wall-clock, interventions, human touches, artifact volume, assessment usefulness; update blueprint §9 metrics as *measured*; write the CHANGELOG adoption entry. If Run A misses the bar, apply blueprint §8: diagnose implementation vs design vs vision — do not patch forward.
-- [ ] Blueprint §6.6 anti-resurrection review — a one-time **human** check (no enum failure classifiers, no second state copy, no per-round artifact families, no verdict-string parsing); flagged to the owner, not an agent task.
+- [x] Blueprint §6.6 anti-resurrection review — the one-time **human** check (no enum failure classifiers, no second state copy, no per-round artifact families, no verdict-string parsing). Reviewed and resolved: the steer-artifact remediation above was the one violation the check surfaced, and it is now fixed and independently re-reviewed. Ready to proceed to Stage 7 Runs A/B.
 
 ## Current Status
-- Branch `feature/mode-b-lite-impl`; committed through Stage 6, with the retrospective-review fix change-set on top (uncommitted pending owner approval). Both test suites green; no-baggage greps clean and enforced in CI.
-- Stage 6 work was independently reviewed pre-commit; the full retrospective was independently assessed post-Stage 6 (see Developer / Reviewer State).
+- Branch `feature/mode-b-lite-impl`; committed through the steer-artifact remediation (`d3c708a`), on top of the retrospective-review fix change-set and Stage 6. Both test suites green; no-baggage greps clean and enforced in CI.
+- Stage 6 work was independently reviewed pre-commit; the full retrospective was independently assessed post-Stage 6; the blueprint §6.6 anti-resurrection review is now performed and resolved (see Developer / Reviewer State). Stage 7 Runs A/B/C are unblocked.
 
 ## Stage 7 Runbook — exact prompts and pre-steps
 
 **Before anything else (order matters):**
-1. Owner approves and commits the retrospective change-set (review + outcomes docs, fixes, tests, design amendments).
-2. Owner performs the blueprint §6.6 **human anti-resurrection review** and records the outcome (review §2's pre-check is advisory input, not a substitute). Gate: required before Runs A/B.
+1. ~~Owner approves and commits the retrospective change-set~~ — done (`d3c708a` and its ancestors).
+2. ~~Owner performs the blueprint §6.6 **human anti-resurrection review**~~ — done: the one violation it found (the steer-artifact family) is fixed and independently re-reviewed; see the Task List and Developer / Reviewer State. Gate cleared for Runs A/B.
 3. Script and run **Run C** from a scratch clone of `pm-test` using the `--harness-command` fake-harness pattern (reuse `skills/project-manager/tests/` builders; remember: fake scripts must drain stdin with `cat -`, never bare `sleep`). No owner gate, no model cost.
 4. For Runs A/B: confirm `~/.claude/skills/project-manager` (and any other harness's skill dir) resolves to **this branch's** skill; reset the `pm-test` fixture repo to its clean baseline commit; archive any stale `.pm/` in the fixture and any old run dirs under the fixture's `<git-dir>/pm/`; confirm the local models are loaded and use **fully-qualified OpenCode model ids** (`macstudio/...` — unqualified ids silently fall back, the Test 1 lesson).
 
@@ -64,6 +64,7 @@ That is the Run A (killer-case) pairing, matching baseline Tests 14/16/17/18. Fo
 ## Developer / Reviewer State
 - Orchestrator run dir: `.orchestrator/runs/` (see latest `reviewers-*` entry). Stage 5+6 change-set reviewed pre-commit by codex `gpt-5.6-sol` (high effort, read-only sandbox): drift-audit against the ledger/blueprint dispositions, then code-review. Findings and dispositions are recorded in the Stage 6 commit message.
 - Retrospective review independently assessed by codex `gpt-5.6-sol` (**xhigh** effort, read-only sandbox), run `reviewers-20260719-105911-94898`: verdict DISSENT, 11/11 findings confirmed or upgraded, 7 new findings (2 high-severity). Dispositions in `docs/mode-b-lite/retrospective-code-review.md` §7.
+- Blueprint §6.6 anti-resurrection assessment by codex `gpt-5.6-sol` (**xhigh** effort, read-only sandbox), run `reviewers-20260719-232650-3292`: VIOLATION (the `steer-<attempt>.md` persistent artifact family). Remediation implemented per its brief (`docs/mode-b-lite/steer-artifact-assessment.md`) and independently code-reviewed twice more by codex `gpt-5.6-sol` (high effort), runs `reviewers-20260720-000134-47577` and `reviewers-20260720-002027-71927`: round 1 FAIL (two findings, both fixed), round 2 FAIL on one residual the lead judged acceptable rather than fixed (see the Task List entry and the `d3c708a` commit message for the reasoning). All four review rounds are Reviewer-performed (codex); the lead session verified and dispositioned every finding.
 - Audit provenance: all reviews Reviewer-performed (codex); the lead session verified and dispositioned every finding.
 
 ## PM-Seat Model for Stage 7
@@ -71,12 +72,11 @@ That is the Run A (killer-case) pairing, matching baseline Tests 14/16/17/18. Fo
 - Escalate back to a Fable-level model (or the owner) for exactly two things: diagnosing a missed Run A bar under blueprint §8 (implementation vs design vs vision attribution), and any amendment to the `docs/mode-b-lite/` reports.
 
 ## Validation
-- Done: per-stage suites; Stage 5 fresh-reader trial; Stage 6 §6 checks 1–5 (terminology grep, path grep, `pm_lib` import graph stdlib-only, README/CONTRIBUTING link reachability, fixture sweep) all pass locally and the greps run in CI.
-- Still needed: Stage 7 Runs A/B/C and the §6.6 human anti-resurrection pass.
+- Done: per-stage suites; Stage 5 fresh-reader trial; Stage 6 §6 checks 1–5 (terminology grep, path grep, `pm_lib` import graph stdlib-only, README/CONTRIBUTING link reachability, fixture sweep) all pass locally and the greps run in CI; the §6.6 human anti-resurrection pass (steer-artifact remediation, fixed and re-reviewed).
+- Still needed: Stage 7 Runs A/B/C.
 
 ## Authorization Gate
 - Governed by blueprint §8: any deviation touching roles/gates/floor/state/commands/artifacts/risk/authority requires amending `docs/mode-b-lite/` first in a dedicated commit. None has been needed through Stage 6.
 
 ## Next Action
-- Owner: approve/commit the retrospective change-set, then perform and record the blueprint §6.6 human anti-resurrection review.
-- Then script and run Stage 7 Run C: build the adversarial fake-harness scenarios listed in the Task List (blueprint §7 + review §7.4) against a scratch clone of `pm-test`, record each outcome (caught / rendered harmless) with evidence paths, then report to the owner and request the Run A/B go-ahead using the Stage 7 Runbook prompt above.
+- Script and run Stage 7 Run C: build the adversarial fake-harness scenarios listed in the Task List (blueprint §7 + review §7.4) against a scratch clone of `pm-test`, record each outcome (caught / rendered harmless) with evidence paths, then report to the owner and request the Run A/B go-ahead using the Stage 7 Runbook prompt above.
