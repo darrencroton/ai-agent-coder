@@ -35,7 +35,7 @@ jobs:
       - name: Compile check
         run: |
           python3 -m py_compile skills/project-manager/scripts/pm.py skills/project-manager/scripts/pm_lib/*.py
-          python3 -m py_compile skills/orchestrator/scripts/reviewer_contract.py skills/orchestrator/scripts/reviewer_sessions.py skills/orchestrator/scripts/reviewer_jobs.py
+          python3 -m py_compile skills/orchestrator/scripts/delegate_contract.py skills/orchestrator/scripts/delegate_sessions.py skills/orchestrator/scripts/delegate_jobs.py
 
       - name: Project Manager tests
         run: python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'
