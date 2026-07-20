@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shlex
+import signal
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -176,6 +177,7 @@ def run_review(
     model: str | None = None,
     effort: str | None = None,
     reviewer_command: str | None = None,
+    timeout: float | None = None,
 ) -> ReviewOutcome:
     """Commission one independent review against the slice's pinned range.
 
@@ -183,6 +185,11 @@ def run_review(
     in-flight slice, and HEAD must have advanced past `before_head` — an
     already-current or unreviewable range refuses outright (PmError) rather
     than silently reviewing nothing.
+
+    `timeout`, when given, bounds the wait on the reviewer subprocess; on
+    expiry the process group is killed and the call fails closed (PmError).
+    There is deliberately no default — a legitimately slow cold local model
+    is the PM's judgement call, not a hard ceiling.
     """
     state = slice_ops.load_writable_state(run_dir, token)
     current = state.get("current_slice")
@@ -288,7 +295,35 @@ def run_review(
         current["reviewer_pids"] = reviewer_pids
         # Saved BEFORE waiting so `stop` can reap a hung reviewer.
         state_mod.save_state(run_dir, state, token)
-        returncode = process.wait()
+        # Printed before the (possibly long) wait begins — a slow-but-alive
+        # local reviewer and a hung one are otherwise indistinguishable from
+        # the PM seat (target-design §12, Amended post-implementation).
+        print(
+            f"reviewer launched: pgid={pgid} report={report_original} stderr={stderr_path}",
+            flush=True,
+        )
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)  # grace for a clean exit; return value unused
+            except subprocess.TimeoutExpired:
+                pass
+            # Unconditional: a descendant that ignores SIGTERM would survive
+            # if SIGKILL only ran when the leader-wait above also timed out
+            # (the leader can exit on SIGTERM while a child lingers).
+            # ProcessLookupError means the group is already empty — success.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            returncode = process.wait()
 
     # Reload and clear the recorded pgid FIRST, on every exit path: the
     # process has exited, so a failed review must not leave a stale
@@ -299,9 +334,24 @@ def run_review(
     current = state.get("current_slice")
     if current is not None and current.get("reviewer_pids"):
         current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
+    # Persisted BEFORE any fallible post-processing (mirror/hash below): if
+    # either raises, the cleared pgid must already be on disk so a later
+    # `stop` cannot SIGKILL a reused pgid recorded as still-live.
+    state_mod.save_state(run_dir, state, token)
+
+    if timed_out:
+        state_mod.append_event(
+            run_dir,
+            "review",
+            slice_id=slice_id,
+            note=f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed",
+        )
+        raise PmError(
+            f"reviewer timed out after {timeout:g}s and was killed (process group {pgid}); "
+            "this is not proof of a hang — a slow cold local model may need a longer or no --timeout"
+        )
 
     if returncode != 0:
-        state_mod.save_state(run_dir, state, token)
         stderr_tail = _tail(stderr_path)
         raise PmError(f"reviewer command failed (exit {returncode}): {stderr_tail}")
 

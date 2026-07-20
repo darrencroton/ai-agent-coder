@@ -12,6 +12,7 @@ live in the modules that own them; nothing here decides anything semantic.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 from pathlib import Path
@@ -26,6 +27,16 @@ from . import state as state_mod
 # Mutating commands accept --token, falling back to PM_RUN_TOKEN in the
 # controller's environment — never the Developer's.
 _TOKEN_ENV_VAR = "PM_RUN_TOKEN"
+
+
+def _positive_seconds(value: str) -> float:
+    """argparse `type=` for `--wait`/`--timeout`: a finite, strictly
+    positive number of seconds. Rejects NaN/inf and non-positive values that
+    would silently mean "wait/timeout do nothing" or "wait forever"."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number > 0, got {value!r}")
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -73,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_slice.add_argument("--token")
 
     observe = subparsers.add_parser("observe", help="Show evidence of the live session's progress")
-    observe.add_argument("--wait", type=float)
+    observe.add_argument("--wait", type=_positive_seconds)
     observe.add_argument("--run")
     observe.add_argument("--token")
 
@@ -99,6 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--model")
     review.add_argument("--effort")
     review.add_argument("--reviewer-command", help="override the whole reviewer command (tests/unsupported tools)")
+    review.add_argument(
+        "--timeout", type=_positive_seconds,
+        help="kill the reviewer process group and fail closed after N seconds; "
+        "there is deliberately no default — a slow cold local model may legitimately need longer",
+    )
     review.add_argument("--run")
     review.add_argument("--token")
 
@@ -330,6 +346,8 @@ def _run_observe(args: argparse.Namespace) -> int:
         return 0
 
     print(f"slice: {outcome.slice_id}")
+    if args.wait:
+        print(f"waited: {outcome.elapsed_seconds:.1f}s (requested {args.wait:g}s)")
     print(f"session running: {outcome.running}")
     print(f"pane changed: {outcome.pane_changed}")
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
@@ -425,6 +443,7 @@ def _run_review(args: argparse.Namespace) -> int:
         model=args.model,
         effort=args.effort,
         reviewer_command=args.reviewer_command,
+        timeout=args.timeout,
     )
     print(f"slice: {outcome.slice_id}")
     print(f"skill: {outcome.skill}  tool: {outcome.tool}")

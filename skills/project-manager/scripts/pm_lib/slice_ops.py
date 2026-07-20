@@ -719,6 +719,7 @@ class ObserveOutcome:
     hard_stop: dict[str, Any] = field(default_factory=lambda: {"present": False, "kinds": [], "markers": []})
     tail: str = ""
     slice_id: str | None = None
+    elapsed_seconds: float = 0.0
 
 
 def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str | None = None) -> ObserveOutcome:
@@ -738,12 +739,23 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     result_existed_before = result_path.is_file()
 
     deadline = time.monotonic() + wait if wait else None
+    wait_start = time.monotonic()
     activity = sessions.detect_activity(session, previous_capture)
+    # Wait exits early ONLY on a meaningful signal — session death, result.json
+    # appearing, or a hard-stop marker in the fresh capture — never on a mere
+    # pane byte-change, which `detect_activity`'s "active" flags on any TUI
+    # spinner/stream churn and would otherwise defeat the wait almost
+    # immediately (target-design §12, Amended post-implementation).
     while deadline is not None and time.monotonic() < deadline:
-        if activity["active"] or not activity["running"] or result_path.is_file():
+        if (
+            not activity["running"]
+            or result_path.is_file()
+            or sessions.scan_hard_stop(activity["capture"])["present"]
+        ):
             break
         time.sleep(_OBSERVE_POLL_SECONDS)
         activity = sessions.detect_activity(session, previous_capture)
+    elapsed_seconds = time.monotonic() - wait_start
 
     capture = activity["capture"]
     pane_changed = capture != previous_capture
@@ -774,7 +786,8 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
             slice_id=current.get("id"),
             note=(
                 f"pane_changed={pane_changed} liveness_changed={liveness_changed} "
-                f"running={activity['running']} result_present={result_present}"
+                f"running={activity['running']} result_present={result_present} "
+                f"elapsed={elapsed_seconds:.1f}s"
             ),
             evidence=str(pane_live_path) if pane_changed else None,
         )
@@ -788,6 +801,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         hard_stop=hard_stop,
         tail=tail,
         slice_id=current.get("id"),
+        elapsed_seconds=elapsed_seconds,
     )
 
 

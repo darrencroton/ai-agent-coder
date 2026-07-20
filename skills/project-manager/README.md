@@ -20,11 +20,11 @@ All commands: `python3 skills/project-manager/scripts/pm.py <command> …`, run 
 | `status [--report] [--run ID]` | where are we? `--report` regenerates `run-report.md` |
 | `approve --slice ID --reason TEXT` | record a **human** approval for a plan-gated slice |
 | `start-slice [--model M] [--effort E] [--risk elevated] [--reviewer-tools T,…] [--harness-command CMD]` | launch (or relaunch) the next eligible slice in a fresh tmux session |
-| `observe [--wait N]` | evidence: liveness, pane tail, result presence, hard-stop markers |
+| `observe [--wait N]` | evidence: liveness, pane tail, result presence, hard-stop markers; a wait returns early only on session death, `result.json` appearing, or a hard-stop marker (never a mere pane change), and reports elapsed wait time |
 | `send --text T --reason R` | one-line nudge into the live session (refused over hard prompts; costs nothing) |
 | `finalize` | run the eight-fact floor and collect evidence (decides nothing) |
 | `finalize --accept "reasoning" \| --steer "correction" \| --stop "reason" [--risk elevated]` | PM's recorded decision; accept requires a passing floor (+ both fresh reviews when elevated); steer costs an attempt |
-| `review --slice ID --skill drift-audit\|code-review [--tool T] [--model M] [--effort E]` | commission an independent review pinned to `before_head..HEAD` |
+| `review --slice ID --skill drift-audit\|code-review [--tool T] [--model M] [--effort E] [--timeout N]` | commission an independent review pinned to `before_head..HEAD`; prints the report path, stderr path, and reviewer process-group id at launch, before waiting |
 | `stop --reason R [--slice-status stopped] [--scavenge]` | end the run preserving evidence; `--scavenge` sweeps sessions even with state destroyed |
 
 Exit codes: 0 success; 1 = a `finalize` refusal — a floor fact failed, or `--accept` was refused for another recorded reason (e.g. a missing or stale mandatory review on an elevated slice); 2 = error/refusal (integrity failures are prefixed `INTEGRITY:` and are terminal — start a new run).

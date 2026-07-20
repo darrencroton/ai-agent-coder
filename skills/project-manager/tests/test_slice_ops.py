@@ -64,6 +64,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -143,6 +144,26 @@ def _credential_prompt_script(*, reveal_after: float = 5.0, sleep_seconds: float
     return f"echo FAKE_HARNESS_READY\nsleep {reveal_after}\necho 'Enter API key to continue'\nsleep {sleep_seconds}"
 
 
+def _trigger_gated_credential_prompt_script(trigger_path: Path, *, sleep_seconds: float = 30.0) -> str:
+    """Like `_credential_prompt_script`, but the credential-prompt marker
+    appears only once `trigger_path` exists on disk, rather than after a
+    fixed delay from harness launch. This makes the marker's appearance
+    OBSERVATION-relative — the test controls exactly when it fires, mid-
+    `observe --wait` — instead of launch-relative, removing the race where
+    a slow `start-slice` could let a fixed-delay marker appear before
+    `observe` ever starts polling (in which case an early return would
+    prove nothing about *mid-wait* detection). Same launch-time-clean
+    requirement as `_credential_prompt_script`: the pane must show nothing
+    but `FAKE_HARNESS_READY` until the trigger appears, or `start-slice`'s
+    launch-time hard-prompt floor would refuse to inject."""
+    return (
+        "echo FAKE_HARNESS_READY\n"
+        f'while [ ! -f "{trigger_path}" ]; do sleep 0.1; done\n'
+        "echo 'Enter API key to continue'\n"
+        f"sleep {sleep_seconds}"
+    )
+
+
 def _dies_quickly_script(*, delay: float = 3.0) -> str:
     return f"echo FAKE_HARNESS_READY\nsleep {delay}"
 
@@ -154,6 +175,26 @@ def _stdin_draining_idle_script() -> str:
     saturate it, silently dropping a *later* `send_line` steer — the same
     reason a real coding CLI (which does read stdin) doesn't hit this."""
     return "echo FAKE_HARNESS_READY\nexec cat -"
+
+
+def _cosmetic_churn_script() -> str:
+    """A harness that keeps changing the pane (a ticking counter) for as
+    long as `observe --wait` might run, draining stdin in the background
+    (`cat -`) so the injected developer prompt is still read per the
+    documented Developer-fake convention. Never writes result.json and
+    never prints a hard-stop marker: a wait against this harness must run
+    to (near) its full deadline, proving `detect_activity`'s any-byte-
+    change `active` flag is no longer used as a wait-exit condition."""
+    return (
+        "echo FAKE_HARNESS_READY\n"
+        "cat - >/dev/null &\n"
+        "i=0\n"
+        "while true; do\n"
+        "  i=$((i+1))\n"
+        "  echo tick-$i\n"
+        "  sleep 0.3\n"
+        "done"
+    )
 
 
 # --- shared base -------------------------------------------------------------
@@ -633,6 +674,174 @@ class TestDeadSession(SliceOpsTestCase):
         code, _out, err = self.run_cli_in_repo(["send", "--text", "hello", "--reason", "nudge", "--token", token])
         self.assertEqual(code, 2)
         self.assertIn("no live session", err)
+
+
+_WAITED_RE = re.compile(r"^waited:\s*([\d.]+)s \(requested ([\d.]+)s\)$", re.MULTILINE)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestObserveWaitSemantics(SliceOpsTestCase):
+    """`observe --wait` honest-wait semantics (target-design §12, Amended
+    post-implementation): the wait runs the full requested duration and
+    breaks early ONLY on session death, `result.json` appearing, or a
+    hard-stop marker — never on a mere pane byte-change."""
+
+    def _observe_wait(self, wait_seconds: float) -> tuple[int, str, str, float, float]:
+        """Run `observe --wait` and return (code, out, err, test_elapsed,
+        reported_elapsed). `test_elapsed` is measured test-side with
+        `time.monotonic()` around the CLI call — the production-reported
+        `elapsed_seconds` (parsed from stdout) is untrustworthy as the sole
+        signal, since a broken observe that returned instantly but printed
+        the full duration would otherwise pass. Timing assertions must be
+        based on `test_elapsed`; `reported_elapsed` is only cross-checked
+        against it (see test_cosmetic_pane_churn_does_not_end_wait_early)."""
+        start = time.monotonic()
+        code, out, err = self.run_cli_in_repo(["observe", "--wait", str(wait_seconds)])
+        test_elapsed = time.monotonic() - start
+        match = _WAITED_RE.search(out)
+        self.assertIsNotNone(match, out)
+        return code, out, err, test_elapsed, float(match.group(1))
+
+    def test_cosmetic_pane_churn_does_not_end_wait_early(self) -> None:
+        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
+
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _cosmetic_churn_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+
+        wait_seconds = 3 * _OBSERVE_POLL_SECONDS
+        code, out, _err, test_elapsed, reported_elapsed = self._observe_wait(wait_seconds)
+        self.assertEqual(code, 0)
+        self.assertIn("session running: True", out)
+        self.assertIn("result present: False", out)
+        # A stray early break would return in ~one poll cycle; the wait must
+        # instead run to (near) the full requested duration despite the
+        # pane changing on every poll. This is the TEST-SIDE measurement, so
+        # a broken observe that returns instantly but prints a fabricated
+        # elapsed value cannot pass.
+        self.assertGreaterEqual(test_elapsed, wait_seconds - 0.5)
+        self.assertLess(test_elapsed, wait_seconds + _OBSERVE_POLL_SECONDS + 3.0)
+        # The production-reported value must not be fabricated either: it
+        # should track the test-side measurement within a sane delta.
+        self.assertLess(abs(reported_elapsed - test_elapsed), 2.0)
+
+    def test_result_json_appearing_mid_wait_ends_wait_early(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        # The harness's own delay clock starts at session launch, not at
+        # `observe`'s first check — start-slice's readiness wait plus prompt
+        # injection alone can take several seconds, so the delay must clear
+        # that bar with margin, or result.json is already there by the time
+        # `observe --wait` runs its first check and elapsed would trivially
+        # be ~0, proving nothing about mid-wait behaviour.
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", _result_only_script(delay=9.0, tail_sleep=5.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+
+        wait_seconds = 25.0
+        code, out, _err, test_elapsed, _reported_elapsed = self._observe_wait(wait_seconds)
+        self.assertEqual(code, 0)
+        self.assertIn("result present: True", out)
+        # Returned early: proven by the TEST-SIDE measurement being well
+        # short of the full requested wait, paired with the result-present
+        # signal above. (A parsed-elapsed lower bound proves nothing beyond
+        # a launch-relative race and has been dropped.)
+        self.assertLess(test_elapsed, 20.0)
+
+    def test_session_death_mid_wait_ends_wait_early(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        # A short delay would race start-slice's own readiness/prompt-
+        # injection wait (see TestDeadSession, which uses the same 7.0s for
+        # the same reason) — too short and start-slice itself fails before
+        # observe ever gets a live session to watch die.
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _dies_quickly_script(delay=7.0))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+
+        wait_seconds = 20.0
+        code, out, _err, test_elapsed, _reported_elapsed = self._observe_wait(wait_seconds)
+        self.assertEqual(code, 0)
+        self.assertIn("session running: False", out)
+        # Returned early: TEST-SIDE elapsed well short of the full wait, plus
+        # the session-death signal above.
+        self.assertLess(test_elapsed, 15.0)
+
+    def test_hard_stop_marker_mid_wait_ends_wait_early(self) -> None:
+        """Deterministic, OBSERVATION-relative version (no launch-relative
+        race): the credential marker is gated on a trigger file that this
+        test touches explicitly partway through the wait, rather than on a
+        fixed delay from harness launch. A fixed launch-relative delay
+        could let a slow `start-slice` cause the marker to appear before
+        `observe` ever starts polling — an early return would then prove
+        nothing about *mid-wait* detection, only an upper bound. Here,
+        `observe --wait` runs on a background thread; the main thread
+        sleeps a short beat (comfortably more than one poll cycle) to give
+        it time to have polled at least once, THEN creates the trigger
+        file. TEST-SIDE elapsed must be both greater than that pre-trigger
+        beat (proving the wait was genuinely still running — i.e. had not
+        already returned — when the marker appeared) and less than the
+        full requested wait (proving it broke early upon detecting the
+        marker)."""
+        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
+
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        trigger = self.repo.parent / "credential_trigger"
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", _trigger_gated_credential_prompt_script(trigger, sleep_seconds=30.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+
+        wait_seconds = 20.0
+        result: dict = {}
+
+        def _run() -> None:
+            start = time.monotonic()
+            code, out, err = self.run_cli_in_repo(["observe", "--wait", str(wait_seconds)])
+            result["elapsed"] = time.monotonic() - start
+            result["code"], result["out"], result["err"] = code, out, err
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+
+        # A short beat, comfortably longer than one poll cycle, before we
+        # create the trigger file — this is what proves `observe` was still
+        # actually mid-wait (had already polled at least once and not yet
+        # returned) at the moment the marker appeared.
+        pre_trigger_beat = 2 * _OBSERVE_POLL_SECONDS
+        time.sleep(pre_trigger_beat)
+        trigger.write_text("go\n", encoding="utf-8")
+        thread.join(timeout=wait_seconds + 15.0)
+        self.assertFalse(thread.is_alive(), "observe --wait did not return in time")
+
+        self.assertEqual(result["code"], 0)
+        self.assertIn("session running: True", result["out"])
+        self.assertIn("hard-stop scan:", result["out"])
+        self.assertNotIn("hard-stop scan: clear", result["out"])
+        self.assertGreater(result["elapsed"], pre_trigger_beat - 0.5)
+        self.assertLess(result["elapsed"], wait_seconds)
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
