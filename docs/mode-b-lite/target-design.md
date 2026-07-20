@@ -249,6 +249,8 @@ Dropped, with their need re-housed: `run-next`/`run --scope remaining` (the PM a
 
 **`finalize` is deliberately not auto-accepting:** the mechanical part reports; the acceptance is PM's recorded act. This is the accountability seam made visible in the CLI.
 
+*(Amended post-implementation, from the Stage 7 Test 19 findings — two observation-honesty fixes, no new command, no state-shape change: **`observe --wait N`** waits the full `N` and returns early only on a meaningful signal — session death, `result.json` appearing, or a hard-stop marker becoming visible — never on a mere pane byte-change; TUI spinner/stream churn made the original any-change early-return defeat the wait entirely and misled the PM about elapsed time. The outcome now also reports the actual elapsed wait so requested and elapsed duration can never be conflated. **`review`** prints the report path, stderr path, and reviewer process-group id at launch, before its synchronous wait — a slow-but-alive local reviewer and a hung one were otherwise indistinguishable from the PM seat — and accepts an optional `--timeout N` that kills the reviewer process group and fails closed with a recorded event; there is deliberately no default timeout, because picking a ceiling for a legitimately slow cold local model would be a statute where patience is the PM's judgement.)*
+
 ## 13. Interfaces and data shapes
 
 1. **Plan format** — unchanged, owned by `implementation-plan` (producer: planning session; consumer: PM parser + humans). Already minimal for its job; `Independent audit required: yes` maps to elevated risk. Versioning: none needed (heading-shape contract, checked by `check-plan`).
