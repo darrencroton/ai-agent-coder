@@ -1,4 +1,4 @@
-"""The mechanical floor: eight non-waivable facts (target-design §3.3).
+"""The mechanical floor: eight non-waivable facts.
 
 One function surface, no decisions. Every fact here computes a true/false
 condition from git, the filesystem, run state, and a pane-text string handed
@@ -11,8 +11,7 @@ git/filesystem absence or failure, and it never writes state, contacts a
 session, or renders an accept/reject verdict. That judgement belongs to the
 PM agent, above this floor, in a later stage.
 
-The eight facts, exactly as enumerated in target-design §3.3 and restated in
-implementation-blueprint.md §3's Stage 2 acceptance criteria:
+The eight facts are:
 
 1. plan-digest: the plan file's current sha256 matches the run's frozen
    `plan.sha256`. A missing or unreadable plan file fails the fact.

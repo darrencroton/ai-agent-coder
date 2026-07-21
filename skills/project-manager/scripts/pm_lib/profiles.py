@@ -1,17 +1,13 @@
 """Harness launch profiles: composed commands and model-inventory queries.
 
-Behaviour is re-specified from observed launch mechanics (see the Stage 2
-brief's old-evidence pointer, the Stage 7 native-Qwen run, and
-``docs/mode-b-lite/replacement-ledger.md`` §9.1 — recorded marker/readiness
-strings, including these base commands and flags, are sanctioned operational
-data; the code composing them is written fresh).
+The recorded marker/readiness strings, base commands, and flags are observed
+operational data; the code composing them is independent.
 
-Launch policy (target-design + implementation-blueprint §4, simplified from
-the old tri-state): there is exactly one composed path — this module's
-profile table — plus an explicit ``--harness-command`` override at the CLI
-layer (Stage 3) for fake harnesses and unsupported setups. This module does
-not implement that override; it only composes the profile-table path and
-fails closed for any harness name outside the table.
+There is exactly one composed path — this module's profile table — plus an
+explicit ``--harness-command`` override at the CLI layer for fake harnesses
+and unsupported setups. This module does not implement that override; it only
+composes the profile-table path and fails closed for any harness name outside
+the table.
 """
 
 from __future__ import annotations

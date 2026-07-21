@@ -1,17 +1,12 @@
 """tmux session lifecycle: launch, readiness, injection, capture, liveness.
 
-This module owns *all* tmux and harness-process contact — no other module
-in this package shells out to tmux (implementation-blueprint.md §4). It
-never judges anything beyond the hard-stop marker scan (`scan_hard_stop`,
-target-design §11's marker floor), which is pure text parsing shared by
-`send_line`, Stage 3's `observe`, and `floor.py`'s fact 8.
+This module owns *all* tmux and harness-process contact — no other module in
+this package shells out to tmux. It never judges anything beyond the
+hard-stop marker scan (`scan_hard_stop`), which is pure text parsing shared
+by `send_line`, `observe`, and `floor.py`'s fact 8.
 
-Behaviour is re-specified from the current implementation's field-proven
-tmux adapter (see the Stage 2 brief's old-evidence pointer). Per
-``docs/mode-b-lite/replacement-ledger.md`` §9.1, the recorded readiness
-banners and hard-stop marker/phrasing strings are the sanctioned data
-carry-over — observations of external tools, not architecture; the code
-around them is written fresh.
+The recorded readiness banners and hard-stop marker/phrasing strings preserve
+field observations of external tools; the code around them is independent.
 """
 
 from __future__ import annotations

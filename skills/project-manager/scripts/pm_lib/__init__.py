@@ -1,10 +1,8 @@
 """Mode B Lite PM toolkit.
 
 Pure-stdlib package. Nothing in ``pm_lib`` or its submodules may import from
-outside the standard library or from ``pm_lib`` itself (see
-``docs/mode-b-lite/target-design.md`` and the implementation blueprint's
-responsibility boundaries). In particular, no module here may import from
-``skills/orchestrator/``.
+outside the standard library or from ``pm_lib`` itself. In particular, no
+module here may import from ``skills/orchestrator/``.
 """
 
 from __future__ import annotations

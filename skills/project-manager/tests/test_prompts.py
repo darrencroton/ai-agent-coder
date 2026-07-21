@@ -1,7 +1,7 @@
 """Protected behaviours: Developer prompt template loading and rendering.
 
-Pins prompts.py (target-design §13.4, implementation-blueprint.md §4 — no
-inline prompt fragments elsewhere in the package):
+Pins prompts.py's rule that there are no inline prompt fragments elsewhere in
+the package:
 
 - `load_template` extracts the single fenced ```md block from a reference
   file's leading section (heading=None, the file's content before its
@@ -11,8 +11,8 @@ inline prompt fragments elsewhere in the package):
   file with no such block, or with more than one, is rejected with a
   `PmError` naming the file. A named `heading` scopes extraction to that
   section instead; an absent heading raises `PmError`.
-- `render_steer_message` (steer-artifact-assessment.md's remediation)
-  sources its fixed wrapper from developer-prompt.md's "## Steer Message
+- `render_steer_message` sources its fixed wrapper from
+  developer-prompt.md's "## Steer Message
   Template" section via `load_template(..., heading=...)`, and substitutes
   `{correction}` — braces inside the correction text itself are never
   treated as format fields, since they are a substituted value, not part

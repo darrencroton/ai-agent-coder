@@ -1,8 +1,7 @@
 """Protected behaviours: git facts, status parsing, and surface matching.
 
-Pins the segment-aware surface-matching semantics carried over per
-`docs/mode-b-lite/replacement-ledger.md` §9.2 (a sanctioned reuse of
-*specification*, not code — PurePosixPath.full_match, not fnmatch, so a
+Pins the segment-aware surface-matching semantics (PurePosixPath.full_match,
+not fnmatch, so a
 single "*" never crosses a "/"), plus the git-fact helpers PM's floor will
 build on in later stages:
 

@@ -1,12 +1,11 @@
-"""The `review` command: commissioning an independent review of the
-pinned diff (target-design §3.3/§5/§10, implementation-blueprint.md §4).
+"""The `review` command: commissioning an independent review of a pinned diff.
 
 `review.py` shares the five-tool roster with the Developer
 launch path conceptually, but not its code: reviews run one-shot/exec where
 the tool supports it (never the Developer's interactive tmux TUI path), so
 this module composes its own command table — re-specified fresh from
 `skills/orchestrator/scripts/delegate_contract.py`'s `compose_delegate_command`
-as behavioural evidence only (ledger §9.4). This module shares no code with
+as behavioural evidence only. This module shares no code with
 `skills/orchestrator/` and never imports from it.
 
 The Reviewer is read-only by instruction and holds no acceptance authority;

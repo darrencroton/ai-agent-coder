@@ -1,9 +1,7 @@
 """Protected behaviours: the plan parser, check-plan report, and risk derivation.
 
-Pins the parser suite re-specified from the current implementation's proven
-behaviour (Stage 1 brief, `docs/mode-b-lite/replacement-ledger.md` §9.2) plus
-the new mechanical `plan_risk` derivation (target-design §4). Each test names
-one frozen scenario:
+Pins the parser's proven behaviour plus the mechanical `plan_risk`
+derivation. Each test names one frozen scenario:
 
 - A clean plan passes check-plan with no errors; a plan with several
   independent defects reports every one of them at once (multi-error

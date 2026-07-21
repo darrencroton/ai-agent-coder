@@ -1,10 +1,9 @@
 """Git facts: process invocation, status parsing, ancestry, surface matching.
 
 Every function here computes a fact from git or normalizes a path string; none
-of them judge anything. Surface matching implements the sanctioned carry-over
-semantics from ``docs/mode-b-lite/replacement-ledger.md`` §9.2 — segment-aware
-glob matching via ``PurePosixPath.full_match`` (Python 3.13+), not ``fnmatch``,
-so a single ``*`` never silently crosses a ``/``.
+of them judge anything. Surface matching uses segment-aware glob matching via
+``PurePosixPath.full_match`` (Python 3.13+), not ``fnmatch``, so a single ``*``
+never silently crosses a ``/``.
 """
 
 from __future__ import annotations

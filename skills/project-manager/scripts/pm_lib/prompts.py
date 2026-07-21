@@ -1,18 +1,15 @@
-"""Template rendering: the Developer and Reviewer prompts (target-design
-§13.4).
+"""Template rendering for the Developer and Reviewer prompts.
 
 The only prompt-shaping logic in the package lives here. Every other module
 that needs rendered prompt text calls into this one — no inline prompt
-fragments in `slice_ops.py`, `review.py`, or anywhere else
-(implementation-blueprint.md §4). Templates are not owned by this module:
-they live in ``references/developer-prompt.md`` and
+fragments in `slice_ops.py`, `review.py`, or anywhere else. Templates are not
+owned by this module: they live in ``references/developer-prompt.md`` and
 ``references/reviewer-prompt.md`` as single fenced ```md blocks, so wording
 can be edited without touching code.
 
-`compile_skill_bundle` re-specifies (never imports) the transitive
-skill-bundle embedding behaviour documented as the one sanctioned
-carry-over in ``docs/mode-b-lite/replacement-ledger.md`` §9.4, whose
-behavioural evidence is ``skills/orchestrator/scripts/delegate_contract.py``
+`compile_skill_bundle` independently implements the transitive skill-bundle
+embedding behaviour also exercised by
+``skills/orchestrator/scripts/delegate_contract.py``
 (`compile_skill_bundle` / `compose_delegate_command`) — this module shares
 no code with it and never imports from ``skills/orchestrator/``.
 """
@@ -156,10 +153,9 @@ def render_launch_pointer(prompt_path: Path, *, reference_path: Path | None = No
 
 def render_steer_message(correction: str, *, reference_path: Path | None = None) -> str:
     """Render a `finalize --steer` correction for direct live-session
-    injection (no artifact file — steer-artifact-assessment.md's
-    remediation). Sourced from the "## Steer Message Template" section of
-    `references/developer-prompt.md` so the fixed wrapper wording lives in
-    exactly one place, not inline here.
+    injection without an artifact file. Sourced from the "## Steer Message
+    Template" section of `references/developer-prompt.md` so the fixed wrapper
+    wording lives in exactly one place, not inline here.
     """
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_STEER_MESSAGE_HEADING)
@@ -172,7 +168,7 @@ def render_steer_message(correction: str, *, reference_path: Path | None = None)
         ) from exc
 
 
-# --- Transitive skill-bundle embedding (replacement-ledger.md §9.4) ---------
+# --- Transitive skill-bundle embedding --------------------------------------
 
 
 def compile_skill_bundle(skill_name: str, *, skills_root: Path | None = None) -> str:

@@ -1237,9 +1237,9 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # idempotently (nothing left at top level → no-op).
     _rotate_prior_attempt(Path(current["artifact_dir"]), attempts - 1)
 
-    # Direct live-session injection, not a persistent numbered artifact
-    # (steer-artifact-assessment.md): the correction is rendered from the
-    # reference-sourced wrapper and pasted straight into the pane, verbatim.
+    # Direct live-session injection, not a persistent numbered artifact: the
+    # correction is rendered from the reference-sourced wrapper and pasted
+    # straight into the pane, verbatim.
     message = prompts.render_steer_message(correction)
     sessions.send_correction(session, message)
 

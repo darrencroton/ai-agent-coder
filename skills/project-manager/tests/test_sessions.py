@@ -3,14 +3,11 @@
 `scan_hard_stop`, `session_name`, and the env-token assertion run without
 tmux. Everything that actually drives a tmux pane is gated with
 `@unittest.skipUnless(shutil.which("tmux"), ...)` and drives a tiny fake
-harness shell script — no real coding CLI, matching the retained
-fake-harness test pattern (replacement-ledger §9.1/§9.3).
+harness shell script — no real coding CLI.
 
 Pins:
 
-- `scan_hard_stop` (target-design §11's marker floor, carried from
-  old-evidence tmux_adapter.HARD_PROMPT_MARKERS + hints.py's usage-limit
-  patterns): at least one positive fixture per marker class — trust_prompt
+- `scan_hard_stop`: at least one positive fixture per marker class — trust_prompt
   (all three directory-trust strings), approval_prompt, credential_prompt,
   permission_prompt, external_side_effect_request (a "push to remote …?"
   shape), and usage_limit_hard_stop (weekly, monthly, account/billing,
@@ -29,8 +26,7 @@ Pins:
   `detect_activity` flagging a pane change, `force_stop` killing a session,
   `sessions_with_prefix` finding sessions by prefix, and `wait_until_ready`
   raising when the session exits before becoming ready.
-- `send_correction` (steer-artifact-assessment.md's direct-injection
-  remediation): a multi-line correction lands in the pane verbatim without
+- `send_correction`: a multi-line correction lands in the pane verbatim without
   ever touching disk, it refuses into a visible credential prompt exactly
   like `send_line`, and it refuses against a dead session.
 """

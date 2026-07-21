@@ -1,9 +1,7 @@
 """Plan parsing, check-plan, eligibility, and mechanical risk derivation.
 
-Behaviour is re-specified from the current implementation's proven parser
-(see the Stage 1 brief's old-evidence pointer and
-``docs/mode-b-lite/replacement-ledger.md`` §9.2) — this module is written
-fresh against that specification, not copied.
+The parser preserves the proven plan-format behaviour from the predecessor
+while keeping its implementation independent.
 """
 
 from __future__ import annotations
