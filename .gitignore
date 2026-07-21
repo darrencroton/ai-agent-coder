@@ -16,6 +16,7 @@ venv/
 .orchestrator/
 .pm/
 .claude/
+HANDOFF.md
 
 # Archived/superseded content (never deleted, not tracked by default)
 archive/
