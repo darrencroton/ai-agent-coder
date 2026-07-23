@@ -10,6 +10,8 @@ No backwards compatibility with tmux is retained; there is no dual runtime path 
 
 This plan is a **sibling** of `docs/implementation-plan-orchestrator-resume-tracking.md`. They share design *philosophy* but by explicit decision **share no code**: PM gets its own thin launcher fitted to its single-serialised-Developer + mechanical-floor + Developer-commits model, rather than importing the orchestrator's multi-job substrate. The orchestrator's delegate contract is role-incompatible with PM's Developer (a delegate *never commits*; a PM Developer *owns the slice commit* — floor fact 6), so PM cannot route its Developer through it. The single deliberately-duplicated artifact is the per-harness *launch + resume command syntax*; PM owns its own copy (frozen in Slice 2 below), matching how `review.py` already re-specs the orchestrator's command table as "behavioural evidence, shares no code, never imports."
 
+The orchestrator-resume plan has been completed (commit 88f0e55..58fe16f).
+
 ## The core mapping (tmux → headless)
 
 | tmux concept | headless replacement |
