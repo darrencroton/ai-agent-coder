@@ -15,13 +15,9 @@ one-shot reviewer command table and the end-to-end `review` command):
    (a target outside the skill's own directory) raises `PmError` naming the
    escaping path, even before checking whether that path exists.
 3. A linked-but-missing file raises `PmError`.
-4. One-shot reviewer command composition, per tool, from `review.
-   compose_reviewer_command` (review.py's own table — never imported from
-   orchestrator): codex, claude, copilot compose with optional model/effort
-   flags; opencode and qwen compose with an optional model flag but raise
-   `PmError` the moment a non-default effort is requested (their tested
-   one-shot commands have no effort flag); an unsupported tool name raises
-   `PmError`.
+4. The reviewer delegates default command composition to `profiles`' shared
+   headless composer in `mode="reviewer"`; the frozen command forms themselves
+   are asserted in `test_profiles.py`.
 5. `render_reviewer_prompt` renders the full contract (pinned range,
    before/after heads, diff path, changed files, contract sections, the
    embedded skill bundle) with no unresolved `{placeholder}` left over.
@@ -140,84 +136,28 @@ class TestCompileSkillBundle(unittest.TestCase):
             prompts.compile_skill_bundle("does-not-exist", skills_root=_REAL_SKILLS_ROOT)
 
 
-# --- 4: one-shot reviewer command composition --------------------------------
+# --- 4: shared reviewer command composition ----------------------------------
 
 
-class TestComposeReviewerCommand(unittest.TestCase):
-    def test_codex(self) -> None:
-        command = review_mod.compose_reviewer_command(
-            "codex", "PROMPT", model="gpt-5", effort="high", repo=Path("/repo")
-        )
-        self.assertEqual(
-            command,
-            [
-                "codex", "exec", "PROMPT",
-                "-m", "gpt-5",
-                "-c", 'model_reasoning_effort="high"',
-                "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/repo",
-            ],
+class TestSharedReviewerCommandComposer(unittest.TestCase):
+    def test_build_reviewer_command_uses_profiles_reviewer_mode(self) -> None:
+        expected = ["shared", "command"]
+        with mock.patch.object(review_mod.profiles, "compose_headless_command", return_value=expected) as compose:
+            command = review_mod._build_reviewer_command(
+                "claude", "PROMPT", model="opus", effort="medium", repo=Path("/repo"), reviewer_command_override=None
+            )
+        self.assertEqual(command, expected)
+        compose.assert_called_once_with(
+            "claude", "PROMPT", mode="reviewer", model="opus", effort="medium", repo=Path("/repo")
         )
 
-    def test_codex_omits_absent_model_and_effort(self) -> None:
-        command = review_mod.compose_reviewer_command("codex", "PROMPT", repo=Path("/repo"))
-        self.assertEqual(
-            command,
-            ["codex", "exec", "PROMPT", "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/repo"],
-        )
-
-    def test_claude(self) -> None:
-        command = review_mod.compose_reviewer_command(
-            "claude", "PROMPT", model="opus", effort="high", repo=Path("/repo")
-        )
-        self.assertEqual(
-            command,
-            [
-                "claude", "-p", "PROMPT",
-                "--model", "opus", "--effort", "high",
-                "--permission-mode", "plan", "--output-format", "text", "--add-dir", "/repo",
-            ],
-        )
-
-    def test_copilot(self) -> None:
-        command = review_mod.compose_reviewer_command(
-            "copilot", "PROMPT", model="gpt-5", effort="high", repo=Path("/repo")
-        )
-        self.assertEqual(
-            command,
-            [
-                "copilot",
-                "--model", "gpt-5", "--effort", "high",
-                "-p", "PROMPT", "--allow-all-tools", "--autopilot", "--silent", "--add-dir", "/repo",
-            ],
-        )
-
-    def test_opencode_with_model_no_effort(self) -> None:
-        command = review_mod.compose_reviewer_command(
-            "opencode", "PROMPT", model="my-model", repo=Path("/repo")
-        )
-        self.assertEqual(
-            command,
-            ["opencode", "run", "PROMPT", "-m", "my-model", "--agent", "plan", "--auto", "--dir", "/repo"],
-        )
-
-    def test_opencode_effort_fails_closed(self) -> None:
-        with self.assertRaises(PmError):
-            review_mod.compose_reviewer_command("opencode", "PROMPT", effort="high", repo=Path("/repo"))
-
-    def test_qwen_with_model_no_effort(self) -> None:
-        command = review_mod.compose_reviewer_command("qwen", "PROMPT", model="qwen-max", repo=Path("/repo"))
-        self.assertEqual(
-            command,
-            ["qwen", "--prompt", "PROMPT", "--model", "qwen-max", "--sandbox", "--output-format", "text"],
-        )
-
-    def test_qwen_effort_fails_closed(self) -> None:
-        with self.assertRaises(PmError):
-            review_mod.compose_reviewer_command("qwen", "PROMPT", effort="high", repo=Path("/repo"))
-
-    def test_unknown_tool_fails(self) -> None:
-        with self.assertRaises(PmError):
-            review_mod.compose_reviewer_command("not-a-real-tool", "PROMPT", repo=Path("/repo"))
+    def test_override_still_bypasses_shared_composer(self) -> None:
+        with mock.patch.object(review_mod.profiles, "compose_headless_command") as compose:
+            command = review_mod._build_reviewer_command(
+                "custom", "PROMPT", model=None, effort=None, repo=Path("/repo"), reviewer_command_override="fake --flag"
+            )
+        self.assertEqual(command, ["fake", "--flag", "PROMPT"])
+        compose.assert_not_called()
 
 
 # --- 5: reviewer prompt rendering --------------------------------------------

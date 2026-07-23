@@ -53,6 +53,7 @@ HARNESS_PROFILES: dict[str, dict[str, Any]] = {
     "qwen": {
         "base_command": ["qwen"],
         "model_flag": "-m",
+        "headless_model_flag": "--model",
         # Qwen Code's interactive command exposes no reasoning-effort flag.
         # An effort request therefore fails closed through _append_effort.
     },
@@ -85,6 +86,20 @@ def _append_effort(command: list[str], profile: dict[str, Any], effort: str | No
         f"harness profile {harness!r} has no effort override for its interactive launch command; "
         "omit --effort for this harness"
     )
+
+
+def _append_headless_model(command: list[str], profile: dict[str, Any], model: str | None) -> None:
+    if model:
+        command.extend([profile.get("headless_model_flag", profile["model_flag"]), model])
+
+
+def _append_headless_effort(command: list[str], profile: dict[str, Any], effort: str | None, harness: str) -> None:
+    if effort and harness in {"opencode", "qwen"}:
+        raise PmError(
+            f"{harness}'s tested headless command has no effort/reasoning flag; "
+            "omit --effort for this harness"
+        )
+    _append_effort(command, profile, effort, harness)
 
 
 def compose_command(
@@ -123,6 +138,151 @@ def compose_command(
         command.extend([profile["session_id_flag"], session_id])
 
     return shlex.join(command)
+
+
+def compose_headless_command(
+    harness: str,
+    pointer: str,
+    *,
+    mode: str,
+    repo: Path,
+    model: str | None = None,
+    effort: str | None = None,
+    session_id: str | None = None,
+    git_access_dir: Path | None = None,
+) -> list[str]:
+    """Compose a one-shot headless launch for the Developer or Reviewer.
+
+    This is deliberately separate from :func:`compose_command`: that older
+    function remains the unchanged tmux-TUI composer until the Slice 4
+    cleanup.  The returned argv is passed directly to ``Popen`` so prompt,
+    model, and path values never require a second round of shell parsing.
+
+    ``session_id`` binds Claude and Copilot Developer launches to the session
+    that a later headless resume must use.  Codex, OpenCode, and Qwen discover
+    their launch-bound identifiers after completion, so the value is unused
+    for those harnesses.  ``git_access_dir`` is the Codex-only git directory
+    that must accompany launches from a linked worktree.
+    """
+    profile = HARNESS_PROFILES.get(harness)
+    if profile is None:
+        raise _unknown_harness_error(harness)
+    if mode not in {"developer", "reviewer"}:
+        raise PmError(f"headless mode must be 'developer' or 'reviewer', got {mode!r}")
+
+    repo_str = str(repo)
+    if mode == "reviewer":
+        if harness == "codex":
+            command = ["codex", "exec", pointer]
+            _append_headless_model(command, profile, model)
+            _append_headless_effort(command, profile, effort, harness)
+            command.extend(["--sandbox", "read-only", "--skip-git-repo-check", "-C", repo_str])
+            return command
+        if harness == "claude":
+            command = ["claude", "-p", pointer]
+            _append_headless_model(command, profile, model)
+            _append_headless_effort(command, profile, effort, harness)
+            command.extend(["--permission-mode", "plan", "--output-format", "text", "--add-dir", repo_str])
+            return command
+        if harness == "copilot":
+            command = ["copilot"]
+            _append_headless_model(command, profile, model)
+            _append_headless_effort(command, profile, effort, harness)
+            command.extend(["-p", pointer, "--allow-all-tools", "--autopilot", "--silent", "--add-dir", repo_str])
+            return command
+        if harness == "opencode":
+            _append_headless_effort([], profile, effort, harness)
+            command = ["opencode", "run", pointer]
+            _append_headless_model(command, profile, model)
+            command.extend(["--agent", "plan", "--auto", "--dir", repo_str])
+            return command
+        _append_headless_effort([], profile, effort, harness)
+        command = ["qwen", "--prompt", pointer]
+        _append_headless_model(command, profile, model)
+        command.extend(["--sandbox", "--output-format", "text"])
+        return command
+
+    if harness == "codex":
+        command = ["codex", "exec", pointer]
+        _append_headless_model(command, profile, model)
+        _append_headless_effort(command, profile, effort, harness)
+        command.extend(["--sandbox", "workspace-write", "--skip-git-repo-check", "-C", repo_str])
+        if git_access_dir is not None:
+            command.extend(["--add-dir", str(git_access_dir)])
+        return command
+    if harness == "claude":
+        command = ["claude", "-p", pointer]
+        _append_headless_model(command, profile, model)
+        _append_headless_effort(command, profile, effort, harness)
+        command.extend(["--permission-mode", "acceptEdits"])
+        if session_id:
+            command.extend(["--session-id", session_id])
+        command.extend(["--add-dir", repo_str])
+        return command
+    if harness == "copilot":
+        command = ["copilot", "-p", pointer]
+        _append_headless_model(command, profile, model)
+        _append_headless_effort(command, profile, effort, harness)
+        command.extend(["--allow-all-tools", "--autopilot"])
+        if session_id:
+            command.extend(["--session-id", session_id])
+        command.extend(["--add-dir", repo_str])
+        return command
+    if harness == "opencode":
+        _append_headless_effort([], profile, effort, harness)
+        command = ["opencode", "run", pointer]
+        _append_headless_model(command, profile, model)
+        command.extend(["--agent", "build", "--auto", "--dir", repo_str])
+        return command
+    _append_headless_effort([], profile, effort, harness)
+    command = ["qwen", "--prompt", pointer]
+    _append_headless_model(command, profile, model)
+    command.extend(["--sandbox", "--output-format", "text"])
+    return command
+
+
+def compose_resume_command(
+    harness: str,
+    correction: str,
+    *,
+    session_id: str,
+    repo: Path,
+    git_access_dir: Path | None = None,
+) -> list[str]:
+    """Compose a Developer's next, resumptive headless turn.
+
+    A caller must first quiesce the preceding process and supply the
+    launch-bound ``session_id``.  Custom ``--harness-command`` overrides are
+    intentionally handled by the lifecycle layer: their resume protocol
+    re-runs the override with ``PM_DEVELOPER_RESUME_SESSION_ID`` set.
+    """
+    if harness not in HARNESS_PROFILES:
+        raise _unknown_harness_error(harness)
+    if not session_id:
+        raise PmError("cannot compose a headless resume without a captured session id")
+
+    repo_str = str(repo)
+    if harness == "claude":
+        return [
+            "claude", "-p", correction, "--resume", session_id,
+            "--permission-mode", "acceptEdits", "--add-dir", repo_str,
+        ]
+    if harness == "codex":
+        command = [
+            "codex", "exec", "resume", session_id, correction,
+            "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", repo_str,
+        ]
+        if git_access_dir is not None:
+            command.extend(["--add-dir", str(git_access_dir)])
+        return command
+    if harness == "copilot":
+        return [
+            "copilot", "-p", correction, f"--resume={session_id}",
+            "--allow-all-tools", "--autopilot", "--add-dir", repo_str,
+        ]
+    if harness == "opencode":
+        return ["opencode", "run", correction, "--session", session_id, "--agent", "build", "--auto", "--dir", repo_str]
+    return ["qwen", "--prompt", correction, "--resume", session_id, "--sandbox", "--output-format", "text"]
 
 
 def query_model_identity(harness: str, model: str) -> dict[str, str] | None:

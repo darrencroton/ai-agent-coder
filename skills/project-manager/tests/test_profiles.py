@@ -24,6 +24,10 @@ the composing code is written fresh):
 - claude-only composition: a `session_id` appends `--session-id <uuid>`;
   a no-op for the other four harnesses.
 - An unknown harness name raises `PmError` naming all five supported harnesses.
+- `compose_headless_command` composes the frozen Developer and Reviewer
+  one-shot forms, while leaving the tmux `compose_command` untouched.
+- `compose_resume_command` composes the frozen Developer resume form for all
+  five harnesses and preserves Codex's linked-worktree git access.
 - `query_model_identity` returns `None` for codex/claude/copilot/qwen (no
   inventory contract). For opencode it runs `opencode models <provider>
   --verbose` (provider = text before the first `/` in the model id) and:
@@ -163,6 +167,156 @@ class TestComposeCommandUnknownHarness(unittest.TestCase):
         message = str(ctx.exception)
         for name in ("codex", "claude", "copilot", "opencode", "qwen"):
             self.assertIn(name, message)
+
+
+class TestComposeHeadlessDeveloperCommand(unittest.TestCase):
+    _repo = Path("/repo")
+    _git_dir = Path("/repo/.git")
+    _session_id = "11111111-1111-1111-1111-111111111111"
+
+    def test_claude(self) -> None:
+        self.assertEqual(
+            profiles.compose_headless_command(
+                "claude", "POINTER", mode="developer", repo=self._repo,
+                model="opus", effort="medium", session_id=self._session_id,
+            ),
+            [
+                "claude", "-p", "POINTER", "--model", "opus", "--effort", "medium",
+                "--permission-mode", "acceptEdits", "--session-id", self._session_id, "--add-dir", "/repo",
+            ],
+        )
+
+    def test_codex_including_linked_worktree_git_access(self) -> None:
+        self.assertEqual(
+            profiles.compose_headless_command(
+                "codex", "POINTER", mode="developer", repo=self._repo,
+                model="gpt-5", effort="high", git_access_dir=self._git_dir,
+            ),
+            [
+                "codex", "exec", "POINTER", "-m", "gpt-5", "-c", 'model_reasoning_effort="high"',
+                "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", "/repo", "--add-dir", "/repo/.git",
+            ],
+        )
+
+    def test_copilot(self) -> None:
+        self.assertEqual(
+            profiles.compose_headless_command(
+                "copilot", "POINTER", mode="developer", repo=self._repo,
+                model="gpt-5", effort="high", session_id=self._session_id,
+            ),
+            [
+                "copilot", "-p", "POINTER", "--model", "gpt-5", "--effort", "high",
+                "--allow-all-tools", "--autopilot", "--session-id", self._session_id, "--add-dir", "/repo",
+            ],
+        )
+
+    def test_opencode(self) -> None:
+        self.assertEqual(
+            profiles.compose_headless_command("opencode", "POINTER", mode="developer", repo=self._repo, model="local/model"),
+            ["opencode", "run", "POINTER", "-m", "local/model", "--agent", "build", "--auto", "--dir", "/repo"],
+        )
+
+    def test_qwen(self) -> None:
+        self.assertEqual(
+            profiles.compose_headless_command("qwen", "POINTER", mode="developer", repo=self._repo, model="qwen-max"),
+            ["qwen", "--prompt", "POINTER", "--model", "qwen-max", "--sandbox", "--output-format", "text"],
+        )
+
+    def test_opencode_and_qwen_effort_fail_closed(self) -> None:
+        for harness in ("opencode", "qwen"):
+            with self.subTest(harness=harness), self.assertRaises(PmError) as ctx:
+                profiles.compose_headless_command(harness, "POINTER", mode="developer", repo=self._repo, effort="high")
+            self.assertIn("headless", str(ctx.exception))
+
+    def test_invalid_mode_and_unknown_harness_fail_closed(self) -> None:
+        with self.assertRaises(PmError):
+            profiles.compose_headless_command("claude", "POINTER", mode="invalid", repo=self._repo)
+        with self.assertRaises(PmError):
+            profiles.compose_headless_command("not-a-harness", "POINTER", mode="developer", repo=self._repo)
+
+
+class TestComposeHeadlessReviewerCommand(unittest.TestCase):
+    _repo = Path("/repo")
+
+    def test_reviewer_shapes_preserve_existing_commands(self) -> None:
+        cases = [
+            (
+                "codex", {"model": "gpt-5", "effort": "high"},
+                ["codex", "exec", "PROMPT", "-m", "gpt-5", "-c", 'model_reasoning_effort="high"', "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/repo"],
+            ),
+            (
+                "claude", {"model": "opus", "effort": "high"},
+                ["claude", "-p", "PROMPT", "--model", "opus", "--effort", "high", "--permission-mode", "plan", "--output-format", "text", "--add-dir", "/repo"],
+            ),
+            (
+                "copilot", {"model": "gpt-5", "effort": "high"},
+                ["copilot", "--model", "gpt-5", "--effort", "high", "-p", "PROMPT", "--allow-all-tools", "--autopilot", "--silent", "--add-dir", "/repo"],
+            ),
+            (
+                "opencode", {"model": "my-model"},
+                ["opencode", "run", "PROMPT", "-m", "my-model", "--agent", "plan", "--auto", "--dir", "/repo"],
+            ),
+            (
+                "qwen", {"model": "qwen-max"},
+                ["qwen", "--prompt", "PROMPT", "--model", "qwen-max", "--sandbox", "--output-format", "text"],
+            ),
+        ]
+        for harness, kwargs, expected in cases:
+            with self.subTest(harness=harness):
+                self.assertEqual(
+                    profiles.compose_headless_command(harness, "PROMPT", mode="reviewer", repo=self._repo, **kwargs), expected
+                )
+
+    def test_opencode_and_qwen_effort_fail_closed(self) -> None:
+        for harness in ("opencode", "qwen"):
+            with self.subTest(harness=harness), self.assertRaises(PmError) as ctx:
+                profiles.compose_headless_command(harness, "PROMPT", mode="reviewer", repo=self._repo, effort="high")
+            self.assertIn("headless", str(ctx.exception))
+
+
+class TestComposeResumeCommand(unittest.TestCase):
+    _repo = Path("/repo")
+    _git_dir = Path("/repo/.git")
+    _session_id = "session-123"
+
+    def test_frozen_resume_shapes(self) -> None:
+        cases = [
+            (
+                "claude", {},
+                ["claude", "-p", "CORRECTION", "--resume", self._session_id, "--permission-mode", "acceptEdits", "--add-dir", "/repo"],
+            ),
+            (
+                "codex", {"git_access_dir": self._git_dir},
+                ["codex", "exec", "resume", self._session_id, "CORRECTION", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", "/repo", "--add-dir", "/repo/.git"],
+            ),
+            (
+                "copilot", {},
+                ["copilot", "-p", "CORRECTION", "--resume=session-123", "--allow-all-tools", "--autopilot", "--add-dir", "/repo"],
+            ),
+            (
+                "opencode", {},
+                ["opencode", "run", "CORRECTION", "--session", self._session_id, "--agent", "build", "--auto", "--dir", "/repo"],
+            ),
+            (
+                "qwen", {},
+                ["qwen", "--prompt", "CORRECTION", "--resume", self._session_id, "--sandbox", "--output-format", "text"],
+            ),
+        ]
+        for harness, kwargs, expected in cases:
+            with self.subTest(harness=harness):
+                self.assertEqual(
+                    profiles.compose_resume_command(harness, "CORRECTION", session_id=self._session_id, repo=self._repo, **kwargs), expected
+                )
+
+    def test_empty_session_id_fails_closed(self) -> None:
+        with self.assertRaises(PmError):
+            profiles.compose_resume_command("codex", "CORRECTION", session_id="", repo=self._repo)
+
+    def test_unknown_harness_and_omitted_codex_git_access_fail_or_compose_as_expected(self) -> None:
+        with self.assertRaises(PmError):
+            profiles.compose_resume_command("not-a-harness", "CORRECTION", session_id=self._session_id, repo=self._repo)
+        command = profiles.compose_resume_command("codex", "CORRECTION", session_id=self._session_id, repo=self._repo)
+        self.assertNotIn("--add-dir", command)
 
 
 class TestQueryModelIdentityNoInventory(unittest.TestCase):

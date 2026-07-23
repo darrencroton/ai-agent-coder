@@ -1,11 +1,8 @@
 """The `review` command: commissioning an independent review of a pinned diff.
 
-`review.py` shares the five-tool roster with the Developer
-launch path conceptually, but not its code: reviews run one-shot/exec where
-the tool supports it (never the Developer's interactive tmux TUI path), so
-this module composes its own command table — re-specified fresh from
-`skills/orchestrator/scripts/delegate_contract.py`'s `compose_delegate_command`
-as behavioural evidence only. This module shares no code with
+`review.py` uses the shared PM headless-composer's reviewer mode. Reviews run
+one-shot/exec where the tool supports it (never the Developer's interactive
+tmux TUI path), while the PM implementation remains independent from
 `skills/orchestrator/` and never imports from it.
 
 The Reviewer is read-only by instruction and holds no acceptance authority;
@@ -31,6 +28,7 @@ from typing import Any
 from . import PmError
 from . import git_ops
 from . import plan as plan_mod
+from . import profiles
 from . import prompts
 from . import slice_ops
 from . import state as state_mod
@@ -42,81 +40,12 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# --- one-shot reviewer command composition (this module's own table) ---------
-
-
-def compose_reviewer_command(
-    tool: str, prompt: str, *, model: str | None = None, effort: str | None = None, repo: Path
-) -> list[str]:
-    """Compose a one-shot reviewer invocation for `tool`. Unsupported tool
-    names, and a non-default `effort` for opencode/qwen (whose tested
-    one-shot commands have no effort/reasoning flag), fail closed with
-    `PmError` rather than silently dropping the request."""
-    repo_str = str(repo)
-
-    if tool == "codex":
-        command = ["codex", "exec", prompt]
-        if model:
-            command.extend(["-m", model])
-        if effort:
-            command.extend(["-c", f'model_reasoning_effort="{effort}"'])
-        command.extend(["--sandbox", "read-only", "--skip-git-repo-check", "-C", repo_str])
-        return command
-
-    if tool == "claude":
-        command = ["claude", "-p", prompt]
-        if model:
-            command.extend(["--model", model])
-        if effort:
-            command.extend(["--effort", effort])
-        command.extend(["--permission-mode", "plan", "--output-format", "text", "--add-dir", repo_str])
-        return command
-
-    if tool == "copilot":
-        command = ["copilot"]
-        if model:
-            command.extend(["--model", model])
-        if effort:
-            command.extend(["--effort", effort])
-        command.extend(["-p", prompt, "--allow-all-tools", "--autopilot", "--silent", "--add-dir", repo_str])
-        return command
-
-    if tool == "opencode":
-        if effort:
-            raise PmError(
-                "opencode's tested one-shot review command has no effort/reasoning flag; "
-                "omit --effort for this tool or choose the configured model explicitly"
-            )
-        command = ["opencode", "run", prompt]
-        if model:
-            command.extend(["-m", model])
-        command.extend(["--agent", "plan", "--auto", "--dir", repo_str])
-        return command
-
-    if tool == "qwen":
-        if effort:
-            raise PmError(
-                "qwen's tested one-shot review command has no effort/reasoning flag; "
-                "omit --effort for this tool or choose the configured model explicitly"
-            )
-        command = ["qwen", "--prompt", prompt]
-        if model:
-            command.extend(["--model", model])
-        command.extend(["--sandbox", "--output-format", "text"])
-        return command
-
-    raise PmError(
-        f"no reviewer command profile is defined for {tool!r}; supported tools: "
-        "codex, claude, copilot, opencode, qwen"
-    )
-
-
 def _build_reviewer_command(
     tool: str, prompt: str, *, model: str | None, effort: str | None, repo: Path, reviewer_command_override: str | None
 ) -> list[str]:
     if reviewer_command_override:
         return shlex.split(reviewer_command_override) + [prompt]
-    return compose_reviewer_command(tool, prompt, model=model, effort=effort, repo=repo)
+    return profiles.compose_headless_command(tool, prompt, mode="reviewer", model=model, effort=effort, repo=repo)
 
 
 def _resolve_tool(state: dict[str, Any], tool_arg: str | None, *, has_override: bool) -> str:
