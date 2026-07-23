@@ -66,7 +66,7 @@ This README is the maintained human-facing skill index. Each skill's own `SKILL.
 | [`scoped-implementation`](skills/scoped-implementation/) | Implements one frozen slice without expanding scope; prepares the receipt for drift audit. |
 | [`drift-audit`](skills/drift-audit/) | Answers one question: was the implementation authorized? Runs before any quality review. |
 | [`code-review`](skills/code-review/) | Senior-level quality review after drift audit passes: correctness, edge cases, tests, error handling, domain-specific risks. |
-| [`orchestrator`](skills/orchestrator/) | Delegates bounded work to another harness through validated semantic contracts — read-only (investigation, drift-audit, code-review) or read-write (a bounded implementation task); the Developer retains verification, gates, commits, and final responsibility either way. |
+| [`orchestrator`](skills/orchestrator/) | Delegates bounded read-only or read-write work through validated contracts, with all-harness session tracking and captured-session continuation; the Developer retains verification, gates, commits, and final responsibility. |
 | [`code-simplifier`](skills/code-simplifier/) | Behaviour-preserving clarity pass over working code; a separate cleanup step, not part of the default chain. |
 | [`handoff`](skills/handoff/) | Compact continuation state for the next session: status, blockers, frozen contract, exact next action. |
 | [`commit`](skills/commit/) | Disciplined commits: stage by name, never skip hooks, message lists every file with reasons. |

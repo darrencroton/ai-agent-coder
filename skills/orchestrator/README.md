@@ -22,8 +22,10 @@ Developer self-audit fallback is allowed on default slices when no read-only del
 - `references/{claude,codex,copilot,opencode,qwen}.md` — harness mechanics and enforcement notes for both access modes
 - `scripts/delegate_contract.py` — validation, prompt rendering, and command composition
 - `scripts/delegate_jobs.py` — tracked delegate lifecycle
-- `scripts/delegate_sessions.py` — session discovery and transcript extraction
+- `scripts/delegate_sessions.py` — launch-bound session-ID discovery, all-harness activity signals, and transcript extraction
 - `tests/` — contract, launcher, lifecycle, and transcript tests
+
+Every launch records a `session_id` field and exposes source-labelled activity for all five harnesses, falling back to captured output when no owned transcript or session-store signal is available. A fresh request can continue a terminal same-run delegate by naming `parent_label` and advancing its `-rN` lineage; the helper re-validates policy and parent identity, uses only the captured parent ID, and records the lineage. See [`references/delegate-contract.md`](references/delegate-contract.md#validated-continuation).
 
 ## Quick verification
 

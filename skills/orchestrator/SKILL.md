@@ -90,12 +90,18 @@ python3 scripts/delegate_jobs.py launch \
 
 Use lowercase kebab-case labels shaped as `<nn>-<tool>-<subtask-slug>[-rN]`. Use `activity`, `wait`, `extract`, and `cancel` for lifecycle management. A rejected request must be corrected from its feedback artifact; never bypass rejection with a raw command.
 
+## Session Tracking and Continuation
+
+Every managed launch records a `session_id` field and exposes it through `status` and `activity`. Claude and Copilot receive launch-bound IDs; Codex, OpenCode, and Qwen use launch-correlated discovery from launch output or session stores and leave the field `null` rather than guess when ownership cannot be established. `activity` reports a source-labelled health signal for every harness, using an owned transcript or session store when available and captured output as the universal fallback.
+
+To continue a delegate, write a fresh schema-v3 request in the same managed run, set `parent_label` to the prior delegate, and give the new request a lineage-preserving `-rN` label. The launcher re-validates the entire request against policy, including tool, model, effort, and access; continuation does not inherit authorization. It blocks unless the parent is terminal, uses the same harness, owns a captured session ID, and belongs to the same advancing label lineage. There is no global “resume last” fallback. The new manifest entry records `parent_label`, `parent_session_id`, and `continuation_index`. See [references/delegate-contract.md](references/delegate-contract.md#validated-continuation) for the authoritative contract and [references/templates.md](references/templates.md#validated-continuation) for a request template.
+
 ## Developer and Delegate Workflow
 
 1. **Preflight** — confirm the selected CLI is installed and authenticated.
 2. **Plan** — keep implementation with the Developer by default; identify bounded work (read-only evidence, or a boundable implementation slice) that benefits from delegation.
 3. **Freeze** — capture the acceptance slice, allowed implementation surface, non-goals, risky areas, and validation before coding, whether the Developer or a read-write delegate will implement it.
-4. **Request** — copy identity/tool/model/effort fields from policy and write a schema-v3 delegate request using [references/templates.md](references/templates.md).
+4. **Request** — copy identity/tool/model/effort fields from policy and write a schema-v3 delegate request using [references/templates.md](references/templates.md); for a continuation, also name the verified parent and advance its `-rN` lineage.
 5. **Launch** — use `delegate_jobs.py launch`; inspect rejection feedback instead of weakening the contract.
 6. **Monitor** — use `activity` on a calm cadence. Silence alone is not failure while the process remains healthy.
 7. **Extract** — read the clean result and verify it against the requested output contract.

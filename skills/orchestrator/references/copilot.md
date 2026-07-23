@@ -24,7 +24,9 @@ Only valid against a policy whose `required_access` includes `read-write`. The c
 
 ## Lifecycle
 
-Copilot has no session-log integration in the helper. `activity` uses helper-managed file/process signals. Use `wait`, `extract`, and `cancel` normally. Do not resume through a raw command; write a new validated request with an `-rN` label.
+Copilot receives a launch-bound UUID through `--session-id`. The helper persists that ID and uses its owned `events.jsonl` transcript as the preferred activity signal, with captured output as the fallback.
+
+Use `delegate_jobs.py activity`, `wait`, `extract`, and `cancel`. A validated continuation composes `copilot --resume=<captured-id>` from a fresh same-run request with `parent_label` and an advancing `-rN` label. The shared parent-identity and policy rules are defined in [delegate-contract.md](delegate-contract.md#validated-continuation); do not invoke raw resume commands.
 
 ## Authentication and configuration
 

@@ -28,9 +28,9 @@ codex exec <prompt> [-m <model>] [-c model_reasoning_effort="<effort>"] --sandbo
 
 ## Lifecycle
 
-Use `delegate_jobs.py activity`, `wait`, `extract`, and `cancel`. The helper discovers Codex rollout JSONL files and uses session activity and assistant output as health/extraction fallbacks. Preserve vendor transcript fields such as `role: assistant`; they are external transcript schema, not orchestrator roles.
+Codex does not accept a caller-set session ID at first launch. The helper captures one only from launch output or a rollout JSONL record correlated by prompt, repository, and start time; unresolved ownership remains `null`. Owned transcript activity and assistant output drive health and extraction, with captured output as the fallback. Preserve vendor transcript fields such as `role: assistant`; they are external transcript schema, not orchestrator roles.
 
-Do not resume a delegate through a raw command. Write a new validated request with an `-rN` label.
+Use `delegate_jobs.py activity`, `wait`, `extract`, and `cancel`. A validated continuation composes `codex exec resume <captured-id>` from a fresh same-run request with `parent_label` and an advancing `-rN` label. The shared parent-identity and policy rules are defined in [delegate-contract.md](delegate-contract.md#validated-continuation); do not invoke raw resume commands.
 
 ## Authentication and configuration
 

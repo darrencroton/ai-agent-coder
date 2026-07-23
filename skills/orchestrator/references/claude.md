@@ -28,9 +28,9 @@ claude -p <prompt> [--model <model>] [--effort <effort>] --permission-mode accep
 
 ## Lifecycle
 
-Use `delegate_jobs.py activity`, `wait`, `extract`, and `cancel`. The helper can discover Claude JSONL sessions and uses session timestamps plus assistant activity as health signals. Empty stdout while the process runs is not evidence of failure.
+Claude receives a launch-bound UUID through `--session-id`. The helper persists that ID, resolves its owned JSONL transcript, and uses transcript timestamps plus assistant activity as health signals; captured output remains the fallback. Empty stdout while the process runs is not evidence of failure.
 
-Do not continue a delegate through a raw `--resume` command. Write a new validated request with an `-rN` label.
+Use `delegate_jobs.py activity`, `wait`, `extract`, and `cancel`. A validated continuation composes `claude --resume <captured-id>` from a fresh same-run request with `parent_label` and an advancing `-rN` label. The shared parent-identity and policy rules are defined in [delegate-contract.md](delegate-contract.md#validated-continuation); do not invoke raw resume commands.
 
 ## Authentication and configuration
 

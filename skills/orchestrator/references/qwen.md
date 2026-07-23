@@ -20,6 +20,8 @@ A live check against the currently installed CLI in this environment hung on any
 
 ## Lifecycle and configuration
 
-Qwen Code has no dedicated session-log integration in the helper. `activity` uses helper-managed file/process signals. Use `wait`, `extract`, and `cancel` normally. Do not resume through a raw command; write a new validated request with an `-rN` label.
+Qwen Code does not accept a caller-set session ID at first launch. The helper captures an ID only from a chat JSONL record correlated by prompt, repository, and start time; unresolved ownership remains `null`. An owned chat transcript is the preferred activity signal, with captured output as the fallback.
+
+Use `delegate_jobs.py activity`, `wait`, `extract`, and `cancel`. A validated continuation composes `qwen --resume <captured-id>` from a fresh same-run request with `parent_label` and an advancing `-rN` label. The shared parent-identity and policy rules are defined in [delegate-contract.md](delegate-contract.md#validated-continuation); do not invoke raw resume commands.
 
 Use the caller-supplied Qwen Code environment and authentication. Do not redirect its configuration or invent credentials. Discover exact model identifiers from the caller's Qwen Code configuration or `qwen --help`; do not guess. Pass explicit model choices through without capability ranking. Qwen Code effort must remain `default` because the tested command exposes no effort flag; unsupported selections fail before launch.

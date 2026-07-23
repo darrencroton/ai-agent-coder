@@ -28,9 +28,9 @@ opencode run <prompt> [-m <provider/model>] --agent build --auto --dir <repo>
 
 ## Lifecycle
 
-OpenCode has no dedicated session-log integration in the helper. `activity` uses helper-managed file/process signals. Use `wait`, `extract`, and `cancel` normally. Cold local models can be quiet; silence alone is not a hang while the process is healthy.
+OpenCode does not accept a caller-set session ID at first launch. The helper captures an ID only from a session-store record correlated by prompt, repository, and start time; unresolved ownership remains `null`. An owned session-store timestamp is the preferred activity signal, with captured output as the fallback. Cold local models can be quiet; silence alone is not a hang while the process is healthy.
 
-Do not resume through raw `--continue` or `--session` commands. Write a new validated request with an `-rN` label.
+Use `delegate_jobs.py activity`, `wait`, `extract`, and `cancel`. A validated continuation composes `opencode run --session <captured-id>` from a fresh same-run request with `parent_label` and an advancing `-rN` label. The shared parent-identity and policy rules are defined in [delegate-contract.md](delegate-contract.md#validated-continuation); do not invoke raw resume commands.
 
 ## Configuration
 

@@ -88,6 +88,44 @@ A `read-write` delegate may create, edit, and run commands needed to complete th
 
 Schema v1/v2, `role`, `workspace-write` as an access value, old Worker keys, and unknown fields are rejected without aliases.
 
+## Validated continuation
+
+A continuation is a new schema-v3 request that names a prior delegate in the same managed run. Add `parent_label` and advance the parent's shared label root with an `-rN` suffix:
+
+```json
+{
+  "schema_version": 3,
+  "label": "01-claude-review-r1",
+  "parent_label": "01-claude-review",
+  "slice_id": "Slice 1",
+  "plan_sha256": "<exact value copied from delegate-policy.json>",
+  "tool": "claude",
+  "model": "opus",
+  "effort": "medium",
+  "access": "read-write",
+  "task": "Resolve the review findings while preserving the frozen contract.",
+  "context": "Continue the completed read-only review in the same Claude session.",
+  "required_skills": [],
+  "files": ["client.py", "tests/test_client.py"],
+  "authorized_surface": ["client.py: reviewed fix only", "tests/test_client.py: regression test only"],
+  "non_goals": ["Do not change public return types.", "Do not touch any other file."],
+  "constraints": ["Address only findings supported by repository evidence.", "Report every file touched."],
+  "expected_output": "List fixes, changed files, and validation results."
+}
+```
+
+`parent_label` activates continuation; an `-rN` label without `parent_label` remains a normal first launch and can still record a retry as before. The continuation request is validated from scratch against the supplied policy. It may change access mode only when that policy authorizes the new mode, and a read-write continuation still requires non-empty `authorized_surface` and `non_goals`. It never inherits permission to commit, mutate Git/GitHub state, re-delegate, or make final acceptance decisions.
+
+Before launching, the helper verifies that the named parent:
+
+- exists in the same managed run
+- is terminal (`completed`, `failed`, or `cancelled`)
+- uses the same harness as the new request
+- owns a non-empty captured `session_id`
+- shares the new label's root, with a new `rN` number greater than the parent's
+
+Failure of any check rejects the request with structured feedback and starts no process. In particular, an unavailable parent ID produces `continuation-session-unavailable`; the helper never substitutes a global “resume last” session. A successful continuation uses the explicit parent ID in the harness-specific resume command and records `parent_label`, `parent_session_id`, and `continuation_index` in the new manifest entry. `status` and `activity` expose the continued session ID like any other managed launch.
+
 ## Harness profiles
 
 `python3 scripts/delegate_jobs.py profiles` reports each supported tool's factual enforcement for both access modes. All five tools are eligible for either:
@@ -113,5 +151,7 @@ python3 scripts/delegate_jobs.py launch \
 Rejected requests create `<label>-request-feedback.{json,md}` and start no process. Correct the named fields and retry with the helper; never bypass validation with a raw harness command.
 
 Successful launches preserve the schema-v3 request, policy, rendered prompt, resolved command, normalized access (plus `authorized_surface`/`non_goals` for a read-write launch), hashes, working directory, process status, stdout, and stderr. Required skills and linked Markdown resources must embed successfully before process creation. The caller reads the delegate's report (or diff) directly; a read-only delegate skill's own verdict vocabulary (for example `PASS WITH RISKS`) appears in the report body, not in any machine-captured sentinel.
+
+Every manifest entry carries `session_id`, using a launch-bound value where ownership can be established and `null` otherwise. `status` and `activity` expose that ID. Activity is source-labelled for all five harnesses: owned transcript/session-store evidence is preferred where available, while captured output is the universal fallback so a live process is never silently unmonitored.
 
 Default slices may fall back to a documented Developer self-audit. A plan that asks for independent review (`Independent audit required: yes`) deserves separate read-only delegate launches for drift audit and code review; if none can be launched, stop and report rather than self-audit.
