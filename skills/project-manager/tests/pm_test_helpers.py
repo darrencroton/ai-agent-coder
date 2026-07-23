@@ -1,9 +1,9 @@
 """Shared fixtures for the PM Stage 1 test suite.
 
-Provides `PmTestCase`: a temp git repo per test, a valid-minimal-plan
-writer (parameterizable per slice), an in-process CLI runner, and a
-run-creation helper built on `state.create_run`. Kept deliberately minimal
-— there is no fake harness here; Stage 1 has no session lifecycle to fake.
+Provides `PmTestCase`: a temp git repo per test, a valid-minimal-plan writer
+(parameterizable per slice), an in-process CLI runner, a run-creation helper
+built on `state.create_run`, and fake harness writers for process-lifecycle
+tests.
 """
 
 from __future__ import annotations
@@ -64,6 +64,33 @@ def write_fake_harness(path: Path, body: str) -> Path:
     path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+def write_headless_fake_harness(path: Path) -> Path:
+    """Write the standard resumable headless fake used by lifecycle tests.
+
+    Every turn writes ``result.json``.  A resume turn, identified by
+    ``PM_DEVELOPER_RESUME_SESSION_ID``, appends its final command argument to
+    ``PM_HEADLESS_FAKE_APPEND_PATH`` and commits that file when it is inside
+    a git repository.
+    """
+    return write_fake_harness(
+        path,
+        r"""set -eu
+turn_text="${1:-}"
+if [ -n "${PM_DEVELOPER_RESUME_SESSION_ID:-}" ]; then
+    echo "HEADLESS_FAKE_RESUME:${PM_DEVELOPER_RESUME_SESSION_ID}"
+    if [ -n "${PM_HEADLESS_FAKE_APPEND_PATH:-}" ]; then
+        printf '%s\n' "$turn_text" >> "$PM_HEADLESS_FAKE_APPEND_PATH"
+        git add "$PM_HEADLESS_FAKE_APPEND_PATH"
+        git commit -q -m "Headless fake resume"
+    fi
+else
+    echo "HEADLESS_FAKE_LAUNCH"
+fi
+printf '{"status":"complete","summary":"headless fake completed"}\n' > "$PM_RESULT_PATH"
+""",
+    )
 
 
 def render_slice(
