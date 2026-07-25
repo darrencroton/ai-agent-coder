@@ -1,12 +1,11 @@
 """Command-line parsing and dispatch (target-design §12).
 
-All eleven commands are wired: `init`, `status` (incl. `--report`),
-`approve`, `start-slice`, `observe`, `send`, `finalize` (bare, and its
+All ten commands are wired: `init`, `status` (incl. `--report`),
+`approve`, `start-slice`, `observe`, `finalize` (bare, and its
 `--accept`/`--steer`/`--stop` decision paths), `review`, `notes`, and
-`stop`. This
-module stays thin: argument parsing, resolving the repo/run/token,
+`stop`. This module stays thin: argument parsing, resolving the repo/run/token,
 dispatching into `slice_ops`/`review`, and formatting output. The actual
-mechanics (state mutation, session control, git facts, review commissioning)
+mechanics (state mutation, process control, git facts, review commissioning)
 live in the modules that own them; nothing here decides anything semantic.
 """
 
@@ -93,16 +92,10 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--run")
     observe.add_argument("--token")
 
-    send = subparsers.add_parser("send", help="Steer the live session")
-    send.add_argument("--text", required=True)
-    send.add_argument("--reason", required=True)
-    send.add_argument("--run")
-    send.add_argument("--token")
-
     finalize = subparsers.add_parser("finalize", help="Run the floor and collect assessment evidence")
     finalize_group = finalize.add_mutually_exclusive_group()
     finalize_group.add_argument("--accept", help="accept the slice; reasoning must be >= 40 characters")
-    finalize_group.add_argument("--steer", help="send a written correction into the live session")
+    finalize_group.add_argument("--steer", help="resume the slice with a written correction (a new budgeted turn)")
     finalize_group.add_argument("--stop", help="stop the slice, recording the reason")
     finalize.add_argument("--risk", help='only "elevated" is accepted; risk can never be lowered')
     finalize.add_argument("--run")
@@ -267,7 +260,8 @@ def _run_status(args: argparse.Namespace) -> int:
         alive = result.current_session_alive
         before_head = (current.get("before_head") or "")[:12]
         print(
-            f"current slice: {current.get('id')}  session={current.get('tmux_session')} "
+            f"current slice: {current.get('id')}  session={current.get('session')} "
+            f"session_id={current.get('session_id')} pid={current.get('pid')} "
             f"alive={alive}  before_head={before_head}…  started_at={current.get('started_at')} "
             f"attempts={current.get('attempts')}"
         )
@@ -343,9 +337,17 @@ def _run_start_slice(args: argparse.Namespace) -> int:
         return 2
 
     verb = "relaunched" if outcome.kind == "relaunched" else "launched"
-    print(f"{verb} {outcome.slice_id} (attempt {outcome.attempt}) in tmux session {outcome.session}")
+    print(
+        f"{verb} {outcome.slice_id} (attempt {outcome.attempt}) as headless session "
+        f"{outcome.session} (pid {outcome.pid}, session_id {outcome.session_id or 'none'})"
+    )
+    if not outcome.session_id:
+        print(
+            "no launch-bound session id captured yet — finalize --steer will re-correlate "
+            "from the completed turn, or block if none can be bound"
+        )
     if outcome.reaped:
-        print(f"reaped stale sessions: {', '.join(outcome.reaped)}")
+        print(f"reaped stale developer process(es): {', '.join(outcome.reaped)}")
     if outcome.notes_warning:
         print(f"WARNING: {outcome.notes_warning}")
     return 0
@@ -367,27 +369,15 @@ def _run_observe(args: argparse.Namespace) -> int:
     if args.wait:
         print(f"waited: {outcome.elapsed_seconds:.1f}s (requested {args.wait:g}s)")
     print(f"session running: {outcome.running}")
-    print(f"pane changed: {outcome.pane_changed}")
+    print(f"output changed: {outcome.output_changed}")
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
     print(f"result present: {outcome.result_present}{status_note}")
     if outcome.hard_stop["present"]:
         print(f"hard-stop scan: {', '.join(outcome.hard_stop['kinds'])}")
     else:
         print("hard-stop scan: clear")
-    print("--- pane tail ---")
+    print("--- output tail ---")
     print(outcome.tail)
-    return 0
-
-
-# --- send ---------------------------------------------------------------------
-
-
-def _run_send(args: argparse.Namespace) -> int:
-    token = _require_token(args)
-    repo = _repo_from_cwd()
-    run_dir = state_mod.resolve_run_dir(repo, args.run)
-    slice_ops.send(repo, run_dir, token, text=args.text, reason=args.reason)
-    print(f"sent: {args.text!r} ({args.reason})")
     return 0
 
 
@@ -421,7 +411,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         outcome = slice_ops.finalize_steer(repo, run_dir, token, correction=args.steer, risk=args.risk)
         if outcome.kind == "steered":
             print(f"steered {outcome.slice_id} (attempt {outcome.attempts})")
-            print("correction delivered directly to the live session (no artifact file written)")
+            print("correction delivered as a resume turn (no artifact file written)")
             return 0
         print(f"pm: error: {outcome.message}", file=sys.stderr)
         return 2
@@ -439,7 +429,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
     print(f"evidence: status-before={outcome.status_before_path}")
     print(f"evidence: status-after={outcome.status_after_path}")
     print(f"evidence: diff={outcome.diff_path}")
-    print(f"evidence: pane={outcome.pane_path}")
+    print(f"evidence: session-output={outcome.session_output_path}")
     print(f"evidence: result={outcome.result_path}")
     return 0 if outcome.report.passed else 1
 
@@ -480,24 +470,30 @@ def _run_stop(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
 
     if args.scavenge:
+        # Only *state* resolution/load failure justifies the sidecar-only
+        # fallback sweep. Everything after this block — including the
+        # termination inside `stop()` — must fail loudly: a swallowed
+        # termination error would print "state unavailable" and exit 0 while
+        # the Developer is still alive.
         try:
             token = _require_token(args)
             run_dir = state_mod.resolve_run_dir(repo, args.run)
             state = slice_ops.load_writable_state(run_dir, token)
-            outcome = slice_ops.stop(repo, run_dir, token, reason=args.reason, slice_status=args.slice_status)
-            extra_killed = slice_ops.stop_scavenge_sweep(run_id=state["run_id"])
-            all_killed = outcome.killed + [name for name in extra_killed if name not in outcome.killed]
-            print(f"stopped run {state['run_id']}; killed sessions: {all_killed}")
-            return 0
         except PmError as exc:
-            killed = slice_ops.stop_scavenge_sweep(run_id=args.run)
-            print(f"pm: scavenge: state unavailable ({exc}); swept sessions: {killed}")
+            killed = slice_ops.stop_scavenge_sweep(repo, run_id=args.run)
+            print(f"pm: scavenge: state unavailable ({exc}); terminated: {killed}")
             return 0
+
+        outcome = slice_ops.stop(repo, run_dir, token, reason=args.reason, slice_status=args.slice_status)
+        extra_killed = slice_ops.stop_scavenge_sweep(repo, run_id=state["run_id"])
+        all_killed = outcome.killed + [name for name in extra_killed if name not in outcome.killed]
+        print(f"stopped run {state['run_id']}; terminated: {all_killed}")
+        return 0
 
     token = _require_token(args)
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     outcome = slice_ops.stop(repo, run_dir, token, reason=args.reason, slice_status=args.slice_status)
-    print(f"stopped run {outcome.run_id}; killed sessions: {outcome.killed}")
+    print(f"stopped run {outcome.run_id}; terminated: {outcome.killed}")
     return 0
 
 
@@ -528,7 +524,6 @@ _HANDLERS = {
     "approve": _run_approve,
     "start-slice": _run_start_slice,
     "observe": _run_observe,
-    "send": _run_send,
     "finalize": _run_finalize,
     "review": _run_review,
     "notes": _run_notes,

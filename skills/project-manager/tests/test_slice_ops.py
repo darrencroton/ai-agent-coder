@@ -1,61 +1,73 @@
-"""Protected behaviours: the Stage 3 slice lifecycle commands (evidence, not
-acceptance).
+"""Protected behaviours: the slice lifecycle commands (evidence, not
+acceptance), running the headless Developer.
 
 Everything here drives `pm_lib.cli.main` in-process (via `run_cli_in_repo`),
-matching an operator invoking the `pm` CLI from inside the working tree.
-No real coding CLI is ever launched — tmux-gated scenarios drive a tiny
-fake-harness `sh` script (`pm_test_helpers.write_fake_harness`), matching
-the retained fake-harness pattern (replacement-ledger §9.1/§9.3). Pins:
+matching an operator invoking the `pm` CLI from inside the working tree. No
+real coding CLI is ever launched — lifecycle scenarios drive a tiny
+fake-harness `sh` script (`pm_test_helpers.write_fake_harness`) as a
+`--harness-command` override: PM launches it detached, passes the launch
+pointer (or, on a resume, the steer correction) as its final argument, and
+reads its captured stdout from the slice's `session-output.txt`. Pins:
 
 1. `init` happy path: creates run state and prints the run capability token
    exactly once; writes the `.pm/` skeleton and a self-ignoring
    `.pm/.gitignore`; slice entries carry `plan_risk`; check-plan warnings
    are printed and the run still proceeds; an `init` event is recorded.
    Re-running `init` while a run already exists creates a SECOND run and
-   repoints `current` — both run directories survive.
+   repoints `current` — both run directories survive. `init` needs no tmux.
 2. `init` failures, each exiting 2 with nothing created: a plan with
    errors; a dirty worktree; an unknown harness with no `--harness-command`
    override; `--attest` naming an unknown slice id; `--branch` naming a
-   branch that does not exist. `--create-branch` succeeds: it creates the
-   branch and switches to it.
-3. Token gating: `approve`/`start-slice`/`send`/`finalize`/`stop` each exit
-   2 with a "token required" message when no token is supplied (flag or
-   `PM_RUN_TOKEN`); a wrong token exits 2 with a plain (non-INTEGRITY)
-   message; a hand-tampered `run.json` makes every one of those commands
-   exit 2 with an `INTEGRITY:`-prefixed message. `status` and `observe`
-   still work with no token at all.
+   branch that does not exist. `--create-branch` succeeds.
+3. Token gating: `approve`/`start-slice`/`finalize`/`stop` each exit 2 with
+   a "token required" message when no token is supplied; a wrong token
+   exits 2 with a plain (non-INTEGRITY) message; a hand-tampered `run.json`
+   makes every one of those commands exit 2 with an `INTEGRITY:`-prefixed
+   message. `status` and `observe` still work with no token at all.
 4. `approve`: records reason + timestamp for an approval-flagged slice; a
-   non-gated slice is refused; a slice with an unclear approval flag is
-   refused even though it is not exactly "no".
-5. Full fake-harness flow (tmux): `init` → `start-slice` (the fake harness
-   makes an authorized commit and writes `result.json`) → `observe --wait`
-   until the result appears → `finalize`: exits 0, prints all eight floor
-   facts as PASS plus evidence paths; state is unchanged except
-   `updated_at`. (Stage 4's `finalize --accept/--steer/--stop` decision
-   paths are pinned in `test_finalize.py`, not here.)
-6. `finalize` with a floor failure (the fake harness also touches an
-   unauthorized file): exits 1, the surface fact prints FAIL, a `floor`
-   event is recorded.
-7. Attempt accounting (tmux): `start-slice`, kill the session (simulate a
-   dead harness), `start-slice` again → a relaunch, and `attempts` reads
-   back as 1 from a **fresh** `status`/state load (the persistence AC);
-   the prior attempt's `result.json` is rotated into `attempt-0/`;
-   exhausting the budget (`--max-attempts 1`) refuses the next relaunch,
-   sets `needs-human`, and exits 2.
-8. Mid-run plan edit: `init`, edit the plan file, `start-slice` → exits 2,
-   run status becomes `needs-human`, a `plan-changed` event is recorded.
-9. Dead session: `observe` reports the session as not running (never
-   raises); `send` refuses to drive it.
-10. `send` nudge (tmux): a live fake session receives a steered line that
-    appears in the pane, and a `send` event is recorded without touching
-    `attempts`; sending into a pane showing a credential prompt is refused
-    by the sessions hard-stop floor.
-11. `stop` (tmux): captures `pane.txt`, kills the run's sessions, sets
-    status `stopped` with the given reason. `stop --scavenge` against a
-    **deleted** state directory still finds and kills a stray
-    `pm-<run-id>-…` session and exits 0.
+   non-gated slice is refused; an unclear approval flag is refused.
+5. Full fake-harness flow: `init` → `start-slice` (the fake makes an
+   authorized commit and writes `result.json`) → `observe --wait` until the
+   result appears → `finalize`: exits 0, prints all eight floor facts as
+   PASS plus evidence paths (including `session-output=`); state is
+   unchanged except `updated_at`.
+6. `finalize` with a floor failure (unauthorized file): exits 1, the
+   surface fact prints FAIL, a `floor` event is recorded.
+7. Attempt accounting: `start-slice`, terminate the process (simulate a
+   dead harness), `start-slice` again → a relaunch, `attempts` reads back
+   as 1 from a fresh state load; the prior attempt's `result.json` is
+   rotated into `attempt-0/`; exhausting the budget refuses the next
+   relaunch, sets `needs-human`, exits 2.
+8. Mid-run plan edit: `init`, edit the plan, `start-slice` → exits 2, run
+   status becomes `needs-human`, a `plan-changed` event is recorded.
+9. Dead process: after the Developer process dies, `observe` reports the
+   session as not running and never raises.
+10. `observe --wait` honest-wait semantics: the wait breaks early ONLY on
+    process death, `result.json`, or a hard-stop marker in the captured
+    session output — never on mere output churn. "output changed" reports
+    growth since the PREVIOUS observation, so back-to-back no-wait observes
+    still record real progress in the event log.
+11. `stop`: leaves `session-output.txt` in place, terminates the tracked
+    Developer process group, sets status `stopped`. `stop --scavenge`
+    against a **deleted** state directory still finds and terminates the
+    process via the identity-validated `developer.pid` sidecar and exits 0;
+    a corrupt sidecar, or one owned by another run, fails closed and never
+    signals anything.
 12. All slices already complete: `start-slice` prints a completion message
-    and exits 0 without touching tmux.
+    and exits 0 without launching anything.
+13. Launch-bound session id capture: claude/copilot/override use the minted
+    launch id; codex/opencode/qwen correlate from THIS launch's own outfile
+    only (never a global lookup) and yield None when no id is present.
+14. Launch environment isolation: an inherited
+    `PM_DEVELOPER_RESUME_SESSION_ID` never reaches an initial launch, and the
+    controller's own environment is restored afterwards.
+15. Termination failures are never swallowed: `stop`, a relaunch, and both
+    `stop --scavenge` paths (readable state and sidecar-only) exit 2 and
+    leave the slice's authority intact; a PID-reuse-safe "nothing to signal"
+    still succeeds.
+16. `_await_launch_session_id` is the bounded, fail-closed pre-quiesce wait:
+    it binds a delayed launch-owned id, times out to None, and short-circuits
+    on a hard-stop marker.
 """
 
 from __future__ import annotations
@@ -63,138 +75,113 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-import shutil
-
 from pm_test_helpers import PmTestCase, parse_init_output, write_fake_harness
 
+from pm_lib import PmError
 from pm_lib import sessions
+from pm_lib import slice_ops
 from pm_lib import state as state_mod
 
-_HAS_TMUX = shutil.which("tmux") is not None
+
+# --- headless fake harness script builders -----------------------------------
+#
+# Each fake receives PM's launch pointer (or, on a resume, the steer
+# correction) as $1 and the PM_* environment; it writes its progress to stdout
+# (captured into session-output.txt) and its completion signal to
+# $PM_RESULT_PATH. No real coding CLI is ever invoked.
 
 
-# --- fake harness script builders --------------------------------------------
-
-
-def _result_heredoc(status: str = "done", summary: str = "did the work") -> str:
+def _write_result_cmd(status: str = "done", summary: str = "did the work") -> str:
     return (
-        'cat > "$PM_RESULT_PATH" <<EOF\n'
-        '{"slice": "$PM_SLICE_ID", "status": "' + status + '", "summary": "' + summary + '"}\n'
-        "EOF"
+        "printf '{\"slice\": \"%s\", \"status\": \"" + status + "\", \"summary\": \"" + summary + "\"}\\n' "
+        '"$PM_SLICE_ID" > "$PM_RESULT_PATH"'
     )
 
 
-def _commit_and_result_script(
+def _commit_and_result_body(
     repo: Path,
     *,
     authorized_file: str = "a.py",
     unauthorized_file: str | None = None,
-    delay: float = 1.0,
-    tail_sleep: float = 3.0,
+    delay: float = 0.0,
+    tail_sleep: float = 0.0,
 ) -> str:
-    """A fake harness that echoes a readiness marker, waits, makes a commit
-    (optionally touching an unauthorized file too), writes result.json, then
-    idles briefly before exiting."""
-    lines = [
-        "echo FAKE_HARNESS_READY",
-        f"sleep {delay}",
-        f'echo "authorized change" >> "{repo}/{authorized_file}"',
-        f'git -C "{repo}" add "{authorized_file}"',
-    ]
+    """Commit the authorized change (optionally also touch an unauthorized
+    file), write result.json, then optionally idle briefly."""
+    lines = ["turn_text=\"${1:-}\"", "echo FAKE_HARNESS_WORKING"]
+    if delay:
+        lines.append(f"sleep {delay}")
+    lines.append(f'echo "authorized change" >> "{repo}/{authorized_file}"')
+    lines.append(f'git -C "{repo}" add "{authorized_file}"')
     if unauthorized_file:
         lines.append(f'echo "oops" >> "{repo}/{unauthorized_file}"')
         lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
     lines.append(f'git -C "{repo}" commit -q -m "slice work"')
-    lines.append(_result_heredoc())
-    lines.append(f"sleep {tail_sleep}")
+    lines.append(_write_result_cmd())
+    if tail_sleep:
+        lines.append(f"sleep {tail_sleep}")
     return "\n".join(lines)
 
 
-def _result_only_script(*, delay: float = 0.5, tail_sleep: float = 3.0) -> str:
-    lines = ["echo FAKE_HARNESS_READY", f"sleep {delay}", _result_heredoc(), f"sleep {tail_sleep}"]
+def _idle_body(*, sleep_seconds: float = 30.0) -> str:
+    return f"echo FAKE_HARNESS_WORKING\nsleep {sleep_seconds}"
+
+
+def _result_only_body(*, delay: float = 0.5, tail_sleep: float = 30.0) -> str:
+    lines = ["echo FAKE_HARNESS_WORKING"]
+    if delay:
+        lines.append(f"sleep {delay}")
+    lines.append(_write_result_cmd())
+    if tail_sleep:
+        lines.append(f"sleep {tail_sleep}")
     return "\n".join(lines)
 
 
-def _idle_script(*, sleep_seconds: float = 30.0) -> str:
-    return f"echo FAKE_HARNESS_READY\nsleep {sleep_seconds}"
+def _dies_after_body(*, delay: float = 3.0) -> str:
+    """Runs, emits benign output, then exits WITHOUT writing result.json."""
+    return f"echo FAKE_HARNESS_WORKING\nsleep {delay}"
 
 
-def _credential_prompt_script(*, reveal_after: float = 5.0, sleep_seconds: float = 30.0) -> str:
-    """A harness that comes up clean, then reveals a credential prompt only
-    *after* the developer prompt has been injected.
-
-    The pane must be clear of hard-stop markers at injection time —
-    `send_prompt` refuses to send the launch pointer into a visible
-    credential/approval/side-effect prompt (the launch-time hard-prompt
-    floor), so a harness that
-    printed the marker as its first line would fail `start-slice` itself and
-    never reach the live-session `send`-refusal this scenario exercises.
-    The readiness wait settles on the clean `FAKE_HARNESS_READY` pane and
-    injects; `reveal_after` seconds later the credential prompt appears, and
-    a subsequent `send` is what must refuse."""
-    return f"echo FAKE_HARNESS_READY\nsleep {reveal_after}\necho 'Enter API key to continue'\nsleep {sleep_seconds}"
-
-
-def _trigger_gated_credential_prompt_script(trigger_path: Path, *, sleep_seconds: float = 30.0) -> str:
-    """Like `_credential_prompt_script`, but the credential-prompt marker
-    appears only once `trigger_path` exists on disk, rather than after a
-    fixed delay from harness launch. This makes the marker's appearance
-    OBSERVATION-relative — the test controls exactly when it fires, mid-
-    `observe --wait` — instead of launch-relative, removing the race where
-    a slow `start-slice` could let a fixed-delay marker appear before
-    `observe` ever starts polling (in which case an early return would
-    prove nothing about *mid-wait* detection). Same launch-time-clean
-    requirement as `_credential_prompt_script`: the pane must show nothing
-    but `FAKE_HARNESS_READY` until the trigger appears, or `start-slice`'s
-    launch-time hard-prompt floor would refuse to inject."""
+def _churn_body() -> str:
+    """Keeps writing output (a ticking counter) for as long as observe --wait
+    might run. Never writes result.json and never prints a hard-stop marker: a
+    wait against this harness must run to (near) its full deadline, proving
+    output growth is no longer a wait-exit condition."""
     return (
-        "echo FAKE_HARNESS_READY\n"
-        f'while [ ! -f "{trigger_path}" ]; do sleep 0.1; done\n'
-        "echo 'Enter API key to continue'\n"
-        f"sleep {sleep_seconds}"
-    )
-
-
-def _dies_quickly_script(*, delay: float = 3.0) -> str:
-    return f"echo FAKE_HARNESS_READY\nsleep {delay}"
-
-
-def _stdin_draining_idle_script() -> str:
-    """A harness that actively reads (and echoes) stdin, unlike a bare
-    `sleep`. Injected text (the launch pointer, then any `send_line` steer)
-    would otherwise sit unread in the pty's canonical-mode input queue and,
-    if it accumulates, silently drop a *later* `send_line` steer — the same
-    reason a real coding CLI (which does read stdin) doesn't hit this."""
-    return "echo FAKE_HARNESS_READY\nexec cat -"
-
-
-def _cosmetic_churn_script() -> str:
-    """A harness that keeps changing the pane (a ticking counter) for as
-    long as `observe --wait` might run, draining stdin in the background
-    (`cat -`) so the injected developer prompt is still read per the
-    documented Developer-fake convention. Never writes result.json and
-    never prints a hard-stop marker: a wait against this harness must run
-    to (near) its full deadline, proving `detect_activity`'s any-byte-
-    change `active` flag is no longer used as a wait-exit condition."""
-    return (
-        "echo FAKE_HARNESS_READY\n"
-        "cat - >/dev/null &\n"
+        "echo FAKE_HARNESS_WORKING\n"
         "i=0\n"
         "while true; do\n"
         "  i=$((i+1))\n"
         "  echo tick-$i\n"
         "  sleep 0.3\n"
         "done"
+    )
+
+
+def _trigger_credential_body(trigger_path: Path, *, sleep_seconds: float = 30.0) -> str:
+    """Emits a credential-prompt marker into the captured output only once
+    `trigger_path` exists on disk — OBSERVATION-relative, so the test controls
+    exactly when the marker appears mid-`observe --wait`."""
+    return (
+        "echo FAKE_HARNESS_WORKING\n"
+        f'while [ ! -f "{trigger_path}" ]; do sleep 0.1; done\n'
+        "echo 'Enter API key to continue'\n"
+        f"sleep {sleep_seconds}"
     )
 
 
@@ -205,23 +192,40 @@ class SliceOpsTestCase(PmTestCase):
     def setUp(self) -> None:
         super().setUp()
         # Operate on a dedicated feature branch, as a real run does — the
-        # implicit-current-branch init path now refuses main/master.
+        # implicit-current-branch init path refuses main/master.
         self._git("checkout", "-q", "-b", "pm-work")
-        self._sessions_to_reap: list[str] = []
-        self.addCleanup(self._reap_sessions)
+        self._procs: list[tuple[int, int, str]] = []
+        self.addCleanup(self._reap_procs)
 
-    def _reap_sessions(self) -> None:
-        for name in self._sessions_to_reap:
-            sessions.force_stop(name)
+    def _reap_procs(self) -> None:
+        for pid, pgid, identity in self._procs:
+            try:
+                sessions.terminate_headless(pid, pgid, identity, term_timeout=0.2, kill_timeout=1.0)
+            except PmError:
+                pass
 
-    def _track_current_session(self, run_id: str, token: str) -> str | None:
+    def _current(self, run_id: str, token: str) -> dict:
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        state = state_mod.load_state(run_dir, token)
-        current = state.get("current_slice") or {}
-        session = current.get("tmux_session")
-        if session:
-            self._sessions_to_reap.append(session)
-        return session
+        return state_mod.load_state(run_dir, token).get("current_slice") or {}
+
+    def _track_current_process(self, run_id: str, token: str) -> tuple[int, int, str] | None:
+        current = self._current(run_id, token)
+        if not current.get("pid"):
+            return None
+        coords = (int(current["pid"]), int(current["pgid"]), str(current["identity"]))
+        self._procs.append(coords)
+        return coords
+
+    def _proc_alive(self, coords: tuple[int, int, str]) -> bool:
+        pid, _pgid, identity = coords
+        return sessions.headless_process_alive(pid, identity)
+
+    def _kill_proc(self, coords: tuple[int, int, str]) -> None:
+        pid, pgid, identity = coords
+        try:
+            sessions.terminate_headless(pid, pgid, identity)
+        except PmError:
+            pass
 
     def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
         deadline = time.monotonic() + timeout
@@ -232,11 +236,10 @@ class SliceOpsTestCase(PmTestCase):
         return predicate()
 
     def _plan_path(self) -> Path:
-        # Deliberately outside self.repo: a plan.md living untracked inside
-        # the repo would itself show up as a dirty (untracked) worktree
-        # entry, tripping init's clean-worktree preflight for reasons that
-        # have nothing to do with the behaviour under test (see
-        # FloorTestCase._plan_path in test_floor.py for the same reasoning).
+        # Deliberately outside self.repo: a plan.md living untracked inside the
+        # repo would itself show up as a dirty (untracked) worktree entry,
+        # tripping init's clean-worktree preflight for reasons unrelated to the
+        # behaviour under test.
         return self.repo.parent / "plan.md"
 
     def _init(self, plan_path: Path, harness_script: Path, *, extra: list[str] | None = None) -> tuple[int, str, str]:
@@ -255,6 +258,9 @@ class SliceOpsTestCase(PmTestCase):
             argv += extra
         return self.run_cli_in_repo(argv)
 
+    def _artifact_dir(self, run_id: str, token: str) -> Path:
+        return Path(self._current(run_id, token)["artifact_dir"])
+
 
 # --- 1. init happy path --------------------------------------------------
 
@@ -262,7 +268,7 @@ class SliceOpsTestCase(PmTestCase):
 class TestInitHappyPath(SliceOpsTestCase):
     def test_init_creates_state_pm_skeleton_and_prints_token_once(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["requirements.txt"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
 
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -270,8 +276,6 @@ class TestInitHappyPath(SliceOpsTestCase):
         run_id, token = parse_init_output(out)
         self.assertEqual(out.count("PM_RUN_TOKEN="), 1)
         self.assertIn("Keep this token out of Developer sessions", out)
-        # A dependency-shaped surface entry is a warning, not an error —
-        # the run proceeds and the warning is still printed.
         self.assertIn("WARNING", out)
 
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
@@ -288,7 +292,7 @@ class TestInitHappyPath(SliceOpsTestCase):
 
     def test_reinit_creates_second_run_and_repoints_current(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
 
         code1, out1, _err1 = self._init(plan_path, harness)
         self.assertEqual(code1, 0)
@@ -309,8 +313,8 @@ class TestInitHappyPath(SliceOpsTestCase):
 
 class TestInitFailures(SliceOpsTestCase):
     def test_plan_with_errors_exits_two_nothing_created(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": None}])  # empty authorized surface -> error
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": None}])  # empty surface -> error
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
 
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -322,7 +326,7 @@ class TestInitFailures(SliceOpsTestCase):
     def test_dirty_worktree_exits_two(self) -> None:
         plan_path = self.write_plan(self._plan_path())
         (self.repo / "untracked.txt").write_text("oops\n", encoding="utf-8")
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
 
         code, _out, err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -340,7 +344,7 @@ class TestInitFailures(SliceOpsTestCase):
 
     def test_attest_unknown_slice_exits_two_nothing_created(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
         code, _out, err = self._init(plan_path, harness, extra=["--attest", "Slice 99"])
         self.assertEqual(code, 2)
         self.assertIn("unknown slice", err)
@@ -348,14 +352,14 @@ class TestInitFailures(SliceOpsTestCase):
 
     def test_branch_nonexistent_exits_two(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
         code, _out, err = self._init(plan_path, harness, extra=["--branch", "does-not-exist"])
         self.assertEqual(code, 2)
         self.assertIn("does not exist", err)
 
     def test_create_branch_creates_and_switches(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
         code, out, _err = self._init(plan_path, harness, extra=["--create-branch", "feature/new-branch"])
         self.assertEqual(code, 0)
         self.assertIn("feature/new-branch", out)
@@ -363,11 +367,9 @@ class TestInitFailures(SliceOpsTestCase):
         self.assertEqual(result.stdout.strip(), "feature/new-branch")
 
     def test_default_onto_main_refused_but_explicit_branch_main_allowed(self) -> None:
-        # Implicitly landing every slice commit on the default branch is the
-        # PM Test 20 footgun; refuse it, but honour an explicit --branch main.
         self._git("checkout", "-q", "main")
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
 
         code, _out, err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -391,7 +393,6 @@ class TestTokenGating(SliceOpsTestCase):
         cases = [
             ["approve", "--slice", "Slice 1", "--reason", "ok"],
             ["start-slice"],
-            ["send", "--text", "hi", "--reason", "steer"],
             ["finalize"],
             ["stop", "--reason", "done"],
         ]
@@ -415,7 +416,6 @@ class TestTokenGating(SliceOpsTestCase):
         cases = [
             ["approve", "--slice", "Slice 1", "--reason", "ok", "--token", token],
             ["start-slice", "--token", token],
-            ["send", "--text", "hi", "--reason", "steer", "--token", token],
             ["finalize", "--token", token],
             ["stop", "--reason", "done", "--token", token],
         ]
@@ -428,10 +428,6 @@ class TestTokenGating(SliceOpsTestCase):
                 code, _out, err = self.run_cli_in_repo(argv)
                 self.assertEqual(code, 2)
                 self.assertIn("INTEGRITY:", err)
-        # Tampering is terminal by construction: no command may heal or
-        # re-sign the unauthenticated bytes (re-signing would launder
-        # attacker-controlled state into MAC-valid state), so the tampered
-        # file must survive verbatim and keep failing closed.
         self.assertEqual((run_dir / "run.json").read_text(encoding="utf-8"), tampered_bytes)
         code, _out, err = self.run_cli_in_repo(["finalize", "--token", token])
         self.assertEqual(code, 2)
@@ -455,8 +451,6 @@ class TestTokenGating(SliceOpsTestCase):
         self.assertEqual(code, 2)
         self.assertIn("INTEGRITY", err)
 
-        # Plain status (no --token, no PM_RUN_TOKEN in env) skips MAC
-        # verification and still succeeds against the same tampered file.
         previous = os.environ.pop("PM_RUN_TOKEN", None)
         try:
             code, _out, _err = self.run_cli_in_repo(["status"])
@@ -518,15 +512,14 @@ class TestApprove(SliceOpsTestCase):
         self.assertIn("not approval-gated", err)
 
 
-# --- 5/6/7/9/10/11/12: tmux-gated flows --------------------------------------
+# --- 5. full fake-harness flow -----------------------------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestFullFakeHarnessFlow(SliceOpsTestCase):
-    def test_full_flow_finalize_all_pass_and_accept_refused(self) -> None:
+    def test_full_flow_finalize_all_pass(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -535,7 +528,12 @@ class TestFullFakeHarnessFlow(SliceOpsTestCase):
         code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         self.assertIn("launched", out)
-        self._track_current_session(run_id, token)
+        # An override's launch-bound id is captured from its own output (never
+        # synthesized) and may not be present the instant after Popen; the
+        # deterministic capture is re-correlated at finalize --steer. Either
+        # start-slice line is therefore valid here.
+        self.assertIn("as headless", out)
+        self._track_current_process(run_id, token)
 
         code, out, _err = self.run_cli_in_repo(["observe", "--wait", "20"])
         self.assertEqual(code, 0)
@@ -549,8 +547,12 @@ class TestFullFakeHarnessFlow(SliceOpsTestCase):
         for number in range(1, 9):
             self.assertRegex(out, re.compile(rf"^{number} \S+ PASS", re.MULTILINE))
         self.assertIn("evidence: diff=", out)
-        self.assertIn("evidence: pane=", out)
+        self.assertIn("evidence: session-output=", out)
         self.assertIn("evidence: result=", out)
+
+        # The captured session output is the outfile itself, under .pm/.
+        session_output = self._artifact_dir(run_id, token) / sessions.SESSION_OUTFILE
+        self.assertTrue(session_output.is_file())
 
         after = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
         before = json.loads(before_bytes.decode("utf-8"))
@@ -559,35 +561,31 @@ class TestFullFakeHarnessFlow(SliceOpsTestCase):
         self.assertEqual(after, before)
 
     def _wait_for_result(self, run_id: str, token: str) -> bool:
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        state = state_mod.load_state(run_dir, token)
-        artifact_dir = Path(state["current_slice"]["artifact_dir"])
+        artifact_dir = self._artifact_dir(run_id, token)
         return self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=15.0)
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+# --- 6. floor failure ---------------------------------------------------------
+
+
 class TestFinalizeFloorFailure(SliceOpsTestCase):
     def test_unauthorized_file_change_fails_finalize(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh",
-            _commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=2.0),
+            _commit_and_result_body(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=3.0),
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
 
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        self.assertTrue(
-            self._wait_for(
-                lambda: (Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]) / "result.json").is_file(),
-                timeout=15.0,
-            )
-        )
+        artifact_dir = self._artifact_dir(run_id, token)
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=15.0))
 
         code, out, _err = self.run_cli_in_repo(["finalize", "--token", token])
         self.assertEqual(code, 1)
@@ -597,11 +595,13 @@ class TestFinalizeFloorFailure(SliceOpsTestCase):
         self.assertTrue(any(event["kind"] == "floor" and "surface" in event["note"] for event in events))
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+# --- 7. attempt accounting ----------------------------------------------------
+
+
 class TestAttemptAccounting(SliceOpsTestCase):
     def test_relaunch_persists_attempts_rotates_prior_result_and_exhausts_budget(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_only_script(delay=0.5, tail_sleep=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_only_body(delay=0.5, tail_sleep=30.0))
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "1"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -610,35 +610,34 @@ class TestAttemptAccounting(SliceOpsTestCase):
         # Attempt 0: launch, let it write a (stale, to-be-superseded) result.
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session0 = self._track_current_session(run_id, token)
-        self.assertIsNotNone(session0)
-        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        coords0 = self._track_current_process(run_id, token)
+        self.assertIsNotNone(coords0)
+        artifact_dir = self._artifact_dir(run_id, token)
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
 
-        # Simulate a dead harness: force-kill the still-running session.
-        sessions.force_stop(session0)
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session0), timeout=10.0))
+        # Simulate a dead harness: terminate the still-running process group.
+        self._kill_proc(coords0)
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords0), timeout=10.0))
 
         # Relaunch: attempts becomes 1 (within budget 1), prior result rotated.
         code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0, out)
         self.assertIn("relaunched", out)
-        session1 = self._track_current_session(run_id, token)
+        coords1 = self._track_current_process(run_id, token)
 
-        # Fresh state load in a new call: attempts persisted as 1.
         reloaded = state_mod.load_state(run_dir, token)
         self.assertEqual(reloaded["current_slice"]["attempts"], 1)
         by_id = {entry["id"]: entry for entry in reloaded["slices"]}
         self.assertEqual(by_id["Slice 1"]["attempts"], 1)
         # Attempt 0's result.json was rotated out of the way before the
-        # relaunch — a stale completion signal can never be mistaken for
-        # the new attempt's. (Attempt 1's own script may have already
-        # written a fresh result.json of its own by now, which is correct
-        # and expected — this only asserts the OLD one was moved aside.)
+        # relaunch — a stale completion signal can never be mistaken for the
+        # new attempt's.
         self.assertTrue((artifact_dir / "attempt-0" / "result.json").is_file())
+        # The pre-relaunch captured output rotated alongside it.
+        self.assertTrue((artifact_dir / "attempt-0" / sessions.SESSION_OUTFILE).is_file())
 
-        sessions.force_stop(session1)
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session1), timeout=10.0))
+        self._kill_proc(coords1)
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords1), timeout=10.0))
 
         # Second relaunch would need attempts=2 > max_attempts=1: refused.
         code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
@@ -648,10 +647,13 @@ class TestAttemptAccounting(SliceOpsTestCase):
         self.assertEqual(final_state["status"], "needs-human")
 
 
+# --- 8. mid-run plan edit -----------------------------------------------------
+
+
 class TestMidRunPlanEdit(SliceOpsTestCase):
     def test_plan_edited_mid_run_stops_before_next_slice(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -670,50 +672,42 @@ class TestMidRunPlanEdit(SliceOpsTestCase):
         self.assertTrue(any(event["kind"] == "plan-changed" for event in events))
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
-class TestDeadSession(SliceOpsTestCase):
-    def test_observe_reports_not_running_and_send_refuses(self) -> None:
+# --- 9. dead process ----------------------------------------------------------
+
+
+class TestDeadProcess(SliceOpsTestCase):
+    def test_observe_reports_not_running_after_process_dies(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _dies_quickly_script(delay=7.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _dies_after_body(delay=3.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertIsNotNone(session)
+        coords = self._track_current_process(run_id, token)
+        self.assertIsNotNone(coords)
 
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=15.0))
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords), timeout=15.0))
 
         code, out, _err = self.run_cli_in_repo(["observe"])
         self.assertEqual(code, 0)
         self.assertIn("session running: False", out)
 
-        code, _out, err = self.run_cli_in_repo(["send", "--text", "hello", "--reason", "nudge", "--token", token])
-        self.assertEqual(code, 2)
-        self.assertIn("no live session", err)
+
+# --- 10. observe --wait semantics ---------------------------------------------
 
 
 _WAITED_RE = re.compile(r"^waited:\s*([\d.]+)s \(requested ([\d.]+)s\)$", re.MULTILINE)
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestObserveWaitSemantics(SliceOpsTestCase):
-    """`observe --wait` honest-wait semantics (target-design §12, Amended
-    post-implementation): the wait runs the full requested duration and
-    breaks early ONLY on session death, `result.json` appearing, or a
-    hard-stop marker — never on a mere pane byte-change."""
+    """`observe --wait` honest-wait semantics: the wait runs the full requested
+    duration and breaks early ONLY on process death, `result.json` appearing,
+    or a hard-stop marker in the captured session output — never on mere output
+    growth."""
 
     def _observe_wait(self, wait_seconds: float) -> tuple[int, str, str, float, float]:
-        """Run `observe --wait` and return (code, out, err, test_elapsed,
-        reported_elapsed). `test_elapsed` is measured test-side with
-        `time.monotonic()` around the CLI call — the production-reported
-        `elapsed_seconds` (parsed from stdout) is untrustworthy as the sole
-        signal, since a broken observe that returned instantly but printed
-        the full duration would otherwise pass. Timing assertions must be
-        based on `test_elapsed`; `reported_elapsed` is only cross-checked
-        against it (see test_cosmetic_pane_churn_does_not_end_wait_early)."""
         start = time.monotonic()
         code, out, err = self.run_cli_in_repo(["observe", "--wait", str(wait_seconds)])
         test_elapsed = time.monotonic() - start
@@ -721,109 +715,130 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertIsNotNone(match, out)
         return code, out, err, test_elapsed, float(match.group(1))
 
-    def test_cosmetic_pane_churn_does_not_end_wait_early(self) -> None:
-        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
-
+    def test_output_changed_tracks_growth_between_observations(self) -> None:
+        # "output changed" means grown since the PREVIOUS observe, not since
+        # the top of this call. A no-wait observe (PM's normal polling shape)
+        # that compared two back-to-back reads of the same file would always
+        # report False and drop the progress record from the event log.
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _cosmetic_churn_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
+        # Use the outfile the run state actually records, and wait for the
+        # harness's own launch line so the first observation below is not
+        # racing an empty file.
+        outfile = Path(self._current(run_id, token)["outfile"])
+        self.assertTrue(
+            self._wait_for(
+                lambda: outfile.is_file() and "FAKE_HARNESS_WORKING" in outfile.read_text(encoding="utf-8"),
+                timeout=10.0,
+            )
+        )
+
+        # First observation establishes the cursor.
+        code, _out, _err = self.run_cli_in_repo(["observe"])
+        self.assertEqual(code, 0)
+
+        # Nothing new since then: no growth, so no change reported.
+        code, out, _err = self.run_cli_in_repo(["observe"])
+        self.assertEqual(code, 0)
+        self.assertIn("output changed: False", out)
+
+        # Output produced between two no-wait observations IS growth.
+        with outfile.open("a", encoding="utf-8") as handle:
+            handle.write("the developer made progress\n")
+        code, out, _err = self.run_cli_in_repo(["observe"])
+        self.assertEqual(code, 0)
+        self.assertIn("output changed: True", out)
+
+        # Growth is recorded only when it actually happens, not on every poll:
+        # exactly two observations saw new bytes — the first (the harness's
+        # launch line) and the third (the appended progress line).
+        events = state_mod.read_events(state_mod.resolve_run_dir(self.repo, run_id))
+        changed = [e for e in events if e["kind"] == "observe" and "output_changed=True" in (e.get("note") or "")]
+        self.assertEqual(len(changed), 2, [e.get("note") for e in events if e["kind"] == "observe"])
+
+    def test_cosmetic_output_churn_does_not_end_wait_early(self) -> None:
+        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
+
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _churn_body())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_process(run_id, token)
 
         wait_seconds = 3 * _OBSERVE_POLL_SECONDS
         code, out, _err, test_elapsed, reported_elapsed = self._observe_wait(wait_seconds)
         self.assertEqual(code, 0)
         self.assertIn("session running: True", out)
         self.assertIn("result present: False", out)
-        # A stray early break would return in ~one poll cycle; the wait must
-        # instead run to (near) the full requested duration despite the
-        # pane changing on every poll. This is the TEST-SIDE measurement, so
-        # a broken observe that returns instantly but prints a fabricated
-        # elapsed value cannot pass.
+        # The wait must run to (near) the full requested duration despite the
+        # output growing on every poll. Test-side measurement, so a broken
+        # observe that returns instantly but prints a fabricated elapsed value
+        # cannot pass.
         self.assertGreaterEqual(test_elapsed, wait_seconds - 0.5)
         self.assertLess(test_elapsed, wait_seconds + _OBSERVE_POLL_SECONDS + 3.0)
-        # The production-reported value must not be fabricated either: it
-        # should track the test-side measurement within a sane delta.
         self.assertLess(abs(reported_elapsed - test_elapsed), 2.0)
 
     def test_result_json_appearing_mid_wait_ends_wait_early(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        # The harness's own delay clock starts at session launch, not at
-        # `observe`'s first check — start-slice's readiness wait plus prompt
-        # injection alone can take several seconds, so the delay must clear
-        # that bar with margin, or result.json is already there by the time
-        # `observe --wait` runs its first check and elapsed would trivially
-        # be ~0, proving nothing about mid-wait behaviour.
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _result_only_script(delay=9.0, tail_sleep=5.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_only_body(delay=4.0, tail_sleep=10.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
 
         wait_seconds = 25.0
         code, out, _err, test_elapsed, _reported_elapsed = self._observe_wait(wait_seconds)
         self.assertEqual(code, 0)
         self.assertIn("result present: True", out)
-        # Returned early: proven by the TEST-SIDE measurement being well
-        # short of the full requested wait, paired with the result-present
-        # signal above. (A parsed-elapsed lower bound proves nothing beyond
-        # a launch-relative race and has been dropped.)
+        # Returned early: test-side elapsed well short of the full wait, paired
+        # with the result-present signal above.
         self.assertLess(test_elapsed, 20.0)
 
-    def test_session_death_mid_wait_ends_wait_early(self) -> None:
+    def test_process_death_mid_wait_ends_wait_early(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        # A short delay would race start-slice's own readiness/prompt-
-        # injection wait (see TestDeadSession, which uses the same 7.0s for
-        # the same reason) — too short and start-slice itself fails before
-        # observe ever gets a live session to watch die.
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _dies_quickly_script(delay=7.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _dies_after_body(delay=4.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
 
         wait_seconds = 20.0
         code, out, _err, test_elapsed, _reported_elapsed = self._observe_wait(wait_seconds)
         self.assertEqual(code, 0)
         self.assertIn("session running: False", out)
-        # Returned early: TEST-SIDE elapsed well short of the full wait, plus
-        # the session-death signal above.
         self.assertLess(test_elapsed, 15.0)
 
     def test_hard_stop_marker_mid_wait_ends_wait_early(self) -> None:
-        """Deterministic, OBSERVATION-relative version (no launch-relative
-        race): the credential marker is gated on a trigger file that this
-        test touches explicitly partway through the wait, rather than on a
-        fixed delay from harness launch. A fixed launch-relative delay
-        could let a slow `start-slice` cause the marker to appear before
-        `observe` ever starts polling — an early return would then prove
-        nothing about *mid-wait* detection, only an upper bound. Here,
-        `observe --wait` runs on a background thread; the main thread
-        sleeps a short beat (comfortably more than one poll cycle) to give
-        it time to have polled at least once, THEN creates the trigger
-        file. TEST-SIDE elapsed must be both greater than that pre-trigger
-        beat (proving the wait was genuinely still running — i.e. had not
-        already returned — when the marker appeared) and less than the
-        full requested wait (proving it broke early upon detecting the
-        marker)."""
+        """OBSERVATION-relative: the credential marker is gated on a trigger
+        file this test touches partway through the wait. `observe --wait` runs
+        on a background thread; the main thread sleeps a beat (more than one
+        poll cycle) so the wait has polled at least once, THEN creates the
+        trigger. Test-side elapsed must be greater than that beat (the wait was
+        still running when the marker appeared) and less than the full wait (it
+        broke early on detecting the marker)."""
         from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
 
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         trigger = self.repo.parent / "credential_trigger"
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _trigger_gated_credential_prompt_script(trigger, sleep_seconds=30.0)
+            self.repo.parent / "fake.sh", _trigger_credential_body(trigger, sleep_seconds=30.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -831,7 +846,7 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
 
         wait_seconds = 20.0
         result: dict = {}
@@ -845,10 +860,6 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         thread = threading.Thread(target=_run)
         thread.start()
 
-        # A short beat, comfortably longer than one poll cycle, before we
-        # create the trigger file — this is what proves `observe` was still
-        # actually mid-wait (had already polled at least once and not yet
-        # returned) at the moment the marker appeared.
         pre_trigger_beat = 2 * _OBSERVE_POLL_SECONDS
         time.sleep(pre_trigger_beat)
         trigger.write_text("go\n", encoding="utf-8")
@@ -863,105 +874,98 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertLess(result["elapsed"], wait_seconds)
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
-class TestSendNudge(SliceOpsTestCase):
-    def test_send_line_appears_in_pane_and_logs_event_without_touching_attempts(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
-
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        attempts_before = state_mod.load_state(run_dir, token)["current_slice"]["attempts"]
-
-        code, _out, _err = self.run_cli_in_repo(
-            ["send", "--text", "PM_STEER_MARKER_XYZ", "--reason", "nudge along", "--token", token]
-        )
-        self.assertEqual(code, 0)
-        self.assertTrue(self._wait_for(lambda: "PM_STEER_MARKER_XYZ" in sessions.pane_text(session), timeout=10.0))
-
-        attempts_after = state_mod.load_state(run_dir, token)["current_slice"]["attempts"]
-        self.assertEqual(attempts_before, attempts_after)
-        events = state_mod.read_events(run_dir)
-        self.assertTrue(any(event["kind"] == "send" and event["note"] == "nudge along" for event in events))
-
-    def test_send_refuses_into_visible_credential_prompt(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _credential_prompt_script(sleep_seconds=15.0))
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: "Enter API key" in sessions.pane_text(session), timeout=10.0))
-
-        code, _out, err = self.run_cli_in_repo(
-            ["send", "--text", "please continue", "--reason", "nudge", "--token", token]
-        )
-        self.assertEqual(code, 2)
-        self.assertIn("credential_prompt", err)
+# --- 11. stop + scavenge ------------------------------------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestStop(SliceOpsTestCase):
-    def test_stop_captures_pane_kills_session_and_sets_status(self) -> None:
+    def test_stop_preserves_output_terminates_process_and_sets_status(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+        coords = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords), timeout=10.0))
 
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        artifact_dir = self._artifact_dir(run_id, token)
 
         code, out, _err = self.run_cli_in_repo(["stop", "--reason", "operator stop", "--token", token])
         self.assertEqual(code, 0, out)
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
-        self.assertTrue((artifact_dir / "pane.txt").is_file())
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords), timeout=10.0))
+        # The captured session output persists (the outfile is the evidence).
+        self.assertTrue((artifact_dir / sessions.SESSION_OUTFILE).is_file())
 
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "stopped")
         self.assertEqual(state["stop_reason"], "operator stop")
 
-    def test_stop_scavenge_finds_run_prefixed_session_with_state_deleted(self) -> None:
+    def test_stop_scavenge_terminates_via_sidecar_with_state_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+        coords = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords), timeout=10.0))
+
+        # The per-run developer.pid sidecar lives under .pm/ and survives a
+        # deleted state directory.
+        sidecar = slice_ops.developer_sidecar_path(self.repo, run_id)
+        self.assertTrue(sidecar.is_file())
 
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
         shutil.rmtree(run_dir)
 
         code, out, _err = self.run_cli_in_repo(["stop", "--reason", "emergency", "--scavenge", "--run", run_id])
         self.assertEqual(code, 0)
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
-        self.assertIn(session, out)
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords), timeout=10.0))
+        self.assertIn(f"developer pid {coords[0]}", out)
+
+    def test_stop_scavenge_never_signals_an_unvalidatable_sidecar(self) -> None:
+        # The sidecar is the only handle state-less scavenge has, so it must
+        # never be trusted blindly: a corrupt sidecar, and one owned by a
+        # different run, both fail closed — the live Developer is left alone
+        # and nothing is reported terminated.
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        coords = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords), timeout=10.0))
+
+        sidecar = slice_ops.developer_sidecar_path(self.repo, run_id)
+        record = json.loads(sidecar.read_text(encoding="utf-8"))
+        shutil.rmtree(state_mod.resolve_run_dir(self.repo, run_id))
+
+        for label, contents in (
+            ("corrupt", "{not json"),
+            ("foreign run", json.dumps({**record, "run_id": f"{run_id}-other"})),
+        ):
+            sidecar.write_text(contents, encoding="utf-8")
+            code, out, _err = self.run_cli_in_repo(
+                ["stop", "--reason", "emergency", "--scavenge", "--run", run_id]
+            )
+            self.assertEqual(code, 0, f"{label}: {out}")
+            self.assertIn("terminated: []", out, label)
+            self.assertTrue(self._proc_alive(coords), label)
 
 
 # --- 12. all slices complete --------------------------------------------
 
 
 class TestAllSlicesComplete(SliceOpsTestCase):
-    def test_start_slice_reports_complete_without_touching_tmux(self) -> None:
+    def test_start_slice_reports_complete_without_launching(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         _state, token, run_dir = self.make_run(plan_path=plan_path, slice_statuses={"Slice 1": "attested"})
 
@@ -987,6 +991,423 @@ class TestAllSlicesComplete(SliceOpsTestCase):
         self.assertTrue(any(event["kind"] == "complete" for event in events))
 
         self.assertTrue((run_dir / "run-report.md").is_file())
+
+
+# --- 13. launch-bound session id correlation (provenance) --------------------
+
+
+class TestLaunchSessionIdCorrelation(unittest.TestCase):
+    """Launch-bound id correlation never queries a bare newest session: it binds
+    only by construction (claude/copilot launch-set uuid), by an override's own
+    printed id, or by a UNIQUE harness-store record matched to THIS launch's
+    exact pointer + repo cwd + start-time window. Newer unrelated candidates,
+    ambiguous (>1) matches, and no match all fail closed to None."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name) / "home"
+        repo = Path(self._tmp.name) / "repo"
+        repo.mkdir(parents=True)
+        # Resolve so store-cwd comparisons are symlink-stable (macOS /var ->
+        # /private/var), matching how PM resolves the repo cwd in production.
+        self.repo = repo.resolve()
+        self.pointer = "read your contract at /x/prompt.md"
+        self.started_at = time.time() - 1.0
+        self.none_outfile = self.repo / "no-such-output.txt"
+
+    def _capture(self, harness_name: str, *, effective_override=None, outfile=None) -> str | None:
+        return slice_ops._capture_launch_session_id(
+            harness_name=harness_name,
+            effective_override=effective_override,
+            launch_id="minted-uuid",
+            outfile=outfile if outfile is not None else self.none_outfile,
+            prompt=self.pointer,
+            cwd=self.repo,
+            started_at=self.started_at,
+        )
+
+    # -- launch-set (claude/copilot) and override --
+
+    def test_claude_and_copilot_use_launch_set_id(self) -> None:
+        for harness in ("claude", "copilot"):
+            self.assertEqual(self._capture(harness), "minted-uuid")
+
+    def test_override_captures_its_own_printed_id_never_synthesized(self) -> None:
+        outfile = self.repo / "ovr.txt"
+        outfile.write_text("PM_DEVELOPER_SESSION_ID: override-abc\nworking...\n", encoding="utf-8")
+        self.assertEqual(
+            self._capture("fake", effective_override="/tmp/fake.sh", outfile=outfile), "override-abc"
+        )
+
+    def test_override_without_printed_id_is_none(self) -> None:
+        outfile = self.repo / "ovr2.txt"
+        outfile.write_text("no id line at all\n", encoding="utf-8")
+        self.assertIsNone(self._capture("fake", effective_override="/tmp/fake.sh", outfile=outfile))
+
+    # -- codex: exact stdout id, else unique store record --
+
+    def _codex_write(self, root: Path, session_id: str, *, cwd: Path, prompt: str, mtime: float) -> Path:
+        subdir = root / "2026" / "07" / "23"
+        subdir.mkdir(parents=True, exist_ok=True)
+        path = subdir / f"rollout-2026-07-23T00-00-00-{session_id}.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {"cwd": str(cwd)}},
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+            },
+        ]
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_codex_exact_stdout_id_wins(self) -> None:
+        outfile = self.repo / "codex-out.txt"
+        outfile.write_text(
+            "OpenAI Codex\nsession id: 11111111-2222-3333-4444-555555555555\n", encoding="utf-8"
+        )
+        self.assertEqual(self._capture("codex", outfile=outfile), "11111111-2222-3333-4444-555555555555")
+
+    def test_codex_store_unique_match_ignores_newer_unrelated(self) -> None:
+        root = self.home / ".codex" / "sessions"
+        good = "aaaaaaaa-1111-2222-3333-444444444444"
+        self._codex_write(root, good, cwd=self.repo, prompt=self.pointer, mtime=time.time())
+        # Newer, but a different prompt / a different cwd → not this launch.
+        self._codex_write(
+            root, "bbbbbbbb-1111-2222-3333-444444444444", cwd=self.repo, prompt="another task", mtime=time.time() + 2
+        )
+        self._codex_write(
+            root, "cccccccc-1111-2222-3333-444444444444", cwd=self.repo.parent, prompt=self.pointer, mtime=time.time() + 3
+        )
+        with mock.patch.object(slice_ops, "_codex_sessions_root", lambda: root):
+            self.assertEqual(self._capture("codex"), good)
+
+    def test_codex_store_ambiguous_is_none(self) -> None:
+        root = self.home / ".codex" / "sessions"
+        self._codex_write(root, "aaaaaaaa-1111-2222-3333-444444444444", cwd=self.repo, prompt=self.pointer, mtime=time.time())
+        self._codex_write(root, "dddddddd-1111-2222-3333-444444444444", cwd=self.repo, prompt=self.pointer, mtime=time.time() + 1)
+        with mock.patch.object(slice_ops, "_codex_sessions_root", lambda: root):
+            self.assertIsNone(self._capture("codex"))
+
+    def test_codex_store_no_match_is_none(self) -> None:
+        root = self.home / ".codex" / "sessions"
+        self._codex_write(root, "eeeeeeee-1111-2222-3333-444444444444", cwd=self.repo, prompt="other", mtime=time.time())
+        with mock.patch.object(slice_ops, "_codex_sessions_root", lambda: root):
+            self.assertIsNone(self._capture("codex"))
+
+    # -- opencode: unique record via read-only SQLite --
+
+    def _opencode_db(self, path: Path, sessions_rows, parts_rows) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(path))
+        try:
+            connection.execute("CREATE TABLE session (id TEXT, directory TEXT, time_created INTEGER)")
+            connection.execute("CREATE TABLE part (id TEXT, session_id TEXT, data TEXT, time_created INTEGER)")
+            connection.executemany("INSERT INTO session VALUES (?,?,?)", sessions_rows)
+            connection.executemany("INSERT INTO part VALUES (?,?,?,?)", parts_rows)
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_opencode_store_unique_match_ignores_newer_unrelated(self) -> None:
+        db = self.home / ".local" / "share" / "opencode" / "opencode.db"
+        now_ms = int(time.time() * 1000)
+        ours = json.dumps({"type": "text", "text": self.pointer})
+        other = json.dumps({"type": "text", "text": "different"})
+        self._opencode_db(
+            db,
+            [
+                ("sess-good", str(self.repo), now_ms),
+                ("sess-otherdir", str(self.repo.parent), now_ms + 2000),
+                ("sess-otherprompt", str(self.repo), now_ms + 3000),
+            ],
+            [
+                ("p1", "sess-good", ours, now_ms),
+                ("p2", "sess-otherdir", ours, now_ms + 2000),
+                ("p3", "sess-otherprompt", other, now_ms + 3000),
+            ],
+        )
+        with mock.patch.object(slice_ops, "_opencode_session_db", lambda: db):
+            self.assertEqual(self._capture("opencode"), "sess-good")
+
+    def test_opencode_store_ambiguous_is_none(self) -> None:
+        db = self.home / ".local" / "share" / "opencode" / "opencode.db"
+        now_ms = int(time.time() * 1000)
+        ours = json.dumps({"type": "text", "text": self.pointer})
+        self._opencode_db(
+            db,
+            [("sess-a", str(self.repo), now_ms), ("sess-b", str(self.repo), now_ms + 1000)],
+            [("p1", "sess-a", ours, now_ms), ("p2", "sess-b", ours, now_ms + 1000)],
+        )
+        with mock.patch.object(slice_ops, "_opencode_session_db", lambda: db):
+            self.assertIsNone(self._capture("opencode"))
+
+    def test_opencode_store_no_match_is_none(self) -> None:
+        db = self.home / ".local" / "share" / "opencode" / "opencode.db"
+        now_ms = int(time.time() * 1000)
+        self._opencode_db(
+            db,
+            [("sess-x", str(self.repo.parent), now_ms)],
+            [("p1", "sess-x", json.dumps({"type": "text", "text": self.pointer}), now_ms)],
+        )
+        with mock.patch.object(slice_ops, "_opencode_session_db", lambda: db):
+            self.assertIsNone(self._capture("opencode"))
+
+    # -- qwen: unique record from the per-project chats store --
+
+    def _qwen_write(self, chats: Path, session_id: str, *, cwd: Path, prompt: str, ts: str) -> Path:
+        chats.mkdir(parents=True, exist_ok=True)
+        path = chats / f"{session_id}.jsonl"
+        row = {
+            "type": "user",
+            "cwd": str(cwd),
+            "timestamp": ts,
+            "sessionId": session_id,
+            "message": {"parts": [{"text": prompt}]},
+        }
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        return path
+
+    def test_qwen_store_unique_match_ignores_newer_unrelated(self) -> None:
+        chats = self.home / ".qwen" / "chats"
+        iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._qwen_write(chats, "qwen-good", cwd=self.repo, prompt=self.pointer, ts=iso)
+        self._qwen_write(chats, "qwen-otherdir", cwd=self.repo.parent, prompt=self.pointer, ts=iso)
+        self._qwen_write(chats, "qwen-otherprompt", cwd=self.repo, prompt="different", ts=iso)
+        with mock.patch.object(slice_ops, "_qwen_chats_root", lambda cwd: chats):
+            self.assertEqual(self._capture("qwen"), "qwen-good")
+
+    def test_qwen_store_ambiguous_is_none(self) -> None:
+        chats = self.home / ".qwen" / "chats"
+        iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._qwen_write(chats, "qwen-a", cwd=self.repo, prompt=self.pointer, ts=iso)
+        self._qwen_write(chats, "qwen-b", cwd=self.repo, prompt=self.pointer, ts=iso)
+        with mock.patch.object(slice_ops, "_qwen_chats_root", lambda cwd: chats):
+            self.assertIsNone(self._capture("qwen"))
+
+    def test_qwen_store_no_match_is_none(self) -> None:
+        chats = self.home / ".qwen" / "chats"
+        iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._qwen_write(chats, "qwen-x", cwd=self.repo, prompt="other", ts=iso)
+        with mock.patch.object(slice_ops, "_qwen_chats_root", lambda cwd: chats):
+            self.assertIsNone(self._capture("qwen"))
+
+
+# --- 14. launch environment isolation -----------------------------------------
+
+
+def _echo_resume_env_body() -> str:
+    """Echo the child-visible PM_DEVELOPER_RESUME_SESSION_ID, then idle."""
+    return 'echo "RESUME_ENV=${PM_DEVELOPER_RESUME_SESSION_ID:-UNSET}"\nsleep 30'
+
+
+class TestLaunchEnvironmentIsolation(SliceOpsTestCase):
+    def test_inherited_resume_session_id_is_unset_for_initial_launch(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _echo_resume_env_body())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        prior = os.environ.get("PM_DEVELOPER_RESUME_SESSION_ID")
+        os.environ["PM_DEVELOPER_RESUME_SESSION_ID"] = "inherited-leak"
+        try:
+            code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+            self.assertEqual(code, 0)
+            self._track_current_process(run_id, token)
+            outfile = self._artifact_dir(run_id, token) / sessions.SESSION_OUTFILE
+            self.assertTrue(
+                self._wait_for(
+                    lambda: outfile.is_file() and "RESUME_ENV=" in outfile.read_text(encoding="utf-8"),
+                    timeout=10.0,
+                )
+            )
+            content = outfile.read_text(encoding="utf-8")
+            # The child saw the var unset even though the controller inherited one.
+            self.assertIn("RESUME_ENV=UNSET", content)
+            self.assertNotIn("inherited-leak", content)
+            # The controller's own environment is left untouched (restored).
+            self.assertEqual(os.environ.get("PM_DEVELOPER_RESUME_SESSION_ID"), "inherited-leak")
+        finally:
+            if prior is None:
+                os.environ.pop("PM_DEVELOPER_RESUME_SESSION_ID", None)
+            else:
+                os.environ["PM_DEVELOPER_RESUME_SESSION_ID"] = prior
+
+
+# --- 15. termination-failure propagation --------------------------------------
+
+
+class TestTerminationFailurePropagates(SliceOpsTestCase):
+    def _launch_idle(self):
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        coords = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords), timeout=10.0))
+        return run_id, token, coords
+
+    def test_stop_does_not_claim_success_when_termination_fails(self) -> None:
+        run_id, token, _coords = self._launch_idle()
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        with mock.patch.object(sessions, "terminate_headless", side_effect=PmError("headless process group survived SIGKILL")):
+            code, _out, err = self.run_cli_in_repo(["stop", "--reason", "operator stop", "--token", token])
+        self.assertEqual(code, 2)
+        self.assertIn("SIGKILL", err)
+        # State is not marked stopped and current authority is not cleared.
+        state = state_mod.load_state(run_dir, token)
+        self.assertNotEqual(state["status"], "stopped")
+        self.assertIsNotNone(state["current_slice"])
+
+    def test_stop_succeeds_when_terminate_returns_false_pid_reuse_safe(self) -> None:
+        run_id, token, _coords = self._launch_idle()
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        # False = nothing of ours to signal (leader gone / PID reused) — a safe
+        # no-op that must NOT block the stop.
+        with mock.patch.object(sessions, "terminate_headless", return_value=False):
+            code, out, _err = self.run_cli_in_repo(["stop", "--reason", "operator stop", "--token", token])
+        self.assertEqual(code, 0, out)
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["status"], "stopped")
+
+    def test_relaunch_aborts_when_prior_cannot_be_terminated(self) -> None:
+        run_id, token, coords = self._launch_idle()
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        before = state_mod.load_state(run_dir, token)["current_slice"]
+        self._kill_proc(coords)
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords), timeout=10.0))
+        with mock.patch.object(sessions, "terminate_headless", side_effect=PmError("headless process group survived SIGKILL")):
+            code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 2)
+        self.assertIn("SIGKILL", err)
+        # No new attempt superseded the prior current_slice.
+        after = state_mod.load_state(run_dir, token)["current_slice"]
+        self.assertEqual(after["session"], before["session"])
+        self.assertEqual(after["attempts"], before["attempts"])
+
+    def test_launch_is_torn_down_when_post_launch_bookkeeping_fails(self) -> None:
+        # Between Popen and the authenticated state write, a sidecar or state
+        # failure would otherwise leave an autonomous Developer running with no
+        # durable handle at all — the headless model has no global process list
+        # to sweep. The launch must be torn down instead.
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        launched: dict[str, object] = {}
+
+        def _capture_then_fail(_path, *, pid, pgid, identity, run_id, slice_id):
+            launched.update(coords=(int(pid), int(pgid), str(identity)))
+            raise PmError("no space left on device writing developer sidecar")
+
+        with mock.patch.object(sessions, "write_developer_sidecar", side_effect=_capture_then_fail):
+            code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 2)
+        self.assertIn("sidecar", err)
+
+        coords = launched.get("coords")
+        self.assertIsNotNone(coords, "the sidecar write should have been reached")
+        self._procs.append(coords)
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords), timeout=10.0))
+        # No half-launched slice is left recorded as current.
+        self.assertIsNone(state_mod.load_state(run_dir, token)["current_slice"])
+
+    def test_scavenge_with_readable_state_reports_termination_failure(self) -> None:
+        # `--scavenge` falls back to the sidecar-only sweep ONLY when the run
+        # state cannot be resolved or loaded. With readable state the sweep is
+        # not a fallback for a *termination* failure: swallowing one would
+        # print "state unavailable" and exit 0 while the Developer lives on —
+        # and with no `--run` given the fallback sweep has no sidecar path to
+        # look up, so it would report nothing terminated at all.
+        run_id, token, _coords = self._launch_idle()
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        with mock.patch.object(sessions, "terminate_headless", side_effect=PmError("headless process group survived SIGKILL")):
+            code, out, err = self.run_cli_in_repo(
+                ["stop", "--reason", "emergency", "--scavenge", "--token", token]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("SIGKILL", err)
+        self.assertNotIn("state unavailable", out)
+        # State keeps the slice's authority: nothing was stopped.
+        state = state_mod.load_state(run_dir, token)
+        self.assertNotEqual(state["status"], "stopped")
+        self.assertIsNotNone(state["current_slice"])
+
+    def test_scavenge_reports_failure_when_termination_fails(self) -> None:
+        run_id, token, _coords = self._launch_idle()
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        shutil.rmtree(run_dir)
+        with mock.patch.object(sessions, "terminate_headless", side_effect=PmError("headless process group survived SIGKILL")):
+            code, _out, err = self.run_cli_in_repo(
+                ["stop", "--reason", "emergency", "--scavenge", "--run", run_id]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("SIGKILL", err)
+
+
+# --- 16. bounded launch-owned capture wait ------------------------------------
+
+
+class TestAwaitLaunchSessionId(unittest.TestCase):
+    """`_await_launch_session_id` is the bounded, fail-closed evidence-gathering
+    wait finalize --steer uses before quiescing: it binds a launch-owned id that
+    appears shortly after launch, times out to None when none appears, and stops
+    early on a hard-stop marker — never synthesizing or guessing an id."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.outfile = self.dir / "session-output.txt"
+        self.outfile.write_text("", encoding="utf-8")
+
+    def _await(self, *, timeout: float, poll: float = 0.05):
+        return slice_ops._await_launch_session_id(
+            harness_name="fake",
+            effective_override="/tmp/fake.sh",
+            outfile=self.outfile,
+            prompt="read your contract at /x/prompt.md",
+            cwd=self.dir,
+            started_at=time.time(),
+            timeout=timeout,
+            poll=poll,
+        )
+
+    def test_binds_override_id_that_appears_after_a_delay(self) -> None:
+        def _emit() -> None:
+            time.sleep(0.3)
+            self.outfile.write_text("PM_DEVELOPER_SESSION_ID: late-id\n", encoding="utf-8")
+
+        thread = threading.Thread(target=_emit)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.assertEqual(self._await(timeout=3.0), "late-id")
+
+    def test_times_out_to_none_when_no_id_appears(self) -> None:
+        self.outfile.write_text("working, but no id line\n", encoding="utf-8")
+        start = time.monotonic()
+        self.assertIsNone(self._await(timeout=0.3))
+        # It actually waited the bound rather than returning instantly.
+        self.assertGreaterEqual(time.monotonic() - start, 0.3)
+
+    def test_short_circuits_on_hard_stop_marker(self) -> None:
+        self.outfile.write_text("Enter API key to continue\n", encoding="utf-8")
+        start = time.monotonic()
+        self.assertIsNone(self._await(timeout=5.0))
+        # Did not wait the full timeout — the hard-stop marker ended the wait.
+        self.assertLess(time.monotonic() - start, 2.0)
 
 
 if __name__ == "__main__":

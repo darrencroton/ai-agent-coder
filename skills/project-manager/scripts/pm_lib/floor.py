@@ -1,10 +1,10 @@
 """The mechanical floor: eight non-waivable facts.
 
 One function surface, no decisions. Every fact here computes a true/false
-condition from git, the filesystem, run state, and a pane-text string handed
-in by the caller — never a model call, never prose semantics, never a tmux
-shell-out (that boundary belongs to `sessions.py`; this module only imports
-its pure `scan_hard_stop` text parser for fact 8). A fact that cannot be
+condition from git, the filesystem, run state, and a session-output string
+handed in by the caller — never a model call, never prose semantics, never a
+process shell-out (that boundary belongs to `sessions.py`; this module only
+imports its pure `scan_hard_stop` text parser for fact 8). A fact that cannot be
 established (a missing file, a git command that fails) is `passed=False`
 with the reason in `detail` — this module never raises on ordinary
 git/filesystem absence or failure, and it never writes state, contacts a
@@ -39,8 +39,8 @@ The eight facts are:
    detail noting no commit is required.
 7. clean-worktree: no meaningful `git status` lines outside `.pm/`
    (`git_ops.meaningful_status_lines` already excludes it).
-8. hard-stop-scan: `sessions.scan_hard_stop(pane_text)` reports no marker
-   present. Empty pane text passes (nothing visible to flag).
+8. hard-stop-scan: `sessions.scan_hard_stop(session_output)` reports no
+   marker present. Empty session output passes (nothing visible to flag).
 """
 
 from __future__ import annotations
@@ -266,14 +266,14 @@ def _fact_clean_worktree(repo: Path) -> FloorFact:
     return FloorFact(7, "clean-worktree", passed, detail, evidence)
 
 
-def _fact_hard_stop_scan(pane_text: str) -> FloorFact:
-    result = scan_hard_stop(pane_text)
+def _fact_hard_stop_scan(session_output: str) -> FloorFact:
+    result = scan_hard_stop(session_output)
     evidence = {"kinds": list(result["kinds"]), "markers": list(result["markers"])}
     passed = not result["present"]
     detail = (
-        "no hard-stop marker is visible in the captured pane"
+        "no hard-stop marker is visible in the captured session output"
         if passed
-        else "a hard-stop marker is visible in the captured pane"
+        else "a hard-stop marker is visible in the captured session output"
     )
     return FloorFact(8, "hard-stop-scan", passed, detail, evidence)
 
@@ -285,7 +285,7 @@ def evaluate_floor(
     slice_id: str,
     *,
     artifact_dir: Path,
-    pane_text: str,
+    session_output: str,
 ) -> FloorReport:
     plan_slice = plan_slice_by_id(slices, slice_id)
     facts = (
@@ -296,6 +296,6 @@ def evaluate_floor(
         _fact_surface(repo, state, plan_slice),
         _fact_commit_ancestry(repo, state),
         _fact_clean_worktree(repo),
-        _fact_hard_stop_scan(pane_text),
+        _fact_hard_stop_scan(session_output),
     )
     return FloorReport(facts=facts)

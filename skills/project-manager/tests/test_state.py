@@ -32,6 +32,10 @@ Pins the single-copy authenticated state model (target-design §8):
   existing-id set.
 - A slice entry may be created with status "attested" (operator-attested
   prior completion) directly at creation time.
+- The headless `current_slice` fields (`session`, `session_id`, `pid`,
+  `pgid`, `identity`, `outfile`, `command_override`, and the launch-correlation
+  metadata `launch_pointer`/`launch_cwd`/`launch_started_at`) round-trip
+  through `save_state`/`load_state` verbatim; no `tmux_session` field survives.
 - `check-plan` exercised end-to-end through the CLI on a good and a bad
   plan (exit 0 / exit 2).
 """
@@ -74,6 +78,45 @@ class TestCreateRunRoundTrip(PmTestCase):
         state, token, run_dir = self.make_run(plan_path=plan_path)
         loaded = state_mod.load_state(run_dir, token)
         self.assertEqual(loaded["run_id"], state["run_id"])
+
+    def test_headless_current_slice_fields_round_trip(self) -> None:
+        # The headless lifecycle records the Developer's detached-process
+        # coordinates on current_slice: a per-attempt label (`session`), the
+        # launch-bound resume id (`session_id`, or null), the tracked
+        # `pid`/`pgid`/`identity`, the captured `outfile`, and any
+        # `command_override`. current_slice is free-form (state validation
+        # never inspects it), so these persist and reload verbatim.
+        plan_path = self.write_plan()
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        current = {
+            "id": "Slice 1",
+            "artifact_dir": str(run_dir / "slices" / "slice-001"),
+            "session": "pm-run-s01a0",
+            "session_id": "sess-abc-123",
+            "pid": 4242,
+            "pgid": 4242,
+            "identity": "Wed Jul 22 09:00:00 2026",
+            "outfile": str(run_dir / "slices" / "slice-001" / "session-output.txt"),
+            "command_override": "/tmp/fake-harness.sh",
+            "launch_pointer": "read your contract at /x/prompt.md",
+            "launch_cwd": str(self.repo),
+            "launch_started_at": 1750000000.5,
+            "before_head": "deadbeef",
+            "started_at": "2026-07-23T00:00:00Z",
+            "attempts": 0,
+            "risk": "standard",
+            "plan_risk": "standard",
+            "wake_at": None,
+            "reviewer_pids": [],
+        }
+        updated = dict(state)
+        updated["current_slice"] = current
+        state_mod.save_state(run_dir, updated, token)
+
+        reloaded = state_mod.load_state(run_dir, token)
+        self.assertEqual(reloaded["current_slice"], current)
+        # No `tmux_session` field survives the cutover.
+        self.assertNotIn("tmux_session", reloaded["current_slice"])
 
     def test_slice_entries_accept_attested_status_at_creation(self) -> None:
         plan_path = self.write_plan(slices=[{}, {}])
@@ -177,12 +220,12 @@ class TestEventsAndReadback(PmTestCase):
         plan_path = self.write_plan()
         _state, _token, run_dir = self.make_run(plan_path=plan_path)
         state_mod.append_event(run_dir, "observation", slice_id="Slice 1", note="a")
-        state_mod.append_event(run_dir, "send", slice_id="Slice 1", note="b", evidence="pane.txt")
+        state_mod.append_event(run_dir, "observe", slice_id="Slice 1", note="b", evidence="session-output.txt")
         events = state_mod.read_events(run_dir)
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0]["kind"], "observation")
         self.assertEqual(events[0]["note"], "a")
-        self.assertEqual(events[1]["evidence"], "pane.txt")
+        self.assertEqual(events[1]["evidence"], "session-output.txt")
         for event in events:
             self.assertIn("ts", event)
             self.assertEqual(event["slice"], "Slice 1")

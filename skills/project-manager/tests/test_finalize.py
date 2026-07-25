@@ -1,62 +1,54 @@
-"""Protected behaviours: Stage 4's acceptance-bearing `finalize` decision
-paths, the risk ratchet, controller-owned notes, and report regeneration.
+"""Protected behaviours: the acceptance-bearing `finalize` decision paths, the
+risk ratchet, controller-owned notes, and report regeneration — over the
+headless Developer.
 
 Everything here drives `pm_lib.cli.main` in-process via `run_cli_in_repo`,
-matching Stage 3's convention; tmux-gated scenarios use a tiny fake-harness
-`sh` script exactly like `test_slice_ops.py`. Pins:
+matching the lifecycle convention; scenarios drive a tiny fake-harness `sh`
+script as a `--harness-command` override exactly like `test_slice_ops.py`. A
+`finalize --steer` is a turn-based resume: the prior `-p`/`exec` turn has run
+to completion and exited, so PM quiesces it (a no-op when already dead), then
+launches a resume turn that the fake recognizes by PM_DEVELOPER_RESUME_SESSION_ID.
+Pins:
 
-1. Full end-to-end acceptance (AC): init -> start-slice (fake dev commits
-   the authorized change + result.json) -> bare `finalize` reports 8/8 ->
-   `finalize --accept "reasoning"` accepts: the slice entry's commit is
-   HEAD, `assessment.md` exists as a controller-owned original (under the
-   state dir) and its `.pm/` mirror, both containing the reasoning text
-   verbatim, all eight floor lines, and "PM assessment only (standard
-   risk)" (no reviews were commissioned on this standard-risk slice);
-   `current_slice` is cleared, the tmux session is gone, and
-   `run-report.md` is regenerated. A second `start-slice` on this
-   single-slice plan reports all slices complete.
-2. `--accept` is refused when the floor fails (an unauthorized file
-   alongside the authorized commit): nothing is accepted, exit 1.
-3. `--accept` is refused when the reasoning is shorter than the 40-
-   character minimum, before any state is touched.
-4. An elevated slice (plan `Risky surfaces touched:` != none): `--accept`
-   is refused naming both missing reviews; after a fake drift-audit and a
-   fake code-review are recorded, an additional commit lands (staleness);
-   `--accept` is refused again, naming the now-stale reviews, until BOTH
-   are re-commissioned against the new HEAD, at which point `--accept`
-   succeeds.
-5. Risk ratchet: a standard-risk slice with `finalize --risk elevated
-   --accept` is refused for missing reviews (proving the ratchet arms the
-   review requirement before acceptance is evaluated); `--risk standard`
-   is rejected outright with a PmError ("risk can only be raised"); the
-   ratchet's effect on the slice entry persists in state even though that
-   particular `--accept` call was refused.
-6. `--steer`: a live session receives the full (possibly multiline)
-   correction pasted directly into the pane, wrapped in the reference-
-   sourced steer-message template — no `steer-<attempt>.md` artifact is
-   written, controller-side or in the `.pm/` mirror; the `steer` event's
-   `note` carries the complete correction verbatim and the assessment's
-   "Attempts / interventions" section renders it legibly; `attempts`
-   increments and persists across a fresh state load; exhausting the
-   attempt budget refuses the next steer and sets `needs-human`; steering a
-   dead session raises PmError directing the operator to relaunch.
-7. `--stop`: the slice entry becomes "stopped", `assessment.md` records
-   decision STOPPED with the `--stop` reasoning verbatim (even though the
-   floor may be failing — that's the point), the run becomes
-   `needs-human`, the session is killed, and the report regenerates.
-8. Controller-owned `notes.md`: content written into the run's original
-   `notes.md` before a launch is mirrored into `.pm/` at `start-slice`; a
-   notes file over the 512 KiB cap prints a prominent (non-fatal) warning
-   at `start-slice`.
-9. Report-from-controller-data (AC): after an acceptance, deleting
-   `.pm/` entirely and running `status --report` still exits 0, recreates
-   `run-report.md` (original and mirror) from state + events + the
-   assessment file under the state dir alone, and the regenerated report
-   contains the assessment text.
-10. `stop` reaps a hung reviewer: a `review --reviewer-command` fake that
-    sleeps in the background is launched as a real subprocess; once its
-    process group is recorded in `current_slice.reviewer_pids`, `stop`
-    kills that process group (tolerating ESRCH).
+1. Full end-to-end acceptance: init -> start-slice (fake commits the
+   authorized change + result.json) -> bare `finalize` reports 8/8 ->
+   `finalize --accept "reasoning"` accepts: the slice entry's commit is HEAD,
+   `assessment.md` exists as a controller-owned original and its `.pm/`
+   mirror, both containing the reasoning verbatim, all eight floor lines, and
+   "PM assessment only (standard risk)"; `current_slice` is cleared and
+   `run-report.md` is regenerated. A second `start-slice` reports complete.
+2. `--accept` refused when the floor fails (unauthorized file): nothing
+   accepted, exit 1.
+3. `--accept` refused when reasoning is under the 40-char minimum, before any
+   state is touched.
+4. Elevated slice: `--accept` refused naming both missing reviews; after fake
+   drift-audit + code-review, a further commit makes them stale; `--accept`
+   refused again until BOTH are re-commissioned against the new HEAD.
+5. Risk ratchet: `finalize --risk elevated --accept` is refused for missing
+   reviews (the ratchet arms the requirement before acceptance); `--risk
+   standard` is rejected; the ratchet persists.
+6. `--steer`: a resume turn is launched with the full (possibly multiline)
+   correction as its argument, wrapped in the reference-sourced steer
+   template — no `steer-<attempt>.md` artifact anywhere; the `steer` event's
+   note carries the complete correction verbatim; `attempts` increments and
+   persists; exhausting the budget refuses the next steer and sets
+   `needs-human`; a steer with no captured launch-bound session id fails
+   closed; a steer resumes normally even though the prior turn already exited;
+   the pre-steer result.json is rotated aside so a steered attempt is never
+   mistaken for complete; a refused steer that already logged a `risk-raise`
+   persists that ratchet so state and the event log agree.
+7. `--stop`: the slice becomes "stopped", `assessment.md` records STOPPED with
+   the reason verbatim, the run becomes `needs-human`, the process is
+   terminated, and the report regenerates.
+8. Controller-owned `notes.md`: content is mirrored into `.pm/` at
+   `start-slice`; an oversized notes file prints a non-fatal warning.
+9. Report-from-controller-data: after acceptance, deleting `.pm/` and running
+   `status --report` still recreates `run-report.md` from state + events +
+   the assessment file under the state dir alone.
+10. `stop` reaps a hung reviewer process group.
+11. Attempt-budget exhaustion is a mandatory stop that closes steer and
+    accept, leaving only `finalize --stop` and `stop`.
+12. Accepting the last undecided slice completes the run.
 """
 
 from __future__ import annotations
@@ -69,6 +61,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -76,11 +69,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from pm_test_helpers import PmTestCase, parse_init_output, write_fake_harness
 
+from pm_lib import PmError
 from pm_lib import sessions
 from pm_lib import slice_ops
 from pm_lib import state as state_mod
 
-_HAS_TMUX = shutil.which("tmux") is not None
 _PM_PY = Path(__file__).resolve().parents[1] / "scripts" / "pm.py"
 
 _LONG_REASONING = (
@@ -89,82 +82,140 @@ _LONG_REASONING = (
 )
 
 
-# --- fake harness / reviewer script builders ----------------------------------
+# --- headless fake harness / reviewer script builders ------------------------
 
 
-def _result_heredoc(status: str = "done", summary: str = "did the work") -> str:
+def _write_result_cmd(status: str = "done", summary: str = "did the work") -> str:
     return (
-        'cat > "$PM_RESULT_PATH" <<EOF\n'
-        '{"slice": "$PM_SLICE_ID", "status": "' + status + '", "summary": "' + summary + '"}\n'
-        "EOF"
+        "printf '{\"slice\": \"%s\", \"status\": \"" + status + "\", \"summary\": \"" + summary + "\"}\\n' "
+        '"$PM_SLICE_ID" > "$PM_RESULT_PATH"'
     )
 
 
-def _commit_and_result_script(
+def _commit_and_result_body(
     repo: Path, *, authorized_file: str = "a.py", unauthorized_file: str | None = None,
-    delay: float = 1.0, tail_sleep: float = 2.0,
+    delay: float = 0.0, tail_sleep: float = 0.0,
 ) -> str:
-    lines = [
-        "echo FAKE_HARNESS_READY",
-        f"sleep {delay}",
-        f'echo "authorized change" >> "{repo}/{authorized_file}"',
-        f'git -C "{repo}" add "{authorized_file}"',
-    ]
+    lines = ["turn_text=\"${1:-}\"", "echo FAKE_HARNESS_WORKING"]
+    if delay:
+        lines.append(f"sleep {delay}")
+    lines.append(f'echo "authorized change" >> "{repo}/{authorized_file}"')
+    lines.append(f'git -C "{repo}" add "{authorized_file}"')
     if unauthorized_file:
         lines.append(f'echo "oops" >> "{repo}/{unauthorized_file}"')
         lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
     lines.append(f'git -C "{repo}" commit -q -m "slice work"')
-    lines.append(_result_heredoc())
-    lines.append(f"sleep {tail_sleep}")
+    lines.append(_write_result_cmd())
+    if tail_sleep:
+        lines.append(f"sleep {tail_sleep}")
     return "\n".join(lines)
 
 
-def _idle_script(*, sleep_seconds: float = 30.0) -> str:
-    return f"echo FAKE_HARNESS_READY\nsleep {sleep_seconds}"
+# A resumable `--harness-command` override prints its own launch-bound id on an
+# exact line that PM captures (never synthesizes). The launch turns below emit
+# it deterministically so a later steer re-correlates the id from the completed
+# turn and resumes; the no-id fake omits it so a steer must block.
+_OVERRIDE_SESSION_ID = "override-session-1"
+_EMIT_OVERRIDE_ID = f'echo "PM_DEVELOPER_SESSION_ID: {_OVERRIDE_SESSION_ID}"'
 
 
-def _stdin_draining_idle_script() -> str:
-    return "echo FAKE_HARNESS_READY\nexec cat -"
+def _idle_body(*, sleep_seconds: float = 30.0) -> str:
+    return f"echo FAKE_HARNESS_WORKING\nsleep {sleep_seconds}"
 
 
-def _credential_prompt_after_ready_script(*, reveal_after: float = 3.0, sleep_seconds: float = 20.0) -> str:
-    """Comes up clean so the initial slice-prompt injection succeeds, then
-    reveals a credential prompt `reveal_after` seconds later — the pane must
-    be clear of hard-stop markers at injection time (`send_prompt` refuses
-    into one), so the prompt has to appear strictly after start-slice."""
-    return f"echo FAKE_HARNESS_READY\nsleep {reveal_after}\necho 'Enter API key to continue'\nsleep {sleep_seconds}"
+def _steer_then_complete_body(repo: Path, *, authorized_file: str = "a.py") -> str:
+    """Launch turn prints its id then idles; the resume turn
+    (PM_DEVELOPER_RESUME_SESSION_ID set) commits the authorized change and writes
+    result.json."""
+    return "\n".join(
+        [
+            'turn_text="${1:-}"',
+            'if [ -n "${PM_DEVELOPER_RESUME_SESSION_ID:-}" ]; then',
+            f'  echo "authorized change" >> "{repo}/{authorized_file}"',
+            f'  git -C "{repo}" add "{authorized_file}"',
+            f'  git -C "{repo}" commit -q -m "slice work"',
+            "  " + _write_result_cmd(),
+            "  sleep 2",
+            "else",
+            "  " + _EMIT_OVERRIDE_ID,
+            "  echo FAKE_HARNESS_WORKING",
+            "  sleep 30",
+            "fi",
+        ]
+    )
 
 
-def _steer_then_complete_script(repo: Path, *, authorized_file: str = "a.py") -> str:
-    """Blocks reading stdin until the `finalize --steer` correction actually
-    arrives (the steer wrapper's stable "PM correction" marker), then commits
-    the authorized change and writes result.json. Completion is thus gated on
-    the steer, not raced against a fixed sleep: since a steer now rotates the
-    pre-steer result.json into attempt-<n>/ (Stage 7), a harness that finished
-    *before* the steer would leave no result for finalize to find. The launch
-    pointer and any earlier lines are read and ignored until the marker."""
-    lines = [
-        "echo FAKE_HARNESS_READY",
-        "while IFS= read -r line; do",
-        '  case "$line" in',
-        '    *"PM correction"*) break ;;',
-        "  esac",
-        "done",
-        f'echo "authorized change" >> "{repo}/{authorized_file}"',
-        f'git -C "{repo}" add "{authorized_file}"',
-        f'git -C "{repo}" commit -q -m "slice work"',
-        _result_heredoc(),
-        "sleep 2",
-    ]
-    return "\n".join(lines)
+def _steer_append_body() -> str:
+    """Launch turn prints its id then idles; the resume turn appends its
+    correction argument to `steer-received.txt` in the slice artifact dir (a
+    headless-observable stand-in for the correction reaching the Developer)."""
+    return "\n".join(
+        [
+            'turn_text="${1:-}"',
+            'if [ -n "${PM_DEVELOPER_RESUME_SESSION_ID:-}" ]; then',
+            "  printf '%s\\n' \"$turn_text\" >> \"$PM_SLICE_ARTIFACT_DIR/steer-received.txt\"",
+            "  sleep 5",
+            "else",
+            "  " + _EMIT_OVERRIDE_ID,
+            "  echo FAKE_HARNESS_WORKING",
+            "  sleep 30",
+            "fi",
+        ]
+    )
 
 
-def _result_then_drain_script() -> str:
-    """Writes result.json immediately, then drains stdin and stays alive, so
-    a steer can be delivered while a now-stale completion signal already
-    exists on disk (Stage 7 Test 21: the pre-steer result must be rotated
-    aside so observe --wait can't mistake it for the steered attempt's)."""
-    return "echo FAKE_HARNESS_READY\n" + _result_heredoc() + "\nexec cat -"
+def _result_then_alive_body() -> str:
+    """Launch turn prints its id, writes result.json, then stays alive; the
+    resume turn idles (writes no result), so after a steer rotates the pre-steer
+    result aside the top-level result.json is genuinely absent until real work
+    lands."""
+    return "\n".join(
+        [
+            'turn_text="${1:-}"',
+            'if [ -n "${PM_DEVELOPER_RESUME_SESSION_ID:-}" ]; then',
+            "  echo FAKE_HARNESS_RESUME",
+            "  sleep 30",
+            "else",
+            "  " + _EMIT_OVERRIDE_ID,
+            "  echo FAKE_HARNESS_WORKING",
+            "  " + _write_result_cmd(),
+            "  sleep 30",
+            "fi",
+        ]
+    )
+
+
+def _delayed_id_steer_body(*, delay: float = 1.0) -> str:
+    """Launch turn emits its exact id only after `delay`s (then idles); the
+    resume turn appends its correction. Exercises the bounded pre-quiesce
+    capture wait: at start-slice the id is not yet present, so an immediately
+    requested steer must wait for THIS launch's own id before quiescing."""
+    return "\n".join(
+        [
+            'turn_text="${1:-}"',
+            'if [ -n "${PM_DEVELOPER_RESUME_SESSION_ID:-}" ]; then',
+            "  printf '%s\\n' \"$turn_text\" >> \"$PM_SLICE_ARTIFACT_DIR/steer-received.txt\"",
+            "  sleep 5",
+            "else",
+            f"  sleep {delay}",
+            "  " + _EMIT_OVERRIDE_ID,
+            "  echo FAKE_HARNESS_WORKING",
+            "  sleep 30",
+            "fi",
+        ]
+    )
+
+
+def _no_session_id_body() -> str:
+    """Launch turn emits NO session-id line and idles; PM can bind no id, so a
+    later steer must block (fail closed) rather than resume."""
+    return "echo FAKE_HARNESS_WORKING\nsleep 30"
+
+
+def _credential_on_launch_body() -> str:
+    """Launch turn surfaces a credential hard-stop marker in its output then
+    idles; a steer must refuse to resume into it."""
+    return "echo 'Enter API key to continue'\nsleep 30"
 
 
 def _write_fake(path: Path, body: str) -> Path:
@@ -197,17 +248,19 @@ def _pgid_alive(pgid: int) -> bool:
 class FinalizeTestCase(PmTestCase):
     def setUp(self) -> None:
         super().setUp()
-        # Operate on a dedicated feature branch, as a real run does — the
-        # implicit-current-branch init path now refuses main/master.
+        # Operate on a dedicated feature branch, as a real run does.
         self._git("checkout", "-q", "-b", "pm-work")
-        self._sessions_to_reap: list[str] = []
+        self._procs: list[tuple[int, int, str]] = []
         self._subprocesses_to_reap: list[subprocess.Popen] = []
-        self.addCleanup(self._reap_sessions)
+        self.addCleanup(self._reap_procs)
         self.addCleanup(self._reap_subprocesses)
 
-    def _reap_sessions(self) -> None:
-        for name in self._sessions_to_reap:
-            sessions.force_stop(name)
+    def _reap_procs(self) -> None:
+        for pid, pgid, identity in self._procs:
+            try:
+                sessions.terminate_headless(pid, pgid, identity, term_timeout=0.2, kill_timeout=1.0)
+            except PmError:
+                pass
 
     def _reap_subprocesses(self) -> None:
         for proc in self._subprocesses_to_reap:
@@ -218,14 +271,28 @@ class FinalizeTestCase(PmTestCase):
                 except Exception:
                     pass
 
-    def _track_current_session(self, run_id: str, token: str) -> str | None:
+    def _current(self, run_id: str, token: str) -> dict:
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        state = state_mod.load_state(run_dir, token)
-        current = state.get("current_slice") or {}
-        session = current.get("tmux_session")
-        if session:
-            self._sessions_to_reap.append(session)
-        return session
+        return state_mod.load_state(run_dir, token).get("current_slice") or {}
+
+    def _track_current_process(self, run_id: str, token: str) -> tuple[int, int, str] | None:
+        current = self._current(run_id, token)
+        if not current.get("pid"):
+            return None
+        coords = (int(current["pid"]), int(current["pgid"]), str(current["identity"]))
+        self._procs.append(coords)
+        return coords
+
+    def _proc_alive(self, coords: tuple[int, int, str]) -> bool:
+        pid, _pgid, identity = coords
+        return sessions.headless_process_alive(pid, identity)
+
+    def _kill_proc(self, coords: tuple[int, int, str]) -> None:
+        pid, pgid, identity = coords
+        try:
+            sessions.terminate_headless(pid, pgid, identity)
+        except PmError:
+            pass
 
     def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
         deadline = time.monotonic() + timeout
@@ -238,6 +305,9 @@ class FinalizeTestCase(PmTestCase):
     def _plan_path(self) -> Path:
         return self.repo.parent / "plan.md"
 
+    def _artifact_dir(self, run_id: str, token: str) -> Path:
+        return Path(self._current(run_id, token)["artifact_dir"])
+
     def _init(self, plan_path: Path, harness_script: Path, *, extra: list[str] | None = None) -> tuple[int, str, str]:
         argv = [
             "init", "--repo", str(self.repo), "--plan", str(plan_path),
@@ -248,21 +318,18 @@ class FinalizeTestCase(PmTestCase):
         return self.run_cli_in_repo(argv)
 
     def _wait_for_result(self, run_id: str, token: str) -> bool:
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        state = state_mod.load_state(run_dir, token)
-        artifact_dir = Path(state["current_slice"]["artifact_dir"])
+        artifact_dir = self._artifact_dir(run_id, token)
         return self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=15.0)
 
 
 # --- 1: full end-to-end acceptance -------------------------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestFullAcceptance(FinalizeTestCase):
     def test_accept_writes_assessment_clears_slice_and_regenerates_report(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -271,7 +338,7 @@ class TestFullAcceptance(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
         code, out, _err = self.run_cli_in_repo(["finalize", "--token", token])
@@ -314,13 +381,12 @@ class TestFullAcceptance(FinalizeTestCase):
 # --- 2: floor failure refuses acceptance --------------------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
     def test_unauthorized_file_refuses_accept(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh",
-            _commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=2.0),
+            _commit_and_result_body(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=3.0),
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -329,7 +395,7 @@ class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
@@ -360,14 +426,13 @@ class TestAcceptRefusedOnShortReasoning(PmTestCase):
 # --- 4: elevated slice review requirement + staleness -------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestElevatedReviewFreshness(FinalizeTestCase):
     def test_missing_then_stale_then_fresh_reviews(self) -> None:
         plan_path = self.write_plan(
             self._plan_path(), slices=[{"files": ["a.py"], "risky": "touches auth"}]
         )
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -376,7 +441,7 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
         # Missing both reviews.
@@ -432,12 +497,11 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
 # --- 5: risk ratchet -----------------------------------------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestRiskRatchet(FinalizeTestCase):
     def test_ratchet_arms_review_requirement_rejects_lowering_and_persists(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -449,7 +513,7 @@ class TestRiskRatchet(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
         code, out, err = self.run_cli_in_repo(
@@ -471,11 +535,10 @@ class TestRiskRatchet(FinalizeTestCase):
 # --- 6: steer --------------------------------------------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestSteer(FinalizeTestCase):
-    def test_steer_injects_correction_directly_increments_attempts_and_exhausts_budget(self) -> None:
+    def test_steer_resumes_increments_attempts_and_exhausts_budget(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _steer_append_body())
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "1"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -483,8 +546,9 @@ class TestSteer(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+        coords0 = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords0), timeout=10.0))
+        artifact_dir = self._artifact_dir(run_id, token)
 
         # Leading/trailing whitespace is meaningful in a verbatim correction
         # (e.g. an indented code block) and must survive untouched.
@@ -492,28 +556,35 @@ class TestSteer(FinalizeTestCase):
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
         self.assertEqual(code, 0, out + err)
         self.assertIn("no artifact file written", out)
+        self._track_current_process(run_id, token)  # track the resume process
 
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["current_slice"]["attempts"], 1)
         self.assertEqual(state["slices"][0]["attempts"], 1)
 
-        # No steer artifact anywhere in either tree — the whole run_dir and
-        # the whole .pm/ mirror, not just the one slice subdirectory the old
-        # artifact used to live in.
+        # The resume turn advances the per-attempt session label to a1 while the
+        # captured harness resume handle (session_id) stays stable.
+        self.assertEqual(state["current_slice"]["session"], sessions.session_name(run_id, 1, 1))
+        self.assertEqual(state["current_slice"]["session_id"], _OVERRIDE_SESSION_ID)
+
+        # No steer artifact anywhere in either tree.
         self.assertFalse(any(run_dir.rglob("steer-*.md")))
         self.assertFalse(any((self.repo / ".pm" / "runs" / run_id).rglob("steer-*.md")))
 
-        # The full multiline correction lands directly in the pane.
+        # The full multiline correction reaches the resume turn (the fake
+        # records what it received into the artifact dir).
+        received = artifact_dir / "steer-received.txt"
         self.assertTrue(
             self._wait_for(
-                lambda: "Please also update the docstring." in sessions.pane_text(session)
-                and "And rerun the tests before committing." in sessions.pane_text(session),
+                lambda: received.is_file()
+                and "Please also update the docstring." in received.read_text(encoding="utf-8")
+                and "And rerun the tests before committing." in received.read_text(encoding="utf-8"),
                 timeout=10.0,
             )
         )
 
-        # The steer event's note carries the complete correction, not a
-        # truncated first line, and no evidence path (no file to point to).
+        # The steer event's note carries the complete correction verbatim, and
+        # no evidence path (no file to point to).
         events = state_mod.read_events(run_dir)
         steer_events = [e for e in events if e["kind"] == "steer"]
         self.assertEqual(len(steer_events), 1)
@@ -521,16 +592,14 @@ class TestSteer(FinalizeTestCase):
         self.assertNotIn("evidence", steer_events[0])
 
         # Budget (max_attempts=1) is now exhausted: the next steer is refused.
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "One more nudge.", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "One more nudge.", "--token", token])
         self.assertEqual(code, 2, err)
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "needs-human")
 
     def test_steer_rotates_stale_pre_steer_result(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_then_drain_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_then_alive_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -538,28 +607,33 @@ class TestSteer(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
-        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        coords0 = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords0), timeout=10.0))
+        artifact_dir = self._artifact_dir(run_id, token)
 
         # Attempt 0 wrote a result.json BEFORE any steer.
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
 
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", "Remove the dead import.", "--token", token])
         self.assertEqual(code, 0, out + err)
+        self._track_current_process(run_id, token)
 
         # The pre-steer completion signal is rotated into attempt-0/ so the
-        # steered attempt can't be mistaken for complete on stale evidence.
-        # The live session is `exec cat -` and writes no new result, so the
-        # top-level result.json is genuinely absent until real work lands.
+        # steered attempt can't be mistaken for complete on stale evidence. The
+        # resume turn writes no new result, so top-level result.json is
+        # genuinely absent until real work lands.
         self.assertTrue((artifact_dir / "attempt-0" / "result.json").is_file())
         self.assertFalse((artifact_dir / "result.json").is_file())
 
-    def test_steer_refuses_into_visible_hard_stop_prompt(self) -> None:
+    def test_immediate_steer_binds_delayed_override_id(self) -> None:
+        # Regression for the post-correction capture race: the override prints
+        # its exact id only ~1s after launch, then idles. A steer requested
+        # immediately after start-slice must still bind THIS launch's own id
+        # via the bounded pre-quiesce capture wait. Without the fix, start-slice
+        # binds nothing (the id is not out yet) and quiescing kills the process
+        # before it emits the id, so the steer wrongly blocks.
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _credential_prompt_after_ready_script(sleep_seconds=15.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _delayed_id_steer_body(delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -567,28 +641,60 @@ class TestSteer(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(
-            self._wait_for(lambda: "Enter API key" in sessions.pane_text(session), timeout=10.0)
-        )
+        self._track_current_process(run_id, token)
+        # The id is not emitted until ~1s in, so start-slice bound none.
+        self.assertIsNone(state_mod.load_state(run_dir, token)["current_slice"]["session_id"])
 
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "please continue", "--token", token]
-        )
+        # An immediately requested steer waits (bounded) for the launch-owned id,
+        # binds it, and resumes — no synthesized or guessed id.
+        code, out, err = self.run_cli_in_repo(["finalize", "--steer", "keep going", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("steered", out)
+        self._track_current_process(run_id, token)
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["current_slice"]["session_id"], _OVERRIDE_SESSION_ID)
+        self.assertEqual(state["current_slice"]["attempts"], 1)
+        self.assertEqual(state["current_slice"]["session"], sessions.session_name(run_id, 1, 1))
+
+    def test_steer_blocks_when_override_emits_no_launch_bound_id(self) -> None:
+        # A `--harness-command` override that prints no session-id line has no
+        # resumable id: PM captures none at launch, re-correlation from the
+        # completed turn still finds none, and finalize --steer fails closed —
+        # WITHOUT the test manually nulling authenticated state.
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _no_session_id_body())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_process(run_id, token)
+        # No id was bound at launch (the override printed none).
+        self.assertIsNone(state_mod.load_state(run_dir, token)["current_slice"]["session_id"])
+
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "keep going", "--token", token])
         self.assertEqual(code, 2, err)
-        self.assertIn("credential_prompt", err)
+        self.assertIn("session id", err)
+        self.assertIn("relaunch", err)
 
-        # Refused before persisting: no steer event recorded, attempts unchanged.
+        # Fail-closed before persisting: attempts unchanged, no steer event.
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["current_slice"]["attempts"], 0)
         events = state_mod.read_events(run_dir)
         self.assertFalse([e for e in events if e["kind"] == "steer"])
 
-    def test_accepted_assessment_retains_full_correction_narrative(self) -> None:
+    def test_refused_steer_persists_the_risk_ratchet_it_logged(self) -> None:
+        # The ratchet is a durable one-way escalation, and `finalize --steer`
+        # writes its `risk-raise` event before the refusal gates run. A refusal
+        # (here: no launch-bound session id) must therefore still persist the
+        # elevation: state reading "standard" while the event log records
+        # "elevated" would fail open on the elevated-review requirement at
+        # accept time. Nothing else the refused turn touched is persisted.
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _steer_then_complete_script(self.repo)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _no_session_id_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -596,11 +702,115 @@ class TestSteer(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
+
+        code, _out, err = self.run_cli_in_repo(
+            ["finalize", "--steer", "keep going", "--risk", "elevated", "--token", token]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertIn("session id", err)
+
+        state = state_mod.load_state(run_dir, token)
+        events = state_mod.read_events(run_dir)
+        self.assertEqual(len([e for e in events if e["kind"] == "risk-raise"]), 1)
+        self.assertEqual(state["slices"][0]["risk"], "elevated")
+        self.assertEqual(state["current_slice"]["risk"], "elevated")
+        # The ratchet only ever raises the mutable field, never the plan fact.
+        self.assertEqual(state["slices"][0]["plan_risk"], "standard")
+        # The refused turn consumed no attempt and logged no steer.
+        self.assertEqual(state["current_slice"]["attempts"], 0)
+        self.assertFalse([e for e in events if e["kind"] == "steer"])
+
+    def test_steer_refuses_into_visible_hard_stop_marker(self) -> None:
+        # The pre-cutover correction rule, preserved headlessly: once the prior
+        # turn has quiesced, a credential/approval/usage/side-effect marker in
+        # its captured output means PM must refuse the resume — before any
+        # attempt increment, rotation, or steer event.
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _credential_on_launch_body())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        coords = self._track_current_process(run_id, token)
+        outfile = self._artifact_dir(run_id, token) / sessions.SESSION_OUTFILE
+        self.assertTrue(
+            self._wait_for(
+                lambda: outfile.is_file() and "Enter API key" in outfile.read_text(encoding="utf-8"),
+                timeout=10.0,
+            )
+        )
+
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "please continue", "--token", token])
+        self.assertEqual(code, 2, err)
+        self.assertIn("credential_prompt", err)
+
+        # Refused before persisting: attempts unchanged, no steer event.
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["current_slice"]["attempts"], 0)
+        events = state_mod.read_events(run_dir)
+        self.assertFalse([e for e in events if e["kind"] == "steer"])
+
+    def test_steer_resumes_even_though_prior_turn_already_exited(self) -> None:
+        # The headless inversion of the old "dead session raises" rule: a prior
+        # turn that has run to completion and exited is the NORMAL precondition
+        # for a steer, so a steer resumes it (after a no-op quiesce) rather than
+        # refusing.
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _steer_then_complete_body(self.repo))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        coords0 = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords0), timeout=10.0))
+
+        # Establish the resumable-session precondition before forcing the
+        # process dead. Merely observing a live PID does not prove the fake has
+        # emitted its launch-bound id yet; killing it before that point would
+        # correctly leave PM with no safe session to resume.
+        outfile = self._artifact_dir(run_id, token) / sessions.SESSION_OUTFILE
+        self.assertTrue(
+            self._wait_for(
+                lambda: outfile.is_file()
+                and f"PM_DEVELOPER_SESSION_ID: {_OVERRIDE_SESSION_ID}"
+                in outfile.read_text(encoding="utf-8"),
+                timeout=10.0,
+            )
+        )
+
+        # Force the known prior turn dead before steering.
+        self._kill_proc(coords0)
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords0), timeout=10.0))
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--steer", "finish the work", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("steered", out)
+        self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+    def test_accepted_assessment_retains_full_correction_narrative(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _steer_then_complete_body(self.repo))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        coords0 = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords0), timeout=10.0))
 
         correction = "Please rename the helper.\nAlso add a docstring."
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
         self.assertEqual(code, 0, out + err)
+        self._track_current_process(run_id, token)
 
         self.assertTrue(self._wait_for_result(run_id, token))
 
@@ -614,7 +824,7 @@ class TestSteer(FinalizeTestCase):
 
     def test_stopped_assessment_retains_full_correction_narrative(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _steer_append_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -622,11 +832,13 @@ class TestSteer(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        coords0 = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords0), timeout=10.0))
 
         correction = "Try the other approach entirely.\nSee the notes for why."
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
         self.assertEqual(code, 0, out + err)
+        self._track_current_process(run_id, token)
 
         code, out, err = self.run_cli_in_repo(
             ["finalize", "--stop", "a human is needed to decide the approach", "--token", token]
@@ -638,35 +850,14 @@ class TestSteer(FinalizeTestCase):
         self.assertIn("Try the other approach entirely.", assessment_text)
         self.assertIn("See the notes for why.", assessment_text)
 
-    def test_steer_dead_session_raises_relaunch_error(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=30.0))
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
-        sessions.force_stop(session)
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
-
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "nudge into the void", "--token", token]
-        )
-        self.assertEqual(code, 2)
-        self.assertIn("relaunch", err)
-
 
 # --- 7: stop decision -----------------------------------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestStopDecision(FinalizeTestCase):
     def test_stop_writes_stopped_assessment_and_regenerates_report(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -674,8 +865,8 @@ class TestStopDecision(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+        coords = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords), timeout=10.0))
 
         code, out, err = self.run_cli_in_repo(
             ["finalize", "--stop", "giving up on this approach", "--token", token]
@@ -683,7 +874,7 @@ class TestStopDecision(FinalizeTestCase):
         self.assertEqual(code, 0, out + err)
         self.assertIn("STOPPED", out)
 
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords), timeout=10.0))
 
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["slices"][0]["status"], "stopped")
@@ -701,11 +892,10 @@ class TestStopDecision(FinalizeTestCase):
 # --- 8: notes.md controller-owned + mirror + tripwire --------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestNotesMirrorAndTripwire(FinalizeTestCase):
     def test_notes_mirrored_at_start_slice_and_large_notes_warn(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=20.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=20.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -715,7 +905,7 @@ class TestNotesMirrorAndTripwire(FinalizeTestCase):
 
         code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
         self.assertNotIn("WARNING", out)
 
         mirror = self.repo / ".pm" / "runs" / run_id / "notes.md"
@@ -724,7 +914,7 @@ class TestNotesMirrorAndTripwire(FinalizeTestCase):
 
     def test_oversized_notes_prints_tripwire_warning(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=20.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=20.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -734,16 +924,16 @@ class TestNotesMirrorAndTripwire(FinalizeTestCase):
 
         code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
         self.assertIn("WARNING", out)
         self.assertIn("512", out)
 
 
-# `notes` needs no tmux (init only), so it is deliberately not tmux-gated.
+# `notes` needs no launch (init only), so no process is involved.
 class TestNotesCommand(FinalizeTestCase):
     def test_set_then_append_write_authoritative_original_and_mirror(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -761,14 +951,11 @@ class TestNotesCommand(FinalizeTestCase):
         text = original.read_text(encoding="utf-8")
         self.assertIn("decision: approach B", text)
         self.assertIn("lesson: watch dedup", text)
-        # The authoritative original carries both; because a later start-slice
-        # re-mirror reads from it, appended notes are never clobbered — the
-        # footgun of hand-editing only the mirror is gone.
         self.assertEqual(mirror.read_text(encoding="utf-8"), text)
 
     def test_requires_a_token(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, _token = parse_init_output(out)
@@ -778,7 +965,7 @@ class TestNotesCommand(FinalizeTestCase):
 
     def test_empty_or_whitespace_text_is_refused(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -790,12 +977,11 @@ class TestNotesCommand(FinalizeTestCase):
 # --- 9: report regenerates with .pm/ deleted ------------------------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestReportFromControllerDataAlone(FinalizeTestCase):
     def test_status_report_recreates_mirror_after_pm_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -804,7 +990,7 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
@@ -826,60 +1012,42 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
         self.assertEqual(mirror_path.read_text(encoding="utf-8"), report_text)
 
 
-# --- 10: stop reaps a hung reviewer -------------------------------------------
+# --- 11: attempt-budget exhaustion closes steer and accept -------------------
 
 
-# --- 11: attempt-budget exhaustion is a mandatory stop that closes send, ----
-# --- steer, and accept, leaving only finalize --stop and stop open ----------
-
-
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
-    def test_budget_exhaustion_kills_session_and_closes_steer_send_accept(self) -> None:
+    def test_budget_exhaustion_terminates_process_and_closes_steer_accept(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "0"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
 
         # Attempt 0 (the initial launch) is never budget-checked — only a
-        # relaunch or a steer counts against the budget — so this succeeds
-        # even with max_attempts=0.
+        # relaunch or a steer counts — so this succeeds even with max_attempts=0.
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+        coords = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for(lambda: self._proc_alive(coords), timeout=10.0))
 
         # The steer itself would be attempt 1, over the budget of 0: refused,
-        # and the exhaustion is a mandatory stop that force-kills the session.
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "fix it please", "--token", token]
-        )
+        # and the exhaustion is a mandatory stop that terminates the process.
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "fix it please", "--token", token])
         self.assertEqual(code, 2, err)
         self.assertIn("attempt budget exhausted", err)
 
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords), timeout=10.0))
 
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "needs-human")
         self.assertEqual(state["stop_reason"], "attempt budget exhausted")
 
-        code, _out, err = self.run_cli_in_repo(
-            ["send", "--text", "hi", "--reason", "nudge", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 2)
         self.assertIn("attempt budget exhausted", err)
 
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--accept", _LONG_REASONING, "--token", token]
-        )
-        self.assertEqual(code, 2)
-        self.assertIn("attempt budget exhausted", err)
-
-        # finalize --stop remains open even after exhaustion — recording the
-        # outcome (floor passing or not) is exactly what a mandatory stop
-        # still permits.
+        # finalize --stop remains open even after exhaustion.
         code, out, err = self.run_cli_in_repo(
             ["finalize", "--stop", "human should look at this", "--token", token]
         )
@@ -897,12 +1065,11 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
 # --- 12: accepting the last undecided slice completes the run ---------------
 
 
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestAcceptingFinalSliceCompletesRun(FinalizeTestCase):
     def test_accepting_final_slice_marks_run_complete(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -911,7 +1078,7 @@ class TestAcceptingFinalSliceCompletesRun(FinalizeTestCase):
 
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
+        self._track_current_process(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
@@ -929,12 +1096,108 @@ class TestAcceptingFinalSliceCompletesRun(FinalizeTestCase):
         self.assertTrue(any(event["kind"] == "complete" for event in events))
 
 
+# --- 13: termination failure never claims success ----------------------------
+
+
+class TestTerminationFailureInFinalize(FinalizeTestCase):
+    def test_accept_does_not_record_acceptance_when_termination_fails(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        # The floor passes, but the Developer process group cannot be terminated:
+        # acceptance must not be recorded and current authority must not clear.
+        with mock.patch.object(
+            sessions, "terminate_headless", side_effect=PmError("headless process group survived SIGKILL")
+        ):
+            code, _out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 2)
+        self.assertIn("SIGKILL", err)
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertNotEqual(state["slices"][0].get("status"), "accepted")
+        self.assertIsNotNone(state["current_slice"])
+        # Termination is attempted before the assessment is rendered, so no
+        # ACCEPTED assessment is left on disk announcing a decision the state
+        # never recorded.
+        self.assertFalse(any(run_dir.rglob("assessment.md")))
+        self.assertFalse(any((self.repo / ".pm" / "runs" / run_id).rglob("assessment.md")))
+
+    def test_stop_does_not_publish_assessment_when_termination_fails(self) -> None:
+        # Same rule as accept, on the stop path: the Developer is terminated
+        # before the STOPPED assessment is published, so a termination failure
+        # cannot leave an assessment on disk announcing a stop the state never
+        # recorded.
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_process(run_id, token)
+
+        with mock.patch.object(
+            sessions, "terminate_headless", side_effect=PmError("headless process group survived SIGKILL")
+        ):
+            code, _out, err = self.run_cli_in_repo(
+                ["finalize", "--stop", "the harness wedged and cannot be recovered", "--token", token]
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("SIGKILL", err)
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertNotEqual(state["slices"][0].get("status"), "stopped")
+        self.assertIsNotNone(state["current_slice"])
+        self.assertFalse(any(run_dir.rglob("assessment.md")))
+        self.assertFalse(any((self.repo / ".pm" / "runs" / run_id).rglob("assessment.md")))
+
+    def test_budget_exhaustion_does_not_stop_when_termination_fails(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "0"])
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_process(run_id, token)
+
+        # The steer is over budget (a mandatory stop), but the process group
+        # cannot be terminated: the run must not be recorded needs-human on a
+        # kill PM could not perform.
+        with mock.patch.object(
+            sessions, "terminate_headless", side_effect=PmError("headless process group survived SIGKILL")
+        ):
+            code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "fix it", "--token", token])
+        self.assertEqual(code, 2)
+        self.assertIn("SIGKILL", err)
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertNotEqual(state["status"], "needs-human")
+
+
+# --- 10: stop reaps a hung reviewer -------------------------------------------
+
+
 class TestStopReapsHungReviewer(PmTestCase):
     def test_stop_kills_reviewer_process_group(self) -> None:
         # plan.md must live OUTSIDE the worktree: an untracked plan.md inside
-        # the repo is a dirty-tree entry, and `review` now refuses on a dirty
-        # worktree (the pinned-tree guard), which would fail this test before
-        # the reviewer subprocess ever launches.
+        # the repo is a dirty-tree entry, and `review` refuses on a dirty
+        # worktree, which would fail before the reviewer subprocess launches.
         plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
         before_head = self._git("rev-parse", "HEAD").stdout.strip()
@@ -996,7 +1259,7 @@ class TestStopReapsHungReviewer(PmTestCase):
         return predicate()
 
 
-# --- _attempts_summary: exact multiline formatting, no tmux required --------
+# --- _attempts_summary: exact multiline formatting, no process required ------
 
 
 class TestAttemptsSummaryFormatting(unittest.TestCase):

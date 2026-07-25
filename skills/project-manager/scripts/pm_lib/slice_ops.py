@@ -3,10 +3,11 @@
 This module wires the pieces other `pm_lib` modules already provide —
 `state`, `plan`, `git_ops`, `sessions`, `profiles`, `prompts` — into the
 per-command sequences described in target-design. Most of it still decides
-nothing semantic: `init`/`status`/`approve`/`start-slice`/`observe`/`send`
-and bare `finalize` only mutate state through the token-authenticated
-`state` module, drive tmux through `sessions`, or read git/filesystem facts
-through `git_ops` — `floor.py` computes the facts, never a verdict.
+nothing semantic: `init`/`status`/`approve`/`start-slice`/`observe` and bare
+`finalize` only mutate state through the token-authenticated `state` module,
+drive the headless Developer process through `sessions`, or read
+git/filesystem facts through `git_ops` — `floor.py` computes the facts, never
+a verdict.
 
 The one place semantic judgement enters this module is `finalize_accept` /
 `finalize_steer` / `finalize_stop`: each is an explicit, recorded act the PM
@@ -24,6 +25,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -45,6 +47,10 @@ _SLICE_ID_RE = re.compile(r"^Slice\s+(?P<number>\d+)$")
 # Artifact rotation / observe polling.
 _OBSERVE_POLL_SECONDS = 2.0
 _OBSERVE_TAIL_LINES = 40
+# Per-slice record of the outfile size seen by the previous `observe`, so
+# "output changed" means growth since the last observation (the headless
+# replacement for diffing against the tmux path's persisted `pane-live.txt`).
+_OBSERVE_CURSOR_FILE = "observe-cursor.txt"
 
 # Controller-owned notes.md tripwire (target-design §10): a hard cap kept as
 # a non-fatal warning, since a runaway notes file silently degrades every
@@ -62,12 +68,38 @@ _PROTECTED_DEFAULT_BRANCHES = frozenset({"main", "master"})
 # `stop` remain available for the slice.
 _BUDGET_EXHAUSTED_REASON = "attempt budget exhausted"
 
+# Launch-bound session-id correlation. PM never queries a bare "newest
+# session": an id is bound to *this* launch either by construction (a
+# launch-set uuid for claude/copilot) or by matching this launch's exact
+# emitted id / harness-store record (its own pointer + repo cwd + start-time
+# window). Anything ambiguous, missing, or unverifiable stays None so
+# `finalize --steer` fails closed.
+#
+# A `--harness-command` override prints its own launch id on a dedicated,
+# exact line; PM captures that (never synthesizes one). An override that emits
+# no such line has no resumable id and steer blocks.
+_OVERRIDE_SESSION_ID_RE = re.compile(r"^\s*PM_DEVELOPER_SESSION_ID\s*[:=]\s*(\S+)\s*$", re.MULTILINE)
+# codex prints `session id: <uuid>` near the top of its exec output.
+_CODEX_STDOUT_ID_RE = re.compile(r"^\s*session id:\s*([0-9a-f-]+)\s*$", re.MULTILINE | re.IGNORECASE)
+# A canonical vendor session-id shape used when reading a store filename.
+_SESSION_UUID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+# Bounded slack (seconds) around this launch's start time for store matching.
+_CORRELATION_WINDOW_SLACK_S = 5.0
+# `finalize --steer` gathers this launch's own session id from the still-live
+# prior turn with a bounded wait before quiescing it (a harness prints/records
+# its id shortly after launch, not synchronously with Popen). The wait is
+# fail-closed: it never synthesizes an id or accepts a newest session, and it
+# stops early once the id is found or the output already shows a hard prompt
+# that will be refused.
+_STEER_CAPTURE_TIMEOUT_S = 5.0
+_STEER_CAPTURE_POLL_S = 0.1
+
 
 def _refuse_if_budget_exhausted(state: dict[str, Any]) -> None:
     if state.get("status") == "needs-human" and state.get("stop_reason") == _BUDGET_EXHAUSTED_REASON:
         raise PmError(
             "attempt budget exhausted for the current slice; record the outcome with "
-            "finalize --stop (or stop the run) — steering, sending, and acceptance are closed"
+            "finalize --stop (or stop the run) — steering and acceptance are closed"
         )
 
 
@@ -235,8 +267,457 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _run_id_session_prefix(run_id: str) -> str:
-    return f"pm-{run_id}"
+# --- headless Developer process helpers (target-design §3/§12) ----------------
+
+
+def developer_sidecar_path(repo: Path, run_id: str) -> Path:
+    """`developer.pid` sidecar location: per-run, under the `.pm/` mirror.
+
+    Placed under the run's artifact dir (not the state dir) so it survives a
+    deleted state directory and is discoverable by `stop --scavenge --run
+    <id>` from the repo and run id alone. `stop_scavenge_sweep` documents what
+    happens when this sidecar is gone too.
+    """
+    return run_artifact_dir(repo, run_id) / sessions.DEVELOPER_PID_SIDECAR
+
+
+def _developer_env(
+    *, artifact_dir: Path, plan_path: Path, slice_id: str, notes_path: Path, result_path: Path
+) -> dict[str, str]:
+    """The PM_* environment every Developer turn (launch or resume) receives.
+
+    Never carries PM_RUN_TOKEN — `sessions.launch_headless` asserts its
+    absence and strips it from the inherited environment as a second guard.
+    """
+    tmp_dir = artifact_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "PM_SLICE_ARTIFACT_DIR": str(artifact_dir),
+        "PM_PLAN_PATH": str(plan_path),
+        "PM_SLICE_ID": slice_id,
+        "PM_NOTES_PATH": str(notes_path),
+        "PM_RESULT_PATH": str(result_path),
+        "TMPDIR": str(tmp_dir),
+    }
+
+
+RESUME_SESSION_ENV_VAR = "PM_DEVELOPER_RESUME_SESSION_ID"
+
+
+def _launch_developer(command: str, repo: Path, env: dict[str, str], artifact_dir: Path) -> dict[str, Any]:
+    """Launch a Developer turn with the resume env var under PM's sole control.
+
+    ``sessions.launch_headless`` copies the controller's environment (minus
+    PM_RUN_TOKEN) and overlays ``env``; an inherited PM_DEVELOPER_RESUME_SESSION_ID
+    would otherwise leak into an *initial* launch and be honoured as a resume.
+    So the var is stripped from the controller environment for the duration of
+    the launch and restored afterwards; the child then sees exactly what ``env``
+    provides — nothing on a launch, the captured id on an override resume.
+    """
+    prior = os.environ.pop(RESUME_SESSION_ENV_VAR, None)
+    try:
+        return sessions.launch_headless(command, repo, env, artifact_dir)
+    finally:
+        if prior is not None:
+            os.environ[RESUME_SESSION_ENV_VAR] = prior
+
+
+def _outfile_size(outfile: Path) -> int:
+    """Captured-output size in bytes; an absent/unreadable outfile counts as
+    zero bytes observed, so it compares equal to "nothing seen yet"."""
+    try:
+        return outfile.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_observe_cursor(cursor_path: Path) -> int:
+    """Bytes of captured output the previous `observe` saw; zero if none."""
+    try:
+        return int(cursor_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_observe_cursor(cursor_path: Path, size: int) -> None:
+    """Record this observation's outfile size. Best-effort: a cursor that
+    cannot be written only costs the next `observe` its growth signal, so it
+    must never fail an otherwise successful read-only observation."""
+    try:
+        cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        cursor_path.write_text(f"{size}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _terminate_current(current: dict[str, Any]) -> bool:
+    """Terminate the identity-checked process group recorded in `current`.
+
+    Returns True when a live group was terminated, False when there was
+    nothing to signal (leader gone, or the PID was reused — the PID-reuse-safe
+    "nothing of ours to kill" case). A ``PmError`` from ``terminate_headless``
+    (a group that survived SIGKILL, or a reused leader that still owns the
+    group) is deliberately NOT swallowed: a caller must never claim success or
+    clear the slice's authority when the tracked process could not be killed.
+    """
+    pid = current.get("pid")
+    pgid = current.get("pgid")
+    identity = current.get("identity")
+    if not (pid and pgid and identity):
+        return False
+    return sessions.terminate_headless(int(pid), int(pgid), str(identity))
+
+
+def _abort_launch(launch: dict[str, Any]) -> None:
+    """Tear down a just-launched turn whose post-launch bookkeeping failed.
+
+    Between ``Popen`` and the authenticated state write there is a window in
+    which the sidecar or state write can fail (a held lock, a full disk). The
+    headless model has no global process list, so a launch left behind by that
+    window would be an autonomous Developer editing the repo with *no* durable
+    handle — the tmux path could at least still sweep its global session list.
+    Terminating here keeps the failure closed. Best-effort by design: the
+    bookkeeping error is the one worth reporting, so a termination failure must
+    not mask it.
+    """
+    try:
+        sessions.terminate_headless(int(launch["pid"]), int(launch["pgid"]), str(launch["identity"]))
+    except (PmError, OSError, KeyError, TypeError, ValueError):
+        pass
+
+
+# --- launch-bound session-id correlation (PM-owned; shares no orchestrator code)
+#
+# The per-vendor store layouts and matching rules below are a thin PM copy of
+# behaviour also implemented in the orchestrator's delegate_sessions.py; per the
+# plan they must stay factually consistent but share no code and never import
+# it. Store roots are module functions so tests can redirect them to a temp
+# tree without touching the real user home.
+
+
+def _codex_sessions_root() -> Path:
+    return Path.home() / ".codex" / "sessions"
+
+
+def _opencode_session_db() -> Path:
+    return Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+
+
+def _qwen_chats_root(cwd: Path) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+    return Path.home() / ".qwen" / "projects" / slug / "chats"
+
+
+def _read_output_head(outfile: Path, *, max_bytes: int = 8192) -> str:
+    try:
+        with outfile.open("rb") as handle:
+            return handle.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _override_stdout_session_id(outfile: Path) -> str | None:
+    """The launch id a `--harness-command` override printed on its own exact
+    line, read only from THIS launch's captured output. None when absent —
+    PM never synthesizes an override id."""
+    head = _read_output_head(outfile)
+    match = _OVERRIDE_SESSION_ID_RE.search(head) or _OVERRIDE_SESSION_ID_RE.search(
+        sessions.read_output_tail(outfile)
+    )
+    return match.group(1) if match else None
+
+
+def _codex_stdout_session_id(outfile: Path) -> str | None:
+    match = _CODEX_STDOUT_ID_RE.search(_read_output_head(outfile))
+    return match.group(1) if match else None
+
+
+def _resolve_path(value: str | Path) -> Path | None:
+    try:
+        return Path(value).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _codex_candidate_cwd_matches(path: Path, cwd: Path) -> bool:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for _ in range(3):
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") != "session_meta":
+                    continue
+                session_cwd = row.get("payload", {}).get("cwd")
+                if not isinstance(session_cwd, str):
+                    return False
+                resolved = _resolve_path(session_cwd)
+                return resolved == cwd if resolved is not None else session_cwd == str(cwd)
+    except OSError:
+        return False
+    return False
+
+
+def _codex_candidate_prompt_matches(path: Path, prompt: str, *, max_lines: int = 40) -> bool:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for _ in range(max_lines):
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                row_type = row.get("type")
+                payload = row.get("payload", {})
+                if row_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+                    for item in payload.get("content", []):
+                        if item.get("type") == "input_text" and item.get("text") == prompt:
+                            return True
+                if row_type == "event_msg" and payload.get("type") == "user_message" and payload.get("message") == prompt:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _unique(matches: list[str]) -> str | None:
+    """A launch-bound id only when exactly one distinct candidate matched;
+    zero or ambiguous (>1) matches fail closed to None."""
+    distinct = sorted(set(matches))
+    return distinct[0] if len(distinct) == 1 else None
+
+
+def _codex_store_session_id(*, cwd: Path, prompt: str, started_at: float, latest: float) -> str | None:
+    root = _codex_sessions_root()
+    if not prompt or not root.exists():
+        return None
+    matches: list[str] = []
+    for candidate in root.rglob("*.jsonl"):
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < started_at - _CORRELATION_WINDOW_SLACK_S or mtime > latest + _CORRELATION_WINDOW_SLACK_S:
+            continue
+        if not _codex_candidate_cwd_matches(candidate, cwd):
+            continue
+        if not _codex_candidate_prompt_matches(candidate, prompt):
+            continue
+        found = _SESSION_UUID_RE.search(candidate.name)
+        if found:
+            matches.append(found.group(0))
+    return _unique(matches)
+
+
+def _opencode_part_matches_prompt(data: str, prompt: str) -> bool:
+    try:
+        payload = json.loads(data)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("type") == "text" and payload.get("text") == prompt
+
+
+def _opencode_store_session_id(*, cwd: Path, prompt: str, started_at: float, latest: float) -> str | None:
+    database = _opencode_session_db()
+    if not prompt or not database.exists():
+        return None
+    try:
+        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+    try:
+        rows = connection.execute(
+            "SELECT id FROM session WHERE directory = ? AND time_created BETWEEN ? AND ? "
+            "ORDER BY time_created DESC",
+            (
+                str(cwd),
+                int((started_at - _CORRELATION_WINDOW_SLACK_S) * 1000),
+                int((latest + _CORRELATION_WINDOW_SLACK_S) * 1000),
+            ),
+        ).fetchall()
+        matches: list[str] = []
+        for (session_id,) in rows:
+            part_rows = connection.execute(
+                "SELECT data FROM part WHERE session_id = ? ORDER BY time_created, id",
+                (session_id,),
+            ).fetchall()
+            if any(_opencode_part_matches_prompt(data, prompt) for (data,) in part_rows):
+                matches.append(str(session_id))
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+    finally:
+        connection.close()
+    return _unique(matches)
+
+
+def _qwen_candidate_session_id(path: Path, prompt: str, cwd: Path, started_at: float, latest: float) -> str | None:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for _ in range(40):
+                line = handle.readline()
+                if not line:
+                    break
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") != "user" or row.get("cwd") != str(cwd):
+                    continue
+                timestamp = _parse_epoch(row.get("timestamp"))
+                if timestamp is None or not (
+                    started_at - _CORRELATION_WINDOW_SLACK_S <= timestamp <= latest + _CORRELATION_WINDOW_SLACK_S
+                ):
+                    continue
+                parts = row.get("message", {}).get("parts", [])
+                if not any(isinstance(part, dict) and part.get("text") == prompt for part in parts):
+                    continue
+                session_id = row.get("sessionId")
+                if isinstance(session_id, str) and session_id and path.stem == session_id:
+                    return session_id
+    except OSError:
+        return None
+    return None
+
+
+def _qwen_store_session_id(*, cwd: Path, prompt: str, started_at: float, latest: float) -> str | None:
+    root = _qwen_chats_root(cwd)
+    if not prompt or not root.exists():
+        return None
+    matches: list[str] = []
+    for candidate in root.glob("*.jsonl"):
+        session_id = _qwen_candidate_session_id(candidate, prompt, cwd, started_at, latest)
+        if session_id:
+            matches.append(session_id)
+    return _unique(matches)
+
+
+def _parse_epoch(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(normalized).astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _correlate_store_session_id(
+    harness_name: str | None, *, outfile: Path, cwd: Path, prompt: str, started_at: float, latest: float
+) -> str | None:
+    """Match one launch to its harness-store record (codex/opencode/qwen).
+
+    codex is tried by its exact stdout id first, then by a unique store record;
+    opencode and qwen are store-only. Every path requires an exact
+    pointer + repo-cwd + start-time-window match and a *single* candidate.
+    """
+    # Compare resolved cwds throughout: a store may record a symlink-resolved
+    # path (e.g. /private/var vs /var on macOS) that a raw string compare misses.
+    cwd = _resolve_path(cwd) or cwd
+    if harness_name == "codex":
+        stdout_id = _codex_stdout_session_id(outfile)
+        if stdout_id:
+            return stdout_id
+        return _codex_store_session_id(cwd=cwd, prompt=prompt, started_at=started_at, latest=latest)
+    if harness_name == "opencode":
+        return _opencode_store_session_id(cwd=cwd, prompt=prompt, started_at=started_at, latest=latest)
+    if harness_name == "qwen":
+        return _qwen_store_session_id(cwd=cwd, prompt=prompt, started_at=started_at, latest=latest)
+    return None
+
+
+def _capture_launch_session_id(
+    *,
+    harness_name: str | None,
+    effective_override: str | None,
+    launch_id: str,
+    outfile: Path,
+    prompt: str,
+    cwd: Path,
+    started_at: float,
+) -> str | None:
+    """Best-effort launch-bound id at launch time (may be None; re-tried later).
+
+    claude/copilot bind the launch-set ``launch_id`` by construction. An
+    override captures its own printed id from this launch's output (never
+    synthesized). codex/opencode/qwen correlate to this launch's own store
+    record. A store or output may not exist immediately after ``Popen``; a
+    None here is re-correlated in ``finalize_steer`` from the completed turn.
+    """
+    if effective_override:
+        return _override_stdout_session_id(outfile)
+    if harness_name in ("claude", "copilot"):
+        return launch_id
+    return _correlate_store_session_id(
+        harness_name, outfile=outfile, cwd=cwd, prompt=prompt, started_at=started_at, latest=time.time()
+    )
+
+
+def _recorrelate_session_id(
+    *, harness_name: str | None, effective_override: str | None, outfile: Path, prompt: str, cwd: Path, started_at: float
+) -> str | None:
+    """Re-run launch-bound correlation after a turn has completed and quiesced.
+
+    Used by ``finalize_steer`` when no id was bound at launch: the override's
+    own printed id and the codex/opencode/qwen store records are all present
+    once the turn has finished. claude/copilot ids are launch-set and need no
+    re-correlation. Still never a bare newest-session query.
+    """
+    if effective_override:
+        return _override_stdout_session_id(outfile)
+    if harness_name in ("claude", "copilot"):
+        return None
+    return _correlate_store_session_id(
+        harness_name, outfile=outfile, cwd=cwd, prompt=prompt, started_at=started_at, latest=time.time()
+    )
+
+
+def _await_launch_session_id(
+    *,
+    harness_name: str | None,
+    effective_override: str | None,
+    outfile: Path,
+    prompt: str,
+    cwd: Path,
+    started_at: float,
+    timeout: float = _STEER_CAPTURE_TIMEOUT_S,
+    poll: float = _STEER_CAPTURE_POLL_S,
+) -> str | None:
+    """Bounded, launch-provenance-safe wait for this launch's own session id.
+
+    Polls the same launch-bound correlation as ``_recorrelate_session_id`` (the
+    override's own printed id, or the codex/opencode/qwen store record matched to
+    this launch) against the still-live prior turn, so an immediately-requested
+    steer can bind an id the harness emits shortly after launch rather than
+    racing it. Returns None — never a synthesized or newest-session id — when no
+    launch-owned id appears within ``timeout``. Stops early once the id is found
+    or the captured output already shows a hard-stop marker that the caller will
+    refuse, so a hard-prompt or no-id turn is not made to wait needlessly long.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        session_id = _recorrelate_session_id(
+            harness_name=harness_name,
+            effective_override=effective_override,
+            outfile=outfile,
+            prompt=prompt,
+            cwd=cwd,
+            started_at=started_at,
+        )
+        if session_id:
+            return session_id
+        if sessions.scan_hard_stop(sessions.read_output_tail(outfile))["present"]:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(poll)
 
 
 # --- Risk ratchet (target-design §4) ------------------------------------------
@@ -298,9 +779,6 @@ def init_run(
     stopped on errors (this function assumes the plan is clean); it does
     not re-check the plan.
     """
-    if not _tmux_present():
-        raise PmError("tmux is required to run PM; install it before running init")
-
     if harness_command is None and harness not in profiles.SUPPORTED_HARNESSES:
         supported = ", ".join(profiles.SUPPORTED_HARNESSES)
         raise PmError(
@@ -449,8 +927,8 @@ def status(repo: Path, run_dir: Path, token: str | None = None) -> StatusResult:
 
     current = state.get("current_slice")
     current_alive: bool | None = None
-    if current and current.get("tmux_session"):
-        current_alive = sessions.session_exists(current["tmux_session"])
+    if current and current.get("pid") and current.get("identity"):
+        current_alive = sessions.headless_process_alive(int(current["pid"]), str(current["identity"]))
 
     return StatusResult(
         state=state,
@@ -495,14 +973,23 @@ class StartSliceOutcome:
     slice_id: str | None = None
     reasons: list[str] = field(default_factory=list)
     attempt: int | None = None
+    # Named exactly as `current_slice` and `status` name them: `session` is
+    # PM's own per-attempt label, `session_id` the harness's launch-bound
+    # resume handle (None when none could be bound to this launch).
     session: str | None = None
+    session_id: str | None = None
+    pid: int | None = None
     reaped: list[str] = field(default_factory=list)
     message: str = ""
     notes_warning: str | None = None
 
 
 def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> None:
-    names = ("result.json", "pane.txt", "pane-live.txt")
+    # The next turn starts with a truncated outfile, so the previous attempt's
+    # observe cursor would misreport growth against it; drop it rather than
+    # rotate it (it is a transient progress marker, not slice evidence).
+    (artifact_dir / _OBSERVE_CURSOR_FILE).unlink(missing_ok=True)
+    names = ("result.json", sessions.SESSION_OUTFILE)
     present = [name for name in names if (artifact_dir / name).exists()]
     if not present:
         return
@@ -596,12 +1083,12 @@ def start_slice(
     if relaunch:
         attempts = int(entry.get("attempts", 0)) + 1
         if attempts > max_attempts:
-            # Exhaustion is a mandatory stop (design §11): kill the live
-            # session so nothing keeps working past the budget; the slice
-            # stays current so finalize --stop can record the full story.
-            session = current.get("tmux_session") if current else None
-            if session:
-                sessions.force_stop(session)
+            # Exhaustion is a mandatory stop (design §11): terminate the
+            # tracked Developer process group so nothing keeps working past
+            # the budget; the slice stays current so finalize --stop can
+            # record the full story.
+            if current:
+                _terminate_current(current)
             state["status"] = "needs-human"
             state["stop_reason"] = _BUDGET_EXHAUSTED_REASON
             state_mod.save_state(run_dir, state, token)
@@ -615,13 +1102,19 @@ def start_slice(
     artifact_dir = slice_artifact_dir(repo, run_id, plan_slice.slice_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    # Terminate any process still tracked by the outgoing current_slice before
+    # relaunching (a relaunch supersedes a dead-or-hung prior attempt). The
+    # headless model has no global process sweep — the tracked pgid and the
+    # sidecar are the only handles — so termination is by recorded identity,
+    # not a prefix scan. Done BEFORE rotation so the outfile is no longer being
+    # written when it is moved aside.
+    reaped: list[str] = []
+    if current and current.get("pid"):
+        if _terminate_current(current):
+            reaped.append(f"developer pid {current['pid']}")
+
     if relaunch:
         _rotate_prior_attempt(artifact_dir, attempts - 1)
-
-    reaped: list[str] = []
-    for name in sessions.sessions_with_prefix(_run_id_session_prefix(run_id)):
-        sessions.force_stop(name)
-        reaped.append(name)
 
     if relaunch:
         before_head = current.get("before_head") if current else None
@@ -661,16 +1154,13 @@ def start_slice(
     prompt_path = artifact_dir / "prompt.md"
     prompt_path.write_text(prompt_text, encoding="utf-8")
 
-    tmp_dir = artifact_dir / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    env = {
-        "PM_SLICE_ARTIFACT_DIR": str(artifact_dir),
-        "PM_PLAN_PATH": str(plan_path),
-        "PM_SLICE_ID": plan_slice.slice_id,
-        "PM_NOTES_PATH": str(slice_notes_path),
-        "PM_RESULT_PATH": str(result_path),
-        "TMPDIR": str(tmp_dir),
-    }
+    env = _developer_env(
+        artifact_dir=artifact_dir,
+        plan_path=plan_path,
+        slice_id=plan_slice.slice_id,
+        notes_path=slice_notes_path,
+        result_path=result_path,
+    )
 
     harness_block = state.get("harness") or {}
     harness_name = harness_block.get("name")
@@ -678,65 +1168,122 @@ def start_slice(
     launch_model = model or harness_block.get("model")
     launch_effort = effort or harness_block.get("effort")
 
-    expected_model_display: str | None = None
+    # A launch-set id used ONLY by claude/copilot (composed into the launch
+    # command and bound by construction). An override prints and PM captures
+    # its own id; codex/opencode/qwen are correlated to this launch's store
+    # record — neither uses this uuid.
+    launch_id = str(uuid.uuid4())
+    pointer = prompts.render_launch_pointer(prompt_path)
+
     if effective_override:
-        command = effective_override
+        # The override runs with the one-line launch pointer as its final
+        # argument; PM_DEVELOPER_RESUME_SESSION_ID is unset on launch (only a
+        # resume sets it), matching the frozen override protocol.
+        command = f"{effective_override} {shlex.quote(pointer)}"
     else:
         git_access_dir = None
-        session_id = None
+        launch_session_id: str | None = None
         if harness_name == "codex" and bool(policy.get("commit_required", True)):
             git_access_dir = git_ops.worktree_git_dir(repo)
-        if harness_name == "claude":
-            session_id = str(uuid.uuid4())
+        if harness_name in ("claude", "copilot"):
+            launch_session_id = launch_id
         if harness_name == "opencode" and launch_model:
-            identity = profiles.query_model_identity(harness_name, launch_model)
-            if identity:
-                expected_model_display = identity["display_name"]
-        command = profiles.compose_command(
-            harness_name,
-            model=launch_model,
-            effort=launch_effort,
-            git_access_dir=git_access_dir,
-            session_id=session_id,
+            # Fail-closed inventory validation preserved from the tmux path: a
+            # model absent from the harness inventory raises here rather than
+            # letting the harness silently fall back to a different model.
+            profiles.query_model_identity(harness_name, launch_model)
+        command = shlex.join(
+            profiles.compose_headless_command(
+                harness_name,
+                pointer,
+                mode="developer",
+                repo=repo,
+                model=launch_model,
+                effort=launch_effort,
+                session_id=launch_session_id,
+                git_access_dir=git_access_dir,
+            )
         )
 
-    session_name = sessions.session_name(run_id, slice_number(plan_slice.slice_id), attempts)
-    sessions.start_session(session_name, repo, command, env)
-    launch_executable = shlex.split(command)[0] if command.strip() else ""
-    sessions.wait_until_ready(session_name, launch_executable, expected_model_display=expected_model_display)
-    sessions.send_prompt(session_name, prompts.render_launch_pointer(prompt_path))
+    session_label = sessions.session_name(run_id, slice_number(plan_slice.slice_id), attempts)
+    launch_cwd = str(repo)
+    launch_started_at = time.time()
+    launch = _launch_developer(command, repo, env, artifact_dir)
+    # Everything from here to the authenticated state write is bookkeeping for
+    # a process that is ALREADY running: if any of it fails, the launch must be
+    # torn down rather than left untracked (see _abort_launch). The guard ends
+    # at save_state — once state records the process, a later event-log failure
+    # must not kill a legitimately tracked Developer.
+    try:
+        # Best-effort at launch; a store/output that is not yet written yields
+        # None and is re-correlated from the completed turn in finalize_steer.
+        session_id = _capture_launch_session_id(
+            harness_name=harness_name,
+            effective_override=effective_override,
+            launch_id=launch_id,
+            outfile=Path(launch["outfile"]),
+            prompt=pointer,
+            cwd=Path(launch_cwd),
+            started_at=launch_started_at,
+        )
+        sessions.write_developer_sidecar(
+            developer_sidecar_path(repo, run_id),
+            pid=launch["pid"],
+            pgid=launch["pgid"],
+            identity=launch["identity"],
+            run_id=run_id,
+            slice_id=plan_slice.slice_id,
+        )
 
-    now = _utc_now_iso()
-    new_current: dict[str, Any] = {
-        "id": plan_slice.slice_id,
-        "artifact_dir": str(artifact_dir),
-        "tmux_session": session_name,
-        "before_head": before_head,
-        "started_at": (current.get("started_at") if relaunch and current and current.get("started_at") else now),
-        "attempts": attempts,
-        "risk": entry.get("risk", plan_slice.plan_risk),
-        "plan_risk": plan_slice.plan_risk,
-        "wake_at": None,
-        "reviewer_pids": [],
-    }
-    launch_overrides: dict[str, Any] = {key: value for key, value in (("model", model), ("effort", effort)) if value}
-    if reviewer_tools:
-        # Recorded per slice (design §8); review._resolve_tool prefers it
-        # over the run-level reviewer configuration.
-        launch_overrides["reviewer_tools"] = list(profiles.parse_reviewer_tools(reviewer_tools))
-    if launch_overrides:
-        new_current["launch"] = launch_overrides
+        now = _utc_now_iso()
+        new_current: dict[str, Any] = {
+            "id": plan_slice.slice_id,
+            "artifact_dir": str(artifact_dir),
+            "session": session_label,
+            "session_id": session_id,
+            "pid": launch["pid"],
+            "pgid": launch["pgid"],
+            "identity": launch["identity"],
+            "outfile": launch["outfile"],
+            "command_override": effective_override,
+            # Launch-correlation metadata for a safe delayed re-correlation at
+            # finalize --steer (the harness store/output may be empty right
+            # after Popen): this launch's exact pointer, cwd, and start time.
+            "launch_pointer": pointer,
+            "launch_cwd": launch_cwd,
+            "launch_started_at": launch_started_at,
+            "before_head": before_head,
+            "started_at": (current.get("started_at") if relaunch and current and current.get("started_at") else now),
+            "attempts": attempts,
+            "risk": entry.get("risk", plan_slice.plan_risk),
+            "plan_risk": plan_slice.plan_risk,
+            "wake_at": None,
+            "reviewer_pids": [],
+        }
+        launch_overrides: dict[str, Any] = {
+            key: value for key, value in (("model", model), ("effort", effort)) if value
+        }
+        if reviewer_tools:
+            # Recorded per slice (design §8); review._resolve_tool prefers it
+            # over the run-level reviewer configuration.
+            launch_overrides["reviewer_tools"] = list(profiles.parse_reviewer_tools(reviewer_tools))
+        if launch_overrides:
+            new_current["launch"] = launch_overrides
 
-    state["current_slice"] = new_current
-    entry["attempts"] = attempts
-    # A successful launch reactivates a run that a human resumed after a
-    # stop/needs-human pause; tampered state can never reach here (the MAC
-    # check above fails closed before any launch).
-    state["status"] = "active"
-    state_mod.save_state(run_dir, state, token)
+        state["current_slice"] = new_current
+        entry["attempts"] = attempts
+        # A successful launch reactivates a run that a human resumed after a
+        # stop/needs-human pause; tampered state can never reach here (the MAC
+        # check above fails closed before any launch).
+        state["status"] = "active"
+        state_mod.save_state(run_dir, state, token)
+    except Exception:
+        _abort_launch(launch)
+        raise
+
     note = f"attempt {attempts}"
     if reaped:
-        note += f"; reaped stale sessions: {', '.join(reaped)}"
+        note += f"; reaped stale developer process(es): {', '.join(reaped)}"
     state_mod.append_event(
         run_dir,
         "relaunch" if relaunch else "launch",
@@ -749,7 +1296,9 @@ def start_slice(
         kind="relaunched" if relaunch else "launched",
         slice_id=plan_slice.slice_id,
         attempt=attempts,
-        session=session_name,
+        session=session_label,
+        session_id=session_id,
+        pid=launch["pid"],
         reaped=reaped,
         notes_warning=notes_warning,
     )
@@ -762,7 +1311,7 @@ def start_slice(
 class ObserveOutcome:
     has_current_slice: bool
     running: bool = False
-    pane_changed: bool = False
+    output_changed: bool = False
     result_present: bool = False
     result_status: str | None = None
     hard_stop: dict[str, Any] = field(default_factory=lambda: {"present": False, "kinds": [], "markers": []})
@@ -775,42 +1324,53 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     # Same opportunistic verification as status(): see the comment there.
     state = state_mod.load_state(run_dir, token)
     current = state.get("current_slice")
-    if not current or not current.get("tmux_session"):
+    if not current or not current.get("outfile"):
         return ObserveOutcome(has_current_slice=False)
 
-    session = current["tmux_session"]
+    outfile = Path(current["outfile"])
     artifact_dir = Path(current["artifact_dir"])
-    pane_live_path = artifact_dir / "pane-live.txt"
-    previous_capture = pane_live_path.read_text(encoding="utf-8") if pane_live_path.exists() else ""
+    pid = current.get("pid")
+    identity = current.get("identity")
     result_path = artifact_dir / "result.json"
+    # "Changed" means grown since the PREVIOUS observation, not since the top
+    # of this call: comparing two reads within one call would make a no-wait
+    # `observe` (PM's normal polling shape) always report "no change" and drop
+    # the progress record from the event log.
+    cursor_path = artifact_dir / _OBSERVE_CURSOR_FILE
+    previous_size = _read_observe_cursor(cursor_path)
 
-    initial_running = sessions.session_exists(session)
+    def _alive() -> bool:
+        return bool(pid and identity and sessions.headless_process_alive(int(pid), str(identity)))
+
+    initial_running = _alive()
     result_existed_before = result_path.is_file()
 
+    running = initial_running
+    latest_tail = ""
     deadline = time.monotonic() + wait if wait else None
     wait_start = time.monotonic()
-    activity = sessions.detect_activity(session, previous_capture)
-    # Wait exits early ONLY on a meaningful signal — session death, result.json
-    # appearing, or a hard-stop marker in the fresh capture — never on a mere
-    # pane byte-change, which `detect_activity`'s "active" flags on any TUI
-    # spinner/stream churn and would otherwise defeat the wait almost
-    # immediately (target-design §12, Amended post-implementation).
+    # Wait exits early ONLY on a meaningful signal — the Developer process
+    # dying, result.json appearing, or a hard-stop marker in the captured
+    # session output — never on mere output growth (a streaming harness churns
+    # its outfile constantly and would otherwise defeat the wait almost
+    # immediately; target-design §12, Amended post-implementation).
     while deadline is not None and time.monotonic() < deadline:
-        if (
-            not activity["running"]
-            or result_path.is_file()
-            or sessions.scan_hard_stop(activity["capture"])["present"]
-        ):
+        running = _alive()
+        latest_tail = sessions.read_output_tail(outfile)
+        if not running or result_path.is_file() or sessions.scan_hard_stop(latest_tail)["present"]:
             break
         time.sleep(_OBSERVE_POLL_SECONDS)
-        activity = sessions.detect_activity(session, previous_capture)
+    else:
+        # No wait, or the wait ran to full duration: refresh once so a
+        # zero-wait observe still reports current liveness and output.
+        running = _alive()
+        latest_tail = sessions.read_output_tail(outfile)
     elapsed_seconds = time.monotonic() - wait_start
 
-    capture = activity["capture"]
-    pane_changed = capture != previous_capture
-    if pane_changed:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        pane_live_path.write_text(capture, encoding="utf-8")
+    current_size = _outfile_size(outfile)
+    output_changed = current_size != previous_size
+    if output_changed:
+        _write_observe_cursor(cursor_path, current_size)
 
     result_present = result_path.is_file()
     result_status: str | None = None
@@ -822,29 +1382,29 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         except (OSError, json.JSONDecodeError):
             result_status = None
 
-    hard_stop = sessions.scan_hard_stop(capture)
-    tail_lines = capture.splitlines()[-_OBSERVE_TAIL_LINES:]
+    hard_stop = sessions.scan_hard_stop(latest_tail)
+    tail_lines = latest_tail.splitlines()[-_OBSERVE_TAIL_LINES:]
     tail = "\n".join(tail_lines)
 
-    liveness_changed = activity["running"] != initial_running
+    liveness_changed = running != initial_running
     result_newly_appeared = result_present and not result_existed_before
-    if pane_changed or liveness_changed or result_newly_appeared:
+    if output_changed or liveness_changed or result_newly_appeared:
         state_mod.append_event(
             run_dir,
             "observe",
             slice_id=current.get("id"),
             note=(
-                f"pane_changed={pane_changed} liveness_changed={liveness_changed} "
-                f"running={activity['running']} result_present={result_present} "
+                f"output_changed={output_changed} liveness_changed={liveness_changed} "
+                f"running={running} result_present={result_present} "
                 f"elapsed={elapsed_seconds:.1f}s"
             ),
-            evidence=str(pane_live_path) if pane_changed else None,
+            evidence=str(outfile) if output_changed else None,
         )
 
     return ObserveOutcome(
         has_current_slice=True,
-        running=activity["running"],
-        pane_changed=pane_changed,
+        running=running,
+        output_changed=output_changed,
         result_present=result_present,
         result_status=result_status,
         hard_stop=hard_stop,
@@ -852,20 +1412,6 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         slice_id=current.get("id"),
         elapsed_seconds=elapsed_seconds,
     )
-
-
-# --- send ---------------------------------------------------------------------
-
-
-def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> None:
-    state = load_writable_state(run_dir, token)
-    _refuse_if_budget_exhausted(state)
-    current = state.get("current_slice")
-    session = current.get("tmux_session") if current else None
-    if not current or not session or not sessions.session_exists(session):
-        raise PmError("no live session — not driving a dead pane")
-    sessions.send_line(session, text)
-    state_mod.append_event(run_dir, "send", slice_id=current.get("id"), note=reason)
 
 
 # --- finalize -------------------------------------------------------------
@@ -882,7 +1428,7 @@ def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> No
 class FinalizeOutcome:
     report: FloorReport
     artifact_dir: Path
-    pane_path: Path
+    session_output_path: Path
     status_before_path: Path
     status_after_path: Path
     diff_path: Path
@@ -895,15 +1441,19 @@ _REQUIRED_ELEVATED_REVIEW_SKILLS = ("code-review", "drift-audit")
 
 
 def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[str, Any]) -> tuple[FloorReport, Path]:
-    """Shared by bare `finalize` and every decision path: capture pane +
-    status-after + diff evidence under the slice's artifact dir, then
-    evaluate the eight-fact floor. Never mutates or saves state."""
+    """Shared by bare `finalize` and every decision path: read the captured
+    session output + write status-after + diff evidence under the slice's
+    artifact dir, then evaluate the eight-fact floor. Never mutates or saves
+    state.
+
+    The Developer's captured stdout already lives at
+    ``<artifact_dir>/session-output.txt`` (the launch outfile), so fact 8
+    reads it directly rather than snapshotting a live tmux pane."""
     slice_id = current["id"]
     artifact_dir = Path(current["artifact_dir"])
-    session = current.get("tmux_session")
-    pane_text = sessions.pane_text(session) if session and sessions.session_exists(session) else ""
+    outfile = Path(current["outfile"]) if current.get("outfile") else artifact_dir / sessions.SESSION_OUTFILE
+    session_output = sessions.read_output_tail(outfile)
 
-    (artifact_dir / "pane.txt").write_text(pane_text, encoding="utf-8")
     (artifact_dir / "status-after.txt").write_text(git_ops.git_status_text(repo), encoding="utf-8")
 
     diff_path = artifact_dir / "diff.patch"
@@ -911,7 +1461,7 @@ def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[
     git_ops.write_git_diff(repo, current.get("before_head"), after_head, diff_path)
 
     slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
-    report = evaluate_floor(repo, state, slices, slice_id, artifact_dir=artifact_dir, pane_text=pane_text)
+    report = evaluate_floor(repo, state, slices, slice_id, artifact_dir=artifact_dir, session_output=session_output)
     return report, artifact_dir
 
 
@@ -944,7 +1494,7 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
     return FinalizeOutcome(
         report=report,
         artifact_dir=artifact_dir,
-        pane_path=artifact_dir / "pane.txt",
+        session_output_path=artifact_dir / sessions.SESSION_OUTFILE,
         status_before_path=artifact_dir / "status-before.txt",
         status_after_path=artifact_dir / "status-after.txt",
         diff_path=artifact_dir / "diff.patch",
@@ -1124,6 +1674,14 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
                 ),
             )
 
+    # Terminate the Developer BEFORE the ACCEPTED assessment is written. A
+    # termination failure raises and refuses the acceptance outright, and doing
+    # it first means no assessment.md is ever left on disk announcing an
+    # acceptance the state never recorded. Deliberately after the review-
+    # freshness gate: a refused acceptance must leave the Developer alive so
+    # the operator can still steer it.
+    _terminate_current(current)
+
     reviews_text = _reviews_consulted_text(reviews, head, effective_risk)
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
     assessment_text = _render_assessment(
@@ -1140,10 +1698,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     entry["assessment"] = str(assessment_original)
     entry["summary"] = first_line
 
-    session = current.get("tmux_session")
     state["current_slice"] = None
-    if session:
-        sessions.force_stop(session)
 
     # Accepting the final undecided slice finishes the run (design §3.4):
     # the state write below is the final one and the report regeneration is
@@ -1178,28 +1733,35 @@ class SteerOutcome:
 
 
 def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, risk: str | None = None) -> SteerOutcome:
-    """`finalize --steer "correction"`: a corrective nudge into the LIVE
-    session, counted against the same attempt budget as a relaunch."""
+    """`finalize --steer "correction"`: resume the slice as a new budgeted
+    turn (target-design headless model).
+
+    Steering is turn-based: the prior `-p`/`exec` turn has run to completion
+    and exited, so a dead prior process is the *normal* precondition, not an
+    error. The prior process is quiesced (confirmed dead, its identity-checked
+    group reaped if it lingers), then a captured launch-bound session id is
+    required (blocking with a clear error if none), then a detached resume
+    turn is launched — counted against the same attempt budget as a relaunch.
+    """
     state = load_writable_state(run_dir, token)
     _refuse_if_budget_exhausted(state)
+    run_id = state["run_id"]
     current = state.get("current_slice")
     if not current:
         raise PmError("no current slice to steer")
     slice_id = current["id"]
-    session = current.get("tmux_session")
-    if not session or not sessions.session_exists(session):
-        raise PmError(f"no live session to steer for {slice_id} — relaunch with start-slice")
     entry = slice_entry(state, slice_id)
     if entry is None:
         raise PmError(f"{slice_id} is not present in the run's slice entries")
 
     # Stripped copy used only to decide "is this blank" and to summarize the
-    # risk-raise event's own note; the correction delivered to the session
+    # risk-raise event's own note; the correction delivered to the resume turn
     # and recorded on the steer event below stays exactly as given — a
     # verbatim correction can legitimately start or end with meaningful
     # whitespace (e.g. an indented code block).
     stripped_correction = correction.strip()
-    if apply_risk_ratchet(entry, current, risk_flag=risk):
+    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
+    if ratcheted:
         note = stripped_correction.splitlines()[0][:120] if stripped_correction else "risk raised via finalize --steer"
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
 
@@ -1209,9 +1771,9 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     policy = state.get("policy") or {}
     max_attempts = int(policy.get("max_attempts", 3))
     if attempts > max_attempts:
-        # Mandatory stop, as in start_slice's exhaustion path: the live
-        # session is killed, not left running past the budget.
-        sessions.force_stop(session)
+        # Mandatory stop, as in start_slice's exhaustion path: the tracked
+        # process group is terminated, not left running past the budget.
+        _terminate_current(current)
         state["status"] = "needs-human"
         state["stop_reason"] = _BUDGET_EXHAUSTED_REASON
         state_mod.save_state(run_dir, state, token)
@@ -1220,30 +1782,157 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
             kind="budget_exhausted", slice_id=slice_id, message="attempt budget exhausted; steer refused"
         )
 
+    harness_name = (state.get("harness") or {}).get("name")
+    override = current.get("command_override")
+    outfile = Path(current["outfile"]) if current.get("outfile") else None
+    launch_pointer = current.get("launch_pointer") or ""
+    launch_cwd = Path(current.get("launch_cwd") or repo)
+    launch_started_at = float(current.get("launch_started_at") or 0.0)
+
+    # The refusal gates below (quiesce, hard-stop, id-required) raise instead of
+    # returning, so they bypass every state write. The risk ratchet applied
+    # above is a durable one-way escalation whose `risk-raise` event is already
+    # in the log, so a refusal here must still persist it — otherwise the event
+    # log claims an elevation the state never recorded and a later accept would
+    # fail open on standard-risk review requirements. Only the ratchet (and any
+    # session id correlated below) is persisted: the attempt increment is not
+    # applied to state until the resume actually launches.
+    try:
+        # Gather this launch's own session id BEFORE quiescing (evidence
+        # gathering, distinct from *requiring* the id below). A harness —
+        # including an override, which prints its exact id line then idles —
+        # emits its id shortly after Popen, not synchronously with it, so an
+        # immediately-requested steer must read the launch-owned evidence from
+        # the still-live turn with a bounded, fail-closed wait. Quiescing first
+        # could kill the process before it emits its id. This never synthesizes
+        # an id and never accepts a newest session.
+        session_id = current.get("session_id")
+        if not session_id and outfile is not None:
+            session_id = _await_launch_session_id(
+                harness_name=harness_name,
+                effective_override=override,
+                outfile=outfile,
+                prompt=launch_pointer,
+                cwd=launch_cwd,
+                started_at=launch_started_at,
+            )
+            if session_id:
+                current["session_id"] = session_id
+
+        # Quiesce the prior turn before requiring the id or launching the
+        # resume: result.json appearing does not prove the harness process
+        # exited, so a resume must never race a still-flushing or still-acting
+        # prior turn. quiesce_headless raises if the tracked group will not die.
+        pid = current.get("pid")
+        pgid = current.get("pgid")
+        identity = current.get("identity")
+        if pid and pgid and identity:
+            sessions.quiesce_headless(int(pid), int(pgid), str(identity))
+
+        # Hard-stop refusal on corrections (pre-cutover rule preserved): once
+        # the prior turn has quiesced, scan its captured output; a credential /
+        # approval / usage-limit / external-side-effect marker means PM must not
+        # blindly resume. Refuse BEFORE any attempt increment, rotation, or
+        # steer event.
+        if outfile is not None:
+            hard_stop = sessions.scan_hard_stop(sessions.read_output_tail(outfile))
+            if hard_stop["present"]:
+                raise PmError(
+                    "refusing to resume into a hard prompt visible in the captured session output: "
+                    + ", ".join(hard_stop["kinds"])
+                )
+
+        # A launch-owned id that only finalized as the turn exited (e.g. a store
+        # record flushed at completion) can still be bound now that it has
+        # quiesced. Still the same launch-bound correlation — never a bare
+        # newest session.
+        if not session_id and outfile is not None:
+            session_id = _recorrelate_session_id(
+                harness_name=harness_name,
+                effective_override=override,
+                outfile=outfile,
+                prompt=launch_pointer,
+                cwd=launch_cwd,
+                started_at=launch_started_at,
+            )
+            if session_id:
+                current["session_id"] = session_id
+
+        # Require a launch-bound session id. Without one, PM will not guess "the
+        # last session" — it fails closed and the operator relaunches with
+        # start-slice (a fresh session) instead.
+        if not session_id:
+            raise PmError(
+                f"no launch-bound session id could be correlated for {slice_id}; cannot resume this "
+                "harness headlessly — relaunch with start-slice"
+            )
+    except PmError:
+        if ratcheted:
+            state_mod.save_state(run_dir, state, token)
+        raise
+
     current["attempts"] = attempts
     entry["attempts"] = attempts
 
-    # Rotate the prior attempt's completion signal into attempt-<n>/ exactly
-    # as a relaunch does (start_slice), so a steered session can never be
-    # mistaken for complete on the pre-steer result.json — observe --wait,
-    # which breaks the instant result.json exists, would otherwise return
-    # immediately on stale evidence (target-design §9; Stage 7 Test 21).
-    # This must stay BEFORE send_correction: rotating after delivery would
-    # race the live session, which may write its fresh post-steer result
-    # before we rotate — archiving the NEW result instead of the stale one.
-    # If send_correction below raises (dead-session race, hard-stop refusal)
-    # the rotation is harmless: the result is preserved under attempt-<n>/,
-    # the attempt increment is not persisted, and a later relaunch re-rotates
-    # idempotently (nothing left at top level → no-op).
-    _rotate_prior_attempt(Path(current["artifact_dir"]), attempts - 1)
+    # Rotate the prior attempt's completion signal + captured output into
+    # attempt-<n>/ before the resume launch (quiesce → rotate → launch): a
+    # steered attempt must never be mistaken for complete on the pre-steer
+    # result.json (observe --wait breaks the instant one exists), and the
+    # pre-steer output must be preserved before the resume truncates the
+    # outfile.
+    artifact_dir = Path(current["artifact_dir"])
+    _rotate_prior_attempt(artifact_dir, attempts - 1)
 
-    # Direct live-session injection, not a persistent numbered artifact: the
-    # correction is rendered from the reference-sourced wrapper and pasted
-    # straight into the pane, verbatim.
+    # Compose and launch the resume turn. The correction is framed by the
+    # reference-sourced steer wrapper; the harness continues its prior session
+    # (profile harnesses via the resume composer's flags; a custom override via
+    # PM_DEVELOPER_RESUME_SESSION_ID).
     message = prompts.render_steer_message(correction)
-    sessions.send_correction(session, message)
+    env = _developer_env(
+        artifact_dir=artifact_dir,
+        plan_path=Path(state["plan"]["path"]),
+        slice_id=slice_id,
+        notes_path=notes_path(repo, run_id),
+        result_path=artifact_dir / "result.json",
+    )
+    if override:
+        command = f"{override} {shlex.quote(message)}"
+        env[RESUME_SESSION_ENV_VAR] = session_id
+    else:
+        git_access_dir = None
+        if harness_name == "codex" and bool(policy.get("commit_required", True)):
+            git_access_dir = git_ops.worktree_git_dir(repo)
+        command = shlex.join(
+            profiles.compose_resume_command(
+                harness_name, message, session_id=session_id, repo=repo, git_access_dir=git_access_dir
+            )
+        )
 
-    state_mod.save_state(run_dir, state, token)
+    launch = _launch_developer(command, repo, env, artifact_dir)
+    # As in start_slice: the resume turn is already running, so its bookkeeping
+    # is guarded up to (and including) the state write — a failure here tears
+    # the new turn down instead of orphaning it untracked.
+    try:
+        # The resume is a new budgeted turn: advance the per-attempt session
+        # label while keeping session_id as the stable harness resume handle.
+        current["session"] = sessions.session_name(run_id, slice_number(slice_id), attempts)
+        current["pid"] = launch["pid"]
+        current["pgid"] = launch["pgid"]
+        current["identity"] = launch["identity"]
+        current["outfile"] = launch["outfile"]
+        sessions.write_developer_sidecar(
+            developer_sidecar_path(repo, run_id),
+            pid=launch["pid"],
+            pgid=launch["pgid"],
+            identity=launch["identity"],
+            run_id=run_id,
+            slice_id=slice_id,
+        )
+        state_mod.save_state(run_dir, state, token)
+    except Exception:
+        _abort_launch(launch)
+        raise
+
     # The complete, verbatim correction lives in the event's note (no
     # truncation, no stripping, no evidence path) — it is the only durable
     # record of what was said, now that no steer file exists to point to.
@@ -1288,6 +1977,15 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
     )
     state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=floor_note, evidence=str(artifact_dir))
 
+    # Terminate before publishing the STOPPED assessment, for the same reason
+    # as finalize_accept: a termination failure raises, and an assessment
+    # written first would be left on disk announcing a stop the state never
+    # recorded. The floor evidence above is deliberately collected first — a
+    # stop record exists to say what happened, floor passing or not.
+    _terminate_current(current)
+    for pgid in list(current.get("reviewer_pids") or []):
+        _kill_reviewer_pgid(pgid)
+
     head = git_ops.git_head(repo)
     reviews = list(entry.get("reviews") or [])
     reviews_text = _reviews_consulted_text(reviews, head, entry.get("risk") or "standard")
@@ -1304,12 +2002,6 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
     entry["decision"] = first_line
     entry["assessment"] = str(assessment_original)
     entry["summary"] = first_line
-
-    session = current.get("tmux_session")
-    if session:
-        sessions.force_stop(session)
-    for pgid in list(current.get("reviewer_pids") or []):
-        _kill_reviewer_pgid(pgid)
 
     state["status"] = "needs-human"
     state["stop_reason"] = reason
@@ -1352,12 +2044,9 @@ def stop(
     run_id = state["run_id"]
     current = state.get("current_slice")
 
-    if current and current.get("artifact_dir"):
-        artifact_dir = Path(current["artifact_dir"])
-        session = current.get("tmux_session")
-        pane_text = sessions.pane_text(session) if session else ""
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        (artifact_dir / "pane.txt").write_text(pane_text, encoding="utf-8")
+    # The Developer's captured stdout already persists at
+    # <artifact_dir>/session-output.txt (the launch outfile), so no separate
+    # snapshot is taken at stop time.
 
     # Reap any recorded reviewer process groups (a hung `review` subprocess)
     # — ESRCH/EPERM tolerated. Applies whenever state is readable, including
@@ -1369,9 +2058,9 @@ def stop(
         current["reviewer_pids"] = []
 
     killed: list[str] = []
-    for name in sessions.sessions_with_prefix(_run_id_session_prefix(run_id)):
-        sessions.force_stop(name)
-        killed.append(name)
+    if current and current.get("pid"):
+        if _terminate_current(current):
+            killed.append(f"developer pid {current['pid']}")
 
     if state.get("status") != "complete":
         state["status"] = "stopped"
@@ -1393,13 +2082,31 @@ def stop(
     return StopOutcome(run_id=run_id, killed=killed)
 
 
-def stop_scavenge_sweep(*, run_id: str | None) -> list[str]:
-    """State-independent tmux sweep for `stop --scavenge` when state cannot be
-    trusted or read at all. Narrows to the given run id's sessions when one
-    is known; otherwise sweeps every PM session regardless of run."""
-    prefix = _run_id_session_prefix(run_id) if run_id else "pm-"
-    killed: list[str] = []
-    for name in sessions.sessions_with_prefix(prefix):
-        sessions.force_stop(name)
-        killed.append(name)
-    return killed
+def stop_scavenge_sweep(repo: Path, *, run_id: str | None) -> list[str]:
+    """State-independent scavenge for `stop --scavenge` when run state cannot
+    be trusted or read at all. Reads the per-run `developer.pid` sidecar (under
+    `.pm/`), validates its recorded identity, and terminates the tracked
+    process group by that identity — never a blind signal.
+
+    A run id is required: the headless model keeps no global process list, so
+    with neither readable state nor a run id (and thus no sidecar path) there
+    is nothing to discover — unlike tmux's global session list. If both the
+    run state and the sidecar are gone, global discovery is impossible."""
+    if not run_id:
+        return []
+    try:
+        record = sessions.read_developer_sidecar(developer_sidecar_path(repo, run_id))
+    except PmError:
+        # A corrupt/unverifiable sidecar fails closed: PM never signals a
+        # process group it cannot validate.
+        return []
+    if record is None or record.get("run_id") != run_id:
+        return []
+    # A corrupt/unreadable sidecar already failed closed above. A termination
+    # failure (a live group that survives SIGKILL, or a reused leader that
+    # still owns the group) is NOT swallowed: scavenge must not report success
+    # when the tracked process could not be killed. A PID-reuse-safe False
+    # (nothing of ours to signal) simply reports nothing terminated.
+    if sessions.terminate_headless(int(record["pid"]), int(record["pgid"]), str(record["identity"])):
+        return [f"developer pid {record['pid']}"]
+    return []
