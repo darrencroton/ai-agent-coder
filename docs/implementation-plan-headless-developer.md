@@ -1,5 +1,29 @@
 # Implementation Plan — PM headless Developer (retire tmux)
 
+## STATUS: COMPLETE (2026-07-26)
+
+All seven slices are implemented, reviewed, and committed on `feature/headless-developer`.
+
+| Slice | Commit |
+|---|---|
+| 1 — headless runner in `sessions.py` (additive) | `52d29ca` |
+| 2 — headless + resume composer; `review.py` adopts it | `0fd11bf` |
+| 3 — atomic tmux→headless lifecycle cutover | `e10c290` |
+| 4 — delete the dead tmux code; rewrite `test_sessions.py` | `9beba44` |
+| 5 — documentation | `ba435c7` |
+| 6 — CI drops tmux; closeout items A/B/C/D3/E | `7ab639f` |
+| 7 — accept-path TOCTOU; F1; closeout items G–M | `20c4f1b` |
+
+**Final state:** `project-manager` suite 327 passing, `orchestrator` suite 78 passing, both with nothing skipped; the PM suite also passes with `tmux` entirely absent from `PATH`. No tmux subprocess call remains in `pm_lib/`.
+
+**Closed as correct with no code change** (do not reopen — both are recorded in the Amendment 2026-07-26 closeout scope):
+- **D2** — fact 8 scans the final 128 KiB of the outfile. A strict *increase* in coverage over the ~50-line tmux pane capture it replaced; streaming the whole outfile would be new machinery for a hypothetical, which VISION principle 9 discourages.
+- **D4** — the opencode/qwen effort guard dropped in Slice 4 **must not be restored**. The hardcoded `harness in {…}` refusal is superseded by the table-driven "no effort flag means fail closed" rule; restoring it would silently defeat opencode's `--variant` mapping.
+
+**Everything else was fixed rather than deferred.** All four findings carried into Slice 7 (F1–F4) are closed: F1 (PM's invalid codex resume shape) and F2 (the orchestrator's independent copy of it) in Slice 7 item K, F3 (the CHANGELOG contradiction) in item J, F4 (the orchestrator's stale OpenCode effort claims) in item L. Nothing from this plan's register remains open.
+
+**One environmental caveat, not a defect:** `scripts/verify_harness_argv.py` verified all five harnesses cleanly during Slice 7, but `copilot --help` began hanging on the development machine late in the session, so the final run reports copilot as *inconclusive* rather than verified. Re-run the script when that CLI is responsive.
+
 ## Purpose
 
 Move the `project-manager` (Mode B) **Developer** from a persistent interactive tmux TUI to a **headless, resumable** invocation, still launched and supervised by PM. This is a simplifying refactor: it deletes readiness-banner detection, keystroke injection, and pane screen-scraping, and replaces the "one named tmux session per slice" model with a detached background process whose captured stdout (the *outfile*) is the universal, harness-agnostic progress signal. All five harnesses become first-class by construction, because the outfile and the `result.json` completion signal are identical for every tool.
@@ -449,15 +473,15 @@ Items **G–I** are PM-side robustness gaps surfaced by the round-1 code review 
 - Tests allowed or expected to change: `test_finalize.py` (a raced-acceptance test plus confirmation that ordinary acceptance is unaffected and that the floor passing twice in a row is not spuriously refused); `test_profiles.py` (`TestComposeResumeCommand`'s codex row and the omitted-`git_access_dir` assertion).
 
 ### Explicit Non-Goals
-- No change to `finalize --steer`, `finalize --stop`, bare `finalize`, `stop`, or `stop --scavenge`. *(F1 changes the argv `finalize --steer` composes, but no lifecycle logic in `slice_ops.py`.)*
+- No change to bare `finalize`, `stop`, or `stop --scavenge`. *(F1 changes the argv `finalize --steer` composes, but no lifecycle logic in `slice_ops.py`.)* **PARTLY SUPERSEDED by Amendment (third), items G and H**, which authorize the `finalize_stop` evidence-pairing fix and the ratchet save in all three decision paths.
 - No reordering of the safety-critical `finalize_steer` sequence (capture id → quiesce → hard-stop scan → re-correlate → require id → rotate → launch).
 - No move of termination earlier than the review-freshness gate.
 - No `cli.py` change; no new CLI flag or subcommand.
 - No change to the floor's eight facts or their logic.
 - **No change to any launch shape**, including codex's; no change to the other four harnesses' resume shapes.
 - **No `--strict-config`** on the composed codex resume command (rationale in the amendment above).
-- No new live-CLI smoke-test infrastructure (recorded as follow-up, not built here).
-- No fix for F2, F3, or F4 — all outside this slice's surface.
+- ~~No new live-CLI smoke-test infrastructure (recorded as follow-up, not built here).~~ **SUPERSEDED by Amendment (third), item I**, which authorizes `verify_harness_argv.py` as a standalone maintainer script (not a test, not CI).
+- ~~No fix for F2, F3, or F4 — all outside this slice's surface.~~ **SUPERSEDED by Amendment (third), items J/K/L**, on the owner's instruction that nothing be deferred out of the plan's final slice.
 - No restoration of the Slice 4 opencode/qwen effort guard; no change to qwen's fail-closed effort handling.
 
 ### Risk Flags
@@ -478,19 +502,12 @@ Items **G–I** are PM-side robustness gaps surfaced by the round-1 code review 
 
 ## Next Chat Prompt
 
-```md
-Plan file: docs/implementation-plan-headless-developer.md
-Slices or batch this session: Slice 1 (or Batch A: Slices 1–2)
+**None — this plan is complete.** All seven slices are implemented, reviewed, and committed (see STATUS at the top of this file). There is no next slice and no follow-up work owed by this plan; every register item was either fixed or explicitly closed as correct, and findings F1–F4 are all closed.
 
-Read the full plan file first. If a selected slice receipt is incomplete or the repo state is unclear, stop and tell me before coding.
+This section previously carried a start-at-Slice-1 prompt. It was stale from the moment Slice 1 landed and would have misdirected anyone reading the plan instead of the handoff, so it is replaced rather than updated.
 
-Work on the current feature branch (feature/headless-developer).
+If you are picking up related work, start from `HANDOFF.md` in the repository root, not from here. Useful entry points that outlived this plan:
 
-Use orchestrator as the controlling skill. Act as the Developer: keep implementation, validation, Git operations, and commits local.
-
-For each selected slice, in plan order: restate the frozen contract; apply scoped-implementation; apply drift-audit and report the gate result; on a passing gate apply code-review; surface findings, fix, re-gate; then ask before committing.
-
-Slice 3 (the cutover) is marked "Independent audit required: yes": commission independent read-only drift-audit and code-review delegates for it, and if none can be launched, STOP and report rather than self-audit it. Slices 1, 2, 4, 5, and 6 are standard: Developer self-audit is acceptable when no Reviewer is available, recorded as such.
-
-Confirm before starting: plan file read, selected slice(s), branch, and the first slice.
-```
+- `skills/project-manager/references/run-state.md` — the authoritative description of the headless session fields, the launch-bound session-id rules, and the quiesced-acceptance guarantee.
+- `skills/project-manager/scripts/verify_harness_argv.py` — run this after changing any per-harness command shape, or after upgrading a harness CLI. It exists because a shape frozen from documentation and never executed survived five slices of review.
+- `docs/VISION.md` — the principles the mechanical floor and the accept path are accountable to.
