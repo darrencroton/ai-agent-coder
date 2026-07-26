@@ -1,9 +1,9 @@
 """The `review` command: commissioning an independent review of a pinned diff.
 
 `review.py` uses the shared PM headless-composer's reviewer mode. Reviews run
-one-shot/exec where the tool supports it (never the Developer's interactive
-tmux TUI path), while the PM implementation remains independent from
-`skills/orchestrator/` and never imports from it.
+one-shot/exec where the tool supports it, read-only rather than the
+Developer's read-write mode, while the PM implementation remains independent
+from `skills/orchestrator/` and never imports from it.
 
 The Reviewer is read-only by instruction and holds no acceptance authority;
 PM reads the report and records the decision itself, in

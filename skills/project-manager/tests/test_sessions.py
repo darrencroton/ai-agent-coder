@@ -1,9 +1,8 @@
-"""Protected behaviours: tmux session lifecycle and the hard-stop marker floor.
+"""Protected behaviours: the headless Developer runner and the hard-stop marker floor.
 
-`scan_hard_stop`, `session_name`, and the env-token assertion run without
-tmux. Everything that actually drives a tmux pane is gated with
-`@unittest.skipUnless(shutil.which("tmux"), ...)` and drives a tiny fake
-harness shell script — no real coding CLI.
+Every test here runs unconditionally — none is skipped. The runtime tests
+drive detached `/bin/sh` commands and a tiny fake harness script, never a real
+coding CLI, so they need no external tool on PATH.
 
 Pins:
 
@@ -15,28 +14,28 @@ Pins:
   mandatory negative fixtures (an informational sub-100% usage warning, a
   conditional "if you hit your limit" phrasing) and a prompt wrapped across
   terminal lines that still matches after whitespace normalization.
-- `session_name` always starts with `pm-<run_id>` (the scavenge sweep
-  prefix) in the frozen `pm-<run_id>-s<NN>a<N>` shape.
-- `start_session` refuses (PmError) when the caller's env dict contains
-  `PM_RUN_TOKEN` — the Developer session must never receive the run
-  capability token.
-- (tmux-gated) A fresh session launch, readiness (stable-pane path),
-  `send_prompt` injection landing in the pane, `send_line` refusing to send
-  into a visible credential prompt, `capture_to` writing pane text,
-  `detect_activity` flagging a pane change, `force_stop` killing a session,
-  `sessions_with_prefix` finding sessions by prefix, and `wait_until_ready`
-  raising when the session exits before becoming ready.
-- `send_correction`: a multi-line correction lands in the pane verbatim without
-  ever touching disk, it refuses into a visible credential prompt exactly
-  like `send_line`, and it refuses against a dead session.
+- `session_name` always starts with `pm-<run_id>` in the frozen
+  `pm-<run_id>-s<NN>a<N>` shape.
+- `launch_headless`: a detached launch records pid/pgid/identity and an
+  outfile capturing both stdout and stderr; it refuses an explicit
+  `PM_RUN_TOKEN` in the caller's env map AND strips an inherited one, so the
+  Developer never receives the run capability token; a launch whose identity
+  cannot be captured is killed and reaped rather than left untracked.
+- `read_output_tail` is byte-bounded, empty for a missing file, and rejects a
+  non-positive bound.
+- Resume: a second detached turn honouring `PM_DEVELOPER_RESUME_SESSION_ID`
+  continues the prior fake session and can commit.
+- `terminate_headless` / `quiesce_headless`: reap an identity-checked process
+  group including its descendants, never signal on an identity mismatch, and
+  still reap a group orphaned by an early leader exit.
+- The `developer.pid` sidecar round-trips at mode 0600, returns `None` when
+  absent, and fails closed on malformed or invalid fields.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -53,10 +52,8 @@ from pm_lib import PmError
 from pm_lib import sessions
 from pm_test_helpers import write_headless_fake_harness
 
-_HAS_TMUX = shutil.which("tmux") is not None
 
-
-# --- scan_hard_stop: no tmux required ---------------------------------------
+# --- scan_hard_stop ---------------------------------------------------------
 
 
 class TestScanHardStopPositiveFixtures(unittest.TestCase):
@@ -150,7 +147,7 @@ class TestScanHardStopWrapping(unittest.TestCase):
         self.assertIn("credential_prompt", result["kinds"])
 
 
-# --- session_name: no tmux required ------------------------------------------
+# --- session_name -----------------------------------------------------------
 
 
 class TestSessionName(unittest.TestCase):
@@ -161,17 +158,6 @@ class TestSessionName(unittest.TestCase):
     def test_shape_is_stable(self) -> None:
         self.assertEqual(sessions.session_name("run-a", 1, 0), "pm-run-a-s01a0")
         self.assertEqual(sessions.session_name("run-a", 12, 2), "pm-run-a-s12a2")
-
-
-# --- env-token assertion: no tmux required -----------------------------------
-
-
-class TestStartSessionEnvTokenAssertion(unittest.TestCase):
-    def test_pm_run_token_in_env_raises(self) -> None:
-        with self.assertRaises(PmError):
-            sessions.start_session(
-                "pm-test-s01a0", Path("/tmp"), "echo hi", {"PM_RUN_TOKEN": "should-never-be-here"}
-            )
 
 
 class HeadlessSessionTestCase(unittest.TestCase):
@@ -448,264 +434,6 @@ class TestDeveloperSidecar(HeadlessSessionTestCase):
                 path.write_text(json.dumps(payload), encoding="utf-8")
                 with self.assertRaises(PmError):
                     sessions.read_developer_sidecar(path)
-
-
-# --- tmux-gated behaviour ------------------------------------------------
-
-
-def _write_fake_harness(path: Path, body: str) -> None:
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for session lifecycle tests")
-class TmuxSessionTestCase(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.repo = Path(self._tmp.name)
-        self._sessions: list[str] = []
-        self.addCleanup(self._cleanup_sessions)
-
-    def _cleanup_sessions(self) -> None:
-        for name in self._sessions:
-            sessions.force_stop(name)
-
-    def _start(self, name: str, command: str, env: dict[str, str] | None = None) -> None:
-        self._sessions.append(name)
-        sessions.start_session(name, self.repo, command, env or {})
-
-    def _wait_for(self, predicate, timeout: float = 10.0, interval: float = 0.2) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return True
-            time.sleep(interval)
-        return predicate()
-
-
-class TestStartSessionAndBasicLifecycle(TmuxSessionTestCase):
-    def test_start_session_creates_a_live_session(self) -> None:
-        name = "pm-test-lifecycle-s01a0"
-        self._start(name, "bash -c 'echo hello; sleep 5'")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-
-    def test_force_stop_kills_the_session(self) -> None:
-        name = "pm-test-forcestop-s01a0"
-        self._start(name, "bash -c 'sleep 30'")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-        sessions.force_stop(name)
-        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(name)))
-
-    def test_sessions_with_prefix_finds_by_prefix(self) -> None:
-        prefix = "pm-test-prefix-sweep"
-        name_a = f"{prefix}-s01a0"
-        name_b = f"{prefix}-s02a0"
-        self._start(name_a, "bash -c 'sleep 30'")
-        self._start(name_b, "bash -c 'sleep 30'")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name_a) and sessions.session_exists(name_b)))
-        found = sessions.sessions_with_prefix(prefix)
-        self.assertIn(name_a, found)
-        self.assertIn(name_b, found)
-
-    def test_capture_to_writes_pane_text(self) -> None:
-        name = "pm-test-capture-s01a0"
-        self._start(name, "bash -c 'echo CAPTURE_MARKER_TEXT; sleep 5'")
-        self.assertTrue(self._wait_for(lambda: "CAPTURE_MARKER_TEXT" in sessions.pane_text(name)))
-        destination = self.repo / "pane.txt"
-        sessions.capture_to(name, destination)
-        self.assertIn("CAPTURE_MARKER_TEXT", destination.read_text(encoding="utf-8"))
-
-    def test_capture_to_writes_placeholder_for_dead_session(self) -> None:
-        destination = self.repo / "pane-dead.txt"
-        sessions.capture_to("pm-test-does-not-exist-s01a0", destination)
-        content = destination.read_text(encoding="utf-8")
-        self.assertTrue(content.strip())
-
-    def test_detect_activity_flags_change(self) -> None:
-        name = "pm-test-activity-s01a0"
-        self._start(name, "bash -c 'sleep 1; echo NEW_ACTIVITY_LINE; sleep 5'")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-        result = sessions.detect_activity(name, "")
-        self.assertTrue(result["running"])
-        self.assertTrue(self._wait_for(lambda: sessions.detect_activity(name, result["capture"])["active"]))
-
-
-class TestSendPrompt(TmuxSessionTestCase):
-    def test_send_prompt_submits_the_pointer_not_just_types_it(self) -> None:
-        name = "pm-test-sendprompt-s01a0"
-        # Echoes SUBMITTED:<line> only after reading a newline, so the marker
-        # proves the pointer was actually submitted (an Enter landed), not
-        # merely echoed by the tty as it would be with a bare `cat -`.
-        self._start(name, "sh -c 'read line; echo SUBMITTED:$line; sleep 30'")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-
-        sessions.send_prompt(name, "read your contract at /x/prompt.md POINTER_MARKER_XYZ")
-
-        self.assertTrue(
-            self._wait_for(
-                lambda: "SUBMITTED:" in sessions.pane_text(name) and "POINTER_MARKER_XYZ" in sessions.pane_text(name)
-            )
-        )
-
-    def test_send_prompt_withholds_second_enter_when_a_hard_stop_appears(self) -> None:
-        name = "pm-test-sendprompt-rescan-s01a0"
-        # After reading the pointer (first Enter), the harness reveals a
-        # credential prompt, then does a TIMED read for a second line: it
-        # prints GOT_SECOND_ENTER if one arrives, NO_SECOND_ENTER if it times
-        # out. The settle-and-rescan must withhold the second Enter, so
-        # NO_SECOND_ENTER is the expected positive outcome. Waiting for that
-        # sentinel — rather than asserting absence immediately — makes the
-        # check race-robust: a broken impl that DID send the second Enter
-        # would print GOT_SECOND_ENTER before the timeout instead.
-        self._start(
-            name,
-            "bash -c 'read a; echo Enter API key to continue; "
-            "if read -t 3 b; then echo GOT_SECOND_ENTER; else echo NO_SECOND_ENTER; fi; sleep 30'",
-        )
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-
-        sessions.send_prompt(name, "read your contract at /x/prompt.md")
-
-        self.assertTrue(self._wait_for(lambda: "NO_SECOND_ENTER" in sessions.pane_text(name), timeout=8.0))
-        self.assertNotIn("GOT_SECOND_ENTER", sessions.pane_text(name))
-
-    def test_send_prompt_refuses_multiline_pointer(self) -> None:
-        # A newline would mean the multi-KB contract leaked into the launch
-        # message instead of the prompt.md file it must point to.
-        with self.assertRaises(PmError):
-            sessions.send_prompt("pm-test-doesnt-matter-s01a0", "line one\nline two")
-
-
-class TestSendLine(TmuxSessionTestCase):
-    def test_send_line_refuses_on_visible_credential_prompt(self) -> None:
-        name = "pm-test-sendline-credential-s01a0"
-        self._start(name, "bash -c 'echo Enter API key to continue; sleep 5'")
-        self.assertTrue(self._wait_for(lambda: "Enter API key" in sessions.pane_text(name)))
-
-        with self.assertRaises(PmError) as ctx:
-            sessions.send_line(name, "please continue")
-        self.assertIn("credential_prompt", str(ctx.exception))
-
-    def test_send_line_refuses_multiline_text(self) -> None:
-        with self.assertRaises(PmError):
-            sessions.send_line("pm-test-doesnt-matter-s01a0", "line one\nline two")
-
-    def test_send_line_refuses_when_session_dead(self) -> None:
-        with self.assertRaises(PmError):
-            sessions.send_line("pm-test-definitely-not-running-s01a0", "hello")
-
-
-class TestSendCorrection(TmuxSessionTestCase):
-    def test_send_correction_delivers_multiline_text_without_a_temp_file(self) -> None:
-        name = "pm-test-sendcorrection-s01a0"
-        self._start(name, "cat -")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-
-        correction = "PM_CORRECTION_FIRST_LINE\nPM_CORRECTION_SECOND_LINE"
-        sessions.send_correction(name, correction)
-
-        self.assertTrue(self._wait_for(lambda: "PM_CORRECTION_SECOND_LINE" in sessions.pane_text(name)))
-        pane = sessions.pane_text(name)
-        self.assertIn("PM_CORRECTION_FIRST_LINE", pane)
-        self.assertIn("PM_CORRECTION_SECOND_LINE", pane)
-
-    def test_send_correction_refuses_on_visible_credential_prompt(self) -> None:
-        name = "pm-test-sendcorrection-credential-s01a0"
-        self._start(name, "bash -c 'echo Enter API key to continue; sleep 5'")
-        self.assertTrue(self._wait_for(lambda: "Enter API key" in sessions.pane_text(name)))
-
-        with self.assertRaises(PmError) as ctx:
-            sessions.send_correction(name, "one\ntwo")
-        self.assertIn("credential_prompt", str(ctx.exception))
-
-    def test_send_correction_refuses_when_session_dead(self) -> None:
-        with self.assertRaises(PmError):
-            sessions.send_correction("pm-test-definitely-not-running-s01a0", "one\ntwo")
-
-    def test_send_correction_deletes_its_tmux_buffer_after_delivery(self) -> None:
-        """The correction must not linger in a named tmux server buffer once
-        delivery succeeds — that would be a persistent copy in a different
-        place, defeating the point of not writing a steer artifact file."""
-        name = "pm-test-sendcorrection-cleanup-s01a0"
-        self._start(name, "cat -")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-
-        sessions.send_correction(name, "PM_CLEANUP_CHECK_MARKER")
-        self.assertTrue(self._wait_for(lambda: "PM_CLEANUP_CHECK_MARKER" in sessions.pane_text(name)))
-
-        result = subprocess.run(
-            ["tmux", "list-buffers", "-F", "#{buffer_name}"], check=False, text=True, capture_output=True
-        )
-        self.assertNotIn(f"{name}_steer", result.stdout.splitlines())
-
-
-class TestStartSessionStripsInheritedToken(TmuxSessionTestCase):
-    def test_start_session_strips_inherited_run_token(self) -> None:
-        # Two distinct ways a token could leak into a Developer session's
-        # inherited environment: (1) the controller PROCESS's own
-        # os.environ at the moment it shells out to tmux, and (2) the
-        # long-running tmux SERVER's own global environment, which a new
-        # session forked into an *already-running* server inherits instead
-        # of the calling process's current os.environ (verified: a bare
-        # os.environ mutation is invisible to a session created in an
-        # already-running default-socket server). Both are seeded here so
-        # this test actually exercises start_session's "unset
-        # PM_RUN_TOKEN;" prefix rather than passing vacuously because the
-        # var was never inherited in the first place.
-        previous_env = os.environ.get("PM_RUN_TOKEN")
-        os.environ["PM_RUN_TOKEN"] = "secret-inherit-test"
-
-        def _restore_env() -> None:
-            if previous_env is None:
-                os.environ.pop("PM_RUN_TOKEN", None)
-            else:
-                os.environ["PM_RUN_TOKEN"] = previous_env
-
-        self.addCleanup(_restore_env)
-
-        subprocess.run(
-            ["tmux", "set-environment", "-g", "PM_RUN_TOKEN", "secret-inherit-test"], check=False
-        )
-        self.addCleanup(
-            lambda: subprocess.run(["tmux", "set-environment", "-gu", "PM_RUN_TOKEN"], check=False)
-        )
-
-        script_path = self.repo / "fake_harness.sh"
-        _write_fake_harness(script_path, 'echo "TOKEN_IS=${PM_RUN_TOKEN:-ABSENT}"\nsleep 15')
-
-        name = "pm-test-striptoken-s01a0"
-        self._start(name, str(script_path), {})
-        self.assertTrue(self._wait_for(lambda: "TOKEN_IS=" in sessions.pane_text(name)))
-        self.assertIn("TOKEN_IS=ABSENT", sessions.pane_text(name))
-
-
-class TestSendPromptCredentialGuard(TmuxSessionTestCase):
-    def test_send_prompt_refuses_into_visible_credential_prompt(self) -> None:
-        name = "pm-test-sendprompt-credential-s01a0"
-        self._start(name, "bash -c 'echo Enter API key to continue; sleep 30'")
-        self.assertTrue(self._wait_for(lambda: "Enter API key" in sessions.pane_text(name)))
-
-        with self.assertRaises(PmError) as ctx:
-            sessions.send_prompt(name, "read your contract at /x/prompt.md")
-        self.assertIn("credential", str(ctx.exception).lower())
-
-
-class TestWaitUntilReady(TmuxSessionTestCase):
-    def test_stable_pane_readiness_returns_once_output_settles(self) -> None:
-        name = "pm-test-readiness-stable-s01a0"
-        self._start(name, "bash -c 'echo READY_BANNER_TEXT; sleep 8'")
-        # "fakeharness" has no banner-keyed dispatch, so this exercises the
-        # generic stable-pane heuristic directly.
-        sessions.wait_until_ready(name, "fakeharness", deadline_seconds=6.0)
-        self.assertIn("READY_BANNER_TEXT", sessions.pane_text(name))
-
-    def test_exited_session_raises(self) -> None:
-        name = "pm-test-readiness-exited-s01a0"
-        self._start(name, "bash -c 'exit 0'")
-        with self.assertRaises(PmError) as ctx:
-            sessions.wait_until_ready(name, "fakeharness", deadline_seconds=5.0)
-        self.assertIn("exited", str(ctx.exception))
 
 
 if __name__ == "__main__":

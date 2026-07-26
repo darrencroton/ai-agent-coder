@@ -1,7 +1,7 @@
 """Harness launch profiles: composed commands and model-inventory queries.
 
-The recorded marker/readiness strings, base commands, and flags are observed
-operational data; the code composing them is independent.
+The recorded executables and flags are observed operational data; the code
+composing them is independent.
 
 There is exactly one composed path — this module's profile table — plus an
 explicit ``--harness-command`` override at the CLI layer for fake harnesses
@@ -24,38 +24,34 @@ SUPPORTED_HARNESSES: tuple[str, ...] = ("codex", "claude", "copilot", "opencode"
 
 HARNESS_PROFILES: dict[str, dict[str, Any]] = {
     "codex": {
-        "base_command": ["codex", "--no-alt-screen", "-s", "workspace-write", "-a", "never"],
+        "executable": "codex",
         "model_flag": "-m",
         "effort_config_key": "model_reasoning_effort",
-        "reviewer_network_flag": ["-c", "sandbox_workspace_write.network_access=true"],
-        "commit_git_access_flag": "--add-dir",
     },
     "claude": {
-        "base_command": ["claude", "--permission-mode", "auto"],
+        "executable": "claude",
         "model_flag": "--model",
         "effort_flag": "--effort",
-        "session_id_flag": "--session-id",
     },
     "copilot": {
-        "base_command": ["copilot", "--allow-all-tools", "--autopilot"],
+        "executable": "copilot",
         "model_flag": "--model",
         "effort_flag": "--effort",
     },
     "opencode": {
-        "base_command": ["opencode", "--auto"],
+        "executable": "opencode",
         "model_flag": "-m",
-        # No effort_flag and no effort_config_key: the interactive TUI this
-        # profile launches has no reasoning-effort flag, so an effort request
-        # fails closed at compose time (see _append_effort below) instead of
-        # launching a broken command.
+        # No effort_flag and no effort_config_key: OpenCode exposes no
+        # reasoning-effort flag, so an effort request fails closed at compose
+        # time (see _append_headless_effort) instead of launching a broken command.
         "model_inventory_command": ["opencode", "models", "{provider}", "--verbose"],
     },
     "qwen": {
-        "base_command": ["qwen"],
+        "executable": "qwen",
         "model_flag": "-m",
         "headless_model_flag": "--model",
-        # Qwen Code's interactive command exposes no reasoning-effort flag.
-        # An effort request therefore fails closed through _append_effort.
+        # Qwen Code exposes no reasoning-effort flag. An effort request
+        # therefore fails closed through _append_headless_effort.
     },
 }
 
@@ -65,13 +61,18 @@ def _unknown_harness_error(harness: str) -> PmError:
     return PmError(f"no PM harness profile is defined for {harness!r}; supported harnesses: {supported}")
 
 
-def _append_model(command: list[str], profile: dict[str, Any], model: str | None) -> None:
-    if not model:
-        return
-    command.extend([profile["model_flag"], model])
+def _append_headless_model(command: list[str], profile: dict[str, Any], model: str | None) -> None:
+    if model:
+        command.extend([profile.get("headless_model_flag", profile["model_flag"]), model])
 
 
-def _append_effort(command: list[str], profile: dict[str, Any], effort: str | None, harness: str) -> None:
+def _append_headless_effort(command: list[str], profile: dict[str, Any], effort: str | None, harness: str) -> None:
+    """Append the harness's reasoning-effort override, or fail closed.
+
+    OpenCode and Qwen Code expose no effort/reasoning flag on their tested
+    headless commands, so an effort request raises rather than being silently
+    dropped or turned into a broken launch command.
+    """
     if not effort:
         return
     effort_flag = profile.get("effort_flag")
@@ -83,61 +84,9 @@ def _append_effort(command: list[str], profile: dict[str, Any], effort: str | No
         command.extend(["-c", f'{effort_config_key}="{effort}"'])
         return
     raise PmError(
-        f"harness profile {harness!r} has no effort override for its interactive launch command; "
+        f"{harness}'s tested headless command has no effort/reasoning flag; "
         "omit --effort for this harness"
     )
-
-
-def _append_headless_model(command: list[str], profile: dict[str, Any], model: str | None) -> None:
-    if model:
-        command.extend([profile.get("headless_model_flag", profile["model_flag"]), model])
-
-
-def _append_headless_effort(command: list[str], profile: dict[str, Any], effort: str | None, harness: str) -> None:
-    if effort and harness in {"opencode", "qwen"}:
-        raise PmError(
-            f"{harness}'s tested headless command has no effort/reasoning flag; "
-            "omit --effort for this harness"
-        )
-    _append_effort(command, profile, effort, harness)
-
-
-def compose_command(
-    harness: str,
-    *,
-    model: str | None = None,
-    effort: str | None = None,
-    reviewer_network: bool = False,
-    git_access_dir: Path | None = None,
-    session_id: str | None = None,
-) -> str:
-    """Compose one harness's launch command from the profile table.
-
-    Only the codex profile applies ``reviewer_network`` and
-    ``git_access_dir`` (its reviewer-network sandbox flag and commit
-    git-directory access flag); only the claude profile applies
-    ``session_id`` (its transcript-capture flag). Passing those keyword
-    arguments for a different harness is silently a no-op rather than an
-    error — Stage 3's caller composes per-slice, and not every harness has
-    an equivalent flag.
-    """
-    profile = HARNESS_PROFILES.get(harness)
-    if profile is None:
-        raise _unknown_harness_error(harness)
-
-    command = list(profile["base_command"])
-    _append_model(command, profile, model)
-    _append_effort(command, profile, effort, harness)
-
-    if harness == "codex":
-        if reviewer_network:
-            command.extend(profile["reviewer_network_flag"])
-        if git_access_dir is not None:
-            command.extend([profile["commit_git_access_flag"], str(git_access_dir)])
-    if harness == "claude" and session_id:
-        command.extend([profile["session_id_flag"], session_id])
-
-    return shlex.join(command)
 
 
 def compose_headless_command(
@@ -153,10 +102,9 @@ def compose_headless_command(
 ) -> list[str]:
     """Compose a one-shot headless launch for the Developer or Reviewer.
 
-    This is deliberately separate from :func:`compose_command`: that older
-    function remains the unchanged tmux-TUI composer until the Slice 4
-    cleanup.  The returned argv is passed directly to ``Popen`` so prompt,
-    model, and path values never require a second round of shell parsing.
+    This is the single launch composer for both seats.  The returned argv is
+    passed directly to ``Popen`` so prompt, model, and path values never
+    require a second round of shell parsing.
 
     ``session_id`` binds Claude and Copilot Developer launches to the session
     that a later headless resume must use.  Codex, OpenCode, and Qwen discover

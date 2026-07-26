@@ -48,8 +48,7 @@ _SLICE_ID_RE = re.compile(r"^Slice\s+(?P<number>\d+)$")
 _OBSERVE_POLL_SECONDS = 2.0
 _OBSERVE_TAIL_LINES = 40
 # Per-slice record of the outfile size seen by the previous `observe`, so
-# "output changed" means growth since the last observation (the headless
-# replacement for diffing against the tmux path's persisted `pane-live.txt`).
+# "output changed" means growth since the last observation.
 _OBSERVE_CURSOR_FILE = "observe-cursor.txt"
 
 # Controller-owned notes.md tripwire (target-design §10): a hard cap kept as
@@ -375,10 +374,9 @@ def _abort_launch(launch: dict[str, Any]) -> None:
     which the sidecar or state write can fail (a held lock, a full disk). The
     headless model has no global process list, so a launch left behind by that
     window would be an autonomous Developer editing the repo with *no* durable
-    handle — the tmux path could at least still sweep its global session list.
-    Terminating here keeps the failure closed. Best-effort by design: the
-    bookkeeping error is the one worth reporting, so a termination failure must
-    not mask it.
+    handle. Terminating here keeps the failure closed. Best-effort by design:
+    the bookkeeping error is the one worth reporting, so a termination failure
+    must not mask it.
     """
     try:
         sessions.terminate_headless(int(launch["pid"]), int(launch["pgid"]), str(launch["identity"]))
@@ -789,7 +787,7 @@ def init_run(
     if harness_command:
         candidate_executable = shlex.split(harness_command)[0] if harness_command.strip() else ""
     else:
-        candidate_executable = profiles.HARNESS_PROFILES[harness]["base_command"][0]
+        candidate_executable = profiles.HARNESS_PROFILES[harness]["executable"]
     if not candidate_executable or not _executable_exists(candidate_executable):
         raise PmError(f"harness executable not found on PATH: {candidate_executable!r}")
 
@@ -847,12 +845,6 @@ def init_run(
     )
 
     return InitResult(run_id=state["run_id"], run_dir=run_dir, token=token, state=state, slices=slices, branch=resolved_branch)
-
-
-def _tmux_present() -> bool:
-    import shutil
-
-    return shutil.which("tmux") is not None
 
 
 def _executable_exists(executable: str) -> bool:
@@ -1188,9 +1180,9 @@ def start_slice(
         if harness_name in ("claude", "copilot"):
             launch_session_id = launch_id
         if harness_name == "opencode" and launch_model:
-            # Fail-closed inventory validation preserved from the tmux path: a
-            # model absent from the harness inventory raises here rather than
-            # letting the harness silently fall back to a different model.
+            # Fail-closed inventory validation: a model absent from the harness
+            # inventory raises here rather than letting the harness silently
+            # fall back to a different model.
             profiles.query_model_identity(harness_name, launch_model)
         command = shlex.join(
             profiles.compose_headless_command(
@@ -1448,7 +1440,7 @@ def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[
 
     The Developer's captured stdout already lives at
     ``<artifact_dir>/session-output.txt`` (the launch outfile), so fact 8
-    reads it directly rather than snapshotting a live tmux pane."""
+    reads it directly rather than snapshotting a live session."""
     slice_id = current["id"]
     artifact_dir = Path(current["artifact_dir"])
     outfile = Path(current["outfile"]) if current.get("outfile") else artifact_dir / sessions.SESSION_OUTFILE
@@ -2090,8 +2082,8 @@ def stop_scavenge_sweep(repo: Path, *, run_id: str | None) -> list[str]:
 
     A run id is required: the headless model keeps no global process list, so
     with neither readable state nor a run id (and thus no sidecar path) there
-    is nothing to discover — unlike tmux's global session list. If both the
-    run state and the sidecar are gone, global discovery is impossible."""
+    is nothing to discover. If both the run state and the sidecar are gone,
+    global discovery is impossible."""
     if not run_id:
         return []
     try:

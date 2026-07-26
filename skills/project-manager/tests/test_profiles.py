@@ -1,31 +1,21 @@
 """Protected behaviours: harness launch-command composition and model inventory.
 
 Pins the five harness profiles (target-design/replacement-ledger §9.1 — the
-observed base commands and override flags are sanctioned operational data;
+observed executables and override flags are sanctioned operational data;
 the composing code is written fresh):
 
 - `HARNESS_PROFILES` has exactly the five supported harnesses: codex,
-  claude, copilot, opencode, qwen.
-- `compose_command` builds each harness's base command exactly as observed:
-  codex `codex --no-alt-screen -s workspace-write -a never`; claude
-  `claude --permission-mode auto`; copilot `copilot --allow-all-tools
-  --autopilot`; opencode `opencode --auto`.
-- Model overrides: codex/opencode use `-m <model>`; claude/copilot use
-  `--model <model>`; qwen uses `-m <model>`.
-- Effort overrides: codex composes `-c model_reasoning_effort="<effort>"`;
-  claude/copilot use `--effort <effort>`; opencode/qwen have no effort
-  mechanism, so an effort request fails closed with a `PmError` at compose
-  time (never silently dropped, never a broken launch command).
-- codex-only composition: `reviewer_network=True` appends `-c
-  sandbox_workspace_write.network_access=true`; a `git_access_dir` appends
-  `--add-dir <path>`. Both are no-ops (not errors) for the other four
-  harnesses, since Stage 3's caller composes generically and not every
-  harness has an equivalent flag.
-- claude-only composition: a `session_id` appends `--session-id <uuid>`;
-  a no-op for the other four harnesses.
+  claude, copilot, opencode, qwen, each with an `executable` matching its
+  harness name (`slice_ops.init` resolves that key on PATH).
 - An unknown harness name raises `PmError` naming all five supported harnesses.
 - `compose_headless_command` composes the frozen Developer and Reviewer
-  one-shot forms, while leaving the tmux `compose_command` untouched.
+  one-shot forms.
+- Model overrides: codex/opencode use `-m <model>`; claude/copilot/qwen use
+  `--model <model>` on their headless commands.
+- Effort overrides: codex composes `-c model_reasoning_effort="<effort>"`;
+  claude/copilot use `--effort <effort>`; opencode/qwen have no headless
+  effort mechanism, so an effort request fails closed with a `PmError` at
+  compose time (never silently dropped, never a broken launch command).
 - `compose_resume_command` composes the frozen Developer resume form for all
   five harnesses and preserves Codex's linked-worktree git access.
 - `query_model_identity` returns `None` for codex/claude/copilot/qwen (no
@@ -62,110 +52,18 @@ class TestHarnessProfileTable(unittest.TestCase):
         self.assertEqual(profiles.SUPPORTED_HARNESSES, expected)
         self.assertEqual(set(profiles.HARNESS_PROFILES), set(expected))
 
+    def test_executable_names_match_the_harness_names(self) -> None:
+        # `slice_ops.init` resolves this key on PATH before accepting a run,
+        # so a renamed or missing entry would break launch pre-flight.
+        for harness in profiles.SUPPORTED_HARNESSES:
+            with self.subTest(harness=harness):
+                self.assertEqual(profiles.HARNESS_PROFILES[harness]["executable"], harness)
 
-class TestComposeCommandBaseCommands(unittest.TestCase):
-    def test_codex_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("codex"), "codex --no-alt-screen -s workspace-write -a never")
-
-    def test_claude_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("claude"), "claude --permission-mode auto")
-
-    def test_copilot_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("copilot"), "copilot --allow-all-tools --autopilot")
-
-    def test_opencode_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("opencode"), "opencode --auto")
-
-    def test_qwen_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("qwen"), "qwen")
-
-
-class TestComposeCommandOverrides(unittest.TestCase):
-    def test_codex_model_and_effort(self) -> None:
-        composed = profiles.compose_command("codex", model="o3", effort="high")
-        # shlex.join shell-quotes the -c value because it contains embedded
-        # double quotes; the underlying token is still model_reasoning_effort="high".
-        self.assertEqual(
-            composed,
-            "codex --no-alt-screen -s workspace-write -a never -m o3 -c 'model_reasoning_effort=\"high\"'",
-        )
-        self.assertIn('model_reasoning_effort="high"', composed)
-
-    def test_claude_model_and_effort(self) -> None:
-        composed = profiles.compose_command("claude", model="sonnet", effort="medium")
-        self.assertEqual(composed, "claude --permission-mode auto --model sonnet --effort medium")
-
-    def test_copilot_model_and_effort(self) -> None:
-        composed = profiles.compose_command("copilot", model="gpt-5", effort="low")
-        self.assertEqual(composed, "copilot --allow-all-tools --autopilot --model gpt-5 --effort low")
-
-    def test_opencode_model_only(self) -> None:
-        composed = profiles.compose_command("opencode", model="local/qwen3.6")
-        self.assertEqual(composed, "opencode --auto -m local/qwen3.6")
-
-    def test_opencode_effort_fails_closed(self) -> None:
+    def test_unknown_harness_error_names_every_supported_harness(self) -> None:
         with self.assertRaises(PmError) as ctx:
-            profiles.compose_command("opencode", effort="high")
-        self.assertIn("opencode", str(ctx.exception))
-
-    def test_qwen_model_only(self) -> None:
-        self.assertEqual(profiles.compose_command("qwen", model="qwen/qwen3.6"), "qwen -m qwen/qwen3.6")
-
-    def test_qwen_effort_fails_closed(self) -> None:
-        with self.assertRaises(PmError) as ctx:
-            profiles.compose_command("qwen", effort="high")
-        self.assertIn("qwen", str(ctx.exception))
-
-    def test_no_overrides_leaves_base_command_untouched(self) -> None:
-        self.assertEqual(profiles.compose_command("claude"), "claude --permission-mode auto")
-
-
-class TestComposeCommandCodexSpecific(unittest.TestCase):
-    def test_reviewer_network_flag(self) -> None:
-        composed = profiles.compose_command("codex", reviewer_network=True)
-        self.assertIn("-c sandbox_workspace_write.network_access=true", composed)
-
-    def test_git_access_dir_flag(self) -> None:
-        composed = profiles.compose_command("codex", git_access_dir=Path("/abs/repo/.git"))
-        self.assertIn("--add-dir /abs/repo/.git", composed)
-
-    def test_reviewer_network_and_git_access_combined(self) -> None:
-        composed = profiles.compose_command(
-            "codex", model="o3", reviewer_network=True, git_access_dir=Path("/abs/repo/.git")
-        )
-        self.assertEqual(
-            composed,
-            "codex --no-alt-screen -s workspace-write -a never -m o3 "
-            "-c sandbox_workspace_write.network_access=true --add-dir /abs/repo/.git",
-        )
-
-    def test_reviewer_network_is_a_noop_for_other_harnesses(self) -> None:
-        composed = profiles.compose_command("claude", reviewer_network=True)
-        self.assertEqual(composed, "claude --permission-mode auto")
-
-    def test_git_access_dir_is_a_noop_for_other_harnesses(self) -> None:
-        composed = profiles.compose_command("opencode", git_access_dir=Path("/abs/repo/.git"))
-        self.assertEqual(composed, "opencode --auto")
-
-
-class TestComposeCommandClaudeSpecific(unittest.TestCase):
-    def test_session_id_flag(self) -> None:
-        composed = profiles.compose_command("claude", session_id="11111111-1111-1111-1111-111111111111")
-        self.assertEqual(
-            composed, "claude --permission-mode auto --session-id 11111111-1111-1111-1111-111111111111"
-        )
-
-    def test_session_id_is_a_noop_for_other_harnesses(self) -> None:
-        composed = profiles.compose_command("codex", session_id="11111111-1111-1111-1111-111111111111")
-        self.assertEqual(composed, "codex --no-alt-screen -s workspace-write -a never")
-
-
-class TestComposeCommandUnknownHarness(unittest.TestCase):
-    def test_unknown_harness_fails_closed_naming_supported_harnesses(self) -> None:
-        with self.assertRaises(PmError) as ctx:
-            profiles.compose_command("gemini")
+            profiles.compose_headless_command("gemini", "POINTER", mode="developer", repo=Path("/repo"))
         message = str(ctx.exception)
-        for name in ("codex", "claude", "copilot", "opencode", "qwen"):
+        for name in profiles.SUPPORTED_HARNESSES:
             self.assertIn(name, message)
 
 
