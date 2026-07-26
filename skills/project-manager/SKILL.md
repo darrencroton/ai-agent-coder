@@ -1,6 +1,6 @@
 ---
 name: project-manager
-description: Supervise autonomous execution of a frozen implementation plan (Mode B) - run one slice at a time in a fresh session, enforce the mechanical floor, assess every slice from repository evidence, commission independent review where risk warrants it, and stop for a human when the plan or the floor requires one.
+description: Supervise autonomous execution of a frozen implementation plan (Mode B) - run one slice at a time through a headless Developer, enforce the mechanical floor, assess every slice from repository evidence, commission independent review where risk warrants it, and stop for a human when the plan or the floor requires one.
 ---
 
 # Project Manager (Mode B)
@@ -58,13 +58,13 @@ Harness: <codex|claude|copilot|opencode|qwen> (optionally: model <model name>)
 
 Use the project-manager skill. You are the PM: the accountable supervisor of this run — you never write slice code yourself.
 
-Start the run for this plan and repo on the harness above. Keep the run token the toolkit gives you to yourself; never pass it to a Developer or Reviewer session.
+Start the run for this plan and repo on the harness above. Keep the run token the toolkit gives you to yourself; never pass it to a Developer process or Reviewer invocation.
 
 Then, slice by slice, in plan order:
-1. Launch a fresh Developer session scoped to that slice's frozen contract.
-2. Check in on it periodically, but be patient — don't re-poll a live session tightly; wait for it to report back or the session to end.
-3. Assess what it produced against the plan, the diff, and the validation evidence — commissioning an independent review when the slice's risk warrants it.
-4. Record your decision: accept, send it back for correction, or stop for a human — whichever the evidence and the plan's gates call for.
+1. Run `start-slice` to launch a detached headless Developer turn scoped to that slice's frozen contract.
+2. Supervise it with bounded `observe --wait N` calls. Treat captured output as progress only; wait for `result.json` or process exit rather than tightly polling or trying to interact with the live turn.
+3. Run `finalize` and assess the repository evidence against the plan, authorized surface, non-goals, and validation plan. Quiesce the Developer before commissioning any independent review the slice's risk warrants.
+4. Record exactly one decision: accept it, resume-steer it with a written correction, or stop for a human. A correction is a new budgeted headless turn, not a message injected into the prior process.
 
 Stop the run and tell me whenever the plan or the mechanical floor requires a human decision, rather than making that call yourself.
 
