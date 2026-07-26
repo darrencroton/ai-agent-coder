@@ -20,13 +20,6 @@ jobs:
         with:
           python-version: "3.13"
 
-      # Runtime tests drive tmux-backed sessions with fake harnesses injected
-      # via --harness-command; no real coding CLI is needed. Tests that require
-      # tmux self-skip when it is absent, so installing it here runs the full
-      # suite rather than a subset.
-      - name: Install tmux
-        run: sudo apt-get update && sudo apt-get install -y tmux
-
       - name: Git identity for test commits
         run: |
           git config --global user.email "ci@example.invalid"
@@ -37,6 +30,10 @@ jobs:
           python3 -m py_compile skills/project-manager/scripts/pm.py skills/project-manager/scripts/pm_lib/*.py
           python3 -m py_compile skills/orchestrator/scripts/delegate_contract.py skills/orchestrator/scripts/delegate_sessions.py skills/orchestrator/scripts/delegate_jobs.py
 
+      # The runtime tests drive detached headless Developer sessions with fake
+      # harnesses injected via --harness-command, so no real coding CLI and no
+      # terminal multiplexer is needed. Nothing self-skips, so this step runs
+      # the whole suite rather than a subset.
       - name: Project Manager tests
         run: python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'
 

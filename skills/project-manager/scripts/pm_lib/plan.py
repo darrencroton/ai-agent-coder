@@ -29,7 +29,7 @@ REQUIRED_SECTIONS: tuple[str, ...] = (
 _COMPLETED_SLICE_STATUSES = {"accepted", "attested"}
 
 # check-plan lint vocabulary. PM's dependency/license/side-effect stop
-# conditions are heuristic (pane markers, prompt prohibitions), not diff
+# conditions are heuristic (session-output markers, prompt prohibitions), not diff
 # inspection: a silent dependency edit inside an authorized surface would
 # pass the file-authorization floor. The compensating control is plan-level
 # — keep these files out of unattended authorized surfaces or approval-gate
@@ -273,7 +273,7 @@ def surface_lint(entry: str) -> str | None:
     ):
         return (
             f"entry {normalized!r} looks dependency-shaped; PM's dependency stop is heuristic "
-            "(pane markers, prompt prohibitions), not diff inspection — approval-gate this slice "
+            "(session-output markers, prompt prohibitions), not diff inspection — approval-gate this slice "
             "or keep dependency manifests out of unattended surfaces"
         )
     if basename.startswith(_LICENSE_SURFACE_PREFIXES):

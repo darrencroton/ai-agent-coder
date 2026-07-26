@@ -14,7 +14,8 @@ reads its captured stdout from the slice's `session-output.txt`. Pins:
    `.pm/.gitignore`; slice entries carry `plan_risk`; check-plan warnings
    are printed and the run still proceeds; an `init` event is recorded.
    Re-running `init` while a run already exists creates a SECOND run and
-   repoints `current` — both run directories survive. `init` needs no tmux.
+   repoints `current` — both run directories survive. `init` launches no
+   Developer process of its own.
 2. `init` failures, each exiting 2 with nothing created: a plan with
    errors; a dirty worktree; an unknown harness with no `--harness-command`
    override; `--attest` naming an unknown slice id; `--branch` naming a
@@ -90,7 +91,14 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from pm_test_helpers import PmTestCase, parse_init_output, write_fake_harness
+from pm_test_helpers import (
+    PmTestCase,
+    commit_and_result_body,
+    idle_body,
+    parse_init_output,
+    write_fake_harness,
+    write_result_cmd,
+)
 
 from pm_lib import PmError
 from pm_lib import sessions
@@ -103,50 +111,16 @@ from pm_lib import state as state_mod
 # Each fake receives PM's launch pointer (or, on a resume, the steer
 # correction) as $1 and the PM_* environment; it writes its progress to stdout
 # (captured into session-output.txt) and its completion signal to
-# $PM_RESULT_PATH. No real coding CLI is ever invoked.
-
-
-def _write_result_cmd(status: str = "done", summary: str = "did the work") -> str:
-    return (
-        "printf '{\"slice\": \"%s\", \"status\": \"" + status + "\", \"summary\": \"" + summary + "\"}\\n' "
-        '"$PM_SLICE_ID" > "$PM_RESULT_PATH"'
-    )
-
-
-def _commit_and_result_body(
-    repo: Path,
-    *,
-    authorized_file: str = "a.py",
-    unauthorized_file: str | None = None,
-    delay: float = 0.0,
-    tail_sleep: float = 0.0,
-) -> str:
-    """Commit the authorized change (optionally also touch an unauthorized
-    file), write result.json, then optionally idle briefly."""
-    lines = ["turn_text=\"${1:-}\"", "echo FAKE_HARNESS_WORKING"]
-    if delay:
-        lines.append(f"sleep {delay}")
-    lines.append(f'echo "authorized change" >> "{repo}/{authorized_file}"')
-    lines.append(f'git -C "{repo}" add "{authorized_file}"')
-    if unauthorized_file:
-        lines.append(f'echo "oops" >> "{repo}/{unauthorized_file}"')
-        lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
-    lines.append(f'git -C "{repo}" commit -q -m "slice work"')
-    lines.append(_write_result_cmd())
-    if tail_sleep:
-        lines.append(f"sleep {tail_sleep}")
-    return "\n".join(lines)
-
-
-def _idle_body(*, sleep_seconds: float = 30.0) -> str:
-    return f"echo FAKE_HARNESS_WORKING\nsleep {sleep_seconds}"
+# $PM_RESULT_PATH. No real coding CLI is ever invoked. The bodies shared with
+# `test_finalize` (`write_result_cmd`, `idle_body`, `commit_and_result_body`)
+# live in `pm_test_helpers`; the ones below are specific to this suite.
 
 
 def _result_only_body(*, delay: float = 0.5, tail_sleep: float = 30.0) -> str:
     lines = ["echo FAKE_HARNESS_WORKING"]
     if delay:
         lines.append(f"sleep {delay}")
-    lines.append(_write_result_cmd())
+    lines.append(write_result_cmd())
     if tail_sleep:
         lines.append(f"sleep {tail_sleep}")
     return "\n".join(lines)
@@ -268,7 +242,7 @@ class SliceOpsTestCase(PmTestCase):
 class TestInitHappyPath(SliceOpsTestCase):
     def test_init_creates_state_pm_skeleton_and_prints_token_once(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["requirements.txt"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
 
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -292,7 +266,7 @@ class TestInitHappyPath(SliceOpsTestCase):
 
     def test_reinit_creates_second_run_and_repoints_current(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
 
         code1, out1, _err1 = self._init(plan_path, harness)
         self.assertEqual(code1, 0)
@@ -314,7 +288,7 @@ class TestInitHappyPath(SliceOpsTestCase):
 class TestInitFailures(SliceOpsTestCase):
     def test_plan_with_errors_exits_two_nothing_created(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": None}])  # empty surface -> error
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
 
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -326,7 +300,7 @@ class TestInitFailures(SliceOpsTestCase):
     def test_dirty_worktree_exits_two(self) -> None:
         plan_path = self.write_plan(self._plan_path())
         (self.repo / "untracked.txt").write_text("oops\n", encoding="utf-8")
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
 
         code, _out, err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -344,7 +318,7 @@ class TestInitFailures(SliceOpsTestCase):
 
     def test_attest_unknown_slice_exits_two_nothing_created(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, _out, err = self._init(plan_path, harness, extra=["--attest", "Slice 99"])
         self.assertEqual(code, 2)
         self.assertIn("unknown slice", err)
@@ -352,14 +326,14 @@ class TestInitFailures(SliceOpsTestCase):
 
     def test_branch_nonexistent_exits_two(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, _out, err = self._init(plan_path, harness, extra=["--branch", "does-not-exist"])
         self.assertEqual(code, 2)
         self.assertIn("does not exist", err)
 
     def test_create_branch_creates_and_switches(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, out, _err = self._init(plan_path, harness, extra=["--create-branch", "feature/new-branch"])
         self.assertEqual(code, 0)
         self.assertIn("feature/new-branch", out)
@@ -369,7 +343,7 @@ class TestInitFailures(SliceOpsTestCase):
     def test_default_onto_main_refused_but_explicit_branch_main_allowed(self) -> None:
         self._git("checkout", "-q", "main")
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
 
         code, _out, err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -519,7 +493,7 @@ class TestFullFakeHarnessFlow(SliceOpsTestCase):
     def test_full_flow_finalize_all_pass(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
+            self.repo.parent / "fake.sh", commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -573,7 +547,7 @@ class TestFinalizeFloorFailure(SliceOpsTestCase):
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh",
-            _commit_and_result_body(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=3.0),
+            commit_and_result_body(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=3.0),
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -653,7 +627,7 @@ class TestAttemptAccounting(SliceOpsTestCase):
 class TestMidRunPlanEdit(SliceOpsTestCase):
     def test_plan_edited_mid_run_stops_before_next_slice(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -721,7 +695,7 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         # that compared two back-to-back reads of the same file would always
         # report False and drop the progress record from the event log.
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -880,7 +854,7 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
 class TestStop(SliceOpsTestCase):
     def test_stop_preserves_output_terminates_process_and_sets_status(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -905,7 +879,7 @@ class TestStop(SliceOpsTestCase):
 
     def test_stop_scavenge_terminates_via_sidecar_with_state_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -934,7 +908,7 @@ class TestStop(SliceOpsTestCase):
         # different run, both fail closed — the live Developer is left alone
         # and nothing is reported terminated.
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -1246,7 +1220,7 @@ class TestLaunchEnvironmentIsolation(SliceOpsTestCase):
 class TestTerminationFailurePropagates(SliceOpsTestCase):
     def _launch_idle(self):
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -1300,7 +1274,7 @@ class TestTerminationFailurePropagates(SliceOpsTestCase):
         # durable handle at all — the headless model has no global process list
         # to sweep. The launch must be torn down instead.
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)

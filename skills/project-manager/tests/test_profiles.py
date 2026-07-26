@@ -13,9 +13,14 @@ the composing code is written fresh):
 - Model overrides: codex/opencode use `-m <model>`; claude/copilot/qwen use
   `--model <model>` on their headless commands.
 - Effort overrides: codex composes `-c model_reasoning_effort="<effort>"`;
-  claude/copilot use `--effort <effort>`; opencode/qwen have no headless
-  effort mechanism, so an effort request fails closed with a `PmError` at
-  compose time (never silently dropped, never a broken launch command).
+  claude/copilot use `--effort <effort>`; opencode uses `--variant <effort>`
+  (the CLI's own "provider-specific reasoning effort" control); qwen has no
+  headless effort mechanism, so an effort request fails closed with a
+  `PmError` at compose time (never silently dropped, never a broken launch
+  command). Every profile carrying an effort mechanism must actually emit it
+  in both modes — pinned table-driven, because the composer once passed a
+  throwaway list to the effort appender, which would turn a newly-added
+  effort flag into a silent no-op.
 - `compose_resume_command` composes the frozen Developer resume form for all
   five harnesses and preserves Codex's linked-worktree git access.
 - `query_model_identity` returns `None` for codex/claude/copilot/qwen (no
@@ -58,6 +63,34 @@ class TestHarnessProfileTable(unittest.TestCase):
         for harness in profiles.SUPPORTED_HARNESSES:
             with self.subTest(harness=harness):
                 self.assertEqual(profiles.HARNESS_PROFILES[harness]["executable"], harness)
+
+    def test_every_effort_mechanism_in_the_table_reaches_the_composed_argv(self) -> None:
+        # Regression guard for a real trap: the composer used to pass a
+        # THROWAWAY list to `_append_headless_effort` for the harnesses that had
+        # no effort mechanism, purely to make it raise. Adding an effort flag to
+        # such a profile would then append it to the discarded list and the flag
+        # would never reach the launch command — configured-looking and inert.
+        # This walks the table rather than naming harnesses, so it holds for any
+        # profile a later slice gives an effort mechanism.
+        for harness, profile in profiles.HARNESS_PROFILES.items():
+            effort_flag = profile.get("effort_flag")
+            effort_config_key = profile.get("effort_config_key")
+            for mode in ("developer", "reviewer"):
+                with self.subTest(harness=harness, mode=mode):
+                    if not effort_flag and not effort_config_key:
+                        with self.assertRaises(PmError):
+                            profiles.compose_headless_command(
+                                harness, "POINTER", mode=mode, repo=Path("/repo"), effort="high"
+                            )
+                        continue
+                    command = profiles.compose_headless_command(
+                        harness, "POINTER", mode=mode, repo=Path("/repo"), effort="high"
+                    )
+                    if effort_flag:
+                        self.assertIn(effort_flag, command)
+                        self.assertEqual(command[command.index(effort_flag) + 1], "high")
+                    else:
+                        self.assertIn(f'{effort_config_key}="high"', command)
 
     def test_unknown_harness_error_names_every_supported_harness(self) -> None:
         with self.assertRaises(PmError) as ctx:
@@ -110,6 +143,15 @@ class TestComposeHeadlessDeveloperCommand(unittest.TestCase):
 
     def test_opencode(self) -> None:
         self.assertEqual(
+            profiles.compose_headless_command(
+                "opencode", "POINTER", mode="developer", repo=self._repo,
+                model="local/model", effort="high",
+            ),
+            ["opencode", "run", "POINTER", "-m", "local/model", "--variant", "high", "--agent", "build", "--auto", "--dir", "/repo"],
+        )
+
+    def test_opencode_without_effort_omits_the_variant_flag(self) -> None:
+        self.assertEqual(
             profiles.compose_headless_command("opencode", "POINTER", mode="developer", repo=self._repo, model="local/model"),
             ["opencode", "run", "POINTER", "-m", "local/model", "--agent", "build", "--auto", "--dir", "/repo"],
         )
@@ -120,11 +162,13 @@ class TestComposeHeadlessDeveloperCommand(unittest.TestCase):
             ["qwen", "--prompt", "POINTER", "--model", "qwen-max", "--sandbox", "--output-format", "text"],
         )
 
-    def test_opencode_and_qwen_effort_fail_closed(self) -> None:
-        for harness in ("opencode", "qwen"):
-            with self.subTest(harness=harness), self.assertRaises(PmError) as ctx:
-                profiles.compose_headless_command(harness, "POINTER", mode="developer", repo=self._repo, effort="high")
-            self.assertIn("headless", str(ctx.exception))
+    def test_qwen_effort_fails_closed(self) -> None:
+        # Qwen Code's option list carries nothing reasoning-related, so an
+        # effort request must raise rather than launch a command that silently
+        # ignores it.
+        with self.assertRaises(PmError) as ctx:
+            profiles.compose_headless_command("qwen", "POINTER", mode="developer", repo=self._repo, effort="high")
+        self.assertIn("headless", str(ctx.exception))
 
     def test_invalid_mode_and_unknown_harness_fail_closed(self) -> None:
         with self.assertRaises(PmError):
@@ -151,8 +195,8 @@ class TestComposeHeadlessReviewerCommand(unittest.TestCase):
                 ["copilot", "--model", "gpt-5", "--effort", "high", "-p", "PROMPT", "--allow-all-tools", "--autopilot", "--silent", "--add-dir", "/repo"],
             ),
             (
-                "opencode", {"model": "my-model"},
-                ["opencode", "run", "PROMPT", "-m", "my-model", "--agent", "plan", "--auto", "--dir", "/repo"],
+                "opencode", {"model": "my-model", "effort": "high"},
+                ["opencode", "run", "PROMPT", "-m", "my-model", "--variant", "high", "--agent", "plan", "--auto", "--dir", "/repo"],
             ),
             (
                 "qwen", {"model": "qwen-max"},
@@ -165,11 +209,20 @@ class TestComposeHeadlessReviewerCommand(unittest.TestCase):
                     profiles.compose_headless_command(harness, "PROMPT", mode="reviewer", repo=self._repo, **kwargs), expected
                 )
 
-    def test_opencode_and_qwen_effort_fail_closed(self) -> None:
-        for harness in ("opencode", "qwen"):
-            with self.subTest(harness=harness), self.assertRaises(PmError) as ctx:
-                profiles.compose_headless_command(harness, "PROMPT", mode="reviewer", repo=self._repo, effort="high")
-            self.assertIn("headless", str(ctx.exception))
+    def test_opencode_without_effort_omits_the_variant_flag(self) -> None:
+        # The mode-specific mirror of the developer assertion: the table-walking
+        # guard in TestHarnessProfileTable only ever composes WITH an effort, so
+        # without this a reviewer-only change that started emitting a default
+        # `--variant` when no effort was requested would go unnoticed.
+        self.assertEqual(
+            profiles.compose_headless_command("opencode", "PROMPT", mode="reviewer", repo=self._repo, model="my-model"),
+            ["opencode", "run", "PROMPT", "-m", "my-model", "--agent", "plan", "--auto", "--dir", "/repo"],
+        )
+
+    def test_qwen_effort_fails_closed(self) -> None:
+        with self.assertRaises(PmError) as ctx:
+            profiles.compose_headless_command("qwen", "PROMPT", mode="reviewer", repo=self._repo, effort="high")
+        self.assertIn("headless", str(ctx.exception))
 
 
 class TestComposeResumeCommand(unittest.TestCase):

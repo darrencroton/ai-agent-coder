@@ -264,45 +264,140 @@ The tmux→headless cutover cannot be split into separately-green commits at the
 
 ### Validation Plan
 - Tests to add/update: `test_prompts.py` still passes with reworded templates.
-- Commands to run: `python3 -m pytest skills/project-manager/tests/test_prompts.py` and `rg -n -i "tmux|capture-pane|pane\.txt|pane-live" skills/project-manager README.md CONTRIBUTING.md` returns nothing. (`CHANGELOG.md` is excluded from the zero-match check: its historical entries legitimately record the prior tmux-era behaviour; this slice only *adds* a new headless entry and does not rewrite that history.)
+- Commands to run: `python3 -m pytest skills/project-manager/tests/test_prompts.py` and `rg -n -i "tmux|capture-pane|pane\.txt|pane-live" skills/project-manager README.md CONTRIBUTING.md` returns nothing **outside the enumerated allowlist below**.
+  - **Amended (see Amendment 2026-07-26, item B).** As originally written this check was unsatisfiable: two classes of match inside the searched paths are deliberate and must survive, so no slice could ever make the bare command return nothing. The check is therefore "no match **across the command's listed paths** outside this allowlist":
+    - `tests/test_state.py` — `tmux_session` appears in **negative** assertions pinning that the field does not survive the cutover. Deleting them would delete the regression guard.
+    - `references/run-state.md` — two deliberately contrastive sentences ("the Developer runs as a detached headless process, not an interactive tmux session"; "no global discovery path (unlike tmux's global session list)"). Both read correctly post-cutover and name tmux only to contrast with it.
+  - `CHANGELOG.md` needs no allowlist entry: it is **outside the command's search paths** (`skills/project-manager`, `README.md`, `CONTRIBUTING.md`), so it can never match this invocation. Its historical entries legitimately record the prior tmux-era behaviour and are deliberately preserved; slices only *add* a headless entry. This is exclusion by scope, not by allowlist — the original Slice 5 wording conflated the two.
+  - Slice 5 satisfied the bare command only over its own eight authorized files. Amended Slice 6 clears the remaining non-allowlisted matches (`run-state.md:74` and the stale test comments), at which point the allowlisted form is genuinely true across those paths. It is **not** a repository-wide claim: this plan file and other historical documents legitimately discuss tmux throughout.
 - Manual checks: follow the README trial recipe end-to-end with a headless fake harness.
 
 ### Rollback Path
 - Revert the slice commit; docs return to describing tmux.
 
-## Slice 6: CI and full-suite green
+## Amendment 2026-07-26 — closeout scope (owner-approved)
+
+Slice 6 as originally frozen authorized only `.github/workflows/ci.yml`. Closing this body of work out requires resolving carry-forward items that all sit outside that surface, so the owner walked the closeout register and decided each item. Every item is **fixed**; nothing is closed unfixed. The decisions are split across two slices because exactly one of them changes behaviour on a safety-critical path:
+
+- **Amended Slice 6** (below) — CI, plus items **A** (stale wording no slice authorized), **B** (the unsatisfiable Slice 5 validation check, fixed in the plan text above), **C** (OpenCode reasoning-effort parity via `--variant`), **D3** (fake-harness helper duplication), and **E** (two pre-existing PM README defects). All of it is wording, a profile-table flag, test-helper relocation, and docs.
+- **New Slice 7** (below) — item **D1**, the accept-path floor TOCTOU window. Separated because it is the only behavioural change to PM's accept decision path; a separate commit lets the drift audit and the code review each reason about one thing, and lets it be reverted without losing the closeout.
+
+Two register items are closed **as already-correct, with no code change**, and are recorded here so they are not rediscovered as open:
+
+- **D2 — fact 8 scans the final 128 KiB of the outfile** (`sessions.read_output_tail(max_bytes=128*1024)`). Closed: this is a strict *increase* in coverage over the ~50-line tmux pane capture it replaced. A hard-stop marker buried under >128 KiB of later output would be missed, but fixing that means streaming the whole outfile — new machinery for a hypothetical, which VISION principle 9 discourages.
+- **D4 — the opencode/qwen effort guard dropped in Slice 4.** Closed as correct and **must not be restored**: the hardcoded `harness in {"opencode","qwen"}` refusal is superseded by the table-driven "no effort flag means fail closed" rule. Restoring it would have kept raising for opencode even after item C adds `effort_flag`, silently overriding the fix.
+
+Two register claims were checked against the repo and found **overstated**; the corrected facts are what the slices below are scoped to:
+
+- Item B's "fixing group A makes the check genuinely true" is wrong — `test_state.py`'s negative assertions and `run-state.md`'s two contrastive sentences must survive. Hence the allowlist form above.
+- Item D3's "~14 of the same helpers" is wrong — the actual overlap is three (`_write_result_cmd` and `_idle_body` byte-identical; `_commit_and_result_body` differing only in signature formatting and a docstring).
+
+## Slice 6: CI, closeout wording, OpenCode effort parity, and README defects
 
 ### Intended Change
-- Update `.github/workflows/ci.yml`: remove the tmux install step and the "tmux-backed runtime tests / tmux self-skip" comments; runtime tests now use headless fakes and need no tmux.
-- Confirm the entire `project-manager` test suite passes with no tmux present.
+- **CI (original Slice 6).** Update `.github/workflows/ci.yml`: remove the tmux install step and the "tmux-backed runtime tests / tmux self-skip" comments; runtime tests use headless fakes and need no tmux. Confirm the entire `project-manager` suite passes with no tmux present.
+- **Item A — stale wording no slice ever authorized.** Reword "pane markers" → "session-output markers" in `plan.py:32` (comment) and `plan.py:276` (**inside a user-facing `check-plan` warning string**, so this is visible output, not just a comment). Drop the stale tmux parenthetical from `references/run-state.md:74` ("the headless replacement for diffing against the tmux path's `pane-live.txt`"), which now disagrees with the reworded comment in `slice_ops.py`. Reword the stale test comments at `tests/pm_test_helpers.py:36` ("in tmux-gated slice_ops tests" — nothing is gated now), `tests/test_slice_ops.py:17`, `tests/test_review.py:244`, `tests/test_floor.py:3` and `:477`. **Leave `run-state.md:66`/`:72` and all of `tests/test_state.py` alone** — allowlisted above as deliberate.
+  - *Addendum, found during implementation:* a repo-wide sweep for references to names the cutover deleted turned up exactly one more instance of this same class — `tests/pm_test_helpers.py:32` still lists the deleted `send` subcommand in its command enumeration, inside the very comment block line 36 sits in. It is fixed with line 36 rather than left dangling, since leaving a known stale reference is what this closeout exists to prevent. Recorded here so the change is authorized rather than drift.
+- **Item C — OpenCode reasoning-effort parity.** `opencode run --variant` is documented by the installed CLI as *"model variant (provider-specific reasoning effort, e.g., high, max, minimal)"*, re-verified at this commit. Give opencode `"effort_flag": "--variant"` in `HARNESS_PROFILES` so `--effort` maps to it instead of failing closed, and update the profile comment. **The mechanical trap this must avoid:** `profiles.py` currently calls `_append_headless_effort([], profile, effort, harness)` for opencode and qwen — a *throwaway list*, used deliberately as a pre-flight "raise before building the command". Adding `effort_flag` alone would append `--variant` to a discarded list and the flag would never reach the argv, a silent no-op that still looks fixed. Opencode's calls must append to the real `command`; unify all five call sites on `_append_headless_effort(command, …)` so the idiom cannot regress. **Qwen is unchanged and stays fail-closed** — its full option list contains nothing reasoning-related. Effort values stay free-form pass-through (PM validates them for no harness), so no new validation is introduced. `skills/project-manager/README.md:16` ("OpenCode and Qwen expose no tested headless effort override") becomes false and must be corrected in the same commit; add a `CHANGELOG.md` entry.
+- **Item D3 — fake-harness helper duplication.** Move the three helpers duplicated between `tests/test_slice_ops.py` and `tests/test_finalize.py` (`_write_result_cmd`, `_idle_body`, `_commit_and_result_body`) into `tests/pm_test_helpers.py`, their correct home, and import them in both files. Behaviour-preserving: the consolidated `_commit_and_result_body` must keep both call sites' semantics exactly (the two copies differ only in signature formatting and a docstring).
+  - **They lose the leading underscore on the way** (`write_result_cmd`, `idle_body`, `commit_and_result_body`), matching `pm_test_helpers.py`'s existing convention that everything it exports is public (`parse_init_output`, `write_fake_harness`, `render_slice`). A module-private name on a deliberately shared helper would misdescribe it. This renames the call sites in both consumer suites — mechanical, and the suite is the check that every one resolved.
+- **Item E — pre-existing PM README defects.** Document `review --reviewer-command` in the CLI table (genuinely absent from the README). Document the `--token`/`--run` pair that the closeout register named as undocumented. **Corrected during round-1 drift audit:** this bullet originally asserted that `--run` and `--token` were "already covered in the prose above the table". That is true of `--token` (`README.md:20`) but **false of `--run`**, which appeared in exactly two table rows (`status`, `notes`) and was defined nowhere — exactly the gap the register recorded. Rather than document `--run` per-row on eight commands, state the shared `--token`/`--run` availability once beneath the intro paragraph, and **drop the two now-redundant per-row `[--run ID]` mentions** so the table and that paragraph agree rather than leaving two rows looking exceptional. Also add `-c user.name`/`-c user.email` to the trial recipe's first `git commit --allow-empty` (`README.md:70`) so the documented recipe works on a machine with no global Git identity — the fake Developer's own commit already does this correctly, so the recipe is internally inconsistent as well as broken.
+
+### Frozen Command Shapes (amending Slice 2's table for opencode only)
+- opencode developer launch — `opencode run <pointer> [-m M] [--variant E] --agent build --auto --dir <repo>`
+- opencode reviewer launch — `opencode run <pointer> [-m M] [--variant E] --agent plan --auto --dir <repo>`
+- opencode resume — **unchanged**: `opencode run <correction> --session <id> --agent build --auto --dir <repo>`. No harness carries effort on a resume turn; opencode stays consistent with the other four rather than diverging.
+- The other four harnesses' launch and resume shapes are **unchanged** from Slice 2.
 
 ### Acceptance Criteria
-- Inputs: the CI config and the full test suite.
-- Outputs: CI installs no tmux; the full suite passes without tmux.
-- User-visible behaviour: CI is simpler and green.
-- Behaviour that must not change: test coverage of the supervise loop, floor, state, and reviewer.
+- Inputs: the CI config, the full test suite, and the closeout files above.
+- Outputs: CI installs no tmux; the full suite passes without tmux; no non-allowlisted tmux/pane wording remains in `skills/project-manager`; `--effort` composes `--variant` for opencode in both modes and still fails closed for qwen; the three duplicated test helpers have exactly one definition; the README documents `--reviewer-command` and its trial recipe runs without a global Git identity.
+- User-visible behaviour: CI is simpler and green; an OpenCode seat now accepts an effort override instead of erroring, in each of the three places one can be supplied — `init --harness opencode --effort E`, `start-slice --effort E` on a run whose harness is opencode (`start-slice` takes no `--harness`; it inherits the run's), and `review --tool opencode --effort E` (`review` selects its harness with `--tool`, not `--harness`); the `check-plan` dependency warning says "session-output markers"; README is accurate.
+- Behaviour that must not change: test coverage of the supervise loop, floor, state, and reviewer; **qwen's fail-closed effort handling**; every other harness's composed argv in both modes, byte-for-byte; every resume shape including opencode's; the eight-fact floor's logic; the `check-plan` warning's *trigger conditions* (only its wording changes).
 
 ### Authorized Surface
 - Files allowed to change:
   - `.github/workflows/ci.yml`
-- Functions/classes/components allowed to change: the tmux install/skip steps and comments.
-- Tests allowed or expected to change: none (migration completed in earlier slices).
+  - `skills/project-manager/scripts/pm_lib/plan.py`
+  - `skills/project-manager/scripts/pm_lib/profiles.py`
+  - `skills/project-manager/references/run-state.md`
+  - `skills/project-manager/README.md`
+  - `skills/project-manager/tests/pm_test_helpers.py`
+  - `skills/project-manager/tests/test_profiles.py`
+  - `skills/project-manager/tests/test_slice_ops.py`
+  - `skills/project-manager/tests/test_finalize.py`
+  - `skills/project-manager/tests/test_review.py`
+  - `skills/project-manager/tests/test_floor.py`
+  - `CHANGELOG.md`
+  - `docs/implementation-plan-headless-developer.md` (this amendment and item B's plan-text fix)
+- Functions/classes/components allowed to change: the tmux install/skip steps and comments in `ci.yml`; the two "pane markers" strings in `plan.py`; opencode's `HARNESS_PROFILES` entry, its comment, the `_append_headless_effort` call sites in `compose_headless_command`, and **`_append_headless_effort`'s own docstring** in `profiles.py`; the stale wording listed in item A; the three helper definitions moved in item D3; the README's harness-difference sentence, CLI table row, shared-flag intro paragraph, and trial recipe.
+  - *The docstring is a required consequence of item C, not optional polish:* it read "OpenCode and Qwen Code expose no effort/reasoning flag", which item C makes **false**. Leaving it would be precisely the documentation-truth defect this closeout exists to remove. Qwen's own profile comment is deliberately **not** in this surface — it was already accurate before and after item C, so a round-1 drift finding correctly flagged its rewrite as unrecorded scope and it was reverted to its committed text.
+- Tests allowed or expected to change: `test_profiles.py` (opencode effort assertions in both modes; qwen still fail-closed), `test_slice_ops.py`/`test_finalize.py`/`pm_test_helpers.py` (helper relocation + comment), `test_review.py`/`test_floor.py` (comments only).
 
 ### Explicit Non-Goals
-- No test rewrites here (done in Slices 1–4).
-- No new CI jobs.
+- **No change to the accept path** — item D1 is Slice 7.
+- No restoration of the Slice 4 opencode/qwen effort guard (register item D4).
+- No change to qwen's effort handling, to any resume shape, or to the other four harnesses' composed argv.
+- No deletion of `test_state.py`'s `tmux_session` negative assertions or `run-state.md:66`/`:72`.
+- No new CI jobs; no widening of the `check-plan` warning's trigger conditions.
+- No streaming rewrite of the fact-8 outfile scan (register item D2, closed above).
 
 ### Risk Flags
-- Risky surfaces touched: none
-- Approval needed before implementation: no
+- Risky surfaces touched: the frozen per-harness command table (opencode's entry) and the fail-closed effort path — the reason the Developer seat runs at `high` effort for this slice and the code review at `high`.
+- Approval needed before implementation: **yes — this amendment**, granted 2026-07-26.
+- Independent audit required: yes (two separate read-only delegates — drift-audit then code-review; see HANDOFF.md "Seat Assignment For The Final Session").
 
 ### Validation Plan
-- Tests to add/update: none.
-- Commands to run: `python3 -m pytest skills/project-manager/tests/` (locally, with no tmux on PATH if possible).
-- Manual checks: the CI YAML has no tmux reference.
+- Tests to add/update: `test_profiles.py` gains opencode `--variant` assertions for developer and reviewer mode and keeps qwen's fail-closed assertion; the relocated helpers are exercised by the existing `test_slice_ops.py`/`test_finalize.py` suites unchanged.
+- Commands to run: the full suite `uv run --python 3.13 --with pytest python -m pytest skills/project-manager/tests/`, passing with nothing skipped, run **unsandboxed** (under a sandbox `test_review.py::TestReviewTimeout::test_slow_reviewer_times_out_kills_process_and_fails_closed` fails with `PermissionError` on `os.killpg` — the sandbox denying the signal, not a defect) and additionally with `tmux` removed from `PATH` to prove the no-tmux claim rather than assume it.
+- Manual checks: the CI YAML has no tmux reference; `rg -n -i "tmux|capture-pane|pane\.txt|pane-live" skills/project-manager README.md CONTRIBUTING.md` matches only the allowlist; composed opencode argv read by eye against the frozen shapes above.
 
 ### Rollback Path
-- Revert the slice commit; CI reinstalls tmux.
+- Revert the slice commit; CI reinstalls tmux, opencode returns to failing closed on `--effort`, and the wording/helper/README changes revert. No other slice depends on it.
+
+## Slice 7: Close the accept-path floor TOCTOU window
+
+### Intended Change
+- `finalize_accept` currently evaluates the eight-fact floor (`slice_ops.py:1638`) and reads HEAD (`:1654`) while the Developer is **still live**, terminating it only afterwards (`:1669`). A harness that commits or edits in that window produces an ACCEPTED assessment describing a tree that is no longer current, and a commit that never faced the surface-authorization check. Close the window by **re-evaluating the floor after quiescing**: once `_terminate_current(current)` has succeeded (so the Developer is provably dead), call `_collect_finalize_evidence` again, re-read HEAD, and record the acceptance only if the floor still passes and HEAD is unchanged. If either moved, refuse the acceptance with a clear message naming the race, and write no assessment.
+- The post-quiesce report and HEAD become the authoritative ones recorded in the assessment: they are the only pair evaluated against a repo no process can still mutate.
+- **Preserve the existing ordering decision that termination comes after the review-freshness gate** (documented in the comment at `slice_ops.py:1669`): a *refused* acceptance must leave the Developer alive so the operator can still steer it. So the fix adds a check after termination rather than moving termination earlier — a refusal caused by a floor failure or a stale review still leaves the Developer running, exactly as today.
+- `_collect_finalize_evidence` is already idempotent and never mutates or saves state (it rewrites `status-after.txt` and `diff.patch` and re-evaluates the floor), so calling it twice needs no new machinery — which is what keeps this consistent with VISION principle 9.
+- Document the guarantee in `references/run-state.md` alongside the existing accept/attempt semantics: acceptance is recorded only against a quiesced repository.
+
+### Acceptance Criteria
+- Inputs: a run with a current slice and a Developer that has written `result.json`; `finalize --accept "reasoning"`.
+- Outputs: on the normal path, an ACCEPTED assessment whose floor report and recorded commit were evaluated after the Developer was confirmed dead. On a raced path, no assessment, a non-zero exit, and a message identifying that the Developer acted during acceptance.
+- User-visible behaviour: unchanged for every non-raced acceptance. A raced acceptance, which previously succeeded with stale evidence, now refuses and tells the operator to re-run `finalize`.
+- Behaviour that must not change: the floor-failed and reviews-stale refusal paths, **including that both still leave the Developer alive**; termination failures still raise and refuse the acceptance outright; no assessment is ever left on disk announcing an acceptance the state never recorded; the run-completion/`regenerate_report` closing sequence; attempt-budget accounting; MAC-authenticated state writes.
+- `cli.py` needs no change: `cli.py:403-408` renders any non-`accepted` outcome kind generically from `outcome.message` and exits 1.
+
+### Authorized Surface
+- Files allowed to change:
+  - `skills/project-manager/scripts/pm_lib/slice_ops.py`
+  - `skills/project-manager/tests/test_finalize.py`
+  - `skills/project-manager/references/run-state.md`
+- Functions/classes/components allowed to change: `finalize_accept` and the `AcceptOutcome` dataclass (a new refusal `kind`) in `slice_ops.py`; the accept-semantics paragraph in `run-state.md`.
+- Tests allowed or expected to change: `test_finalize.py` (a raced-acceptance test plus confirmation that ordinary acceptance is unaffected and that the floor passing twice in a row is not spuriously refused).
+
+### Explicit Non-Goals
+- No change to `finalize --steer`, `finalize --stop`, bare `finalize`, `stop`, or `stop --scavenge`.
+- No reordering of the safety-critical `finalize_steer` sequence (capture id → quiesce → hard-stop scan → re-correlate → require id → rotate → launch).
+- No move of termination earlier than the review-freshness gate.
+- No `cli.py` change; no new CLI flag or subcommand.
+- No change to the floor's eight facts or their logic.
+
+### Risk Flags
+- Risky surfaces touched: the accept decision path — the point at which PM records an irreversible assessment.
+- Approval needed before implementation: **yes — this amendment**, granted 2026-07-26.
+- Independent audit required: yes.
+
+### Validation Plan
+- Tests to add/update: a fake harness that writes `result.json`, commits, then keeps committing until killed, so HEAD provably differs between the two evaluations → acceptance refuses with the race message and writes no assessment; an ordinary accept still succeeds (proving the second floor evaluation is not spuriously failing — note `_collect_finalize_evidence` writes into the artifact dir on both runs, so this test is the guard against the second run's own writes flipping a fact); floor-failed and reviews-stale refusals still leave the Developer alive.
+- Commands to run: the full suite `uv run --python 3.13 --with pytest python -m pytest skills/project-manager/tests/`, unsandboxed, nothing skipped.
+- Manual checks: read `finalize_accept` end to end and confirm the ordering comment still describes the code.
+
+### Rollback Path
+- Revert the slice commit; `finalize_accept` returns to a single pre-termination floor evaluation. Slice 6 is unaffected.
 
 ## Next Chat Prompt
 

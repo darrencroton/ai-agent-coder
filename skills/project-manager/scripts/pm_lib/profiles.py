@@ -41,9 +41,12 @@ HARNESS_PROFILES: dict[str, dict[str, Any]] = {
     "opencode": {
         "executable": "opencode",
         "model_flag": "-m",
-        # No effort_flag and no effort_config_key: OpenCode exposes no
-        # reasoning-effort flag, so an effort request fails closed at compose
-        # time (see _append_headless_effort) instead of launching a broken command.
+        # `opencode run --variant` is documented by the CLI as "model variant
+        # (provider-specific reasoning effort, e.g., high, max, minimal)", so it
+        # is OpenCode's reasoning-effort control and `--effort` maps onto it.
+        # Values are provider-specific and passed through verbatim, exactly as
+        # for the other harnesses' effort flags.
+        "effort_flag": "--variant",
         "model_inventory_command": ["opencode", "models", "{provider}", "--verbose"],
     },
     "qwen": {
@@ -69,9 +72,11 @@ def _append_headless_model(command: list[str], profile: dict[str, Any], model: s
 def _append_headless_effort(command: list[str], profile: dict[str, Any], effort: str | None, harness: str) -> None:
     """Append the harness's reasoning-effort override, or fail closed.
 
-    OpenCode and Qwen Code expose no effort/reasoning flag on their tested
-    headless commands, so an effort request raises rather than being silently
-    dropped or turned into a broken launch command.
+    Qwen Code exposes no effort/reasoning flag on its tested headless command,
+    so an effort request raises rather than being silently dropped or turned
+    into a broken launch command. Every call site passes the real ``command``:
+    a throwaway list would turn a table entry that *does* carry an effort flag
+    into a silent no-op that still looks configured.
     """
     if not effort:
         return
@@ -139,14 +144,14 @@ def compose_headless_command(
             command.extend(["-p", pointer, "--allow-all-tools", "--autopilot", "--silent", "--add-dir", repo_str])
             return command
         if harness == "opencode":
-            _append_headless_effort([], profile, effort, harness)
             command = ["opencode", "run", pointer]
             _append_headless_model(command, profile, model)
+            _append_headless_effort(command, profile, effort, harness)
             command.extend(["--agent", "plan", "--auto", "--dir", repo_str])
             return command
-        _append_headless_effort([], profile, effort, harness)
         command = ["qwen", "--prompt", pointer]
         _append_headless_model(command, profile, model)
+        _append_headless_effort(command, profile, effort, harness)
         command.extend(["--sandbox", "--output-format", "text"])
         return command
 
@@ -177,14 +182,14 @@ def compose_headless_command(
         command.extend(["--add-dir", repo_str])
         return command
     if harness == "opencode":
-        _append_headless_effort([], profile, effort, harness)
         command = ["opencode", "run", pointer]
         _append_headless_model(command, profile, model)
+        _append_headless_effort(command, profile, effort, harness)
         command.extend(["--agent", "build", "--auto", "--dir", repo_str])
         return command
-    _append_headless_effort([], profile, effort, harness)
     command = ["qwen", "--prompt", pointer]
     _append_headless_model(command, profile, model)
+    _append_headless_effort(command, profile, effort, harness)
     command.extend(["--sandbox", "--output-format", "text"])
     return command
 

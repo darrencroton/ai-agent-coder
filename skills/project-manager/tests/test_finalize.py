@@ -67,7 +67,14 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from pm_test_helpers import PmTestCase, parse_init_output, write_fake_harness
+from pm_test_helpers import (
+    PmTestCase,
+    commit_and_result_body,
+    idle_body,
+    parse_init_output,
+    write_fake_harness,
+    write_result_cmd,
+)
 
 from pm_lib import PmError
 from pm_lib import sessions
@@ -83,44 +90,17 @@ _LONG_REASONING = (
 
 
 # --- headless fake harness / reviewer script builders ------------------------
-
-
-def _write_result_cmd(status: str = "done", summary: str = "did the work") -> str:
-    return (
-        "printf '{\"slice\": \"%s\", \"status\": \"" + status + "\", \"summary\": \"" + summary + "\"}\\n' "
-        '"$PM_SLICE_ID" > "$PM_RESULT_PATH"'
-    )
-
-
-def _commit_and_result_body(
-    repo: Path, *, authorized_file: str = "a.py", unauthorized_file: str | None = None,
-    delay: float = 0.0, tail_sleep: float = 0.0,
-) -> str:
-    lines = ["turn_text=\"${1:-}\"", "echo FAKE_HARNESS_WORKING"]
-    if delay:
-        lines.append(f"sleep {delay}")
-    lines.append(f'echo "authorized change" >> "{repo}/{authorized_file}"')
-    lines.append(f'git -C "{repo}" add "{authorized_file}"')
-    if unauthorized_file:
-        lines.append(f'echo "oops" >> "{repo}/{unauthorized_file}"')
-        lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
-    lines.append(f'git -C "{repo}" commit -q -m "slice work"')
-    lines.append(_write_result_cmd())
-    if tail_sleep:
-        lines.append(f"sleep {tail_sleep}")
-    return "\n".join(lines)
-
-
+#
+# The bodies shared with `test_slice_ops` (`write_result_cmd`, `idle_body`,
+# `commit_and_result_body`) live in `pm_test_helpers`; the ones below are
+# specific to this suite.
+#
 # A resumable `--harness-command` override prints its own launch-bound id on an
 # exact line that PM captures (never synthesizes). The launch turns below emit
 # it deterministically so a later steer re-correlates the id from the completed
 # turn and resumes; the no-id fake omits it so a steer must block.
 _OVERRIDE_SESSION_ID = "override-session-1"
 _EMIT_OVERRIDE_ID = f'echo "PM_DEVELOPER_SESSION_ID: {_OVERRIDE_SESSION_ID}"'
-
-
-def _idle_body(*, sleep_seconds: float = 30.0) -> str:
-    return f"echo FAKE_HARNESS_WORKING\nsleep {sleep_seconds}"
 
 
 def _steer_then_complete_body(repo: Path, *, authorized_file: str = "a.py") -> str:
@@ -134,7 +114,7 @@ def _steer_then_complete_body(repo: Path, *, authorized_file: str = "a.py") -> s
             f'  echo "authorized change" >> "{repo}/{authorized_file}"',
             f'  git -C "{repo}" add "{authorized_file}"',
             f'  git -C "{repo}" commit -q -m "slice work"',
-            "  " + _write_result_cmd(),
+            "  " + write_result_cmd(),
             "  sleep 2",
             "else",
             "  " + _EMIT_OVERRIDE_ID,
@@ -178,7 +158,7 @@ def _result_then_alive_body() -> str:
             "else",
             "  " + _EMIT_OVERRIDE_ID,
             "  echo FAKE_HARNESS_WORKING",
-            "  " + _write_result_cmd(),
+            "  " + write_result_cmd(),
             "  sleep 30",
             "fi",
         ]
@@ -329,7 +309,7 @@ class TestFullAcceptance(FinalizeTestCase):
     def test_accept_writes_assessment_clears_slice_and_regenerates_report(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
+            self.repo.parent / "fake.sh", commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -386,7 +366,7 @@ class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh",
-            _commit_and_result_body(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=3.0),
+            commit_and_result_body(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=3.0),
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -432,7 +412,7 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
             self._plan_path(), slices=[{"files": ["a.py"], "risky": "touches auth"}]
         )
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
+            self.repo.parent / "fake.sh", commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -501,7 +481,7 @@ class TestRiskRatchet(FinalizeTestCase):
     def test_ratchet_arms_review_requirement_rejects_lowering_and_persists(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
+            self.repo.parent / "fake.sh", commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -857,7 +837,7 @@ class TestSteer(FinalizeTestCase):
 class TestStopDecision(FinalizeTestCase):
     def test_stop_writes_stopped_assessment_and_regenerates_report(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -895,7 +875,7 @@ class TestStopDecision(FinalizeTestCase):
 class TestNotesMirrorAndTripwire(FinalizeTestCase):
     def test_notes_mirrored_at_start_slice_and_large_notes_warn(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=20.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=20.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -914,7 +894,7 @@ class TestNotesMirrorAndTripwire(FinalizeTestCase):
 
     def test_oversized_notes_prints_tripwire_warning(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=20.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=20.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -933,7 +913,7 @@ class TestNotesMirrorAndTripwire(FinalizeTestCase):
 class TestNotesCommand(FinalizeTestCase):
     def test_set_then_append_write_authoritative_original_and_mirror(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -955,7 +935,7 @@ class TestNotesCommand(FinalizeTestCase):
 
     def test_requires_a_token(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, _token = parse_init_output(out)
@@ -965,7 +945,7 @@ class TestNotesCommand(FinalizeTestCase):
 
     def test_empty_or_whitespace_text_is_refused(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -981,7 +961,7 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
     def test_status_report_recreates_mirror_after_pm_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
+            self.repo.parent / "fake.sh", commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -1018,7 +998,7 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
 class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
     def test_budget_exhaustion_terminates_process_and_closes_steer_accept(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "0"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -1069,7 +1049,7 @@ class TestAcceptingFinalSliceCompletesRun(FinalizeTestCase):
     def test_accepting_final_slice_marks_run_complete(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
+            self.repo.parent / "fake.sh", commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -1103,7 +1083,7 @@ class TestTerminationFailureInFinalize(FinalizeTestCase):
     def test_accept_does_not_record_acceptance_when_termination_fails(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
+            self.repo.parent / "fake.sh", commit_and_result_body(self.repo, delay=1.0, tail_sleep=3.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -1139,7 +1119,7 @@ class TestTerminationFailureInFinalize(FinalizeTestCase):
         # cannot leave an assessment on disk announcing a stop the state never
         # recorded.
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -1166,7 +1146,7 @@ class TestTerminationFailureInFinalize(FinalizeTestCase):
 
     def test_budget_exhaustion_does_not_stop_when_termination_fails(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_body())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_body())
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "0"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)

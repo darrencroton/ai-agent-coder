@@ -241,7 +241,7 @@ class ReviewCommandTestCase(PmTestCase):
         review only reads current_slice.id/before_head, so this test suite
         sets current_slice directly (pm_test_helpers.set_current_slice) and
         advances HEAD with a plain git commit, exactly like the floor tests
-        do for the same reason (no tmux dependency for this command)."""
+        do for the same reason (this command launches no Developer process)."""
         plan_path = self.write_plan(self._plan_path(), slices=slices or [{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
         before_head = self._git("rev-parse", "HEAD").stdout.strip()

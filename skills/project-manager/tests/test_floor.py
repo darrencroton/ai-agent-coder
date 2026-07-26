@@ -1,6 +1,6 @@
 """Protected behaviours: the mechanical floor's eight facts (target-design §3.3).
 
-Pure git + filesystem tests, no tmux. Pins:
+Pure git + filesystem tests, launching no Developer process. Pins:
 
 - The floor is exactly eight facts, numbered and named per target-design
   §3.3 / implementation-blueprint §3 Stage 2 AC: plan-digest,
@@ -473,8 +473,8 @@ class TestFactHardStopScan(FloorTestCase):
     def test_marker_wrapped_across_session_output_lines_still_fails(self) -> None:
         # A hard-stop prompt wrapped across captured output lines must still
         # fail fact 8: scan_hard_stop whitespace-normalizes before matching,
-        # so a marker split by newlines in the outfile is detected exactly as
-        # it was for wrapped tmux pane rows.
+        # so a marker split by newlines in the outfile is detected just as one
+        # on a single line is.
         _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
         self._commit_authorized_change()
         self._write_result()

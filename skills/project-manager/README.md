@@ -13,24 +13,26 @@ To start a Mode B run, paste the launcher prompt from [SKILL.md](SKILL.md#launch
 - At least one supported coding CLI for the Developer seat: `codex`, `claude`, `copilot`, `opencode`, or `qwen` (or any command via `--harness-command`)
 - Optionally a reviewer CLI (`codex`, `claude`, `copilot`, `opencode`, `qwen`) for PM-commissioned reviews
 
-All five supported harnesses are equally eligible for either seat; the operator chooses what fits the plan. Profiles encode factual CLI differences only: for example, OpenCode and Qwen expose no tested headless effort override, so `--effort` fails closed for those harnesses rather than being silently ignored.
+All five supported harnesses are equally eligible for either seat; the operator chooses what fits the plan. Profiles encode factual CLI differences only: `--effort` composes each harness's own reasoning control (Codex `-c model_reasoning_effort`, Claude and Copilot `--effort`, OpenCode `--variant`), and Qwen exposes no headless effort mechanism at all, so `--effort` fails closed for that harness rather than being silently ignored.
 
 ## CLI
 
 All commands: `python3 skills/project-manager/scripts/pm.py <command> …`, run from inside the target repository (except `check-plan`/`init`, which take paths). Mutating commands need the run capability token (`--token` or `PM_RUN_TOKEN` in your environment).
 
+Every command below except `check-plan` and `init` also accepts `--token TOKEN` and `--run ID`; the table omits them per-row for readability. `--run` selects a specific run when a repository holds more than one, defaulting to the `current` pointer.
+
 | Command | Purpose |
 |---|---|
 | `check-plan --plan P [--repo R]` | "Is this plan runnable?" — errors fail closed; also runs automatically at init |
 | `init --repo R --plan P --harness H [--model M] [--effort E] [--branch B \| --create-branch B] [--attest "Slice 1,…"] [--max-attempts N] [--reviewer-tools T,…] [--reviewer-model M] [--reviewer-effort E] [--harness-command CMD]` | set up the run; freezes the plan digest; prints the token once (refuses main/master by implicit default — pass `--branch`/`--create-branch`) |
-| `status [--report] [--run ID]` | where are we? `--report` regenerates `run-report.md` |
+| `status [--report]` | where are we? `--report` regenerates `run-report.md` |
 | `approve --slice ID --reason TEXT` | record a **human** approval for a plan-gated slice |
 | `start-slice [--model M] [--effort E] [--risk elevated] [--reviewer-tools T,…] [--harness-command CMD]` | launch (or relaunch) the next eligible slice as a fresh headless session |
 | `observe [--wait N]` | evidence: liveness, session-output tail, result presence, hard-stop markers; a wait returns early only on process death, `result.json` appearing, or a hard-stop marker (never a mere output change), and reports elapsed wait time |
 | `finalize` | run the eight-fact floor and collect evidence (decides nothing) |
 | `finalize --accept "reasoning" \| --steer "correction" \| --stop "reason" [--risk elevated]` | PM's recorded decision; accept requires a passing floor (+ both fresh reviews when elevated); steer costs an attempt |
-| `review --slice ID --skill drift-audit\|code-review [--tool T] [--model M] [--effort E] [--timeout N]` | commission an independent review pinned to `before_head..HEAD` (`--tool` ∈ codex/claude/copilot/opencode/qwen); prints the report path, stderr path, and reviewer process-group id at launch, before waiting |
-| `notes --append TEXT \| --set TEXT [--run ID]` | update the run's curated `notes.md` — writes the state-dir original then re-mirrors; never hand-edit the `.pm/` mirror |
+| `review --slice ID --skill drift-audit\|code-review [--tool T] [--model M] [--effort E] [--timeout N] [--reviewer-command CMD]` | commission an independent review pinned to `before_head..HEAD` (`--tool` ∈ codex/claude/copilot/opencode/qwen; `--reviewer-command` overrides the whole reviewer command for tests or an unsupported tool); prints the report path, stderr path, and reviewer process-group id at launch, before waiting |
+| `notes --append TEXT \| --set TEXT` | update the run's curated `notes.md` — writes the state-dir original then re-mirrors; never hand-edit the `.pm/` mirror |
 | `stop --reason R [--slice-status stopped] [--scavenge]` | end the run preserving evidence; `--scavenge` sweeps sessions even with state destroyed |
 
 Exit codes: 0 success; 1 = a `finalize` refusal — a floor fact failed, or `--accept` was refused for another recorded reason (e.g. a missing or stale mandatory review on an elevated slice); 2 = error/refusal (integrity failures are prefixed `INTEGRITY:` and are terminal — start a new run).
@@ -67,7 +69,7 @@ Clean up with your normal tools when a run is done; `.pm/` and `<git-dir>/pm/` a
 From an empty scratch directory:
 
 ```sh
-git init -q -b main trial && cd trial && git commit --allow-empty -q -m base
+git init -q -b main trial && cd trial && git -c user.name=dev -c user.email=dev@local commit --allow-empty -q -m base
 cat > ../trial-plan.md <<'PLAN'
 ## Slice 1: hello file
 

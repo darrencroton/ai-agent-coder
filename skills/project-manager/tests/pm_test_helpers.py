@@ -29,12 +29,12 @@ from pm_lib import state as state_mod  # noqa: E402
 
 # Stage 3 additions -----------------------------------------------------------
 #
-# Most Stage 3 commands (status/approve/start-slice/observe/send/finalize/
-# stop) resolve their repo from the controller's cwd, not a --repo flag
+# Most Stage 3 commands (status/approve/start-slice/observe/finalize/stop)
+# resolve their repo from the controller's cwd, not a --repo flag
 # (only init/check-plan take one) — `run_cli_in_repo` runs a CLI call with
 # cwd temporarily set to the test repo. `write_fake_harness` builds a tiny
-# `sh` script standing in for a coding CLI in tmux-gated slice_ops tests
-# (the retained fake-harness pattern, replacement-ledger §9.1/§9.3).
+# `sh` script standing in for a coding CLI in the headless process-lifecycle
+# tests (the retained fake-harness pattern, replacement-ledger §9.1/§9.3).
 # `parse_init_output` extracts the run id and one-time-printed token from
 # `init`'s stdout so later commands in the same test can use them.
 
@@ -91,6 +91,50 @@ fi
 printf '{"status":"complete","summary":"headless fake completed"}\n' > "$PM_RESULT_PATH"
 """,
     )
+
+
+# Shared fake-harness bodies. These are the scenario fragments both lifecycle
+# suites (`test_slice_ops`, `test_finalize`) need, so they live here rather than
+# being defined twice — a duplicated fake that drifts between the two files
+# would make the same scenario mean two different things.
+
+
+def write_result_cmd(status: str = "done", summary: str = "did the work") -> str:
+    """A shell fragment writing a minimal valid `result.json` to $PM_RESULT_PATH."""
+    return (
+        "printf '{\"slice\": \"%s\", \"status\": \"" + status + "\", \"summary\": \"" + summary + "\"}\\n' "
+        '"$PM_SLICE_ID" > "$PM_RESULT_PATH"'
+    )
+
+
+def idle_body(*, sleep_seconds: float = 30.0) -> str:
+    """A fake harness that produces one line of output then idles until killed."""
+    return f"echo FAKE_HARNESS_WORKING\nsleep {sleep_seconds}"
+
+
+def commit_and_result_body(
+    repo: Path,
+    *,
+    authorized_file: str = "a.py",
+    unauthorized_file: str | None = None,
+    delay: float = 0.0,
+    tail_sleep: float = 0.0,
+) -> str:
+    """Commit the authorized change (optionally also touch an unauthorized
+    file), write result.json, then optionally idle briefly."""
+    lines = ["turn_text=\"${1:-}\"", "echo FAKE_HARNESS_WORKING"]
+    if delay:
+        lines.append(f"sleep {delay}")
+    lines.append(f'echo "authorized change" >> "{repo}/{authorized_file}"')
+    lines.append(f'git -C "{repo}" add "{authorized_file}"')
+    if unauthorized_file:
+        lines.append(f'echo "oops" >> "{repo}/{unauthorized_file}"')
+        lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
+    lines.append(f'git -C "{repo}" commit -q -m "slice work"')
+    lines.append(write_result_cmd())
+    if tail_sleep:
+        lines.append(f"sleep {tail_sleep}")
+    return "\n".join(lines)
 
 
 def render_slice(
