@@ -1457,6 +1457,27 @@ def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[
     return report, artifact_dir
 
 
+def _persist_risk_ratchet(run_dir: Path, state: dict[str, Any], token: str) -> None:
+    """Durably record a just-applied risk ratchet, immediately.
+
+    A decision path applies the ratchet, appends a `risk-raise` event, and then
+    does a lot of fallible work — evidence collection touches the filesystem,
+    termination can raise, review artifacts are re-hashed from disk — before it
+    would otherwise save state. Any exception in that stretch would leave the
+    durable event log claiming an elevated slice while authenticated state still
+    said `standard`, and a later acceptance would then skip the very elevated
+    review requirement the event announced.
+
+    Saving here rather than guarding each fallible step is what makes that
+    impossible for *every* failure mode rather than the handful anyone thought
+    to catch. It is safe precisely because it happens while the ratchet's risk
+    fields are the only mutation on `state`: no decision has been made yet, so
+    there is no half-written decision to persist. The later save rewrites the
+    same fields.
+    """
+    state_mod.save_state(run_dir, state, token)
+
+
 def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) -> FinalizeOutcome:
     state = load_writable_state(run_dir, token)
     current = state.get("current_slice")
@@ -1600,7 +1621,7 @@ def _render_assessment(
 
 @dataclass
 class AcceptOutcome:
-    kind: str  # accepted | floor_failed | reviews_stale
+    kind: str  # accepted | floor_failed | reviews_stale | raced
     slice_id: str
     report: FloorReport | None = None
     assessment_path: Path | None = None
@@ -1614,6 +1635,13 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     an elevated slice additionally requires both a drift-audit and a
     code-review entry recorded fresh against the current HEAD (design §5's
     review-freshness rule) before acceptance is recorded.
+
+    Both of those gates necessarily run while the Developer is still live, so
+    they describe a tree it could still be changing. Acceptance is therefore
+    re-checked once the Developer is provably dead — the floor, HEAD, and (for
+    an elevated slice) the mandatory reports' freshness — and it is that
+    post-quiesce evidence that gets recorded: PM never records an ACCEPTED
+    assessment against a repository a tracked process could still mutate.
     """
     stripped_reasoning = reasoning.strip()
     if len(stripped_reasoning) < _ACCEPT_REASONING_MIN_CHARS:
@@ -1632,8 +1660,10 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     if entry is None:
         raise PmError(f"{slice_id} is not present in the run's slice entries")
 
-    if apply_risk_ratchet(entry, current, risk_flag=risk):
+    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
+    if ratcheted:
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=stripped_reasoning.splitlines()[0][:120])
+        _persist_risk_ratchet(run_dir, state, token)
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
     floor_note = "8/8 passed" if report.passed else "failed: " + ", ".join(
@@ -1673,6 +1703,68 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     # freshness gate: a refused acceptance must leave the Developer alive so
     # the operator can still steer it.
     _terminate_current(current)
+
+    # Everything gated above was measured while the Developer was still live,
+    # so it describes a tree the Developer could still have been changing: a
+    # harness that committed in that window would otherwise earn an ACCEPTED
+    # assessment describing a tree that is no longer current, carrying a commit
+    # that never faced the surface-authorization fact. Now that the process is
+    # provably dead, take the evidence again. This second pair is the only one
+    # measured against a repository no tracked process can still mutate, so it
+    # is the authoritative one and it is what the assessment records.
+    #
+    # Re-running the whole floor rather than only re-reading HEAD is deliberate:
+    # a Developer that *edited* without committing leaves HEAD identical but
+    # trips the clean-worktree fact, and one that wrote a hard-stop marker on
+    # its way out trips fact 8.
+    #
+    # This needs no new machinery (VISION principle 9): _collect_finalize_evidence
+    # is idempotent and saves no state, and no floor fact reads either of the two
+    # files it rewrites (status-after.txt, diff.patch), so its own writes cannot
+    # flip a fact.
+    #
+    quiesced_report, quiesced_artifact_dir = _collect_finalize_evidence(repo, state, current)
+    quiesced_head = git_ops.git_head(repo)
+
+    reasons = []
+    if quiesced_head != head:
+        reasons.append(f"HEAD moved from {head} to {quiesced_head}")
+    if not quiesced_report.passed:
+        failed_names = ", ".join(fact.name for fact in quiesced_report.facts if not fact.passed)
+        reasons.append(f"the floor no longer passes: {failed_names}")
+    if effective_risk == "elevated":
+        # The mandatory reviews are acceptance evidence too, and _is_review_fresh
+        # re-hashes each report from disk. The pre-termination gate above ran
+        # while the Developer was live, and a codex Developer is handed the
+        # worktree git dir as a writable root — which is exactly where review
+        # originals live. So a report rewritten on the way out would otherwise
+        # sail through: it moves neither HEAD nor the worktree, and no floor
+        # fact reads it. Without this check the ACCEPTED assessment could even
+        # render its own mandatory review as "[SUPERSEDED - stale]".
+        still_fresh = _fresh_reviews_for_head(reviews, quiesced_head)
+        lost = sorted(set(_REQUIRED_ELEVATED_REVIEW_SKILLS) - set(still_fresh.keys()))
+        if lost:
+            reasons.append(f"required review(s) no longer fresh: {', '.join(lost)}")
+    if reasons:
+        detail = "; ".join(reasons)
+        state_mod.append_event(
+            run_dir, "floor", slice_id=slice_id,
+            note=f"post-quiesce re-check refused acceptance: {detail}",
+            evidence=str(quiesced_artifact_dir),
+        )
+        state_mod.save_state(run_dir, state, token)
+        return AcceptOutcome(
+            kind="raced", slice_id=slice_id, report=quiesced_report,
+            message=(
+                f"acceptance refused for {slice_id}: the Developer acted while the acceptance was "
+                f"being decided ({detail}), so the evidence the decision rested on is stale and "
+                "nothing was accepted. The Developer has been terminated; re-run `finalize` to see "
+                "the current evidence, then accept or steer afresh."
+            ),
+        )
+    # quiesced_head == head is guaranteed above, so `head` below is already the
+    # post-quiesce value; only the report needs swapping for the authoritative one.
+    report = quiesced_report
 
     reviews_text = _reviews_consulted_text(reviews, head, effective_risk)
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
@@ -1756,6 +1848,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     if ratcheted:
         note = stripped_correction.splitlines()[0][:120] if stripped_correction else "risk raised via finalize --steer"
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
+        _persist_risk_ratchet(run_dir, state, token)
 
     # Increment FIRST, then decide: a candidate attempt count over budget
     # is never persisted, matching start_slice's relaunch-exhaustion path.
@@ -1859,6 +1952,10 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
                 "harness headlessly — relaunch with start-slice"
             )
     except PmError:
+        # The ratchet itself is already durable (persisted immediately after its
+        # event above). This save is still load-bearing for a *different* field:
+        # the gates above may have correlated and stored `session_id` on
+        # `current`, and a refusal should not throw that away.
         if ratcheted:
             state_mod.save_state(run_dir, state, token)
         raise
@@ -1959,9 +2056,11 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
         raise PmError(f"{slice_id} is not present in the run's slice entries")
 
     stripped_reason = reason.strip()
-    if apply_risk_ratchet(entry, current, risk_flag=risk):
+    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
+    if ratcheted:
         note = stripped_reason.splitlines()[0][:120] if stripped_reason else "risk raised via finalize --stop"
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
+        _persist_risk_ratchet(run_dir, state, token)
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
     floor_note = "8/8 passed" if report.passed else "failed: " + ", ".join(
@@ -1973,10 +2072,27 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
     # as finalize_accept: a termination failure raises, and an assessment
     # written first would be left on disk announcing a stop the state never
     # recorded. The floor evidence above is deliberately collected first — a
-    # stop record exists to say what happened, floor passing or not.
+    # stop record exists to say what happened, floor passing or not, and that
+    # event is the record of what the Developer left behind.
     _terminate_current(current)
     for pgid in list(current.get("reviewer_pids") or []):
         _kill_reviewer_pgid(pgid)
+
+    # Re-collect once the Developer is provably dead so the assessment's floor
+    # report and HEAD are one *consistent* pair. HEAD was always read after
+    # termination, so pairing it with the pre-termination report could describe
+    # a tree that never existed at any single instant. Unlike finalize_accept
+    # this can never refuse: a stop records what happened, floor passing or not.
+    report, artifact_dir = _collect_finalize_evidence(repo, state, current)
+    quiesced_floor_note = "8/8 passed" if report.passed else "failed: " + ", ".join(
+        fact.name for fact in report.facts if not fact.passed
+    )
+    if quiesced_floor_note != floor_note:
+        state_mod.append_event(
+            run_dir, "floor", slice_id=slice_id,
+            note=f"post-quiesce re-read (recorded in the assessment): {quiesced_floor_note}",
+            evidence=str(artifact_dir),
+        )
 
     head = git_ops.git_head(repo)
     reviews = list(entry.get("reviews") or [])

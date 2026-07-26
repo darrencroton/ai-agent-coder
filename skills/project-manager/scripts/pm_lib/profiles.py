@@ -208,6 +208,11 @@ def compose_resume_command(
     launch-bound ``session_id``.  Custom ``--harness-command`` overrides are
     intentionally handled by the lifecycle layer: their resume protocol
     re-runs the override with ``PM_DEVELOPER_RESUME_SESSION_ID`` set.
+
+    A resume turn is *not* simply the launch turn with a session id bolted on:
+    each harness's resume subcommand accepts its own flag set, and codex's in
+    particular is much narrower than its launch subcommand's. These shapes are
+    observed against the installed CLIs, not inferred from the launch shapes.
     """
     if harness not in HARNESS_PROFILES:
         raise _unknown_harness_error(harness)
@@ -221,12 +226,28 @@ def compose_resume_command(
             "--permission-mode", "acceptEdits", "--add-dir", repo_str,
         ]
     if harness == "codex":
+        # `codex exec resume` is a stricter parser than `codex exec`: of the
+        # launch turn's flags it accepts only --skip-git-repo-check, and
+        # rejects --sandbox, -C, and --add-dir outright at argument parsing.
+        # The two capabilities worth keeping are re-expressed as -c config
+        # overrides, which resume does accept; -C needs no replacement because
+        # the launcher already passes cwd=repo to Popen, which is also what
+        # makes codex's implicit "workdir" writable root the repo.
         command = [
             "codex", "exec", "resume", session_id, correction,
-            "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", repo_str,
+            "-c", 'sandbox_mode="workspace-write"',
         ]
         if git_access_dir is not None:
-            command.extend(["--add-dir", str(git_access_dir)])
+            # The --add-dir equivalent. json.dumps emits a TOML-compatible
+            # array of escaped strings, so a path containing a quote or a
+            # backslash cannot break out of the override. ensure_ascii=False is
+            # required, not cosmetic: the default escapes a non-BMP character
+            # (an emoji in a worktree path) into a `\\uXXXX` surrogate pair, and
+            # TOML rejects surrogates as not being Unicode scalar values — so a
+            # resume in such a worktree would die in codex's config parser.
+            roots = json.dumps([str(git_access_dir)], ensure_ascii=False)
+            command.extend(["-c", f"sandbox_workspace_write.writable_roots={roots}"])
+        command.append("--skip-git-repo-check")
         return command
     if harness == "copilot":
         return [

@@ -37,6 +37,7 @@ the composing code is written fresh):
 
 from __future__ import annotations
 
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -238,7 +239,12 @@ class TestComposeResumeCommand(unittest.TestCase):
             ),
             (
                 "codex", {"git_access_dir": self._git_dir},
-                ["codex", "exec", "resume", self._session_id, "CORRECTION", "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", "/repo", "--add-dir", "/repo/.git"],
+                [
+                    "codex", "exec", "resume", self._session_id, "CORRECTION",
+                    "-c", 'sandbox_mode="workspace-write"',
+                    "-c", 'sandbox_workspace_write.writable_roots=["/repo/.git"]',
+                    "--skip-git-repo-check",
+                ],
             ),
             (
                 "copilot", {},
@@ -268,6 +274,74 @@ class TestComposeResumeCommand(unittest.TestCase):
             profiles.compose_resume_command("not-a-harness", "CORRECTION", session_id=self._session_id, repo=self._repo)
         command = profiles.compose_resume_command("codex", "CORRECTION", session_id=self._session_id, repo=self._repo)
         self.assertNotIn("--add-dir", command)
+        # No git access requested means no writable-roots override at all,
+        # rather than an empty array that would narrow the sandbox.
+        self.assertEqual(
+            command,
+            [
+                "codex", "exec", "resume", self._session_id, "CORRECTION",
+                "-c", 'sandbox_mode="workspace-write"',
+                "--skip-git-repo-check",
+            ],
+        )
+
+    def test_codex_resume_omits_every_flag_codex_exec_resume_rejects(self) -> None:
+        """`codex exec resume` accepts only --skip-git-repo-check of the launch
+        turn's four flags; the other three are argument-parsing errors, which
+        made `finalize --steer` against a codex Developer impossible. The
+        capabilities survive as -c config overrides, verified against the
+        installed CLI rather than inferred from the launch shape."""
+        for kwargs in ({}, {"git_access_dir": self._git_dir}):
+            with self.subTest(git_access_dir=bool(kwargs)):
+                command = profiles.compose_resume_command(
+                    "codex", "CORRECTION", session_id=self._session_id, repo=self._repo, **kwargs
+                )
+                for rejected in ("--sandbox", "-C", "--add-dir"):
+                    self.assertNotIn(rejected, command)
+                self.assertIn("--skip-git-repo-check", command)
+                self.assertIn('sandbox_mode="workspace-write"', command)
+
+    def test_codex_resume_writable_roots_value_is_escaped_toml(self) -> None:
+        """The writable-roots value is generated, not concatenated, so a path
+        containing a quote or backslash cannot break out of the override."""
+        command = profiles.compose_resume_command(
+            "codex", "CORRECTION", session_id=self._session_id, repo=self._repo,
+            git_access_dir=Path('/repo/we"ird\\path/.git'),
+        )
+        self.assertIn(r'sandbox_workspace_write.writable_roots=["/repo/we\"ird\\path/.git"]', command)
+
+    def test_codex_resume_writable_roots_survives_a_non_bmp_path(self) -> None:
+        """A non-BMP character must be emitted literally, not as a `\\uXXXX`
+        surrogate pair: TOML rejects surrogates as not being Unicode scalar
+        values, so the escaped form would make codex fail in its config parser
+        for any worktree whose path contains an emoji."""
+        command = profiles.compose_resume_command(
+            "codex", "CORRECTION", session_id=self._session_id, repo=self._repo,
+            git_access_dir=Path("/repo/wt-\U0001f600/.git"),
+        )
+        value = next(part for part in command if part.startswith("sandbox_workspace_write."))
+        self.assertIn("\U0001f600", value)
+        self.assertNotIn("\\u", value)
+        # It must be parseable as the TOML it claims to be.
+        self.assertEqual(
+            tomllib.loads(value)["sandbox_workspace_write"]["writable_roots"],
+            ["/repo/wt-\U0001f600/.git"],
+        )
+
+    def test_non_codex_resume_shapes_are_untouched_by_the_codex_fix(self) -> None:
+        """The F1 repair is codex-resume-only: the other four harnesses keep
+        their --add-dir/--dir style access exactly as Slice 2 froze it."""
+        for harness, expected_access in (
+            ("claude", ["--add-dir", "/repo"]),
+            ("copilot", ["--add-dir", "/repo"]),
+            ("opencode", ["--dir", "/repo"]),
+        ):
+            with self.subTest(harness=harness):
+                command = profiles.compose_resume_command(
+                    harness, "CORRECTION", session_id=self._session_id, repo=self._repo
+                )
+                self.assertEqual(command[-2:], expected_access)
+                self.assertNotIn("-c", command)
 
 
 class TestQueryModelIdentityNoInventory(unittest.TestCase):

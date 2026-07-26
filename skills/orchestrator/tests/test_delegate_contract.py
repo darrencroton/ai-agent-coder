@@ -483,14 +483,44 @@ class DelegateContractTests(unittest.TestCase):
                     write_command = delegate_contract.compose_delegate_command(self.validate_write(tool=tool), "prompt")
                 self.assertEqual(read_only_command, write_command)
 
-    def test_opencode_nondefault_effort_fails_closed(self):
+    def test_opencode_nondefault_effort_composes_variant(self):
+        """`opencode run --variant` is the CLI's own "provider-specific reasoning
+        effort" control, so effort maps onto it rather than failing closed. This
+        test previously pinned the opposite claim, which stopped being true."""
         policy = dict(self.policy, required_effort="high")
         request = dict(self.request, effort="high")
         contract = delegate_contract.validate_contract(policy, request, self.run_dir)
-        with self.assertRaises(delegate_contract.DelegateContractError) as raised:
-            delegate_contract.compose_delegate_command(contract, "prompt")
-        self.assertEqual(raised.exception.issues[0].code, "unsupported-effort")
-        self.assertEqual(raised.exception.issues[0].field, "effort")
+        command = delegate_contract.compose_delegate_command(contract, "prompt")
+        self.assertIn("--variant", command)
+        self.assertEqual(command[command.index("--variant") + 1], "high")
+        # The effort flag must not displace the agent/auto/dir tail.
+        self.assertEqual(command[-5:-1], ["--agent", "plan", "--auto", "--dir"])
+        self.assertLess(command.index("--variant"), command.index("--agent"))
+
+    def test_codex_continuation_omits_flags_codex_exec_resume_rejects(self):
+        """`codex exec resume` accepts only --skip-git-repo-check of the launch
+        flags and rejects --sandbox and -C at argument parsing, so composing them
+        meant a codex continuation could never launch (observed: exit 2,
+        "unexpected argument '--sandbox' found"). The sandbox survives as a -c
+        config override; -C is unnecessary because the child runs with
+        cwd=repo_path."""
+        policy = dict(self.policy, required_tools=["codex"])
+        request = dict(self.request, tool="codex")
+        contract = delegate_contract.validate_contract(policy, request, self.run_dir)
+
+        launch = delegate_contract.compose_delegate_command(contract, "prompt")
+        self.assertEqual(launch[:3], ["codex", "exec", "prompt"])
+        self.assertIn("--sandbox", launch)
+        self.assertIn("-C", launch)
+
+        resumed = delegate_contract.compose_delegate_command(
+            contract, "prompt", resume_session_id="session-123"
+        )
+        self.assertEqual(resumed[:5], ["codex", "exec", "resume", "session-123", "prompt"])
+        self.assertNotIn("--sandbox", resumed)
+        self.assertNotIn("-C", resumed)
+        self.assertIn("--skip-git-repo-check", resumed)
+        self.assertIn('sandbox_mode="read-only"', resumed)
 
     def test_qwen_nondefault_effort_fails_closed(self):
         policy = dict(self.policy, required_tools=["qwen"], required_effort="high")

@@ -198,6 +198,88 @@ def _credential_on_launch_body() -> str:
     return "echo 'Enter API key to continue'\nsleep 30"
 
 
+def _acts_during_acceptance_body(repo: Path, last_act: str) -> str:
+    """Do the slice work cleanly, write result.json, then act ONCE more at the
+    moment PM terminates the Developer — the accept-path TOCTOU window.
+
+    Sequencing this off SIGTERM rather than off a commit loop is what makes the
+    race reliable instead of a timing gamble. PM signals the whole process
+    group, so the `sleep` dies immediately and the shell then runs the trap; the
+    trap's own `git` child is spawned after that signal was delivered, so it is
+    not hit by it, and `terminate_headless` waits for the entire group to die
+    before PM can reach its post-quiesce re-check. The last act therefore lands
+    after PM's pre-termination evidence was gathered and before the re-check
+    reads the repo. Until the trap fires the harness is idle and the worktree is
+    clean, so the pre-termination floor sees a genuine 8/8 pass.
+
+    The trap is installed BEFORE `result.json` is published, deliberately: the
+    tests wait on `result.json` to decide the Developer is ready, so publishing
+    first would leave a window where PM could terminate a harness with no
+    handler installed yet.
+
+    One bound remains: `terminate_headless` escalates to SIGKILL after a 5s
+    SIGTERM grace, so a trap somehow exceeding that would be cut short. Neither
+    that nor a trap that silently did nothing can produce a false green — every
+    test below independently asserts that the act really happened — so the worst
+    case is a red flake, never a vacuous pass.
+    """
+    return "\n".join(
+        [
+            'turn_text="${1:-}"',
+            "echo FAKE_HARNESS_WORKING",
+            f'echo "authorized change" >> "{repo}/a.py"',
+            f'git -C "{repo}" add a.py',
+            f'git -C "{repo}" commit -q -m "slice work"',
+            f"trap '{last_act}; exit 0' TERM",
+            write_result_cmd(),
+            "while true; do sleep 0.2; done",
+        ]
+    )
+
+
+def _unauthorized_commit_during_acceptance_body(repo: Path) -> str:
+    """Commits an UNAUTHORIZED file as it is terminated, so the floor genuinely
+    passes before termination and genuinely fails after it. Used to pin that a
+    decision path records evidence measured at one consistent instant."""
+    return _acts_during_acceptance_body(
+        repo,
+        f'echo oops >> "{repo}/b.py"; git -C "{repo}" add b.py; '
+        f'git -C "{repo}" commit -q -m "unauthorized commit during finalize"',
+    )
+
+
+def _corrupts_review_during_acceptance_body(repo: Path) -> str:
+    """Rewrites the recorded review reports as it is terminated. HEAD is
+    unchanged, the worktree stays clean, and no floor fact reads a review
+    artifact — so this is caught only because the mandatory reports' freshness
+    is re-checked after quiescence.
+
+    The write path is real rather than contrived: `_is_review_fresh` re-hashes
+    each report from disk, the originals live under the run directory inside the
+    worktree git dir, and a codex Developer is handed that git dir as an extra
+    writable root so it can commit."""
+    return _acts_during_acceptance_body(
+        repo,
+        f"""for r in "{repo}"/.git/pm/*/slices/slice-001/review-*.md; do echo tampered >> "$r"; done""",
+    )
+
+
+def _commits_during_acceptance_body(repo: Path) -> str:
+    """Slips one more *commit* in as it is terminated, so HEAD provably differs
+    between PM's two evaluations. The commit is empty so the worktree stays
+    clean throughout and HEAD movement is the sole trigger under test."""
+    return _acts_during_acceptance_body(
+        repo, f'git -C \"{repo}\" commit -q --allow-empty -m \"commit during acceptance\"'
+    )
+
+
+def _edits_during_acceptance_body(repo: Path) -> str:
+    """Slips an uncommitted *edit* in as it is terminated. HEAD is unchanged, so
+    this is caught only because the whole floor is re-evaluated (fact 7,
+    clean-worktree) rather than HEAD alone being re-read."""
+    return _acts_during_acceptance_body(repo, f'echo \"late edit\" >> \"{repo}/a.py\"')
+
+
 def _write_fake(path: Path, body: str) -> Path:
     path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -385,6 +467,365 @@ class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
         entry = state["slices"][0]
         self.assertIsNone(entry.get("status"))
         self.assertIsNotNone(state["current_slice"])
+
+
+# --- 2b: the accept-path TOCTOU window ----------------------------------------
+#
+# The floor evaluation and the review-freshness gate both necessarily run while
+# the Developer is still live. A harness that acts in that window would earn an
+# ACCEPTED assessment describing a tree that is no longer current, carrying a
+# commit that never faced the surface-authorization fact. PM therefore takes the
+# evidence again once the process is provably dead and records the acceptance
+# only if the floor still passes and HEAD is unchanged.
+
+
+class TestAcceptRefusesWhenDeveloperActsDuringAcceptance(FinalizeTestCase):
+    def _run_to_result(self, body: str) -> tuple[str, str, Path, tuple[int, int, str] | None]:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", body)
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        coords = self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+        return run_id, token, run_dir, coords
+
+    def _assert_nothing_accepted(self, run_dir: Path, token: str) -> None:
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        self.assertIsNone(entry.get("status"))
+        self.assertIsNone(entry.get("commit"))
+        self.assertIsNone(entry.get("assessment"))
+        # The slice stays undecided and open, so the operator can re-finalize.
+        self.assertIsNotNone(state["current_slice"])
+        self.assertNotEqual(state.get("status"), "complete")
+        assessment = run_dir / "slices" / "slice-001" / "assessment.md"
+        self.assertFalse(assessment.exists(), "an acceptance PM refused must leave no assessment on disk")
+
+    def test_commit_during_termination_refuses_acceptance(self) -> None:
+        run_id, token, run_dir, _coords = self._run_to_result(_commits_during_acceptance_body(self.repo))
+
+        # The pre-termination floor is a genuine 8/8, so this acceptance would
+        # have succeeded before the post-quiesce re-check existed.
+        code, out, err = self.run_cli_in_repo(["finalize", "--token", token])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count(" PASS "), 8)
+        head_before = self._git("rev-parse", "HEAD").stdout.strip()
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("acted while the acceptance was being decided", out + err)
+        self.assertIn("HEAD moved from", out + err)
+
+        head_after = self._git("rev-parse", "HEAD").stdout.strip()
+        self.assertNotEqual(head_before, head_after, "the fake must really have moved HEAD, or this test is vacuous")
+        self.assertIn(head_before, out + err)
+        self.assertIn(head_after, out + err)
+        self._assert_nothing_accepted(run_dir, token)
+
+    def test_uncommitted_edit_during_termination_refuses_acceptance(self) -> None:
+        """HEAD is unchanged here; only re-running the *whole floor* catches it."""
+        run_id, token, run_dir, _coords = self._run_to_result(_edits_during_acceptance_body(self.repo))
+        head_before = self._git("rev-parse", "HEAD").stdout.strip()
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("acted while the acceptance was being decided", out + err)
+        self.assertIn("the floor no longer passes: clean-worktree", out + err)
+        self.assertNotIn("HEAD moved from", out + err)
+
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), head_before)
+        self.assertTrue(
+            self._git("status", "--porcelain").stdout.strip(),
+            "the fake must really have dirtied the worktree, or this test is vacuous",
+        )
+        self._assert_nothing_accepted(run_dir, token)
+
+    def test_quiet_developer_still_accepts_and_records_post_quiesce_evidence(self) -> None:
+        """The guard against the opposite failure: PM collects evidence twice,
+        and `_collect_finalize_evidence` rewrites `status-after.txt` and
+        `diff.patch` on both runs, so this pins that the second evaluation does
+        not spuriously refuse an ordinary acceptance. The harness stays alive
+        until PM terminates it, so termination and the re-check both really run.
+        """
+        run_id, token, run_dir, coords = self._run_to_result(
+            commit_and_result_body(self.repo, delay=0.2, tail_sleep=30.0)
+        )
+        assert coords is not None
+        self.assertTrue(self._proc_alive(coords), "the Developer must still be live when acceptance begins")
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ACCEPTED", out)
+
+        self.assertTrue(self._wait_for(lambda: not self._proc_alive(coords)))
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        self.assertEqual(entry["status"], "accepted")
+        # The recorded commit is the post-quiesce HEAD, which here equals the
+        # pre-termination one precisely because nothing raced.
+        self.assertEqual(entry["commit"], head)
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), head)
+        assessment_text = Path(entry["assessment"]).read_text(encoding="utf-8")
+        self.assertEqual(assessment_text.count(": PASS"), 8)
+
+    def test_review_corrupted_during_termination_refuses_acceptance(self) -> None:
+        """The mandatory reports are acceptance evidence too. Re-checking only
+        the floor and HEAD would miss a Developer that rewrote a required review
+        on its way out: HEAD is unchanged, the worktree is clean, and no floor
+        fact reads a review artifact — so the acceptance would proceed, and the
+        ACCEPTED assessment would render its own mandatory review as
+        `[SUPERSEDED - stale for current HEAD]`."""
+        plan_path = self.write_plan(
+            self._plan_path(), slices=[{"files": ["a.py"], "risky": "touches auth"}]
+        )
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", _corrupts_review_during_acceptance_body(self.repo)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        for skill, marker in (("drift-audit", "drift-1"), ("code-review", "code-1")):
+            fake = _fake_reviewer_ok(self.repo.parent / f"fake_{marker}.sh", marker)
+            code, _out, err = self.run_cli_in_repo(
+                ["review", "--slice", "Slice 1", "--skill", skill, "--tool", "t1",
+                 "--reviewer-command", str(fake), "--token", token]
+            )
+            self.assertEqual(code, 0, err)
+
+        reports = sorted((run_dir / "slices" / "slice-001").glob("review-*.md"))
+        self.assertEqual(len(reports), 2, "both mandatory reviews must exist before the accept")
+        before = {path: path.read_bytes() for path in reports}
+        head_before = self._git("rev-parse", "HEAD").stdout.strip()
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("acted while the acceptance was being decided", out + err)
+        self.assertIn("required review(s) no longer fresh", out + err)
+        # HEAD and the worktree are untouched: freshness is the sole trigger.
+        self.assertNotIn("HEAD moved from", out + err)
+        self.assertNotIn("the floor no longer passes", out + err)
+
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), head_before)
+        self.assertTrue(
+            any(path.read_bytes() != before[path] for path in reports),
+            "the fake must really have altered a review report, or this test is vacuous",
+        )
+        self._assert_nothing_accepted(run_dir, token)
+
+    def test_refusals_that_precede_termination_still_leave_the_developer_alive(self) -> None:
+        """The ordering the fix must not disturb: floor-failed and reviews-stale
+        both refuse *before* termination, so the operator can still steer. Only
+        the race refusal happens after termination, because detecting it
+        requires the Developer to be dead."""
+        plan_path = self.write_plan(
+            self._plan_path(), slices=[{"files": ["a.py"], "risky": "touches auth"}]
+        )
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh",
+            commit_and_result_body(self.repo, unauthorized_file="b.py", delay=0.2, tail_sleep=30.0),
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        coords = self._track_current_process(run_id, token)
+        assert coords is not None
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        # Floor-failed (b.py is outside the authorized surface).
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("floor failed", out + err)
+        self.assertTrue(self._proc_alive(coords), "a floor-failed refusal must leave the Developer steerable")
+
+        # Reviews-stale: make the floor pass, leaving the elevated slice's
+        # missing reviews as the only refusal reason.
+        self._git("rm", "-q", "--cached", "b.py")
+        (self.repo / "b.py").unlink()
+        self._git("commit", "-q", "-m", "drop the unauthorized file")
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("drift-audit", out + err)
+        self.assertTrue(self._proc_alive(coords), "a reviews-stale refusal must leave the Developer steerable")
+
+
+class TestStopRecordsConsistentEvidence(FinalizeTestCase):
+    def test_stop_assessment_pairs_post_quiesce_floor_with_post_quiesce_head(self) -> None:
+        """`finalize --stop` always read HEAD *after* termination but collected
+        the floor report *before* it, so a Developer acting in that window
+        produced a STOPPED record pairing a report and a HEAD that never
+        described the tree at the same instant. The fake commits an unauthorized
+        file on its way out: the pre-termination floor is a genuine 8/8, the
+        post-quiesce floor genuinely fails the surface fact, and the assessment
+        must describe the tree its recorded HEAD actually names.
+
+        A stop must still be *recorded* — it reports what happened, floor
+        passing or not — so this asserts consistency, never a refusal.
+        """
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", _unauthorized_commit_during_acceptance_body(self.repo)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        self._track_current_process(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--token", token])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.count(" PASS "), 8, "the floor must genuinely pass before termination")
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--stop", "human needed", "--token", token])
+        self.assertEqual(code, 0, out + err)
+
+        head_after = self._git("rev-parse", "HEAD").stdout.strip()
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        self.assertEqual(entry["status"], "stopped")
+
+        assessment_text = Path(entry["assessment"]).read_text(encoding="utf-8")
+        self.assertIn(head_after, assessment_text, "the assessment records the post-quiesce HEAD")
+        self.assertTrue(
+            self._git("show", "--stat", "--oneline", head_after).stdout.find("b.py") >= 0,
+            "the fake must really have committed the unauthorized file, or this test is vacuous",
+        )
+        # The report must describe THAT commit's tree, not the pre-termination one.
+        self.assertIn("surface: FAIL", assessment_text)
+        self.assertNotEqual(assessment_text.count(": PASS"), 8)
+
+
+class TestRatchetSurvivesAnyLaterFailure(FinalizeTestCase):
+    """A raised risk must be as durable as the `risk-raise` event announcing it.
+
+    Every decision path applies the ratchet, appends that durable event, and then
+    does a lot of fallible work before it would otherwise save state. If anything
+    in that stretch raises, the event log would claim an elevated slice while
+    authenticated state still said `standard` — and a later acceptance would skip
+    the elevated review requirement the event says was armed.
+
+    Each case gets its OWN run. Sharing one run across cases would let a case
+    whose guard is entirely missing still observe the `elevated` a previous case
+    had already persisted — passing vacuously.
+    """
+
+    def _fresh_run_at_standard_risk(self, body: str | None = None) -> tuple[Path, str]:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", body or idle_body())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        self._track_current_process(run_id, token)
+        self.assertEqual(
+            state_mod.load_state(run_dir, token)["slices"][0].get("risk"), "standard",
+            "each case must start from standard, or it cannot prove anything",
+        )
+        return run_dir, token
+
+    def _assert_elevated_survived(self, run_dir: Path, token: str) -> None:
+        self.assertEqual(
+            state_mod.load_state(run_dir, token)["slices"][0].get("risk"), "elevated",
+            "the ratchet the durable risk-raise event announced must survive the failure",
+        )
+
+    def _accept(self, run_dir: Path, token: str):
+        return slice_ops.finalize_accept(
+            self.repo, run_dir, token, reasoning=_LONG_REASONING, risk="elevated")
+
+    def _stop(self, run_dir: Path, token: str):
+        return slice_ops.finalize_stop(
+            self.repo, run_dir, token, reason="human needed", risk="elevated")
+
+    def test_ratchet_survives_a_raising_evidence_collection(self) -> None:
+        """A PmError is the failure anyone thinks to catch. A FileNotFoundError
+        is the one that actually happens: `_collect_finalize_evidence` writes
+        `status-after.txt` into the artifact dir, so a Developer that deletes
+        that dir on its way out raises OSError, not PmError. Catching only
+        PmError would pass the first and lose the ratchet on the second."""
+        for path_name, call in (("accept", self._accept), ("stop", self._stop)):
+            for failure_name, exc in (
+                ("PmError", PmError("artifact dir vanished")),
+                ("FileNotFoundError", FileNotFoundError("artifact dir vanished")),
+            ):
+                with self.subTest(path=path_name, failure=failure_name):
+                    run_dir, token = self._fresh_run_at_standard_risk()
+                    with mock.patch.object(slice_ops, "_collect_finalize_evidence", side_effect=exc):
+                        with self.assertRaises(type(exc)):
+                            call(run_dir, token)
+                    self._assert_elevated_survived(run_dir, token)
+
+    def _run_with_passing_floor(self) -> tuple[Path, str]:
+        run_dir, token = self._fresh_run_at_standard_risk(
+            commit_and_result_body(self.repo, delay=0.2, tail_sleep=30.0)
+        )
+        artifact_dir = Path(self._current(run_dir.name, token)["artifact_dir"])
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=15.0))
+        return run_dir, token
+
+    def test_ratchet_survives_a_termination_failure_on_stop(self) -> None:
+        """Termination raises from *outside* evidence collection, so a guard
+        wrapped around collection alone cannot cover it."""
+        run_dir, token = self._run_with_passing_floor()
+        with mock.patch.object(
+            slice_ops, "_terminate_current", side_effect=PmError("group survived SIGKILL")
+        ):
+            with self.assertRaises(PmError):
+                self._stop(run_dir, token)
+        self._assert_elevated_survived(run_dir, token)
+
+    def test_ratchet_survives_a_termination_failure_on_accept(self) -> None:
+        """Same for accept — but reaching termination there needs the two
+        mandatory reviews recorded first, because the ratchet this test applies
+        is precisely what makes them mandatory, and the review-freshness gate
+        deliberately returns *before* termination."""
+        run_dir, token = self._run_with_passing_floor()
+        for skill, marker in (("drift-audit", "d1"), ("code-review", "c1")):
+            fake = _fake_reviewer_ok(self.repo.parent / f"rev_{marker}.sh", marker)
+            code, _out, err = self.run_cli_in_repo(
+                ["review", "--slice", "Slice 1", "--skill", skill, "--tool", "t1",
+                 "--reviewer-command", str(fake), "--token", token]
+            )
+            self.assertEqual(code, 0, err)
+
+        with mock.patch.object(
+            slice_ops, "_terminate_current", side_effect=PmError("group survived SIGKILL")
+        ):
+            with self.assertRaises(PmError):
+                self._accept(run_dir, token)
+        self._assert_elevated_survived(run_dir, token)
+
+    def test_ratchet_survives_a_refused_steer(self) -> None:
+        """`finalize_steer` never collects floor evidence, so its own fallible
+        gate is the one that matters: an idle fake emits no session id, so the
+        steer fails closed at the require-id gate after the ratchet's event was
+        already durable."""
+        run_dir, token = self._fresh_run_at_standard_risk()
+        with self.assertRaises(PmError):
+            slice_ops.finalize_steer(
+                self.repo, run_dir, token, correction="please fix the thing", risk="elevated")
+        self._assert_elevated_survived(run_dir, token)
 
 
 # --- 3: reasoning too short ----------------------------------------------------

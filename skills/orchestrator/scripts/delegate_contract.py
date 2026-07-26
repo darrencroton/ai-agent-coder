@@ -741,22 +741,19 @@ def compose_delegate_command(
         )
 
     if tool == "opencode":
-        if effort != "default":
-            raise DelegateContractError(
-                [
-                    ContractIssue(
-                        "unsupported-effort",
-                        "effort",
-                        "the tested OpenCode run command has no effort/variant flag",
-                        "Set effort to 'default'; choose the configured model explicitly if a different capability level is required.",
-                    )
-                ]
-            )
         command = ["opencode", "run", prompt]
         if resume_session_id is not None:
             command.extend(["--session", resume_session_id])
         if model != "default":
             command.extend(["-m", model])
+        if effort != "default":
+            # `opencode run --variant` is documented by the CLI as "model variant
+            # (provider-specific reasoning effort, e.g., high, max, minimal)", so
+            # it is OpenCode's reasoning-effort control. This branch used to fail
+            # closed on the claim that no such flag existed, which stopped being
+            # true; values are provider-specific and pass through verbatim, as
+            # for every other harness's effort flag.
+            command.extend(["--variant", effort])
         command.extend(["--agent", "build" if write else "plan", "--auto", "--dir", repo])
         return command
 
@@ -796,9 +793,10 @@ def compose_delegate_command(
         return command
 
     if tool == "codex":
+        resuming = resume_session_id is not None
         command = (
             ["codex", "exec", "resume", resume_session_id, prompt]
-            if resume_session_id is not None
+            if resuming
             else ["codex", "exec", prompt]
         )
         if model != "default":
@@ -806,7 +804,18 @@ def compose_delegate_command(
         if effort != "default":
             command.extend(["-c", f'model_reasoning_effort="{effort}"'])
         sandbox = "workspace-write" if write else "read-only"
-        command.extend(["--sandbox", sandbox, "--skip-git-repo-check", "-C", repo])
+        if resuming:
+            # `codex exec resume` is a stricter parser than `codex exec`: of the
+            # launch flags it accepts only --skip-git-repo-check, and rejects
+            # --sandbox and -C outright at argument parsing. Composing them here
+            # meant a codex continuation could never launch — it exited 2 with
+            # "unexpected argument '--sandbox' found" before doing any work. The
+            # sandbox becomes an equivalent -c config override, which resume does
+            # accept; -C needs no replacement because delegate_jobs.py already
+            # passes cwd=repo_path to the child process.
+            command.extend(["-c", f'sandbox_mode="{sandbox}"', "--skip-git-repo-check"])
+        else:
+            command.extend(["--sandbox", sandbox, "--skip-git-repo-check", "-C", repo])
         return command
 
     if tool == "copilot":
