@@ -1132,6 +1132,22 @@ class TestLaunchSessionIdCorrelation(unittest.TestCase):
         with mock.patch.object(slice_ops, "_opencode_session_db", lambda: db):
             self.assertIsNone(self._capture("opencode"))
 
+    def test_opencode_store_matches_quote_wrapped_text(self) -> None:
+        # Some opencode versions persist the first user-message part wrapped
+        # in one extra literal pair of double quotes (PM Test 2, headless
+        # round): stored text == '"' + prompt + '"'. The matcher must strip
+        # exactly one such layer rather than failing the exact-match closed.
+        db = self.home / ".local" / "share" / "opencode" / "opencode.db"
+        now_ms = int(time.time() * 1000)
+        wrapped = json.dumps({"type": "text", "text": f'"{self.pointer}"'})
+        self._opencode_db(
+            db,
+            [("sess-quoted", str(self.repo), now_ms)],
+            [("p1", "sess-quoted", wrapped, now_ms)],
+        )
+        with mock.patch.object(slice_ops, "_opencode_session_db", lambda: db):
+            self.assertEqual(self._capture("opencode"), "sess-quoted")
+
     # -- qwen: unique record from the per-project chats store --
 
     def _qwen_write(self, chats: Path, session_id: str, *, cwd: Path, prompt: str, ts: str) -> Path:

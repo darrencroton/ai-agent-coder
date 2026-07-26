@@ -38,7 +38,7 @@ Frozen contract (this is your complete authorization):
 Workflow:
 1. Apply the scoped-implementation skill against this frozen contract. If the skill is not installed on this harness, follow the contract directly and note `skill unavailable: scoped-implementation` in your summary.
 2. Run the validation required by the contract. Write what you ran and the actual output that matters to `{artifact_dir}/validation.md` — honest evidence, including failures.
-3. When the slice passes its validation, commit it with the commit skill (or a clean conventional commit if the skill is unavailable). Commit only this slice's work.
+3. When the slice passes its validation, commit it with the commit skill (or a clean conventional commit if the skill is unavailable). Commit only this slice's work. This is a headless, non-interactive run: once validation passes you have explicit permission to commit directly — do not pause to ask for confirmation, even if your own project instructions otherwise say to ask before committing; nothing here authorizes anything beyond this one slice's commit.
 4. Write `{result_path}` as your completion signal:
 
     {{"slice": "{slice_id}", "status": "done", "summary": "<one honest paragraph>", "notes": "<optional: decisions, interfaces, lessons, or warnings worth carrying to later slices>"}}

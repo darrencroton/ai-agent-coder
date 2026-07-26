@@ -518,7 +518,22 @@ def _opencode_part_matches_prompt(data: str, prompt: str) -> bool:
         payload = json.loads(data)
     except (json.JSONDecodeError, TypeError, ValueError):
         return False
-    return isinstance(payload, dict) and payload.get("type") == "text" and payload.get("text") == prompt
+    if not isinstance(payload, dict) or payload.get("type") != "text":
+        return False
+    text = payload.get("text")
+    if text == prompt:
+        return True
+    # Some opencode versions persist the first user-message part wrapped in
+    # one extra literal pair of double quotes not present in the rendered
+    # prompt (observed empirically: stored text == '"' + prompt + '"').
+    # Strip exactly one such layer before giving up the match.
+    return (
+        isinstance(text, str)
+        and len(text) >= 2
+        and text[0] == '"'
+        and text[-1] == '"'
+        and text[1:-1] == prompt
+    )
 
 
 def _opencode_store_session_id(*, cwd: Path, prompt: str, started_at: float, latest: float) -> str | None:
