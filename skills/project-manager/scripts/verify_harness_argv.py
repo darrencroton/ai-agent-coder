@@ -28,9 +28,9 @@ Usage
     python3 skills/project-manager/scripts/verify_harness_argv.py
     python3 skills/project-manager/scripts/verify_harness_argv.py --harness codex
 
-Exit status is 0 when every flag of every installed harness was found, and 1
-when any flag is missing — that is a frozen command shape which the installed
-CLI would reject.
+Exit status is 0 when every flag of every installed harness was found, 1 when
+any flag is not advertised by the receiving command's help, and 2 when a CLI
+could not be queried reliably.
 """
 
 from __future__ import annotations
@@ -87,9 +87,9 @@ def _flags(argv: list[str]) -> list[str]:
 
 
 def _help_text(command: list[str]) -> str:
-    # Generous: some CLIs are slow to print help on a cold start, and a timeout
-    # here must never be mistaken for a missing flag.
+    # A timeout or non-zero exit is inconclusive, not evidence of a missing flag.
     result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=180)
+    result.check_returncode()
     return (result.stdout or "") + (result.stderr or "")
 
 
@@ -114,13 +114,9 @@ def _composed(harness: str) -> list[tuple[str, list[str]]]:
     git_dir = _GIT_DIR if harness == "codex" else None
     out: list[tuple[str, list[str]]] = []
     for mode in ("developer", "reviewer"):
-        # Model and effort are composed as SEPARATE variants, not just combined.
-        # A combined-only matrix silently loses coverage for a harness that
-        # fails closed on effort: qwen's refusal would discard the whole
-        # variant, taking its perfectly valid --model with it, and qwen would
-        # still be counted as checked. Separating them means only the effort
-        # variant can be refused.
-        for model, effort in ((None, None), ("a-model", None), (None, "high"), ("a-model", "high")):
+        # Separate variants keep qwen's expected effort refusal from hiding its
+        # valid model flag. A base or combined variant adds no flag coverage.
+        for model, effort in (("a-model", None), (None, "high")):
             try:
                 out.append((
                     "launch",
@@ -162,20 +158,24 @@ def verify(harness: str) -> tuple[bool, bool, list[str]]:
     # (claude, copilot, qwen) map both kinds to the same `--help`, and invoking
     # a slow CLI twice for identical output is pure waste.
     help_cache: dict[tuple[str, ...], str] = {}
-    ok = True
+    # Check the union once per receiving command. This script verifies flag
+    # presence, not argv combinations, so per-variant reports are redundant.
+    grouped: dict[tuple[str, tuple[str, ...]], set[str]] = {}
     for kind, argv in _composed(harness):
         help_command = _HELP_COMMANDS[(harness, kind)]
-        key = tuple(help_command)
-        if key not in help_cache:
-            help_cache[key] = _help_text(help_command)
-        missing = [flag for flag in _flags(argv) if not _mentions(help_cache[key], flag)]
+        grouped.setdefault((kind, tuple(help_command)), set()).update(_flags(argv))
+
+    ok = True
+    for (kind, help_command), flags in grouped.items():
+        if help_command not in help_cache:
+            help_cache[help_command] = _help_text(list(help_command))
+        missing = [flag for flag in sorted(flags) if not _mentions(help_cache[help_command], flag)]
         if missing:
             ok = False
-            lines.append(f"{harness} {kind}: MISSING {', '.join(missing)}")
-            lines.append(f"    composed: {' '.join(argv)}")
-            lines.append(f"    checked against: {' '.join(_HELP_COMMANDS[(harness, kind)])}")
+            lines.append(f"{harness} {kind}: NOT ADVERTISED {', '.join(missing)}")
+            lines.append(f"    checked against: {' '.join(help_command)}")
         else:
-            lines.append(f"{harness} {kind}: ok ({len(_flags(argv))} flags)")
+            lines.append(f"{harness} {kind}: ok ({len(flags)} flags)")
     return ok, True, lines
 
 
@@ -200,13 +200,18 @@ def main(argv: list[str] | None = None) -> int:
             # verification tool that conflates the two cries wolf, and a tool
             # that cries wolf stops being read.
             unverifiable.append(harness)
-            lines = [f"{harness}: COULD NOT VERIFY - {type(exc).__name__}: {exc}"]
+            detail = str(exc)
+            if isinstance(exc, subprocess.CalledProcessError):
+                cli_output = (exc.stderr or exc.stdout or "").strip()
+                if cli_output:
+                    detail += f": {cli_output}"
+            lines = [f"{harness}: COULD NOT VERIFY - {type(exc).__name__}: {detail}"]
         for line in lines:
             print(line)
 
     print()
     if rejected:
-        print(f"RESULT: a frozen command shape would be REJECTED by: {', '.join(rejected)}")
+        print(f"RESULT: composed flags not advertised by CLI help: {', '.join(rejected)}")
         return 1
     if unverifiable:
         print(f"RESULT: INCONCLUSIVE - could not query: {', '.join(unverifiable)}. No flag mismatch was found "

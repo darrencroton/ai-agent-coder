@@ -37,6 +37,7 @@ the composing code is written fresh):
 
 from __future__ import annotations
 
+import subprocess
 import tomllib
 import unittest
 from pathlib import Path
@@ -50,6 +51,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from pm_lib import PmError
 from pm_lib import profiles
+import verify_harness_argv
 
 
 class TestHarnessProfileTable(unittest.TestCase):
@@ -99,6 +101,36 @@ class TestHarnessProfileTable(unittest.TestCase):
         message = str(ctx.exception)
         for name in profiles.SUPPORTED_HARNESSES:
             self.assertIn(name, message)
+
+
+class TestHarnessArgvVerifier(unittest.TestCase):
+    def test_nonzero_help_exit_is_inconclusive(self) -> None:
+        error = subprocess.CalledProcessError(2, ["tool", "--help"], stderr="help failed")
+        with mock.patch.object(verify_harness_argv, "verify", side_effect=error):
+            with mock.patch("builtins.print") as print_mock:
+                result = verify_harness_argv.main(["--harness", "codex"])
+        self.assertEqual(result, 2)
+        output = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("INCONCLUSIVE", output)
+        self.assertIn("help failed", output)
+
+    def test_composed_variants_cover_flags_without_redundant_combinations(self) -> None:
+        commands = verify_harness_argv._composed("codex")
+        self.assertEqual(sum(kind == "launch" for kind, _command in commands), 4)
+        launch_flags = {
+            flag
+            for kind, command in commands
+            if kind == "launch"
+            for flag in verify_harness_argv._flags(command)
+        }
+        self.assertIn("-m", launch_flags)
+        self.assertIn("-c", launch_flags)
+
+        qwen_commands = verify_harness_argv._composed("qwen")
+        self.assertEqual(sum(kind == "launch" for kind, _command in qwen_commands), 2)
+        self.assertTrue(
+            any("--model" in command for kind, command in qwen_commands if kind == "launch")
+        )
 
 
 class TestComposeHeadlessDeveloperCommand(unittest.TestCase):

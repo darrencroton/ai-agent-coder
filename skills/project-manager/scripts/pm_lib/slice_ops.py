@@ -1457,25 +1457,31 @@ def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[
     return report, artifact_dir
 
 
-def _persist_risk_ratchet(run_dir: Path, state: dict[str, Any], token: str) -> None:
-    """Durably record a just-applied risk ratchet, immediately.
+def _raise_risk(
+    run_dir: Path,
+    state: dict[str, Any],
+    current: dict[str, Any],
+    entry: dict[str, Any],
+    token: str,
+    *,
+    risk_flag: str | None,
+    note: str,
+) -> bool:
+    """Apply and persist a risk ratchet before any later operation can fail.
 
-    A decision path applies the ratchet, appends a `risk-raise` event, and then
-    does a lot of fallible work — evidence collection touches the filesystem,
-    termination can raise, review artifacts are re-hashed from disk — before it
-    would otherwise save state. Any exception in that stretch would leave the
-    durable event log claiming an elevated slice while authenticated state still
-    said `standard`, and a later acceptance would then skip the very elevated
-    review requirement the event announced.
-
-    Saving here rather than guarding each fallible step is what makes that
-    impossible for *every* failure mode rather than the handful anyone thought
-    to catch. It is safe precisely because it happens while the ratchet's risk
-    fields are the only mutation on `state`: no decision has been made yet, so
-    there is no half-written decision to persist. The later save rewrites the
-    same fields.
+    Only the ratchet's risk fields may be mutated on ``state`` when called.
     """
+    if not apply_risk_ratchet(entry, current, risk_flag=risk_flag):
+        return False
+    state_mod.append_event(run_dir, "risk-raise", slice_id=current["id"], note=note)
     state_mod.save_state(run_dir, state, token)
+    return True
+
+
+def _floor_note(report: FloorReport) -> str:
+    if report.passed:
+        return "8/8 passed"
+    return "failed: " + ", ".join(fact.name for fact in report.facts if not fact.passed)
 
 
 def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) -> FinalizeOutcome:
@@ -1489,17 +1495,21 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
         entry = slice_entry(state, slice_id)
         if entry is None:
             raise PmError(f"{slice_id} is not present in the run's slice entries")
-        if apply_risk_ratchet(entry, current, risk_flag=risk):
-            state_mod.append_event(
-                run_dir, "risk-raise", slice_id=slice_id, note="risk raised via bare finalize --risk elevated"
-            )
+        _raise_risk(
+            run_dir,
+            state,
+            current,
+            entry,
+            token,
+            risk_flag=risk,
+            note="risk raised via bare finalize --risk elevated",
+        )
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
 
-    note = "8/8 passed" if report.passed else "failed: " + ", ".join(
-        fact.name for fact in report.facts if not fact.passed
+    state_mod.append_event(
+        run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir)
     )
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=note, evidence=str(artifact_dir))
     # updated_at bump (and, when --risk was given, the ratchet) only — no
     # other semantic field changes in bare finalize.
     state_mod.save_state(run_dir, state, token)
@@ -1660,15 +1670,18 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     if entry is None:
         raise PmError(f"{slice_id} is not present in the run's slice entries")
 
-    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
-    if ratcheted:
-        state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=stripped_reasoning.splitlines()[0][:120])
-        _persist_risk_ratchet(run_dir, state, token)
+    _raise_risk(
+        run_dir,
+        state,
+        current,
+        entry,
+        token,
+        risk_flag=risk,
+        note=stripped_reasoning.splitlines()[0][:120],
+    )
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    floor_note = "8/8 passed" if report.passed else "failed: " + ", ".join(
-        fact.name for fact in report.facts if not fact.passed
-    )
+    floor_note = _floor_note(report)
     state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=floor_note, evidence=str(artifact_dir))
 
     if not report.passed:
@@ -1704,25 +1717,10 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     # the operator can still steer it.
     _terminate_current(current)
 
-    # Everything gated above was measured while the Developer was still live,
-    # so it describes a tree the Developer could still have been changing: a
-    # harness that committed in that window would otherwise earn an ACCEPTED
-    # assessment describing a tree that is no longer current, carrying a commit
-    # that never faced the surface-authorization fact. Now that the process is
-    # provably dead, take the evidence again. This second pair is the only one
-    # measured against a repository no tracked process can still mutate, so it
-    # is the authoritative one and it is what the assessment records.
-    #
-    # Re-running the whole floor rather than only re-reading HEAD is deliberate:
-    # a Developer that *edited* without committing leaves HEAD identical but
-    # trips the clean-worktree fact, and one that wrote a hard-stop marker on
-    # its way out trips fact 8.
-    #
-    # This needs no new machinery (VISION principle 9): _collect_finalize_evidence
-    # is idempotent and saves no state, and no floor fact reads either of the two
-    # files it rewrites (status-after.txt, diff.patch), so its own writes cannot
-    # flip a fact.
-    #
+    # The earlier gates preserve steerability on refusal but observed a live
+    # Developer. Re-run the whole floor now: HEAD alone would miss uncommitted
+    # edits and hard-stop output written during termination. Evidence collection
+    # rewrites status-after.txt and diff.patch, neither of which is a floor input.
     quiesced_report, quiesced_artifact_dir = _collect_finalize_evidence(repo, state, current)
     quiesced_head = git_ops.git_head(repo)
 
@@ -1733,14 +1731,8 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         failed_names = ", ".join(fact.name for fact in quiesced_report.facts if not fact.passed)
         reasons.append(f"the floor no longer passes: {failed_names}")
     if effective_risk == "elevated":
-        # The mandatory reviews are acceptance evidence too, and _is_review_fresh
-        # re-hashes each report from disk. The pre-termination gate above ran
-        # while the Developer was live, and a codex Developer is handed the
-        # worktree git dir as a writable root — which is exactly where review
-        # originals live. So a report rewritten on the way out would otherwise
-        # sail through: it moves neither HEAD nor the worktree, and no floor
-        # fact reads it. Without this check the ACCEPTED assessment could even
-        # render its own mandatory review as "[SUPERSEDED - stale]".
+        # Review artifacts under the worktree git dir are writable by a Codex
+        # Developer through its extra git-dir root, and are not floor inputs.
         still_fresh = _fresh_reviews_for_head(reviews, quiesced_head)
         lost = sorted(set(_REQUIRED_ELEVATED_REVIEW_SKILLS) - set(still_fresh.keys()))
         if lost:
@@ -1844,11 +1836,19 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # verbatim correction can legitimately start or end with meaningful
     # whitespace (e.g. an indented code block).
     stripped_correction = correction.strip()
-    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
-    if ratcheted:
-        note = stripped_correction.splitlines()[0][:120] if stripped_correction else "risk raised via finalize --steer"
-        state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
-        _persist_risk_ratchet(run_dir, state, token)
+    ratcheted = _raise_risk(
+        run_dir,
+        state,
+        current,
+        entry,
+        token,
+        risk_flag=risk,
+        note=(
+            stripped_correction.splitlines()[0][:120]
+            if stripped_correction
+            else "risk raised via finalize --steer"
+        ),
+    )
 
     # Increment FIRST, then decide: a candidate attempt count over budget
     # is never persisted, matching start_slice's relaunch-exhaustion path.
@@ -2056,16 +2056,18 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
         raise PmError(f"{slice_id} is not present in the run's slice entries")
 
     stripped_reason = reason.strip()
-    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
-    if ratcheted:
-        note = stripped_reason.splitlines()[0][:120] if stripped_reason else "risk raised via finalize --stop"
-        state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
-        _persist_risk_ratchet(run_dir, state, token)
+    _raise_risk(
+        run_dir,
+        state,
+        current,
+        entry,
+        token,
+        risk_flag=risk,
+        note=stripped_reason.splitlines()[0][:120] if stripped_reason else "risk raised via finalize --stop",
+    )
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    floor_note = "8/8 passed" if report.passed else "failed: " + ", ".join(
-        fact.name for fact in report.facts if not fact.passed
-    )
+    floor_note = _floor_note(report)
     state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=floor_note, evidence=str(artifact_dir))
 
     # Terminate before publishing the STOPPED assessment, for the same reason
@@ -2084,9 +2086,7 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
     # a tree that never existed at any single instant. Unlike finalize_accept
     # this can never refuse: a stop records what happened, floor passing or not.
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    quiesced_floor_note = "8/8 passed" if report.passed else "failed: " + ", ".join(
-        fact.name for fact in report.facts if not fact.passed
-    )
+    quiesced_floor_note = _floor_note(report)
     if quiesced_floor_note != floor_note:
         state_mod.append_event(
             run_dir, "floor", slice_id=slice_id,
