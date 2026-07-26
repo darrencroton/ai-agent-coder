@@ -24,7 +24,7 @@ Each skill is a self-contained directory under [`skills/`](skills/) with a stand
 
 - **Compose through a bootstrap repo.** If you maintain a private agent-home repo that composes skills from several sources into one canonical catalogue, register this repo there and let its setup script clone it and create the symlinks.
 
-The atomic skills need nothing beyond the Markdown files. Supervised autonomy (Mode B) additionally needs Python 3.13 or newer, `git`, `tmux`, and at least one supported coding CLI on the machine that runs Project Manager.
+The atomic skills need nothing beyond the Markdown files. Supervised autonomy (Mode B) additionally needs Python 3.13 or newer, `git`, and at least one supported coding CLI on the machine that runs Project Manager.
 
 ## The Autonomy Ladder
 
@@ -40,9 +40,9 @@ In your coding assistant: *"Use the code-review skill on the diff on this branch
 - Chat 2: paste the launcher into a fresh session. The agent implements one slice, audits its own authorization, reviews quality, and asks you before committing. Repeat per slice.
 - Both launchers (checkpointed and autonomous): [`skills/implementation-plan/SKILL.md`](skills/implementation-plan/SKILL.md) → "Next Chat Prompt Format".
 
-**3. Mode B — Supervised autonomy (Project Manager).** The gatekeeper moves outside the implementing agent. PM is an accountable supervising agent backed by a deterministic toolkit: the toolkit owns durable run state, fresh tmux-backed sessions (one per slice — the context reset that makes long plans tractable), artifact capture, and an eight-fact mechanical floor (frozen surface, commit ancestry, clean worktree, plan digest, recorded approvals, and more); the PM agent owns everything semantic — it assesses each completed slice from the diff, commit, and validation evidence, records its reasoning in a durable assessment, commissions independent drift-audit and code-review sessions where risk warrants, steers bounded corrections, and stops for a human on anything the plan or the floor reserves for one. The PM seat is a model you choose — a local model can hold it — and its recorded judgement is the accountability layer above the floor.
+**3. Mode B — Supervised autonomy (Project Manager).** The gatekeeper moves outside the implementing agent. PM is an accountable supervising agent backed by a deterministic toolkit: the toolkit owns durable run state, fresh headless Developer sessions (one per slice — the context reset that makes long plans tractable), artifact capture, and an eight-fact mechanical floor (frozen surface, commit ancestry, clean worktree, plan digest, recorded approvals, and more); the PM agent owns everything semantic — it assesses each completed slice from the diff, commit, and validation evidence, records its reasoning in a durable assessment, commissions independent drift-audit and code-review sessions where risk warrants, steers bounded corrections, and stops for a human on anything the plan or the floor reserves for one. The PM seat is a model you choose — a local model can hold it — and its recorded judgement is the accountability layer above the floor.
 
-- Verify your machine once with the tmux-backed trial in [`skills/project-manager/README.md`](skills/project-manager/README.md) → "Verify your setup".
+- Verify your machine once with the fake-harness trial in [`skills/project-manager/README.md`](skills/project-manager/README.md) → "Verify your setup".
 - Sanity-check the plan: `python3 skills/project-manager/scripts/pm.py check-plan --plan <plan.md>` (also runs automatically at `init` — a defective plan stops before any harness launches).
 - Start the run with the Mode B launcher in [`skills/project-manager/SKILL.md`](skills/project-manager/SKILL.md) → "Launcher".
 
@@ -62,7 +62,7 @@ This README is the maintained human-facing skill index. Each skill's own `SKILL.
 | Skill | What it does |
 |-------|-------------|
 | [`implementation-plan`](skills/implementation-plan/) | Breaks a request into auditable slices with frozen contracts: acceptance criteria, authorized surface, validation, risk flags, and a copyable launcher for the next chat. |
-| [`project-manager`](skills/project-manager/) | Supervises execution of an existing plan one slice at a time: durable run state, whole-plan sanity check, fresh tmux-backed session per slice, an eight-fact mechanical floor, recorded PM assessments, commissioned independent reviews. |
+| [`project-manager`](skills/project-manager/) | Supervises execution of an existing plan one slice at a time: durable run state, whole-plan sanity check, fresh headless session per slice, an eight-fact mechanical floor, recorded PM assessments, commissioned independent reviews. |
 | [`scoped-implementation`](skills/scoped-implementation/) | Implements one frozen slice without expanding scope; prepares the receipt for drift audit. |
 | [`drift-audit`](skills/drift-audit/) | Answers one question: was the implementation authorized? Runs before any quality review. |
 | [`code-review`](skills/code-review/) | Senior-level quality review after drift audit passes: correctness, edge cases, tests, error handling, domain-specific risks. |

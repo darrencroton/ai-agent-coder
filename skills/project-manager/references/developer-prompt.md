@@ -52,12 +52,12 @@ Hard rules:
 - Do not weaken or delete failing tests to get a pass; a real failure you cannot fix inside the surface is a blocked report, not a workaround.
 - You hold no acceptance authority: report honestly and let the evidence speak. PM independently checks the diff, the commit, and your validation output.
 
-Stop (status "blocked") when: the contract is ambiguous or contradicts the repository, validation fails and the fix is outside the surface, the work needs an unauthorized file/tool/credential/external effect, or anything requires human judgement. A prompt on screen asking for credentials, permissions, or an external side effect is always a stop, never something to answer.
+Stop (status "blocked") when: the contract is ambiguous or contradicts the repository, validation fails and the fix is outside the surface, the work needs an unauthorized file/tool/credential/external effect, or anything requires human judgement. A prompt asking for credentials, permissions, or an external side effect is always a stop, never something to answer.
 ```
 
 ## Launch Pointer
 
-PM delivers only this one-line pointer into the fresh session at launch; the full contract above is written to `prompt.md` in the slice artifact directory and the Developer reads it from there. This keeps the launch message far below any harness TUI input-buffer limit that silently truncates a multi-KB paste (PM Test 20, Finding 1). The rendered block must stay a single line — `send_prompt` refuses a newline — and the only brace in it is the `{prompt_path}` field.
+PM passes only this one-line pointer as the harness's headless prompt argument at launch (the exact form is per-harness — `-p`, `exec <prompt>`, `run <prompt>`, `--prompt`, or a final positional argument for a `--harness-command` override); the full contract above is written to `prompt.md` in the slice artifact directory and the Developer reads it from there. This keeps the launch prompt far below any harness input limit that silently truncates a multi-KB prompt (PM Test 20, Finding 1). By convention the rendered block stays a single line — that keeps the composed launch command readable and safe to log — and the only brace in it is the `{prompt_path}` field.
 
 ```md
 Read your complete frozen slice contract at {prompt_path} now, in full, before doing anything else — it is your only authorization for this slice. Do not read other files, plan, edit, commit, or run anything until you have read it, then follow its Workflow and Hard rules exactly.
@@ -65,7 +65,7 @@ Read your complete frozen slice contract at {prompt_path} now, in full, before d
 
 ## Steer Message Template
 
-PM renders this to deliver a corrective nudge directly into your live session — no new file is written for it. The same escaping note above applies: the only braces in the block below are the `{correction}` field.
+PM renders this as the prompt of a resume turn that continues your session after the previous turn has ended — no new file is written for it. The same escaping note above applies: the only braces in the block below are the `{correction}` field.
 
 ```md
 PM correction — this stays inside your frozen slice contract above. It may narrow, clarify, or redirect how you proceed, but it never expands your authorized surface, adds scope, or grants new authority:

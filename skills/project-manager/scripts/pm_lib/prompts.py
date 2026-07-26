@@ -133,12 +133,16 @@ def render_launch_pointer(prompt_path: Path, *, reference_path: Path | None = No
     session to read its full contract from `prompt_path`.
 
     The complete frozen contract is written to `prompt_path` in the slice
-    artifact directory; only this short pointer is injected into the
-    session, so delivery never depends on a harness TUI accepting a
-    multi-KB paste (PM Test 20, Finding 1). Sourced from the "## Launch
-    Pointer" section of `references/developer-prompt.md` so the wording
-    lives in exactly one place. The result must be a single line — a
-    newline would be rejected by `sessions.send_prompt`.
+    artifact directory; only this short pointer is passed as the harness's
+    headless prompt argument at launch (the exact form is per-harness —
+    `-p`, `exec <prompt>`, `run <prompt>`, `--prompt`, or a final
+    positional argument for a `--harness-command` override), so delivery
+    never depends on a harness accepting a multi-KB prompt (PM Test 20,
+    Finding 1). Sourced
+    from the "## Launch Pointer" section of
+    `references/developer-prompt.md` so the wording lives in exactly one
+    place. By convention the result stays a single line, which keeps the
+    composed launch command readable and safe to log.
     """
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_LAUNCH_POINTER_HEADING)
@@ -152,10 +156,10 @@ def render_launch_pointer(prompt_path: Path, *, reference_path: Path | None = No
 
 
 def render_steer_message(correction: str, *, reference_path: Path | None = None) -> str:
-    """Render a `finalize --steer` correction for direct live-session
-    injection without an artifact file. Sourced from the "## Steer Message
-    Template" section of `references/developer-prompt.md` so the fixed wrapper
-    wording lives in exactly one place, not inline here.
+    """Render a `finalize --steer` correction, passed as the prompt
+    argument of a resume turn without an artifact file. Sourced from the
+    "## Steer Message Template" section of `references/developer-prompt.md`
+    so the fixed wrapper wording lives in exactly one place, not inline here.
     """
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_STEER_MESSAGE_HEADING)

@@ -158,8 +158,9 @@ class TestRenderSteerMessage(unittest.TestCase):
 class TestRenderLaunchPointer(unittest.TestCase):
     def test_single_line_pointer_names_the_contract_path(self) -> None:
         rendered = prompts.render_launch_pointer(Path("/runs/x/slices/slice-001/prompt.md"))
-        # Must be a single line — sessions.send_prompt refuses a newline, and
-        # the whole point is that the multi-KB contract stays in the file.
+        # Single line by rendering convention — it is passed as the harness's
+        # headless prompt argument, and the whole point is that the multi-KB
+        # contract stays in the file.
         self.assertNotIn("\n", rendered)
         self.assertIn("/runs/x/slices/slice-001/prompt.md", rendered)
         self.assertNotIn("{prompt_path}", rendered)

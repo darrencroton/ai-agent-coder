@@ -9,11 +9,11 @@ To start a Mode B run, paste the launcher prompt from [SKILL.md](SKILL.md#launch
 ## Requirements
 
 - Python ≥ 3.13 (`PurePosixPath.full_match` drives authorized-surface matching; `pm.py` refuses older interpreters)
-- `git`, `tmux`
+- `git`
 - At least one supported coding CLI for the Developer seat: `codex`, `claude`, `copilot`, `opencode`, or `qwen` (or any command via `--harness-command`)
 - Optionally a reviewer CLI (`codex`, `claude`, `copilot`, `opencode`, `qwen`) for PM-commissioned reviews
 
-All five supported harnesses are equally eligible for either seat; the operator chooses what fits the plan. Profiles encode factual CLI differences only: for example, OpenCode and Qwen expose no tested interactive effort override, so `--effort` fails closed for those harnesses rather than being silently ignored.
+All five supported harnesses are equally eligible for either seat; the operator chooses what fits the plan. Profiles encode factual CLI differences only: for example, OpenCode and Qwen expose no tested headless effort override, so `--effort` fails closed for those harnesses rather than being silently ignored.
 
 ## CLI
 
@@ -25,9 +25,8 @@ All commands: `python3 skills/project-manager/scripts/pm.py <command> …`, run 
 | `init --repo R --plan P --harness H [--model M] [--effort E] [--branch B \| --create-branch B] [--attest "Slice 1,…"] [--max-attempts N] [--reviewer-tools T,…] [--reviewer-model M] [--reviewer-effort E] [--harness-command CMD]` | set up the run; freezes the plan digest; prints the token once (refuses main/master by implicit default — pass `--branch`/`--create-branch`) |
 | `status [--report] [--run ID]` | where are we? `--report` regenerates `run-report.md` |
 | `approve --slice ID --reason TEXT` | record a **human** approval for a plan-gated slice |
-| `start-slice [--model M] [--effort E] [--risk elevated] [--reviewer-tools T,…] [--harness-command CMD]` | launch (or relaunch) the next eligible slice in a fresh tmux session |
-| `observe [--wait N]` | evidence: liveness, pane tail, result presence, hard-stop markers; a wait returns early only on session death, `result.json` appearing, or a hard-stop marker (never a mere pane change), and reports elapsed wait time |
-| `send --text T --reason R` | one-line nudge into the live session (refused over hard prompts; costs nothing) |
+| `start-slice [--model M] [--effort E] [--risk elevated] [--reviewer-tools T,…] [--harness-command CMD]` | launch (or relaunch) the next eligible slice as a fresh headless session |
+| `observe [--wait N]` | evidence: liveness, session-output tail, result presence, hard-stop markers; a wait returns early only on process death, `result.json` appearing, or a hard-stop marker (never a mere output change), and reports elapsed wait time |
 | `finalize` | run the eight-fact floor and collect evidence (decides nothing) |
 | `finalize --accept "reasoning" \| --steer "correction" \| --stop "reason" [--risk elevated]` | PM's recorded decision; accept requires a passing floor (+ both fresh reviews when elevated); steer costs an attempt |
 | `review --slice ID --skill drift-audit\|code-review [--tool T] [--model M] [--effort E] [--timeout N]` | commission an independent review pinned to `before_head..HEAD` (`--tool` ∈ codex/claude/copilot/opencode/qwen); prints the report path, stderr path, and reviewer process-group id at launch, before waiting |
@@ -36,19 +35,19 @@ All commands: `python3 skills/project-manager/scripts/pm.py <command> …`, run 
 
 Exit codes: 0 success; 1 = a `finalize` refusal — a floor fact failed, or `--accept` was refused for another recorded reason (e.g. a missing or stale mandatory review on an elevated slice); 2 = error/refusal (integrity failures are prefixed `INTEGRITY:` and are terminal — start a new run).
 
-If a harness displays a directory-trust or permission prompt, the PM stops and leaves that approval to the human. The human may configure trust through the harness's own supported mechanism, then rerun `start-slice`; the PM must not acknowledge the dialog with `tmux send-keys` or change user-global harness configuration itself.
+If a harness displays a directory-trust or permission prompt, the PM stops and leaves that approval to the human. The human may configure trust through the harness's own supported mechanism, then rerun `start-slice`; the PM must not answer the dialog on the human's behalf or change user-global harness configuration itself.
 
 ## Layout: who owns what
 
 - **`<git-dir>/pm/<run-id>/`** — authoritative state (`run.json`, HMAC-authenticated) and every PM-authored original (assessments, reviews, notes, report — plain files, protected by living outside the worktree, not by the MAC). See [references/run-state.md](references/run-state.md).
-- **`<repo>/.pm/runs/<run-id>/`** — the human-facing mirror of PM artifacts plus Developer-authored evidence (`result.json`, `validation.md`, pane captures, diffs, prompts). Self-ignoring via `.pm/.gitignore`. The boundary, precisely: PM's records and decisions live in the controller originals and are never read back from this mirror — but Developer-authored evidence here (`result.json`, `validation.md`) *is* input to the floor and to PM's assessment. Vandalizing it damages the Developer's own case and fails the slice closed (floor fact 4); it can never forge an acceptance or alter PM state.
-- Per slice: `prompt.md` (the rendered authorization), `pane-live.txt`/`pane.txt`, `status-before/after.txt`, `diff.patch`, `validation.md`, `result.json`, `attempt-<n>/` for superseded launches, `assessment.md` + `review-*.md` mirrors.
+- **`<repo>/.pm/runs/<run-id>/`** — the human-facing mirror of PM artifacts plus Developer-authored evidence (`result.json`, `validation.md`, captured session output, diffs, prompts). Self-ignoring via `.pm/.gitignore`. The boundary, precisely: PM's records and decisions live in the controller originals and are never read back from this mirror — but Developer-authored evidence here (`result.json`, `validation.md`) *is* input to the floor and to PM's assessment. Vandalizing it damages the Developer's own case and fails the slice closed (floor fact 4); it can never forge an acceptance or alter PM state.
+- Per slice: `prompt.md` (the rendered authorization), `session-output.txt` (the Developer's captured stdout/stderr), `status-before/after.txt`, `diff.patch`, `validation.md`, `result.json`, `observe-cursor.txt` (transient: the outfile byte count `observe` compares against), `attempt-<n>/` for superseded launches, `assessment.md` + `review-*.md` mirrors. Per run, not per slice: `developer.pid` — the sidecar carrying the tracked PID/PGID and start-time identity that lets `stop --scavenge` find and terminate a Developer even with run state deleted.
 
 ## Trust model, honestly
 
 Mechanical and non-waivable: the eight floor facts (frozen plan digest; repo/branch identity; recorded approvals; result presence/identity; changed files ⊆ frozen surface; commit ancestry and branch head; clean worktree; no visible hard-stop prompt). Everything semantic — is the change good, is the evidence sufficient — is the PM agent's recorded judgement; read the assessments.
 
-Known limits, inherited and stated: the floor sees final Git-visible worktree state only (ignored files, Git hooks/metadata, and write-then-revert effects escape it); dependency/license/side-effect stops are heuristic (pane markers + prompt prohibitions + plan-level surface exclusion); role authority is capability-token-raised, not OS-enforced — a same-user process that steals the token or subverts the PM agent is outside the threat model; `attested` slices are operator narration; PM-seat quality is load-bearing — a weak model in the PM seat weakens the judgement layer itself.
+Known limits, inherited and stated: the floor sees final Git-visible worktree state only (ignored files, Git hooks/metadata, and write-then-revert effects escape it); dependency/license/side-effect stops are heuristic (session-output markers + prompt prohibitions + plan-level surface exclusion); role authority is capability-token-raised, not OS-enforced — a same-user process that steals the token or subverts the PM agent is outside the threat model; `attested` slices are operator narration; PM-seat quality is load-bearing — a weak model in the PM seat weakens the judgement layer itself.
 
 ## Privacy & sensitive artifacts
 
@@ -56,7 +55,7 @@ Everything stays local; the toolkit phones nowhere. But captured artifacts can s
 
 | Artifact | May contain |
 |---|---|
-| `pane*.txt` | anything printed in-session: code, env values, echoed secrets |
+| `session-output.txt` | anything the Developer printed: code, env values, echoed secrets |
 | harness-side transcripts (e.g. Claude Code's own session files — the toolkit passes `--session-id` but does not copy them into `.pm/`) | full session content, stored under the harness's home directory |
 | `diff.patch`, `review-*.md` | repository code, including sensitive files inside the surface |
 | `validation.md`, `result.json` | command output the Developer chose to record |
@@ -102,7 +101,6 @@ echo hello > hello.txt && git add hello.txt
 git -c user.name=dev -c user.email=dev@local commit -q -m "Slice 1: hello file"
 echo "ran: cat hello.txt -> $(cat hello.txt)" > "$PM_SLICE_ARTIFACT_DIR/validation.md"
 printf '{"slice":"%s","status":"done","summary":"created hello.txt","notes":"trial run; nothing to carry forward"}\n' "$PM_SLICE_ID" > "$PM_RESULT_PATH"
-cat -
 FAKE
 PM=<path-to>/skills/project-manager/scripts/pm.py
 python3 $PM init --repo . --plan ../trial-plan.md --harness fake --create-branch pm-trial --harness-command "sh ../fake-dev.sh"
@@ -118,4 +116,4 @@ You should see the floor pass 8/8, the acceptance land with an assessment, and a
 
 ## Maintainer map
 
-`scripts/pm.py` (entry) → `pm_lib/`: `cli` (parsing/dispatch) · `plan` (parser, lint, risk derivation) · `state` (lite-1 authenticated state, events, report) · `git_ops` (facts + surface matching) · `floor` (the eight facts) · `sessions` (all tmux contact + hard-stop markers) · `profiles` (harness table) · `slice_ops` (command orchestration) · `review` (PM-commissioned reviewers) · `prompts` (template rendering). Tests in `tests/` use fake harnesses via `--harness-command`; tmux-dependent tests skip when tmux is absent.
+`scripts/pm.py` (entry) → `pm_lib/`: `cli` (parsing/dispatch) · `plan` (parser, lint, risk derivation) · `state` (lite-1 authenticated state, events, report) · `git_ops` (facts + surface matching) · `floor` (the eight facts) · `sessions` (the headless process runner + hard-stop markers) · `profiles` (harness table) · `slice_ops` (command orchestration) · `review` (PM-commissioned reviewers) · `prompts` (template rendering). Tests in `tests/` use fake harnesses via `--harness-command` and need no external tool; nothing self-skips.

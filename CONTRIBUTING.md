@@ -32,14 +32,14 @@ Each skill's `SKILL.md` is the source of truth for its own triggers, workflow, a
 
 ## Tests
 
-- Project Manager: `python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'`. Tests needing `tmux` self-skip when it is absent; no test needs a real coding CLI (runtime tests inject fake harnesses). Module layout: `skills/project-manager/README.md` → "Maintainer map".
+- Project Manager: `python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'`. No test self-skips and no test needs a real coding CLI (runtime tests inject fake harnesses). Module layout: `skills/project-manager/README.md` → "Maintainer map".
 - Orchestrator: `python3 -m unittest discover -s skills/orchestrator/tests -p 'test_*.py'`.
 - CI runs both suites plus compile checks on every push and pull request using the minimum supported PM runtime, Python 3.13. Keep them green; never weaken a failing test to make it pass — a failing test is evidence of a real problem.
 - New behavior lands with a regression test pinned beside it. Keep tests boundary-focused rather than permutation-heavy.
 
 ## Change Conventions
 
-- **Fail closed by default.** Ambiguity stops a run; new paths must not accept work from narration, pane text, or hints.
+- **Fail closed by default.** Ambiguity stops a run; new paths must not accept work from narration, session output, or hints.
 - **Fix the owning layer.** Root-cause first; strengthen the contract layer that owns the problem (one definition, all harnesses) rather than patching a symptom where it appeared. Do not migrate slice Developer responsibilities into PM.
 - **Replace, don't shadow.** When a stronger deterministic contract replaces an older path, remove the obsolete path and update tests and docs in the same change.
 - **Be honest about enforcement.** Every documented guarantee names its layer: mechanical, evidence-checked, or heuristic. Overclaiming is a defect.
