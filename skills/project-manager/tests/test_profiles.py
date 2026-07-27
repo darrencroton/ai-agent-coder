@@ -37,7 +37,9 @@ the composing code is written fresh):
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -101,6 +103,94 @@ class TestHarnessProfileTable(unittest.TestCase):
         message = str(ctx.exception)
         for name in profiles.SUPPORTED_HARNESSES:
             self.assertIn(name, message)
+
+
+class TestSessionStoreProbe(unittest.TestCase):
+    """The probe guards PM's resume path against a store that moved or reshaped.
+
+    Its one hard rule is the same as the flag check's: never report something
+    nobody could look at as verified, and never fail a healthy install — a
+    check that cries wolf stops being read.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _probe(self, harness: str, path: Path) -> tuple[bool, str]:
+        with mock.patch.object(verify_harness_argv, "_store_path", return_value=path):
+            ok, lines = verify_harness_argv.probe_session_store(harness)
+        return ok, "\n".join(lines)
+
+    def test_missing_user_level_store_fails(self) -> None:
+        ok, output = self._probe("codex", self.root / "gone")
+        self.assertFalse(ok)
+        self.assertIn("MISSING", output)
+
+    def test_missing_per_repo_store_is_not_checked_rather_than_broken(self) -> None:
+        """qwen's store is scoped to the working directory, so absence means
+        'never run here' — failing it would cry wolf on a healthy install."""
+        ok, output = self._probe("qwen", self.root / "never-used")
+        self.assertTrue(ok)
+        self.assertIn("NOT CHECKED", output)
+        self.assertNotIn("MISSING", output)
+
+    def test_directory_store_counts_the_glob_the_runtime_reader_uses(self) -> None:
+        store = self.root / "sessions"
+        store.mkdir()
+        # An unexercised store is neither failed nor counted as verified.
+        ok, output = self._probe("codex", store)
+        self.assertTrue(ok)
+        self.assertIn("NOT CHECKED", output)
+
+        # codex's reader rglobs, so a nested record counts and a non-matching
+        # file does not.
+        nested = store / "2026" / "07"
+        nested.mkdir(parents=True)
+        (nested / "rollout.jsonl").write_text("{}", encoding="utf-8")
+        (nested / "ignored.txt").write_text("x", encoding="utf-8")
+        ok, output = self._probe("codex", store)
+        self.assertTrue(ok)
+        self.assertIn("1 record(s)", output)
+
+        # qwen's reader does not recurse, so the same nested layout must read
+        # as unexercised for it rather than as a verified store.
+        ok, output = self._probe("qwen", store)
+        self.assertTrue(ok)
+        self.assertIn("NOT CHECKED", output)
+
+        # ...and it must still match a top-level record, or a glob that stopped
+        # matching real sessions would look like a healthy empty store. Pinning
+        # only the negative case above would pass under any immediate pattern.
+        (store / "session.jsonl").write_text("{}", encoding="utf-8")
+        (store / "settings.json").write_text("{}", encoding="utf-8")
+        ok, output = self._probe("qwen", store)
+        self.assertTrue(ok)
+        self.assertIn("1 record(s)", output)
+
+    def test_sqlite_store_requires_the_columns_the_correlation_query_reads(self) -> None:
+        """Table names are not enough: the runtime query names columns, and a
+        schema keeping the tables while dropping a column still fails closed
+        mid-run. The probe must catch that here instead."""
+        good = self.root / "good.db"
+        with sqlite3.connect(good) as connection:
+            connection.execute("CREATE TABLE session (id TEXT, directory TEXT, time_created INTEGER)")
+            connection.execute(
+                "CREATE TABLE part (id TEXT, data TEXT, session_id TEXT, time_created INTEGER)"
+            )
+        ok, output = self._probe("opencode", good)
+        self.assertTrue(ok, output)
+
+        # Both tables present, but `part.data` — which the correlation query
+        # selects — is gone. Name-only checking would wrongly pass this.
+        thin = self.root / "thin.db"
+        with sqlite3.connect(thin) as connection:
+            connection.execute("CREATE TABLE session (id TEXT, directory TEXT, time_created INTEGER)")
+            connection.execute("CREATE TABLE part (id TEXT, session_id TEXT, time_created INTEGER)")
+        ok, output = self._probe("opencode", thin)
+        self.assertFalse(ok)
+        self.assertIn("SCHEMA CHANGED", output)
 
 
 class TestHarnessArgvVerifier(unittest.TestCase):

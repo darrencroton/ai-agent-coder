@@ -369,6 +369,8 @@ def _run_observe(args: argparse.Namespace) -> int:
     if args.wait:
         print(f"waited: {outcome.elapsed_seconds:.1f}s (requested {args.wait:g}s)")
     print(f"session running: {outcome.running}")
+    if not outcome.running:
+        print(f"session ended: {outcome.exit_summary}")
     print(f"output changed: {outcome.output_changed}")
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
     print(f"result present: {outcome.result_present}{status_note}")

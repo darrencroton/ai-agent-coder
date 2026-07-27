@@ -620,6 +620,23 @@ class TestAttemptAccounting(SliceOpsTestCase):
         final_state = state_mod.load_state(run_dir, token)
         self.assertEqual(final_state["status"], "needs-human")
 
+    def test_rotation_carries_the_exit_sidecar_with_its_output(self) -> None:
+        """A turn's exit status is only evidence while it sits beside the
+        output it describes: left behind, it strands the prior turn's diagnosis
+        AND misreports the next turn, which starts with no status of its own.
+        """
+        artifact_dir = Path(self.repo) / "artifacts"
+        artifact_dir.mkdir()
+        outfile = artifact_dir / sessions.SESSION_OUTFILE
+        outfile.write_text("output\n", encoding="utf-8")
+        sessions.exit_status_path(outfile).write_text("7\n", encoding="utf-8")
+
+        slice_ops._rotate_prior_attempt(artifact_dir, 0)
+
+        rotated = artifact_dir / "attempt-0"
+        self.assertEqual(sessions.read_exit_status(rotated / sessions.SESSION_OUTFILE), 7)
+        self.assertIsNone(sessions.read_exit_status(outfile))
+
 
 # --- 8. mid-run plan edit -----------------------------------------------------
 
@@ -667,6 +684,9 @@ class TestDeadProcess(SliceOpsTestCase):
         code, out, _err = self.run_cli_in_repo(["observe"])
         self.assertEqual(code, 0)
         self.assertIn("session running: False", out)
+        # The diagnosis, not just the liveness: this fake ends itself having
+        # written no result.json — the shape that previously carried no information.
+        self.assertIn("session ended: exited 0 (clean exit)", out)
 
 
 # --- 10. observe --wait semantics ---------------------------------------------

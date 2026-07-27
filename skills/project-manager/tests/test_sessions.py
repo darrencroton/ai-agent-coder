@@ -213,6 +213,52 @@ class HeadlessSessionTestCase(unittest.TestCase):
         return predicate()
 
 
+class TestHeadlessExitStatus(HeadlessSessionTestCase):
+    """The Developer is detached and reparented, so waitpid() can never report
+    how it ended. The turn's own shell records the status instead — the only
+    thing that distinguishes a crash from a clean exit that produced nothing.
+    """
+
+    def _status_after_exit(self, command: str) -> tuple[int | None, Path]:
+        launch = self._launch(command)
+        outfile = Path(launch["outfile"])
+        self.assertTrue(
+            self._wait_for(lambda: not sessions.headless_process_alive(launch["pid"], launch["identity"]))
+        )
+        return sessions.read_exit_status(outfile), outfile
+
+    def test_records_the_harness_exit_code(self) -> None:
+        """Also pins the no-race claim: the helper reads only after the tracked
+        process is gone, so a complete status must already be there."""
+        for command, expected in (("exit 0", 0), ("exit 7", 7)):
+            with self.subTest(command=command):
+                status, _outfile = self._status_after_exit(command)
+                self.assertEqual(status, expected)
+
+    def test_a_terminated_turn_records_no_status(self) -> None:
+        """PM killing the group is not the harness ending itself, and the
+        absence of a status is what says so."""
+        launch = self._launch("sleep 30")
+        outfile = Path(launch["outfile"])
+        sessions.terminate_headless(launch["pid"], launch["pgid"], launch["identity"], term_timeout=0.2)
+        self.assertIsNone(sessions.read_exit_status(outfile))
+
+    def test_a_relaunch_never_inherits_the_prior_turn_status(self) -> None:
+        first = self._launch("exit 5")
+        outfile = Path(first["outfile"])
+        self.assertTrue(self._wait_for(lambda: sessions.read_exit_status(outfile) == 5))
+        # Same artifact dir, as a relaunch or resume reuses: the stale status
+        # must not survive into the new turn's evidence.
+        second = self._launch("sleep 30")
+        self.assertIsNone(sessions.read_exit_status(Path(second["outfile"])))
+
+    def test_describe_exit_status_separates_the_three_endings(self) -> None:
+        self.assertIn("still running", sessions.describe_exit_status(None, running=True))
+        self.assertIn("terminated by PM", sessions.describe_exit_status(None, running=False))
+        self.assertIn("clean exit", sessions.describe_exit_status(0, running=False))
+        self.assertIn("signal 9", sessions.describe_exit_status(137, running=False))
+
+
 class TestHeadlessLaunchAndResume(HeadlessSessionTestCase):
     def test_launch_and_resume_write_output_result_and_commit(self) -> None:
         harness = write_headless_fake_harness(self.repo / "fake-headless.sh")

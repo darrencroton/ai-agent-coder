@@ -23,6 +23,13 @@ that `pm_lib.profiles` actually produces and asserts each one appears in the
 help text of the exact subcommand that will receive it. A harness that is not
 installed is reported and skipped without failing the run.
 
+For the three harnesses PM cannot tell a session id at launch (codex,
+opencode, qwen), it additionally checks that the CLI's session store is still
+where `slice_ops` looks for it. That is the other shape frozen from
+observation rather than contract: an upgrade that relocates the store costs PM
+its `finalize --steer` path, and today that is discovered mid-run rather than
+here.
+
 Usage
 -----
     python3 skills/project-manager/scripts/verify_harness_argv.py
@@ -48,6 +55,31 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from pm_lib import PmError  # noqa: E402
 from pm_lib import profiles  # noqa: E402
+from pm_lib import slice_ops  # noqa: E402
+
+# Harnesses that cannot be told their session id at launch, so PM must find it
+# afterwards by reading the CLI's own session store. claude and copilot are
+# absent deliberately: PM sets their id at launch, so they have no store to
+# drift. The probe reuses slice_ops' own path helpers rather than restating
+# them — a copy here could agree with the docs and disagree with the code.
+#
+# `glob` and `projections` are what the runtime readers actually consume, kept
+# in the shape they consume them: a zero-row projection checks the columns the
+# correlation query names, not merely that a table of that name survives.
+# `per_repo` marks a store scoped to the working directory rather than the
+# user, so absent means "never used here", not "moved", and is never breakage.
+_SESSION_STORES: dict[str, dict[str, object]] = {
+    "codex": {"kind": "dir", "glob": "**/*.jsonl", "per_repo": False},
+    "qwen": {"kind": "dir", "glob": "*.jsonl", "per_repo": True},
+    "opencode": {
+        "kind": "sqlite",
+        "per_repo": False,
+        "projections": (
+            "SELECT id, directory, time_created FROM session LIMIT 0",
+            "SELECT data, session_id, time_created, id FROM part LIMIT 0",
+        ),
+    },
+}
 
 # The help invocation for the subcommand each composed argv actually targets.
 # Getting this per-subcommand is the whole point: `codex exec` accepts flags
@@ -142,6 +174,78 @@ def _composed(harness: str) -> list[tuple[str, list[str]]]:
     return out
 
 
+def _store_path(harness: str) -> Path:
+    if harness == "codex":
+        return slice_ops._codex_sessions_root()
+    if harness == "opencode":
+        return slice_ops._opencode_session_db()
+    return slice_ops._qwen_chats_root(Path.cwd())
+
+
+def probe_session_store(harness: str) -> tuple[bool, list[str]]:
+    """Check that the session store PM correlates against is still usable.
+
+    PM binds a resume to the turn that produced it, and codex/opencode/qwen
+    only reveal their id after launch, so an upgrade that moves or reshapes the
+    store costs PM its correction path — discovered at `finalize --steer`,
+    mid-run, after the Developer has already done the work.
+
+    The guarantee is deliberately narrow, like the flag check above: **the
+    store exists and still answers the shape the runtime readers query** — the
+    record glob for a directory store, a zero-row run of the real projections
+    for opencode. It cannot verify how a *value* inside a record is encoded,
+    and that is precisely the gap that bites: the one correlation bug this
+    round actually hit was a stored prompt gaining a literal quote layer. A
+    pass means "not obviously broken", never "resume works".
+
+    Nothing unexercised is ever reported as verified: an empty store, and a
+    `per_repo` store absent because the harness has not run in this directory,
+    are both NOT CHECKED rather than ok or broken.
+    """
+    spec = _SESSION_STORES[harness]
+    path = _store_path(harness)
+    if not path.exists():
+        if spec["per_repo"]:
+            return True, [
+                f"{harness} store: NOT CHECKED - no store for this working directory ({path})",
+                "    Per-repository store; run once from a repo where this harness has worked.",
+            ]
+        return False, [
+            f"{harness} store: MISSING - {path}",
+            "    PM cannot correlate a launch here; finalize --steer would fail closed.",
+        ]
+
+    if spec["kind"] == "sqlite":
+        import sqlite3
+
+        if not path.is_file():
+            return False, [f"{harness} store: NOT A DATABASE - {path}"]
+        # The same encoded read-only URI the runtime reader builds, so a path
+        # this probe accepts is one that reader can also open.
+        try:
+            connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        except (sqlite3.Error, ValueError) as exc:
+            return False, [f"{harness} store: UNREADABLE - {path}: {exc}"]
+        try:
+            for projection in spec["projections"]:
+                connection.execute(projection)
+        except sqlite3.Error as exc:
+            return False, [
+                f"{harness} store: SCHEMA CHANGED - {path}: {exc}",
+                "    The correlation query cannot run; finalize --steer would fail closed.",
+            ]
+        finally:
+            connection.close()
+        return True, [f"{harness} store: ok ({path}, correlation projections run)"]
+
+    if not path.is_dir():
+        return False, [f"{harness} store: NOT A DIRECTORY - {path}"]
+    records = sum(1 for _ in path.glob(str(spec["glob"])))
+    if not records:
+        return True, [f"{harness} store: NOT CHECKED - no {spec['glob']} records under {path}"]
+    return True, [f"{harness} store: ok ({path}, {records} record(s) matching {spec['glob']})"]
+
+
 def verify(harness: str) -> tuple[bool, bool, list[str]]:
     """Returns (ok, checked, lines).
 
@@ -176,6 +280,11 @@ def verify(harness: str) -> tuple[bool, bool, list[str]]:
             lines.append(f"    checked against: {' '.join(help_command)}")
         else:
             lines.append(f"{harness} {kind}: ok ({len(flags)} flags)")
+
+    if harness in _SESSION_STORES:
+        store_ok, store_lines = probe_session_store(harness)
+        ok = ok and store_ok
+        lines.extend(store_lines)
     return ok, True, lines
 
 
@@ -189,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     unverifiable: list[str] = []
     checked: list[str] = []
     skipped: list[str] = []
+    stores_unchecked: list[str] = []
     for harness in harnesses:
         try:
             harness_ok, harness_checked, lines = verify(harness)
@@ -206,12 +316,14 @@ def main(argv: list[str] | None = None) -> int:
                 if cli_output:
                     detail += f": {cli_output}"
             lines = [f"{harness}: COULD NOT VERIFY - {type(exc).__name__}: {detail}"]
+        if any("store: NOT CHECKED" in line for line in lines):
+            stores_unchecked.append(harness)
         for line in lines:
             print(line)
 
     print()
     if rejected:
-        print(f"RESULT: composed flags not advertised by CLI help: {', '.join(rejected)}")
+        print(f"RESULT: composed flags not advertised by CLI help, or session store missing: {', '.join(rejected)}")
         return 1
     if unverifiable:
         print(f"RESULT: INCONCLUSIVE - could not query: {', '.join(unverifiable)}. No flag mismatch was found "
@@ -222,6 +334,10 @@ def main(argv: list[str] | None = None) -> int:
     if skipped:
         summary += f" - NOT CHECKED (not installed): {', '.join(skipped)}"
     print(summary)
+    # Reported separately so a store nobody could look at never reads as a
+    # verified one, exactly as an uninstalled harness never reads as checked.
+    if stores_unchecked:
+        print(f"        session store NOT CHECKED (none for this directory): {', '.join(stores_unchecked)}")
     return 0
 
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -148,7 +149,13 @@ def scan_hard_stop(text: str) -> dict[str, Any]:
 
 DEVELOPER_PID_SIDECAR = "developer.pid"
 SESSION_OUTFILE = "session-output.txt"
+SESSION_EXIT_SUFFIX = ".exit"
 _HEADLESS_CHILDREN: dict[int, subprocess.Popen] = {}
+
+
+def exit_status_path(outfile: Path) -> Path:
+    """The sidecar recording how the turn that wrote ``outfile`` ended."""
+    return outfile.with_name(outfile.name + SESSION_EXIT_SUFFIX)
 
 
 def _process_exists(pid: int) -> bool:
@@ -223,9 +230,28 @@ def launch_headless(
     process_env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
     process_env.update(env)
 
+    # Record how the turn ends, in the turn's own shell: the Developer is
+    # detached and reparented, so a later `pm.py` invocation cannot waitpid()
+    # it and could otherwise only ever report "not running".
+    #
+    # The wrapper writes only after the foreground command returns, so it
+    # outlives the harness and a caller seeing the process gone sees a complete
+    # status. The compound form also stops /bin/sh exec-optimizing itself away
+    # for a simple command, which would leave nothing to record the status.
+    #
+    # The guarantee is exactly "the *foreground* command ended". PM's own
+    # composers emit a single shlex.join'd argv, so it holds for every profile
+    # harness; a `--harness-command` override that backgrounds its real work
+    # (`... &`) would return immediately and be reported as a clean exit while
+    # still running. Such an override already defeats liveness tracking, which
+    # is why overrides are documented as foreground commands.
+    exit_path = exit_status_path(outfile)
+    exit_path.unlink(missing_ok=True)
+    wrapped = f"({command}\n) ; printf '%s\\n' \"$?\" > {shlex.quote(str(exit_path))}\n"
+
     with outfile.open("wb") as output_handle:
         process = subprocess.Popen(
-            command,
+            wrapped,
             shell=True,
             executable="/bin/sh",
             cwd=str(repo),
@@ -258,6 +284,37 @@ def launch_headless(
         "identity": identity,
         "outfile": str(outfile),
     }
+
+
+def read_exit_status(outfile: Path) -> int | None:
+    """Return how the turn that wrote ``outfile`` ended, or None if it never said.
+
+    ``None`` is itself evidence rather than a gap: the status is recorded the
+    instant the harness returns, so its absence on a process that is no longer
+    running means the turn did not end on its own — PM terminated the group, or
+    the machine did — instead of meaning the status was lost.
+    """
+    try:
+        raw = exit_status_path(outfile).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def describe_exit_status(status: int | None, *, running: bool) -> str:
+    """One human-readable line about how (or whether) a turn ended."""
+    if running:
+        return "still running"
+    if status is None:
+        return "no exit status recorded (terminated by PM or the machine, not by the harness)"
+    if status == 0:
+        return "exited 0 (clean exit)"
+    if status > 128:
+        return f"exited {status} (killed by signal {status - 128})"
+    return f"exited {status} (harness reported failure)"
 
 
 def read_output_tail(outfile: Path, *, max_bytes: int = 128 * 1024) -> str:

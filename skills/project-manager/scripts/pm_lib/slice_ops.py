@@ -996,7 +996,11 @@ def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> None:
     # observe cursor would misreport growth against it; drop it rather than
     # rotate it (it is a transient progress marker, not slice evidence).
     (artifact_dir / _OBSERVE_CURSOR_FILE).unlink(missing_ok=True)
-    names = ("result.json", sessions.SESSION_OUTFILE)
+    names = (
+        "result.json",
+        sessions.SESSION_OUTFILE,
+        sessions.SESSION_OUTFILE + sessions.SESSION_EXIT_SUFFIX,
+    )
     present = [name for name in names if (artifact_dir / name).exists()]
     if not present:
         return
@@ -1325,6 +1329,7 @@ class ObserveOutcome:
     tail: str = ""
     slice_id: str | None = None
     elapsed_seconds: float = 0.0
+    exit_summary: str = ""
 
 
 def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str | None = None) -> ObserveOutcome:
@@ -1393,6 +1398,10 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     tail_lines = latest_tail.splitlines()[-_OBSERVE_TAIL_LINES:]
     tail = "\n".join(tail_lines)
 
+    # Only meaningful once the process is gone; a live turn has not exited yet.
+    exit_status = None if running else sessions.read_exit_status(outfile)
+    exit_summary = sessions.describe_exit_status(exit_status, running=running)
+
     liveness_changed = running != initial_running
     result_newly_appeared = result_present and not result_existed_before
     if output_changed or liveness_changed or result_newly_appeared:
@@ -1404,6 +1413,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
                 f"output_changed={output_changed} liveness_changed={liveness_changed} "
                 f"running={running} result_present={result_present} "
                 f"elapsed={elapsed_seconds:.1f}s"
+                + ("" if running else f" exit={exit_summary}")
             ),
             evidence=str(outfile) if output_changed else None,
         )
@@ -1418,6 +1428,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         tail=tail,
         slice_id=current.get("id"),
         elapsed_seconds=elapsed_seconds,
+        exit_summary=exit_summary,
     )
 
 
