@@ -482,9 +482,10 @@ class DelegateContractTests(unittest.TestCase):
 
     def test_codex_pins_the_sandbox_and_forbids_approval_escalation_on_both_paths(self):
         """The codex sandbox is only a boundary while approvals cannot escalate out of
-        it: under an `on-request` approval policy the model may request escalation for
-        a sandbox-blocked command and be granted it non-interactively. Launch and
-        continuation must both pin the sandbox and pin the approval policy."""
+        it (rationale and evidence: references/codex.md), so launch and continuation
+        must both pin the sandbox and pin the approval policy. This is the only place
+        `approval_policy` is asserted for the delegate paths — the neighbouring
+        `test_harness_commands_select_*` tests are index-based on `sandbox_mode` alone."""
         for contract, expected_sandbox in (
             (self.validate(tool="codex"), "read-only"),
             (self.validate_write(tool="codex"), "workspace-write"),

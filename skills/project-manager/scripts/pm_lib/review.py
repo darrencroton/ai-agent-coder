@@ -60,12 +60,12 @@ def compose_reviewer_command(
             command.extend(["-m", model])
         if effort:
             command.extend(["-c", f'model_reasoning_effort="{effort}"'])
-        # `approval_policy="never"` is what makes the read-only sandbox a boundary:
-        # under an `on-request` policy the reviewer can request escalation for a
-        # sandbox-blocked command and be granted it with no human present. The
-        # sandbox is set through its config key to match the orchestrator's codex
-        # profile, which must use the config form because `codex exec resume`
-        # rejects `--sandbox`.
+        # The read-only sandbox is only a boundary while approvals cannot escalate
+        # out of it, so the policy is pinned rather than inherited from the caller.
+        # The sandbox is set through its config key to match the orchestrator's
+        # codex profile, which must use the config form because `codex exec resume`
+        # rejects `--sandbox`. Full rationale and the verifying evidence:
+        # skills/orchestrator/references/codex.md.
         command.extend(
             [
                 "-c",

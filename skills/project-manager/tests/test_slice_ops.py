@@ -56,6 +56,11 @@ the retained fake-harness pattern (replacement-ledger §9.1/§9.3). Pins:
     `pm-<run-id>-…` session and exits 0.
 12. All slices already complete: `start-slice` prints a completion message
     and exits 0 without touching tmux.
+13. Real-harness composition (tmux): `start-slice` with no
+    `--harness-command` override composes an actual codex launch argv,
+    carrying the linked-worktree git directory that `commit_required`
+    requires. Every other lifecycle scenario overrides the command, so this
+    is the only test that executes that branch at all.
 """
 
 from __future__ import annotations
@@ -63,11 +68,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -77,6 +84,7 @@ import shutil
 
 from pm_test_helpers import PmTestCase, parse_init_output, write_fake_harness
 
+from pm_lib import git_ops
 from pm_lib import sessions
 from pm_lib import state as state_mod
 
@@ -987,6 +995,52 @@ class TestAllSlicesComplete(SliceOpsTestCase):
         self.assertTrue(any(event["kind"] == "complete" for event in events))
 
         self.assertTrue((run_dir / "run-report.md").is_file())
+
+
+# --- 13. real-harness composition ---------------------------------------
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestRealHarnessComposition(SliceOpsTestCase):
+    def test_launch_without_an_override_composes_a_real_harness_command(self) -> None:
+        """The composition branch this reaches hid a lost local binding on the
+        sibling headless branch: `start-slice` raised NameError there while the
+        whole suite stayed green. Codex is the harness under test because it is
+        the only one whose composition reads run policy (`commit_required` adds
+        the linked-worktree git directory, without which the slice commit cannot
+        be made from inside the sandbox).
+
+        `start_session` is wrapped to record the composed command and start a
+        stand-in in its place; readiness is stubbed because it waits on the
+        composed executable's own TUI banner. Composition therefore runs for
+        real without invoking a coding CLI.
+        """
+        composed: list[str] = []
+        real_start_session = sessions.start_session
+
+        def capture(session: str, repo: Path, command: str, env: dict[str, str]) -> None:
+            composed.append(command)
+            real_start_session(session, repo, "sleep 30", env)
+
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        code, out, _err = self.run_cli_in_repo(
+            ["init", "--repo", str(self.repo), "--plan", str(plan_path), "--harness", "codex"]
+        )
+        self.assertEqual(code, 0, out)
+        run_id, token = parse_init_output(out)
+
+        with mock.patch.object(sessions, "start_session", capture), mock.patch.object(
+            sessions, "wait_until_ready", lambda *args, **kwargs: None
+        ):
+            code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self._track_current_session(run_id, token)
+        self.assertEqual(code, 0, err)
+
+        self.assertEqual(len(composed), 1)
+        argv = shlex.split(composed[0])
+        self.assertEqual(argv[:6], ["codex", "--no-alt-screen", "-s", "workspace-write", "-a", "never"])
+        self.assertIn("--add-dir", argv)
+        self.assertEqual(argv[argv.index("--add-dir") + 1], str(git_ops.worktree_git_dir(self.repo)))
 
 
 if __name__ == "__main__":
