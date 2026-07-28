@@ -804,6 +804,10 @@ def compose_delegate_command(
         if effort != "default":
             command.extend(["-c", f'model_reasoning_effort="{effort}"'])
         sandbox = "workspace-write" if write else "read-only"
+        # The sandbox above is only a boundary while approvals cannot escalate out
+        # of it, so the policy is pinned rather than inherited from the caller.
+        # Full rationale and the verifying evidence: references/codex.md.
+        command.extend(["-c", 'approval_policy="never"'])
         if resuming:
             # `codex exec resume` is a stricter parser than `codex exec`: of the
             # launch flags it accepts only --skip-git-repo-check, and rejects

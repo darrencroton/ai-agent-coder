@@ -131,7 +131,7 @@ Failure of any check rejects the request with structured feedback and starts no 
 `python3 scripts/delegate_jobs.py profiles` reports each supported tool's factual enforcement for both access modes. All five tools are eligible for either:
 
 - Claude: partial plan-mode enforcement read-only; `acceptEdits` auto-approves file edits read-write
-- Codex: mechanical read-only sandbox; mechanical `workspace-write` sandbox confines writes to the working directory and `/tmp`
+- Codex: mechanical read-only sandbox; mechanical `workspace-write` sandbox confines writes to the working directory, `/tmp`, and `$TMPDIR`. Both hold only because the launcher pins `approval_policy="never"`; under an approval policy that permits escalation the sandbox is not a boundary — see [codex.md](codex.md)
 - Copilot: prompt-enforced either way; the composed command is identical for both access modes
 - OpenCode: edit tools denied by the plan agent read-only; the build agent grants unrestricted tool permissions read-write, prompt-enforced
 - Qwen Code: prompt-enforced repository behavior either way; the composed command is identical for both access modes, with sandboxing requested but not guaranteed

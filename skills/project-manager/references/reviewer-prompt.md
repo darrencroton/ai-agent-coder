@@ -4,7 +4,9 @@ PM commissions every independent review itself, after implementation, against a 
 
 > Editing note: rendered with Python `str.format`; only the listed
 > `{placeholder}` fields may appear in braces — escape any literal brace as
-> `{{`/`}}`.
+> `{{`/`}}`. `{drift_audit_report}` is a readable path or the literal `none`;
+> all wording stays in this file, including the authorization statement, so no
+> reviewer-facing prose lives in `prompts.py`.
 
 ```md
 REVIEWER MODE: you are a read-only independent Reviewer commissioned by Project Manager. No edits, no file creation, no Git or state-changing commands, no re-delegation, no acceptance decisions — report findings and stop.
@@ -17,6 +19,8 @@ Reviewed range: {before_head}..{reviewed_head} (this exact range; the tree at {r
 Pinned diff file: {diff_path}
 Pinned changed files: 
 {changed_files}
+Authorization: Project Manager checks the changed surface against the frozen authorized surface itself, as a non-waivable gate, so treat authorization as established unless your own reading of the pinned diff contradicts it — never caveat your conclusions on the absence of an independent audit report.
+Independent drift-audit report for this range: {drift_audit_report}
 
 Frozen contract the change must satisfy:
 - Intended change:

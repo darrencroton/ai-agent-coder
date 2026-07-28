@@ -255,6 +255,12 @@ def load_writable_state(run_dir: Path, token: str) -> dict[str, Any]:
         raise
 
 
+def attempt_ceiling(state: dict[str, Any]) -> int:
+    """The run's per-slice attempt ceiling. One reader, so the budget the
+    exhaustion paths enforce is always the one the CLI reports."""
+    return int((state.get("policy") or {}).get("max_attempts", 3))
+
+
 def slice_entry(state: dict[str, Any], slice_id: str) -> dict[str, Any] | None:
     for entry in state.get("slices", []):
         if isinstance(entry, dict) and entry.get("id") == slice_id:
@@ -1089,7 +1095,7 @@ def start_slice(
         )
 
     policy = state.get("policy") or {}
-    max_attempts = int(policy.get("max_attempts", 3))
+    max_attempts = attempt_ceiling(state)
 
     if relaunch:
         attempts = int(entry.get("attempts", 0)) + 1
@@ -1452,6 +1458,9 @@ class FinalizeOutcome:
     diff_path: Path
     result_path: Path
     slice_id: str
+    # Printed together so pacing a steer never requires reading run.json.
+    attempts: int = 0
+    max_attempts: int = 0
 
 
 _ACCEPT_REASONING_MIN_CHARS = 40
@@ -1549,6 +1558,8 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
         diff_path=artifact_dir / "diff.patch",
         result_path=artifact_dir / "result.json",
         slice_id=slice_id,
+        attempts=int(current.get("attempts", 0)),
+        max_attempts=attempt_ceiling(state),
     )
 
 
@@ -1559,7 +1570,7 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
+def is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
     """A review is fresh for `head` iff it was recorded against exactly
     this HEAD and its artifact still exists with a matching sha256 (design
     §5: any tree change after a mandatory review invalidates it)."""
@@ -1574,7 +1585,7 @@ def _is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
 def _fresh_reviews_for_head(reviews: list[dict[str, Any]], head: str | None) -> dict[str, dict[str, Any]]:
     fresh: dict[str, dict[str, Any]] = {}
     for review in reviews:
-        if _is_review_fresh(review, head):
+        if is_review_fresh(review, head):
             skill = review.get("skill")
             if skill:
                 fresh[skill] = review
@@ -1586,7 +1597,7 @@ def _reviews_consulted_text(reviews: list[dict[str, Any]], head: str | None, eff
         return "PM assessment only (standard risk)" if effective_risk != "elevated" else "(no reviews recorded)"
     lines: list[str] = []
     for review in reviews:
-        stale = "" if _is_review_fresh(review, head) else " [SUPERSEDED - stale for current HEAD]"
+        stale = "" if is_review_fresh(review, head) else " [SUPERSEDED - stale for current HEAD]"
         lines.append(
             f"- {review.get('skill')}/{review.get('tool')} @ {review.get('head')} -> "
             f"{review.get('artifact')}{stale}"
@@ -1831,6 +1842,7 @@ class SteerOutcome:
     kind: str  # steered | budget_exhausted
     slice_id: str
     attempts: int | None = None
+    max_attempts: int = 0
     message: str = ""
 
 
@@ -1880,7 +1892,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # is never persisted, matching start_slice's relaunch-exhaustion path.
     attempts = int(current.get("attempts", 0)) + 1
     policy = state.get("policy") or {}
-    max_attempts = int(policy.get("max_attempts", 3))
+    max_attempts = attempt_ceiling(state)
     if attempts > max_attempts:
         # Mandatory stop, as in start_slice's exhaustion path: the tracked
         # process group is terminated, not left running past the budget.
@@ -2054,7 +2066,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     state_mod.append_event(run_dir, "steer", slice_id=slice_id, note=correction)
 
     return SteerOutcome(
-        kind="steered", slice_id=slice_id, attempts=attempts,
+        kind="steered", slice_id=slice_id, attempts=attempts, max_attempts=max_attempts,
         message=f"steered {slice_id} (attempt {attempts})",
     )
 

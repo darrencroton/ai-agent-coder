@@ -248,6 +248,7 @@ class TestComposeHeadlessDeveloperCommand(unittest.TestCase):
             ),
             [
                 "codex", "exec", "POINTER", "-m", "gpt-5", "-c", 'model_reasoning_effort="high"',
+                "-c", 'approval_policy="never"',
                 "--sandbox", "workspace-write", "--skip-git-repo-check", "-C", "/repo", "--add-dir", "/repo/.git",
             ],
         )
@@ -307,7 +308,7 @@ class TestComposeHeadlessReviewerCommand(unittest.TestCase):
         cases = [
             (
                 "codex", {"model": "gpt-5", "effort": "high"},
-                ["codex", "exec", "PROMPT", "-m", "gpt-5", "-c", 'model_reasoning_effort="high"', "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/repo"],
+                ["codex", "exec", "PROMPT", "-m", "gpt-5", "-c", 'model_reasoning_effort="high"', "-c", 'approval_policy="never"', "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/repo"],
             ),
             (
                 "claude", {"model": "opus", "effort": "high"},
@@ -363,6 +364,7 @@ class TestComposeResumeCommand(unittest.TestCase):
                 "codex", {"git_access_dir": self._git_dir},
                 [
                     "codex", "exec", "resume", self._session_id, "CORRECTION",
+                    "-c", 'approval_policy="never"',
                     "-c", 'sandbox_mode="workspace-write"',
                     "-c", 'sandbox_workspace_write.writable_roots=["/repo/.git"]',
                     "--skip-git-repo-check",
@@ -402,6 +404,7 @@ class TestComposeResumeCommand(unittest.TestCase):
             command,
             [
                 "codex", "exec", "resume", self._session_id, "CORRECTION",
+                "-c", 'approval_policy="never"',
                 "-c", 'sandbox_mode="workspace-write"',
                 "--skip-git-repo-check",
             ],

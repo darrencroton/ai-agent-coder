@@ -243,6 +243,7 @@ def render_reviewer_prompt(
     authorized_surface: str,
     explicit_non_goals: str,
     risk_flags: str,
+    drift_audit_report: str | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
 ) -> str:
@@ -250,7 +251,10 @@ def render_reviewer_prompt(
 
     Embeds the named skill's complete transitive bundle
     (`compile_skill_bundle`) so the review contract survives a harness with
-    no skill loader of its own.
+    no skill loader of its own. `drift_audit_report` is the readable path to a
+    drift-audit report already recorded fresh against this exact range, or None
+    for the template's literal `none` — the authorization wording itself lives
+    in the template, not here.
     """
     template = load_template(reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH)
     skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root)
@@ -264,6 +268,7 @@ def render_reviewer_prompt(
         "reviewed_head": reviewed_head,
         "diff_path": diff_path,
         "changed_files": changed_files_text,
+        "drift_audit_report": drift_audit_report or "none",
         "intended_change": intended_change,
         "acceptance_criteria": acceptance_criteria,
         "authorized_surface": authorized_surface,

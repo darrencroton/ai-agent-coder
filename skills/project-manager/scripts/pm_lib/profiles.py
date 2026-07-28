@@ -59,6 +59,13 @@ HARNESS_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 
+# Codex's sandbox is only a boundary while approvals cannot escalate out of it,
+# so every codex seat pins the policy instead of inheriting the caller's, and
+# no headless turn faces an approval prompt it cannot answer. Full rationale
+# and the verifying evidence: skills/orchestrator/references/codex.md.
+_CODEX_APPROVAL_POLICY: tuple[str, ...] = ("-c", 'approval_policy="never"')
+
+
 def _unknown_harness_error(harness: str) -> PmError:
     supported = ", ".join(SUPPORTED_HARNESSES)
     return PmError(f"no PM harness profile is defined for {harness!r}; supported harnesses: {supported}")
@@ -129,6 +136,7 @@ def compose_headless_command(
             command = ["codex", "exec", pointer]
             _append_headless_model(command, profile, model)
             _append_headless_effort(command, profile, effort, harness)
+            command.extend(_CODEX_APPROVAL_POLICY)
             command.extend(["--sandbox", "read-only", "--skip-git-repo-check", "-C", repo_str])
             return command
         if harness == "claude":
@@ -159,6 +167,7 @@ def compose_headless_command(
         command = ["codex", "exec", pointer]
         _append_headless_model(command, profile, model)
         _append_headless_effort(command, profile, effort, harness)
+        command.extend(_CODEX_APPROVAL_POLICY)
         command.extend(["--sandbox", "workspace-write", "--skip-git-repo-check", "-C", repo_str])
         if git_access_dir is not None:
             command.extend(["--add-dir", str(git_access_dir)])
@@ -235,6 +244,7 @@ def compose_resume_command(
         # makes codex's implicit "workdir" writable root the repo.
         command = [
             "codex", "exec", "resume", session_id, correction,
+            *_CODEX_APPROVAL_POLICY,
             "-c", 'sandbox_mode="workspace-write"',
         ]
         if git_access_dir is not None:

@@ -1044,6 +1044,52 @@ class TestSteer(FinalizeTestCase):
         self.assertEqual(state["current_slice"]["attempts"], 0)
         self.assertFalse([e for e in events if e["kind"] == "steer"])
 
+    def test_real_harness_launch_and_resume_compose_without_an_override(self) -> None:
+        """Every other lifecycle test drives a `--harness-command` override, so
+        the branch that composes a REAL harness argv — the one an actual run
+        takes — was never executed. A lost local binding there raised NameError
+        at `start-slice` and at `finalize --steer` for a codex Developer while
+        the whole suite stayed green. Codex is the harness under test because it
+        is the only one whose composition reads run policy (`commit_required`
+        selects the linked-worktree writable root) on both paths.
+
+        `_launch_developer` is patched to record the composed command and launch
+        a stand-in in its place, so composition runs for real without invoking a
+        coding CLI."""
+        composed: list[str] = []
+        real_launch = slice_ops._launch_developer
+
+        def capture(command: str, repo: Path, env: dict, artifact_dir: Path) -> dict:
+            composed.append(command)
+            # Prints the session-id line codex writes to stdout, so the launch
+            # is correlated and the resume path is reachable.
+            stand_in = "printf 'session id: 019fa73e-b8e8-7d82-9e4d-0186e3d83bf0\\n'; sleep 30"
+            return real_launch(stand_in, repo, env, artifact_dir)
+
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        code, out, _err = self.run_cli_in_repo(
+            ["init", "--repo", str(self.repo), "--plan", str(plan_path), "--harness", "codex"]
+        )
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        with mock.patch.object(slice_ops, "_launch_developer", capture):
+            code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+            self.assertEqual(code, 0, err)
+            self._track_current_process(run_id, token)
+
+            code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "keep going", "--token", token])
+            self.assertEqual(code, 0, err)
+            self._track_current_process(run_id, token)
+
+        launch, resume = composed
+        self.assertTrue(launch.startswith("codex exec "), launch)
+        self.assertIn("codex exec resume", resume)
+        # The sandbox is only a boundary while approvals cannot escalate out of
+        # it, so both real-harness turns must carry the pinned policy.
+        for command in (launch, resume):
+            self.assertIn('approval_policy="never"', command)
+
     def test_steer_refuses_into_visible_hard_stop_marker(self) -> None:
         # The pre-cutover correction rule, preserved headlessly: once the prior
         # turn has quiesced, a credential/approval/usage/side-effect marker in

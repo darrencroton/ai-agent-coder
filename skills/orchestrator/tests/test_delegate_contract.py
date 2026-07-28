@@ -503,7 +503,13 @@ class DelegateContractTests(unittest.TestCase):
         meant a codex continuation could never launch (observed: exit 2,
         "unexpected argument '--sandbox' found"). The sandbox survives as a -c
         config override; -C is unnecessary because the child runs with
-        cwd=repo_path."""
+        cwd=repo_path.
+
+        Asserted against the set of flags resume *accepts* rather than a denylist
+        of known-bad ones, so a future flag added to the shared codex branch is
+        caught here instead of at a delegate's launch. Both paths must also pin
+        `approval_policy="never"`, without which the sandbox is not a boundary at
+        all (references/codex.md)."""
         policy = dict(self.policy, required_tools=["codex"])
         request = dict(self.request, tool="codex")
         contract = delegate_contract.validate_contract(policy, request, self.run_dir)
@@ -512,15 +518,17 @@ class DelegateContractTests(unittest.TestCase):
         self.assertEqual(launch[:3], ["codex", "exec", "prompt"])
         self.assertIn("--sandbox", launch)
         self.assertIn("-C", launch)
+        self.assertIn('approval_policy="never"', launch)
 
         resumed = delegate_contract.compose_delegate_command(
             contract, "prompt", resume_session_id="session-123"
         )
         self.assertEqual(resumed[:5], ["codex", "exec", "resume", "session-123", "prompt"])
-        self.assertNotIn("--sandbox", resumed)
-        self.assertNotIn("-C", resumed)
+        accepted_resume_flags = {"-c", "-m", "--skip-git-repo-check"}
+        self.assertEqual({arg for arg in resumed if arg.startswith("-")} - accepted_resume_flags, set())
         self.assertIn("--skip-git-repo-check", resumed)
         self.assertIn('sandbox_mode="read-only"', resumed)
+        self.assertIn('approval_policy="never"', resumed)
 
     def test_qwen_nondefault_effort_fails_closed(self):
         policy = dict(self.policy, required_tools=["qwen"], required_effort="high")
