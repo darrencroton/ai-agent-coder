@@ -253,13 +253,17 @@ def _run_status(args: argparse.Namespace) -> int:
     print(f"plan: {plan_info.get('path')}  sha256: {(plan_info.get('sha256') or '')[:12]}…")
     print(f"stop reason: {state.get('stop_reason')}")
 
+    # The attempt ceiling is printed alongside every attempt count so pacing a
+    # steer never requires reading run.json directly.
+    max_attempts = (state.get("policy") or {}).get("max_attempts", 3)
     print("slices:")
     for entry in state.get("slices", []):
         commit = entry.get("commit")
         commit_short = commit[:10] if commit else "-"
         print(
             f"  {entry['id']:<10} status={entry.get('status') or 'pending':<10} "
-            f"risk={entry.get('risk'):<9} attempts={entry.get('attempts', 0)} commit={commit_short}"
+            f"risk={entry.get('risk'):<9} attempts={entry.get('attempts', 0)}/{max_attempts} "
+            f"commit={commit_short}"
         )
 
     current = state.get("current_slice")
@@ -269,7 +273,7 @@ def _run_status(args: argparse.Namespace) -> int:
         print(
             f"current slice: {current.get('id')}  session={current.get('tmux_session')} "
             f"alive={alive}  before_head={before_head}…  started_at={current.get('started_at')} "
-            f"attempts={current.get('attempts')}"
+            f"attempts={current.get('attempts')}/{max_attempts}"
         )
     else:
         print("current slice: none")
@@ -436,6 +440,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
     outcome = slice_ops.finalize(repo, run_dir, token, risk=args.risk)
     print(f"slice: {outcome.slice_id}")
     _print_floor_facts(outcome.report)
+    print(f"attempts: {outcome.attempts}/{outcome.max_attempts}")
     print(f"evidence: status-before={outcome.status_before_path}")
     print(f"evidence: status-after={outcome.status_after_path}")
     print(f"evidence: diff={outcome.diff_path}")

@@ -888,6 +888,8 @@ class FinalizeOutcome:
     diff_path: Path
     result_path: Path
     slice_id: str
+    attempts: int = 0
+    max_attempts: int = 0
 
 
 _ACCEPT_REASONING_MIN_CHARS = 40
@@ -950,6 +952,8 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
         diff_path=artifact_dir / "diff.patch",
         result_path=artifact_dir / "result.json",
         slice_id=slice_id,
+        attempts=int(current.get("attempts", 0)),
+        max_attempts=int((state.get("policy") or {}).get("max_attempts", 3)),
     )
 
 
@@ -960,7 +964,7 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
+def is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
     """A review is fresh for `head` iff it was recorded against exactly
     this HEAD and its artifact still exists with a matching sha256 (design
     §5: any tree change after a mandatory review invalidates it)."""
@@ -975,7 +979,7 @@ def _is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
 def _fresh_reviews_for_head(reviews: list[dict[str, Any]], head: str | None) -> dict[str, dict[str, Any]]:
     fresh: dict[str, dict[str, Any]] = {}
     for review in reviews:
-        if _is_review_fresh(review, head):
+        if is_review_fresh(review, head):
             skill = review.get("skill")
             if skill:
                 fresh[skill] = review
@@ -987,7 +991,7 @@ def _reviews_consulted_text(reviews: list[dict[str, Any]], head: str | None, eff
         return "PM assessment only (standard risk)" if effective_risk != "elevated" else "(no reviews recorded)"
     lines: list[str] = []
     for review in reviews:
-        stale = "" if _is_review_fresh(review, head) else " [SUPERSEDED - stale for current HEAD]"
+        stale = "" if is_review_fresh(review, head) else " [SUPERSEDED - stale for current HEAD]"
         lines.append(
             f"- {review.get('skill')}/{review.get('tool')} @ {review.get('head')} -> "
             f"{review.get('artifact')}{stale}"

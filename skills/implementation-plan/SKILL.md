@@ -33,6 +33,8 @@ Choose slice size based on risk, coupling, rollback, and expected implementer st
 
 Do not create extra slices just to separate every file or every documentation step. Split when a boundary improves authorization, reviewability, rollback, or human approval, not because smaller is automatically better.
 
+Treat a slice that bundles several new functions plus their wiring plus documentation as a split signal regardless of profile — it is usually too large for one reviewable diff and one implementer turn. Split on natural seams (pure logic, then I/O, then presentation, then wiring and docs), which also tends to order the resulting slices by descending risk so cheaper models can take the later ones.
+
 When useful, include a short `Implementation Profiles` section before the slice receipts:
 
 ```md
@@ -84,6 +86,27 @@ Use this shape for every implementation slice:
 ### Rollback Path
 - ...
 ```
+
+## Writing Acceptance Criteria
+
+`Acceptance Criteria` is the shared behavioural checklist: it reaches the implementer and a `project-manager`-commissioned reviewer verbatim, as the pinned contract the change must satisfy. Requirements that must bind both seats belong in the slice's own sections — plan text outside them reaches neither.
+
+Write them as an enumerable checklist, one verifiable assertion per line, rather than as paragraphs. Requirements buried mid-paragraph get lost even by strong models, and a checklist is what lets a reviewer or supervisor check completeness at a glance:
+
+```md
+- [ ] Both axes are log-scaled on every path, including the all-unusable empty figure.
+- [ ] Unusable points are never passed to `errorbar`.
+```
+
+Make each assertion independently checkable, and state explicitly when one must hold on *every* path — that is the coupling implementers most often miss when two requirements share a sentence.
+
+For slices specifying numerical functions, declare the expected input domain once under `Inputs:` and state that behaviour outside it is unspecified, so implementers need not guard overflow or underflow of intermediate products for out-of-domain values. Three rules keep that from becoming a blanket excuse:
+
+- Name any **in-domain exception that must hold** as its own assertion (for example, "a bin with `sigma == 0` must yield exactly `0`, not `nan`").
+- Keep the declared domain consistent with what the CLI and configuration actually accept. A value the program admits without error is in-domain by definition; narrowing the declaration instead of validating the input is a planning defect.
+- Validation of *malformed* input — wrong dtype, wrong shape, non-finite, negative counts — is still required wherever untrusted values enter the program: the CLI, configuration, and data files. A declared domain excuses float64 extremity handling, never missing validation at those boundaries.
+
+Declare the domain; do not instruct reviewers how to rate findings. Severity is the `code-review` skill's contract, and it already caps out-of-domain behaviour below the blocking levels.
 
 ## Machine-Consumed Fields
 

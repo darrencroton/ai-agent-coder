@@ -102,10 +102,12 @@ _CONDITIONAL_LIMIT_RE = re.compile(r"\bif you hit your limit\b")
 def scan_hard_stop(text: str) -> dict[str, Any]:
     """The hard-stop marker floor, shared by send_line, observe, and floor fact 8.
 
-    Whitespace-normalizes (a prompt wrapped across terminal rows must still
-    match) and lowercases for keyword matching, exactly as the old-evidence
-    tmux adapter did. No confidence grades, no subtypes beyond the kind
-    labels, no reset-time parsing — the PM agent reads the pane itself.
+    Whitespace-normalizes and lowercases for keyword matching, exactly as the
+    old-evidence tmux adapter did. A prompt wrapped across terminal rows still
+    matches because capture rejoins wrapped lines first (`pane_text`); this
+    normalization alone would not rescue a marker split mid-token. No
+    confidence grades, no subtypes beyond the kind labels, no reset-time
+    parsing — the PM agent reads the pane itself.
     """
     normalized = re.sub(r"\s+", " ", text or "")
     lowered = normalized.lower()
@@ -188,8 +190,14 @@ def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -
 
 
 def pane_text(session: str) -> str:
-    """`capture-pane -p -S -32768`; empty string on any failure."""
-    result = _run_tmux("capture-pane", "-p", "-S", "-32768", "-t", session)
+    """`capture-pane -p -J -S -32768`; empty string on any failure.
+
+    `-J` rejoins lines tmux hard-wrapped at the pane width. Without it a
+    marker split mid-token ("Ente" / "r API key to continue") survives
+    `scan_hard_stop`'s whitespace normalization as "Ente r API key" and
+    matches nothing, making hard-stop detection depend on pane width.
+    """
+    result = _run_tmux("capture-pane", "-p", "-J", "-S", "-32768", "-t", session)
     return result.stdout if result.returncode == 0 else ""
 
 
@@ -198,7 +206,7 @@ def capture_to(session: str, destination: Path) -> None:
     if not shutil.which("tmux"):
         destination.write_text("tmux was unavailable during capture\n", encoding="utf-8")
         return
-    result = _run_tmux("capture-pane", "-p", "-S", "-32768", "-t", session)
+    result = _run_tmux("capture-pane", "-p", "-J", "-S", "-32768", "-t", session)
     if result.returncode == 0:
         destination.write_text(result.stdout, encoding="utf-8")
     else:

@@ -140,6 +140,34 @@ def _resolve_tool(state: dict[str, Any], tool_arg: str | None, *, has_override: 
     )
 
 
+def _fresh_drift_audit_report(
+    repo: Path, run_dir: Path, run_id: str, entry: dict[str, Any] | None, head: str
+) -> str | None:
+    """A reviewer-readable path to a drift-audit report already recorded fresh
+    against `head`, or None.
+
+    Freshness reuses `slice_ops.is_review_fresh` — the same rule that decides
+    whether an elevated slice's mandatory reviews still hold — so a report
+    superseded by a later tree change is never presented as current. The
+    reviewer is pointed at the `.pm/` mirror, which sits inside the repository
+    it is scoped to read, but only after re-copying the hash-verified original
+    over it: freshness authenticates the controller original, so handing over a
+    mirror that was not just written from it would let anything with write
+    access to the gitignored mirror substitute a different report.
+    """
+    for review in reversed((entry or {}).get("reviews") or []):
+        if review.get("skill") != "drift-audit" or not slice_ops.is_review_fresh(review, head):
+            continue
+        original = Path(str(review.get("artifact")))
+        try:
+            relative = original.relative_to(run_dir)
+        except ValueError:
+            return str(original)
+        slice_ops.mirror_artifact(repo, run_dir, run_id, str(relative))
+        return str(slice_ops.run_artifact_dir(repo, run_id) / relative)
+    return None
+
+
 def _tail(path: Path, max_chars: int = _STDERR_TAIL_CHARS) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -243,6 +271,11 @@ def run_review(
     resolved_effort = effort or reviewer_block.get("effort")
 
     prompt_text = prompts.render_reviewer_prompt(
+        # Never handed to a drift audit itself: a second audit of the same
+        # commit must stay independent of the first one's verdict.
+        drift_audit_report=None if skill == "drift-audit" else _fresh_drift_audit_report(
+            repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head
+        ),
         skill_name=skill,
         repo=str(repo),
         slice_id=slice_id,

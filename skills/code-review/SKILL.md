@@ -46,7 +46,8 @@ Every review must do all of the following:
 
 ### 2. Confirm authorization status
 - If a `drift-audit` result is supplied, summarize its verdict and proceed to quality review.
-- If a frozen contract exists but no `drift-audit` result is supplied, state that the user should explicitly call the drift-audit skill first. Continue only if the user explicitly asks for combined drift and quality review.
+- If the commissioning context states that the authorization check was performed elsewhere — for example a supervising Project Manager that checks the changed surface against the frozen authorization itself — record that as the authorization status and proceed to quality review. Do not re-audit authorization or caveat your conclusions on the absence of a separate report.
+- If a frozen contract exists but no `drift-audit` result is supplied and nothing states it was done elsewhere, state that the user should explicitly call the drift-audit skill first. Continue only if the user explicitly asks for combined drift and quality review.
 - If a supplied `drift-audit` result is incomplete or contradicted by the diff, report that as an open question instead of silently redoing the audit.
 
 ### 3. Establish expected behaviour
@@ -87,6 +88,8 @@ Before finishing, ask:
 - `P2 Medium`: important weakness in tests, validation, maintainability, portability, or performance that should be addressed soon.
 - `P3 Low`: minor clarity, documentation, or style issue. Mention only if it adds signal.
 
+`P0` and `P1` are gated on reachability: rate a finding there only when you can state how the defect is reached — a CLI invocation, a configuration legal under documented ranges, a plausible input file, a caller inside the reviewed system, or, for surface documented as public, any value inside its documented domain. Hand-constructing values at a helper's signature that no caller and no documented contract can produce is a demonstration of the defect, not a reachability path; where a plan declares an input domain (see the `implementation-plan` skill), behaviour outside it is likewise unreachable. Such findings cap at `P2` and state why. Reachability gates severity and nothing else: never stop examining edge cases, never suppress a finding, and when reachability is genuinely uncertain say so and rate `P2` rather than guessing in either direction.
+
 Default output should focus on `P0` to `P2`. Include `P3` only when the review is otherwise clean or the note is unusually useful.
 
 ## What Good Findings Look Like
@@ -97,7 +100,7 @@ Each finding must include:
 - severity
 - concise title
 - why it matters in runtime, scientific, or maintenance terms
-- evidence path: violated requirement, failing scenario, risky control flow, missing validation, or contract break
+- evidence path: violated requirement, failing scenario, risky control flow, missing validation, or contract break — for a `P0` or `P1`, this must include the reachability path required above, and a finding capped at `P2` for unreachability must say what it would take to reach it
 - concrete fix direction or verification step
 
 Bad finding: vague, speculative, or style-only without impact.
@@ -106,11 +109,11 @@ Good finding: specific, reproducible, and tied to real engineering risk.
 
 ## Required Output
 
-When a `drift-audit` result exists, start with `Authorization Status`, then list quality findings ordered by severity. When no frozen contract exists, start with findings as usual.
+When a `drift-audit` result exists, or the commissioning context states that authorization was checked elsewhere, start with `Authorization Status` recording which of the two it was, then list quality findings ordered by severity. When no frozen contract exists, start with findings as usual.
 
 ```md
 ## Authorization Status
-- Drift audit verdict:
+- Drift audit verdict, or the check the commissioning context performed:
 - Notes:
 
 ## Findings

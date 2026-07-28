@@ -147,6 +147,42 @@ class TestScanHardStopWrapping(unittest.TestCase):
         self.assertIn("credential_prompt", result["kinds"])
 
 
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real pane")
+class TestPaneTextRejoinsHardWraps(unittest.TestCase):
+    """The capture half of the same floor: whitespace normalization cannot
+    repair a marker tmux split MID-TOKEN at the pane edge ("Ente"/"r API
+    key" normalizes to "Ente r API key"), so `pane_text` must pass `-J`.
+    Driven at a pinned 20-column width because the defect is width-
+    dependent: without a forced wrap point this would pass either way."""
+
+    def test_marker_split_mid_token_by_pane_width_is_detected(self) -> None:
+        session = "pm-test-hardwrap-s01a0"
+        padding = "x" * 19  # pushes the wrap boundary inside "Enter"
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session, "-x", "20", "-y", "10",
+             f"sh -c 'printf \"{padding}Enter API key to continue\\n\"; sleep 30'"],
+            check=True, capture_output=True,
+        )
+        self.addCleanup(sessions.force_stop, session)
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and "continue" not in sessions.pane_text(session):
+            time.sleep(0.2)
+
+        # The fixture must still be adversarial: an unjoined capture splits
+        # the marker, so this test cannot silently stop pinning anything.
+        unjoined = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", session], capture_output=True, text=True, check=True
+        ).stdout
+        self.assertNotIn("Enter API key", unjoined)
+
+        joined = sessions.pane_text(session)
+        self.assertIn("Enter API key", joined)
+        result = sessions.scan_hard_stop(joined)
+        self.assertTrue(result["present"])
+        self.assertIn("credential_prompt", result["kinds"])
+
+
 # --- session_name: no tmux required ------------------------------------------
 
 
