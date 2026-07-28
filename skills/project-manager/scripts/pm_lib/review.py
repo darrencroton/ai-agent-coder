@@ -60,7 +60,23 @@ def compose_reviewer_command(
             command.extend(["-m", model])
         if effort:
             command.extend(["-c", f'model_reasoning_effort="{effort}"'])
-        command.extend(["--sandbox", "read-only", "--skip-git-repo-check", "-C", repo_str])
+        # `approval_policy="never"` is what makes the read-only sandbox a boundary:
+        # under an `on-request` policy the reviewer can request escalation for a
+        # sandbox-blocked command and be granted it with no human present. The
+        # sandbox is set through its config key to match the orchestrator's codex
+        # profile, which must use the config form because `codex exec resume`
+        # rejects `--sandbox`.
+        command.extend(
+            [
+                "-c",
+                'sandbox_mode="read-only"',
+                "-c",
+                'approval_policy="never"',
+                "--skip-git-repo-check",
+                "-C",
+                repo_str,
+            ]
+        )
         return command
 
     if tool == "claude":

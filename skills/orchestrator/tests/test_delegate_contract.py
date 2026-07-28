@@ -364,7 +364,7 @@ class DelegateContractTests(unittest.TestCase):
     def test_harness_commands_select_only_read_only_modes_by_default(self):
         cases = {
             "claude": ("--permission-mode", "plan"),
-            "codex": ("--sandbox", "read-only"),
+            "codex": ("-c", 'sandbox_mode="read-only"'),
             "opencode": ("--agent", "plan"),
             "qwen": ("--sandbox", "--output-format"),
         }
@@ -374,6 +374,8 @@ class DelegateContractTests(unittest.TestCase):
                 if tool == "qwen":
                     self.assertIn(flag, command)
                     self.assertEqual(command[command.index(expected) + 1], "text")
+                elif tool == "codex":
+                    self.assertEqual(command[command.index(expected) - 1], flag)
                 else:
                     self.assertEqual(command[command.index(flag) + 1], expected)
                 self.assertNotIn("acceptEdits", command)
@@ -462,16 +464,52 @@ class DelegateContractTests(unittest.TestCase):
                 if tool == "copilot":
                     self.assertIn(f"--resume={session_id}", command)
 
+    def test_codex_resume_command_uses_only_flags_the_resume_subcommand_accepts(self):
+        """`codex exec resume` has its own, smaller flag set than `codex exec`: it
+        rejects `--sandbox` and `-C` outright, so composing them fails the launch
+        before the delegate ever starts. Assert against the accepted set rather than
+        a denylist, so any future flag added to the shared codex branch is caught."""
+        accepted_resume_flags = {"-c", "-m", "--skip-git-repo-check"}
+        for contract in (self.validate(tool="codex"), self.validate_write(tool="codex")):
+            with self.subTest(access=contract["access"]):
+                command = delegate_contract.compose_delegate_command(
+                    contract,
+                    "prompt",
+                    resume_session_id="12345678-1234-1234-1234-123456789abc",
+                )
+                composed_flags = {arg for arg in command if arg.startswith("-")}
+                self.assertEqual(composed_flags - accepted_resume_flags, set())
+
+    def test_codex_pins_the_sandbox_and_forbids_approval_escalation_on_both_paths(self):
+        """The codex sandbox is only a boundary while approvals cannot escalate out of
+        it: under an `on-request` approval policy the model may request escalation for
+        a sandbox-blocked command and be granted it non-interactively. Launch and
+        continuation must both pin the sandbox and pin the approval policy."""
+        for contract, expected_sandbox in (
+            (self.validate(tool="codex"), "read-only"),
+            (self.validate_write(tool="codex"), "workspace-write"),
+        ):
+            for resume_session_id in (None, "12345678-1234-1234-1234-123456789abc"):
+                with self.subTest(access=contract["access"], resumed=resume_session_id is not None):
+                    command = delegate_contract.compose_delegate_command(
+                        contract, "prompt", resume_session_id=resume_session_id
+                    )
+                    self.assertIn(f'sandbox_mode="{expected_sandbox}"', command)
+                    self.assertIn('approval_policy="never"', command)
+
     def test_harness_commands_select_write_enabled_modes(self):
         cases = {
             "claude": ("--permission-mode", "acceptEdits"),
-            "codex": ("--sandbox", "workspace-write"),
+            "codex": ("-c", 'sandbox_mode="workspace-write"'),
             "opencode": ("--agent", "build"),
         }
         for tool, (flag, expected) in cases.items():
             with self.subTest(tool=tool):
                 command = delegate_contract.compose_delegate_command(self.validate_write(tool=tool), "prompt")
-                self.assertEqual(command[command.index(flag) + 1], expected)
+                if tool == "codex":
+                    self.assertEqual(command[command.index(expected) - 1], flag)
+                else:
+                    self.assertEqual(command[command.index(flag) + 1], expected)
 
         # Copilot and Qwen have no tested mechanical write-enabled flag distinct
         # from their read-only command; access is entirely prompt-enforced for

@@ -806,7 +806,16 @@ def compose_delegate_command(
         if effort != "default":
             command.extend(["-c", f'model_reasoning_effort="{effort}"'])
         sandbox = "workspace-write" if write else "read-only"
-        command.extend(["--sandbox", sandbox, "--skip-git-repo-check", "-C", repo])
+        # `codex exec resume` rejects `--sandbox` and `-C`, so both paths express the
+        # sandbox through its config key instead. `approval_policy="never"` is what
+        # makes that sandbox an actual boundary: under an `on-request` policy (a
+        # common setting in the caller's own `~/.codex/config.toml`) the model can
+        # request escalation for a sandbox-blocked command and be granted it without
+        # any human present. `-C` is redundant on the resume path anyway, because the
+        # launcher already starts every delegate in the policy repository.
+        command.extend(["-c", f'sandbox_mode="{sandbox}"', "-c", 'approval_policy="never"', "--skip-git-repo-check"])
+        if resume_session_id is None:
+            command.extend(["-C", repo])
         return command
 
     if tool == "copilot":

@@ -160,7 +160,9 @@ class TestComposeReviewerCommand(unittest.TestCase):
                 "codex", "exec", "PROMPT",
                 "-m", "gpt-5",
                 "-c", 'model_reasoning_effort="high"',
-                "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/repo",
+                "-c", 'sandbox_mode="read-only"',
+                "-c", 'approval_policy="never"',
+                "--skip-git-repo-check", "-C", "/repo",
             ],
         )
 
@@ -168,7 +170,12 @@ class TestComposeReviewerCommand(unittest.TestCase):
         command = review_mod.compose_reviewer_command("codex", "PROMPT", repo=Path("/repo"))
         self.assertEqual(
             command,
-            ["codex", "exec", "PROMPT", "--sandbox", "read-only", "--skip-git-repo-check", "-C", "/repo"],
+            [
+                "codex", "exec", "PROMPT",
+                "-c", 'sandbox_mode="read-only"',
+                "-c", 'approval_policy="never"',
+                "--skip-git-repo-check", "-C", "/repo",
+            ],
         )
 
     def test_claude(self) -> None:

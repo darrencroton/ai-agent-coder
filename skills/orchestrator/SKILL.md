@@ -50,7 +50,7 @@ Equal eligibility does not imply identical enforcement. Read the selected tool r
 | Tool | Read-only boundary | Read-write boundary | Reference |
 |---|---|---|---|
 | Claude Code | Plan-mode restrictions; command execution still requires delegate discipline | `acceptEdits` auto-approves file edits; prompt-enforced beyond that | [references/claude.md](references/claude.md) |
-| Codex CLI | Read-only sandbox | `workspace-write` sandbox mechanically confines writes to the working directory and `/tmp` | [references/codex.md](references/codex.md) |
+| Codex CLI | Read-only sandbox | `workspace-write` sandbox mechanically confines writes to the working directory, `/tmp`, and `$TMPDIR` | [references/codex.md](references/codex.md) |
 | GitHub Copilot CLI | Prompt-enforced read-only behavior | Prompt-enforced; same command as read-only | [references/copilot.md](references/copilot.md) |
 | OpenCode CLI | Plan agent denies edit tools; shell discipline remains prompt-enforced | Build agent grants unrestricted tool permissions; prompt-enforced | [references/opencode.md](references/opencode.md) |
 | Qwen Code | Prompt-enforced repository read-only behavior; launcher requests sandboxing | Prompt-enforced; same command as read-only | [references/qwen.md](references/qwen.md) |
