@@ -342,7 +342,8 @@ INSTALL_RECIPES: dict[str, dict[str, list[str]]] = {
              "pipx": ["pipx", "install", "ruff"],
              "brew": ["brew", "install", "ruff"],
              "pip": [sys.executable, "-m", "pip", "install", "--user", "ruff"]},
-    "codespell": {"pipx": ["pipx", "install", "codespell"],
+    "codespell": {"uv": ["uv", "tool", "install", "codespell"],
+                  "pipx": ["pipx", "install", "codespell"],
                   "brew": ["brew", "install", "codespell"],
                   "pip": [sys.executable, "-m", "pip", "install", "--user", "codespell"]},
     "markdownlint-cli2": {"npm": ["npm", "install", "-g", "markdownlint-cli2"]},
@@ -715,6 +716,7 @@ def report(payload: dict[str, Any], as_json: bool) -> None:
     if payload["uncovered"]:
         print(f"uncovered languages: {', '.join(payload['uncovered'])} "
               "-- treat as N/A, not as a pass")
+    print_missing_hint(payload.get("missing_binaries") or [])
 
 
 # --------------------------------------------------------------------------- #
@@ -732,6 +734,27 @@ def package_managers() -> list[str]:
         elif have(probe):
             found.append("apt" if m == "apt-get" else m)
     return found
+
+
+def print_missing_hint(missing: list[str]) -> None:
+    """The single place that says what a missing linter means and what fixes it.
+
+    `check` never installs (invariant 1), so the only correct response to a
+    missing tool is to tell the human what is absent and what would install it.
+    Shared by `detect` and `check` so the wording cannot drift apart.
+    """
+    if not missing:
+        return
+    # Not "this language went unchecked": another tool may cover it, and
+    # `coverage` owns that answer.
+    print(f"\nmissing linters: {', '.join(missing)} — those checks did not run")
+    print("  install (human, one-off):  lint.py install        # dry run, prints commands")
+    print("                             lint.py install --yes  # execute them")
+    # Only mention uv where uv would actually supply something missing.
+    uv_would_help = any("uv" in INSTALL_RECIPES.get(b, {}) for b in missing)
+    if uv_would_help and "uv" not in package_managers():
+        print("  uv is the simplest way to get the Python linters and is not installed here:")
+        print("    brew install uv   (or see https://docs.astral.sh/uv/)")
 
 
 def cmd_detect(args) -> int:
@@ -761,9 +784,7 @@ def cmd_detect(args) -> int:
             tier = "" if r["default"] else " (opt-in)"
             print(f"  {r['name']:<16} {r['language']:<9} {r['files']:>4} file(s)  {state}{tier}")
         if missing:
-            print(f"\nmissing: {', '.join(missing)}")
-            print("run:  lint.py install            # dry run, prints commands")
-            print("      lint.py install --yes      # execute them")
+            print_missing_hint(missing)
         else:
             print("\nall selected tools installed")
     return EXIT_PASS
@@ -851,8 +872,8 @@ def cmd_check(args) -> int:
     if not files:
         payload = {"mode": "differential" if differential else "absolute",
                    "repo": root, "file_count": 0, "coverage": {}, "tools": [],
-                   "new_findings": [], "uncovered": [], "verdict": "pass",
-                   "reason": "no files in scope"}
+                   "new_findings": [], "uncovered": [], "missing_binaries": [],
+                   "verdict": "pass", "reason": "no files in scope"}
         report(payload, args.json)
         return EXIT_PASS
 
@@ -910,6 +931,7 @@ def cmd_check(args) -> int:
         "files": files,
         "coverage": cov,
         "uncovered": uncovered,
+        "missing_binaries": sorted({t.binary for t in tools if not have(t.binary)}),
         "errors": errored,
         # Per-tool finding COUNT, not the findings themselves: the full list is
         # reported once under new_findings, so carrying it twice would be noise.

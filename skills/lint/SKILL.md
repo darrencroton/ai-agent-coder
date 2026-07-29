@@ -40,7 +40,10 @@ These are load-bearing. Do not work around them.
 
 1. **`check` never installs anything.** Installing mutates the machine.
    `install` is a separate, explicit, human-run subcommand, dry-run unless
-   `--yes` is passed.
+   `--yes` is passed. An agent that finds a tool missing **reports it and lets
+   the human decide** — it never runs `install --yes` on its own initiative, in
+   any mode. `check` and `detect` name the missing binaries and print the
+   install command so the human knows exactly what is needed.
 2. **A missing linter is `unavailable` coverage, never a pass.** The report names
    every language present with no tool available. `--require-coverage` turns that
    into exit 3 so an automated caller cannot mistake absence of findings for
@@ -100,9 +103,9 @@ Full CLI reference, the tool table, and per-language notes: [README.md](README.m
    the default branch; for a pre-commit check use `--base HEAD`, which sees the
    uncommitted and untracked work the commit will contain.
 2. **Check coverage first.** Run `detect`. If a language in the change has no
-   tool installed, either install it (`install --yes`, if you are the human and
-   this is setup) or record the gap explicitly. Never let an uncovered language
-   read as a clean result.
+   tool installed, record the gap explicitly and surface it — say which binary
+   is missing and what installs it. Only the human runs `install --yes`. Never
+   let an uncovered language read as a clean result.
 3. **Run `check --base <ref>`.** Read the findings.
 4. **Fix or account for every new finding.** Each one is either fixed inside the
    authorized surface, or explicitly recorded with a reason — a project

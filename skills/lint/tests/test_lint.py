@@ -348,6 +348,80 @@ class TestInstallSafety(unittest.TestCase):
         self.assertNotIn("cmd_install", src)
         self.assertNotIn("pip install", src)
 
+    def test_missing_binary_hint_names_the_tool_and_the_install_command(self):
+        """A missing linter must tell the human what is absent and what fixes
+        it — silence is how an unavailable gate reads as a pass."""
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            lint.print_missing_hint(["ruff", "markdownlint-cli2"])
+        text = buf.getvalue()
+        self.assertIn("ruff", text)
+        self.assertIn("markdownlint-cli2", text)
+        self.assertIn("those checks did not run", text)
+        self.assertIn("lint.py install", text)
+
+    def test_missing_binary_hint_is_silent_when_nothing_is_missing(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            lint.print_missing_hint([])
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_python_tools_resolve_to_one_install_path_when_uv_exists(self):
+        """ruff and codespell are both Python tools: with uv available they must
+        plan the same manager, not uv for one and `pip install --user` for the
+        other. Availability is stubbed so the assertion holds on any host."""
+        import contextlib
+        import io
+        with TempRepo() as repo:
+            repo.write("a.py", "x = 1\n")
+            repo.commit("base")
+
+            class A:
+                paths, base, enable, skip = [], None, [], []
+                json, timeout, yes, all_tools = False, 30, False, True
+            a = A(); a.repo = repo.dir
+
+            # Only uv is installed: every linter is missing, uv is the one manager.
+            original = lint.have
+            lint.have = lambda binary: binary == "uv"
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = lint.cmd_install(a)
+            finally:
+                lint.have = original
+            self.assertEqual(rc, lint.EXIT_PASS)
+            text = buf.getvalue()
+            self.assertIn("uv tool install ruff", text)
+            self.assertIn("uv tool install codespell", text)
+            self.assertNotIn("pip install --user", text)
+            self.assertIn("dry run", text)
+
+    def test_uv_note_is_silent_when_uv_cannot_supply_the_missing_tool(self):
+        """Recommending uv for a Node or C binary it cannot install is a false
+        instruction, not a helpful default."""
+        import contextlib
+        import io
+        original = lint.have
+        lint.have = lambda binary: False  # nothing installed, uv included
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                lint.print_missing_hint(["markdownlint-cli2", "clang-format"])
+            md_only = buf.getvalue()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                lint.print_missing_hint(["ruff"])
+            with_python = buf.getvalue()
+        finally:
+            lint.have = original
+        self.assertNotIn("uv", md_only)
+        self.assertIn("uv", with_python)
+
 
 class TestExitCodes(unittest.TestCase):
     def test_codes_are_distinct_and_documented(self):

@@ -362,6 +362,8 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     run_id = state.get("run_id")
     plan_info = state.get("plan") or {}
     harness_info = state.get("harness") or {}
+    reviewer_info = state.get("reviewer") or {}
+    policy_info = state.get("policy") or {}
     plan_sha = (plan_info.get("sha256") or "")[:12]
 
     lines.append(f"# PM Run Report: {run_id}")
@@ -373,6 +375,15 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
         f"- Harness: {harness_info.get('name')} model={harness_info.get('model')} "
         f"effort={harness_info.get('effort')}"
     )
+    # Reviewer and budget are the run's other two comparability controls. Labelled
+    # "run default" because `--reviewer-tools`/`--tool` override it per slice; the
+    # budget mirrors the enforcement default so the report cannot state one the
+    # toolkit would not apply.
+    lines.append(
+        f"- Reviewer (run default): {', '.join(reviewer_info.get('tools') or []) or None} "
+        f"model={reviewer_info.get('model')} effort={reviewer_info.get('effort')}"
+    )
+    lines.append(f"- Attempt budget: {policy_info.get('max_attempts', 10)} per slice")
     lines.append(f"- Status: {state.get('status')}")
     lines.append(f"- Stop reason: {state.get('stop_reason')}")
     lines.append("")

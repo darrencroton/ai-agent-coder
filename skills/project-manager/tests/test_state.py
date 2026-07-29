@@ -354,6 +354,46 @@ class TestNewRunIdCollisions(unittest.TestCase):
         self.assertEqual(run_id, f"{now_base}-3")
 
 
+class TestRunReportHeader(PmTestCase):
+    """The report header is the run's own record of its configuration.
+
+    Harness, reviewer, and attempt budget are the three controls that decide
+    whether two runs are comparable at all; a report naming only the harness
+    leaves the other two to an operator's separate notes, which is exactly
+    where they were observed to drift out of agreement with the run itself.
+    """
+
+    def _header(self, **overrides) -> str:
+        state = {
+            "run_id": "20260729T000000Z",
+            "repo": "/repo", "branch": "feature/x", "status": "active",
+            "plan": {"path": "/plan.md", "sha256": "a" * 64, "slice_count": 1},
+            "harness": {"name": "opencode", "model": "qwen3.6-27b-bf16", "effort": None},
+            "reviewer": {"tools": ["codex"], "model": "gpt-5.6-sol", "effort": "high"},
+            "policy": {"max_attempts": 10, "commit_required": True},
+            "slices": [], "approvals": {}, "stop_reason": None,
+        }
+        state.update(overrides)
+        return state_mod.render_run_report(state, [], Path(self.repo))
+
+    def test_header_records_harness_reviewer_and_budget(self) -> None:
+        text = self._header()
+        self.assertIn("- Harness: opencode model=qwen3.6-27b-bf16", text)
+        self.assertIn("- Reviewer (run default): codex model=gpt-5.6-sol effort=high", text)
+        self.assertIn("- Attempt budget: 10 per slice", text)
+
+    def test_header_survives_a_run_with_no_reviewer_configured(self) -> None:
+        text = self._header(reviewer={}, policy={})
+        self.assertIn("- Reviewer (run default): None", text)
+
+    def test_absent_policy_renders_the_budget_the_toolkit_actually_enforces(self) -> None:
+        """`max_attempts` is absent-tolerant in enforcement (`cli.py`,
+        `slice_ops.py` both default to 10). A report printing `None` would
+        state a budget no command would apply."""
+        text = self._header(policy={})
+        self.assertIn("- Attempt budget: 10 per slice", text)
+
+
 class TestCliCheckPlanAndStubs(PmTestCase):
     def test_check_plan_cli_exits_zero_on_good_plan(self) -> None:
         plan_path = self.write_plan()
