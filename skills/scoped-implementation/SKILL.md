@@ -27,7 +27,7 @@ If the contract is missing or too vague, stop after drafting a candidate contrac
 1. **Confirm contract** - restate the authorized surface and non-goals briefly.
 2. **Check starting state** - inspect `git status` and relevant files. Do not overwrite unrelated user changes.
 3. **Implement only the slice** - keep edits inside the authorized files/functions. Do not perform opportunistic cleanup.
-4. **Validate** - run the targeted checks from the contract. Add or update tests when the contract requires it.
+4. **Validate** - run the targeted checks from the contract. Add or update tests when the contract requires it. Then run the `lint` skill differentially against the slice's starting commit (`check --base <ref>`) and account for every new finding: fix it inside the authorized surface, or record why it stands. If a fix needs an unauthorized file, stop and report rather than widening the surface. Report an uncovered language as a gap, never as a pass.
 5. **Prepare drift audit input** - collect the frozen contract, changed files, diff summary, and validation results for the user's next explicit call to the drift-audit skill.
 6. **Report receipt** - finish with the implementation receipt below. Do not run the drift-audit skill as part of this skill unless the user explicitly calls both skills in the same request.
 
@@ -64,6 +64,11 @@ End with this shape:
 
 ### Validation Run
 - ...
+
+### Lint (differential)
+- Base ref:
+- Verdict (pass / new findings / uncovered language):
+- New findings and their disposition:
 
 ### Drift Audit Input
 - Frozen contract:

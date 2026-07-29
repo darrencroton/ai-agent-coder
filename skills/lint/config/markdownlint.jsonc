@@ -1,0 +1,53 @@
+// Default markdownlint rules for the lint skill: DEFECTS, NOT TASTE.
+//
+// Used only when the target project has no markdownlint config of its own
+// (.markdownlint*, .markdownlint-cli2*, or a package.json key). A project's own
+// configuration always wins -- see SKILL.md invariant 4.
+//
+// Rules stay on by default so genuinely useful new checks are picked up; the
+// list below turns off the ones that encode a house style rather than a defect.
+// Two facts bound the risk of a future release adding a noisy rule: lint is
+// differential (only findings this change introduces are reported) and it is
+// not a floor fact, so `--skip markdownlint` is always available.
+{
+  "default": true,
+
+  // --- Off: line width is a house style, not a defect. --------------------- //
+  // Many projects (including this one) deliberately do not hard-wrap prose,
+  // because modern renderers soft-wrap and manual wrapping is worse to edit.
+  "MD013": false,
+
+  // --- Off: cosmetic whitespace and marker styles. ------------------------- //
+  "MD004": false, // ul-style (- vs * vs +)
+  "MD007": false, // ul-indent width
+  "MD012": false, // multiple consecutive blank lines
+  "MD029": false, // ordered-list numbering style
+  "MD030": false, // spaces after list marker
+  "MD035": false, // horizontal-rule style
+  "MD046": false, // code-block style (indented vs fenced)
+  "MD048": false, // code-fence style (``` vs ~~~)
+  "MD049": false, // emphasis style (_ vs *)
+  "MD050": false, // strong style (__ vs **)
+  "MD060": false, // table pipe spacing
+
+  // --- Off: legitimate in this repo's document shapes. --------------------- //
+  // Implementation plans repeat "### Validation Plan", "### Rollback Path" and
+  // friends once per slice by design, so duplicate headings are structural,
+  // not an error.
+  "MD024": false,
+  "MD003": false, // heading style (setext vs atx)
+  "MD033": false, // inline HTML -- sometimes the only way to express a thing
+  "MD036": false, // emphasis used instead of a heading -- a judgement call
+  "MD041": false, // first line must be a top-level heading
+  "MD044": false  // proper-names capitalisation -- needs per-project word list
+
+  // Everything else stays ON. The load-bearing ones:
+  //   MD056 table-column-count   -- a wrong cell count silently drops data
+  //   MD058 blanks-around-tables -- a table without them may not render
+  //   MD022 blanks-around-headings, MD031 blanks-around-fences,
+  //   MD032 blanks-around-lists  -- rendering defects in strict CommonMark
+  //   MD040 fenced-code-language -- no syntax highlighting, worse a11y
+  //   MD011 reversed-link-syntax, MD039 spaces-in-links, MD042 empty-links
+  //   MD025 single top-level heading, MD001 heading-increment
+  //   MD009 trailing spaces, MD047 single trailing newline
+}

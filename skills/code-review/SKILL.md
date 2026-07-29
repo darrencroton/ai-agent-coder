@@ -62,6 +62,7 @@ Every review must do all of the following:
 
 ### 5. Use supporting validation when it is proportionate
 - When cheap and relevant, run targeted tests, builds, linters, or static analysis to validate or falsify review hypotheses.
+- Mechanical hygiene is the `lint` skill's job, not yours: unused names, formatting drift, import order, misspellings, malformed Markdown tables. If a lint verdict is supplied, do not re-report what it already found; if one is absent, note that lint coverage was not evidenced rather than substituting a manual scan for it. Spend your attention on what a linter cannot decide — correctness, contracts, edge cases, numerical behaviour.
 - For C and C++, treat compiler warnings and sanitizers as supporting evidence, not as substitutes for reasoning.
 - For scientific and numerical changes, prefer targeted regression tests, reference-data checks, or benchmark comparisons when available.
 

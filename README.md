@@ -4,7 +4,7 @@
 
 AI coding agents are strong implementers and unreliable narrators: left unsupervised they expand scope, grade their own work generously, and report success that can diverge from what actually happened in the repository. This repository combines a small mechanical floor of non-negotiable checks — the highest-harm failures (unauthorized surface changes, broken history, self-approved human gates) are made mechanically impossible — with accountable, recorded judgement above it. What "authorized" means is frozen before coding; authorization is audited before quality; and every acceptance rests on repository evidence and is recorded with its reasoning, never accepted on the agent's say-so. The agent moves fast inside the lane — it just doesn't get to redraw it.
 
-The system is graduated: use one skill standalone (a single code review), run a plan slice-by-slice with checkpoints, or hand a whole plan to an external supervisor and come back to committed, assessed slices. The protected outcomes stay constant at every rung; the process depth scales with risk — a docs slice carries light process, a consequential one carries independent review and human decisions. The skill chain — **plan → scoped implementation → validation → drift audit → code review → commit** — is the shared vocabulary throughout; who holds the gates, and how deep each check goes, is what changes between rungs.
+The system is graduated: use one skill standalone (a single code review), run a plan slice-by-slice with checkpoints, or hand a whole plan to an external supervisor and come back to committed, assessed slices. The protected outcomes stay constant at every rung; the process depth scales with risk — a docs slice carries light process, a consequential one carries independent review and human decisions. The skill chain — **plan → scoped implementation → validation → lint → drift audit → code review → commit** — is the shared vocabulary throughout; who holds the gates, and how deep each check goes, is what changes between rungs.
 
 Why it exists, who it serves, and the principles that govern design decisions live in [`docs/VISION.md`](docs/VISION.md).
 
@@ -24,7 +24,7 @@ Each skill is a self-contained directory under [`skills/`](skills/) with a stand
 
 - **Compose through a bootstrap repo.** If you maintain a private agent-home repo that composes skills from several sources into one canonical catalogue, register this repo there and let its setup script clone it and create the symlinks.
 
-The atomic skills need nothing beyond the Markdown files. Supervised autonomy (Mode B) additionally needs Python 3.13 or newer, `git`, `tmux`, and at least one supported coding CLI on the machine that runs Project Manager.
+The atomic skills need nothing beyond the Markdown files, except `lint`, which additionally uses whichever linters your repositories need — it detects what is missing and prints the install commands (`skills/lint/scripts/lint.py detect`), and never installs anything implicitly. Supervised autonomy (Mode B) additionally needs Python 3.13 or newer, `git`, `tmux`, and at least one supported coding CLI on the machine that runs Project Manager.
 
 ## The Autonomy Ladder
 
@@ -64,6 +64,7 @@ This README is the maintained human-facing skill index. Each skill's own `SKILL.
 | [`implementation-plan`](skills/implementation-plan/) | Breaks a request into auditable slices with frozen contracts: acceptance criteria, authorized surface, validation, risk flags, and a copyable launcher for the next chat. |
 | [`project-manager`](skills/project-manager/) | Supervises execution of an existing plan one slice at a time: durable run state, whole-plan sanity check, fresh tmux-backed session per slice, an eight-fact mechanical floor, recorded PM assessments, commissioned independent reviews. |
 | [`scoped-implementation`](skills/scoped-implementation/) | Implements one frozen slice without expanding scope; prepares the receipt for drift audit. |
+| [`lint`](skills/lint/) | Deterministic hygiene before any model-based review: runs the project's linters and reports only the findings this change introduced. A missing linter is reported as uncovered, never as a pass. |
 | [`drift-audit`](skills/drift-audit/) | Answers one question: was the implementation authorized? Runs before any quality review. |
 | [`code-review`](skills/code-review/) | Senior-level quality review after drift audit passes: correctness, edge cases, tests, error handling, domain-specific risks. |
 | [`orchestrator`](skills/orchestrator/) | Delegates bounded read-only or read-write work through validated contracts, with all-harness session tracking and captured-session continuation; the Developer retains verification, gates, commits, and final responsibility. |
@@ -80,11 +81,12 @@ The default flow for feature or bug work, at every rung:
 
 1. **Plan** — `implementation-plan`: define slices, freeze contracts, flag risky surfaces.
 2. **Implement** — `scoped-implementation` against one frozen slice, in a fresh session.
-3. **Audit scope** — `drift-audit`: was what happened authorized? Always before quality review.
-4. **Review quality** — `code-review` after the authorization gate passes.
-5. **Simplify** (optional) — `code-simplifier` as a separate pass over working code.
-6. **Hand off** (if needed) — `handoff` before ending an unfinished session.
-7. **Commit** — `commit`, only with explicit approval (yours in checkpointed Mode A; the plan's standing authorization in autonomous Mode A; in Mode B the Developer commits per slice and PM's recorded acceptance above a passing floor is what lets the run advance).
+3. **Lint** — `lint`: deterministic findings this change introduced, differential against the starting commit so pre-existing debt cannot block. Before the reviews, because these findings are unarguable and free.
+4. **Audit scope** — `drift-audit`: was what happened authorized? Always before quality review.
+5. **Review quality** — `code-review` after the authorization gate passes.
+6. **Simplify** (optional) — `code-simplifier` as a separate pass over working code.
+7. **Hand off** (if needed) — `handoff` before ending an unfinished session.
+8. **Commit** — `commit`, only with explicit approval (yours in checkpointed Mode A; the plan's standing authorization in autonomous Mode A; in Mode B the Developer commits per slice and PM's recorded acceptance above a passing floor is what lets the run advance).
 
 One deliberate ordering difference: in Mode B the slice commit comes *before* the reviews — the Developer commits, then PM runs the floor and commissions `drift-audit`/`code-review` against the committed diff before deciding acceptance. The per-slice commit is what makes the reviewed state exact and any mistake one revert away.
 
@@ -100,6 +102,7 @@ Everything the system produces — run state, artifacts, transcripts, Reviewer e
 - **Frozen contract** — a slice's authorization, fixed before coding: acceptance criteria, authorized surface, non-goals, validation plan, rollback path.
 - **Authorized surface** — the files (and functions/tests) a slice may touch; everything else is drift.
 - **Drift audit** — the authorization gate: compares actual changes against the frozen contract, before any quality judgment.
+- **Differential lint** — the `lint` skill's default question: not "is this code clean?" but "does this change introduce a finding that was not there before?". Pre-existing findings are out of scope; a newly introduced one is not.
 - **Gate** — a check that must pass before work advances. In Mode A these are the in-session chain steps (validation, drift audit, code review, commit evidence); in Mode B there are exactly three: the mechanical floor, PM assessment, and human approval.
 - **Harness** — a coding-agent CLI (Codex CLI, Claude Code, OpenCode, Copilot CLI, …) that PM or you run a session in.
 - **Orchestrator** — the standalone skill and workflow that lets a Developer delegate bounded work to another harness, in either access mode below.

@@ -81,6 +81,7 @@ Use this shape for every implementation slice:
 ### Validation Plan
 - Tests to add/update:
 - Commands to run:
+- Lint (differential, via the `lint` skill): required unless the slice changes no linted file
 - Manual checks:
 
 ### Rollback Path

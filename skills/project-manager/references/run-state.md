@@ -32,7 +32,7 @@ Writes are atomic (temp file + rename) under an advisory `fcntl` lock (`.lock`);
   "plan": {"path": "/abs/plan.md", "sha256": "…", "slice_count": 5},
   "harness": {"name": "codex", "model": null, "effort": null, "command_override": null},
   "reviewer": {"tools": ["copilot"], "model": null, "effort": null},
-  "policy": {"max_attempts": 3, "commit_required": true},
+  "policy": {"max_attempts": 10, "commit_required": true},
   "auth": {"token_sha256": "…"},
   "current_slice": {
     "id": "Slice 3", "artifact_dir": "…", "tmux_session": "pm-<run-id>-s03a0",

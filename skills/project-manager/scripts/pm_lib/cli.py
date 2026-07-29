@@ -255,7 +255,7 @@ def _run_status(args: argparse.Namespace) -> int:
 
     # The attempt ceiling is printed alongside every attempt count so pacing a
     # steer never requires reading run.json directly.
-    max_attempts = (state.get("policy") or {}).get("max_attempts", 3)
+    max_attempts = (state.get("policy") or {}).get("max_attempts", 10)
     print("slices:")
     for entry in state.get("slices", []):
         commit = entry.get("commit")

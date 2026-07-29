@@ -348,7 +348,7 @@ def init_run(
         "model": reviewer_model,
         "effort": reviewer_effort,
     }
-    policy_block = {"max_attempts": max_attempts if max_attempts is not None else 3, "commit_required": True}
+    policy_block = {"max_attempts": max_attempts if max_attempts is not None else 10, "commit_required": True}
 
     state, token, run_dir = state_mod.create_run(
         repo,
@@ -591,7 +591,7 @@ def start_slice(
         )
 
     policy = state.get("policy") or {}
-    max_attempts = int(policy.get("max_attempts", 3))
+    max_attempts = int(policy.get("max_attempts", 10))
 
     if relaunch:
         attempts = int(entry.get("attempts", 0)) + 1
@@ -953,7 +953,7 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
         result_path=artifact_dir / "result.json",
         slice_id=slice_id,
         attempts=int(current.get("attempts", 0)),
-        max_attempts=int((state.get("policy") or {}).get("max_attempts", 3)),
+        max_attempts=int((state.get("policy") or {}).get("max_attempts", 10)),
     )
 
 
@@ -1211,7 +1211,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # is never persisted, matching start_slice's relaunch-exhaustion path.
     attempts = int(current.get("attempts", 0)) + 1
     policy = state.get("policy") or {}
-    max_attempts = int(policy.get("max_attempts", 3))
+    max_attempts = int(policy.get("max_attempts", 10))
     if attempts > max_attempts:
         # Mandatory stop, as in start_slice's exhaustion path: the live
         # session is killed, not left running past the budget.
