@@ -56,12 +56,14 @@ These are load-bearing. Do not work around them.
 4. **Defects, not taste.** The tool set is deliberately limited to findings with
    an objective answer. It carries no complexity metric, no naming opinion, and
    no architectural rule. **A project's own conventions win:** the linters read
-   the project's own config files first, and `config/markdownlint.jsonc` supplies
-   a defect-focused default only when the project has none (line length, marker
-   styles, and duplicate headings are off — the last because an implementation
-   plan repeats `### Validation Plan` once per slice by design). If a plan
-   mandates something a generic rule would flag, the plan is right and the rule
-   must be skipped (`--skip <tool>`).
+   the project's own config files first, and `config/ruff.toml` and
+   `config/markdownlint.jsonc` supply defect-focused defaults only when the
+   project has none. Both exist because the tools' own defaults are broader than
+   this rule allows — ruff's default set flags import ordering and rewrites
+   `config = dict(...)` to a literal, which on one calibration repo was the
+   documented convention of the project being linted. If a plan mandates
+   something a generic rule would flag, the plan is right and the rule must be
+   skipped (`--skip <tool>`).
 5. **Nothing is mutated.** No `--fix`, no reformat-in-place. This skill reports;
    the Developer edits. (External tools may still write their own caches.)
 6. **The comparison is a good heuristic, not an oracle.** Signatures are

@@ -1,0 +1,47 @@
+# Default ruff rules for the lint skill: DEFECTS, NOT TASTE.
+#
+# Used only when the target project has no ruff configuration of its own
+# (ruff.toml, .ruff.toml, or a [tool.ruff] table in pyproject.toml). A project's
+# own configuration always wins -- see SKILL.md invariant 4.
+#
+# Why an explicit select rather than ruff's defaults: ruff's default rule set is
+# broad and version-dependent, and it includes style-with-judgement rules. On the
+# two repositories this skill was calibrated against, the defaults produced 26
+# and 43 findings, of which the great majority were taste -- import ordering,
+# `dict()` versus a literal, semicolons, imports below a sys.path fixup. One of
+# those, C408, fires on `config = dict(...)`, which is the documented convention
+# of the very project it was flagging. A linter whose opinion outranks the plan
+# is worse than no linter. The list below produces 7 and 10 findings on the same
+# code, all of them defects.
+#
+# This applies to `ruff check` only. Formatting is not selected here: with no
+# project config, `ruff format --check` uses its own defaults either way.
+
+[lint]
+select = [
+  "F",     # pyflakes: unused imports and variables, undefined names, f-string
+           # bugs. The core of the tool -- F841 is the dead-local class that
+           # five supervised runs shipped and two LLM reviewers missed.
+  "E9",    # syntax and IO errors: the file could not even be parsed.
+  "B",     # bugbear: real traps, not style. B905 zip-without-strict silently
+           # truncates to the shortest input -- a genuine defect in numerical
+           # code; B904 loses the original traceback on re-raise.
+  "T10",   # a forgotten pdb/breakpoint left in committed code.
+  "DTZ",   # naive and deprecated datetime calls, including utcnow().
+  "ASYNC", # blocking calls inside async functions.
+  "PLE",   # pylint's error tier only -- never its convention or refactor tiers.
+]
+
+# Deliberately NOT selected, with the reason, so the next person does not
+# "helpfully" add them back:
+#   I    import sorting            -- pure ordering, no defect
+#   C4   comprehension rewrites    -- C408 fights a documented dict() convention
+#   SIM  simplifications           -- judgement; often less readable
+#   UP   pyupgrade                 -- modernisation, not correctness
+#   E4   import placement          -- E402 fires on deliberate sys.path fixups
+#   E7   statement style           -- E702 is semicolons, pure taste
+#   E5   line length               -- house style (cf. MD013 in markdownlint)
+#   RUF  ruff-specific             -- mixed; RUF001-003 flag unicode that is
+#                                     legitimate in scientific prose
+#   S    bandit                    -- security focus, low value for numerics;
+#                                     available per-repo if a project wants it

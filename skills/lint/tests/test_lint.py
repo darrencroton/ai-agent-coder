@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -657,6 +658,40 @@ class TestConfigPrecedence(unittest.TestCase):
         with TempRepo() as repo:
             repo.write("package.json", '{"markdownlint-cli2": {"config": {}}}')
             self.assertEqual(lint._markdownlint_config(repo.dir), [])
+
+    def test_ruff_uses_shipped_default_when_project_has_none(self):
+        with TempRepo() as repo:
+            argv = lint._ruff_config(repo.dir)
+            self.assertEqual(argv[:1], ["--config"])
+            self.assertTrue(argv[1].endswith("ruff.toml"))
+
+    def test_project_ruff_config_wins(self):
+        for name in ("ruff.toml", ".ruff.toml"):
+            with TempRepo() as repo:
+                repo.write(name, "[lint]\nselect = [\"E\"]\n")
+                self.assertEqual(lint._ruff_config(repo.dir), [], name)
+
+    def test_pyproject_wins_only_when_it_configures_ruff(self):
+        """Nearly every Python project has a pyproject.toml; treating its mere
+        presence as ruff configuration would disable the default everywhere."""
+        with TempRepo() as repo:
+            repo.write("pyproject.toml", "[project]\nname = \"x\"\n")
+            self.assertNotEqual(lint._ruff_config(repo.dir), [])
+        with TempRepo() as repo:
+            repo.write("pyproject.toml", "[project]\nname = \"x\"\n\n[tool.ruff.lint]\nselect = [\"F\"]\n")
+            self.assertEqual(lint._ruff_config(repo.dir), [])
+
+    def test_shipped_ruff_default_selects_defects_not_taste(self):
+        """The rule set is the whole point of shipping a config: F841 (the dead
+        local five runs shipped) must be in; the taste families must be out."""
+        shipped = os.path.join(lint.SKILL_DIR, "config", "ruff.toml")
+        with open(shipped, encoding="utf-8") as fh:
+            body = fh.read()
+        selected = re.search(r"select = \[(.*?)\n\]", body, re.S).group(1)
+        for family in ("\"F\"", "\"B\"", "\"DTZ\""):
+            self.assertIn(family, selected)
+        for taste in ("\"I\"", "\"C4\"", "\"SIM\"", "\"UP\"", "\"E7\"", "\"RUF\""):
+            self.assertNotIn(taste, selected)
 
     def test_clang_format_skipped_without_project_config(self):
         with TempRepo() as repo:

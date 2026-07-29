@@ -311,6 +311,32 @@ _MDL_PROJECT_CONFIGS = (
 )
 
 
+_RUFF_PROJECT_CONFIGS = ("ruff.toml", ".ruff.toml")
+
+
+def _ruff_config(cwd: str) -> list[str]:
+    """Use the project's own ruff config when it has one; otherwise the skill's
+    shipped defect-focused default (SKILL.md invariant 4).
+
+    A `pyproject.toml` counts only when it actually carries a `[tool.ruff]`
+    table — nearly every Python project has the file, and treating its mere
+    presence as configuration would silently disable the default everywhere.
+    """
+    for name in _RUFF_PROJECT_CONFIGS:
+        if os.path.exists(os.path.join(cwd, name)):
+            return []
+    pyproject = os.path.join(cwd, "pyproject.toml")
+    if os.path.exists(pyproject):
+        try:
+            with open(pyproject, encoding="utf-8") as fh:
+                if re.search(r"^\s*\[tool\.ruff", fh.read(), re.MULTILINE):
+                    return []
+        except OSError:
+            pass
+    shipped = os.path.join(SKILL_DIR, "config", "ruff.toml")
+    return ["--config", shipped] if os.path.exists(shipped) else []
+
+
 def _markdownlint_config(cwd: str) -> list[str]:
     """Use the project's own markdownlint config when it has one; otherwise the
     skill's shipped defect-focused default (SKILL.md invariant 4)."""
@@ -361,8 +387,8 @@ TOOLS: list[Tool] = [
     Tool(
         name="ruff-check", language="python", extensions=PY, binary="ruff",
         build=lambda b, f: [b, "check", "--output-format=json", "--force-exclude", "--"] + f,
-        parse=_parse_ruff_check,
-        note="Superset of pyflakes/pycodestyle/isort/pyupgrade.",
+        parse=_parse_ruff_check, extra_argv=_ruff_config,
+        note="Unused names, undefined names, bugbear traps, naive datetimes.",
     ),
     Tool(
         name="ruff-format", language="python", extensions=PY, binary="ruff",
@@ -779,6 +805,11 @@ def cmd_detect(args) -> int:
         print(json.dumps(payload, indent=2))
     else:
         print(f"lint detect: {len(files)} file(s) in scope under {root}")
+        if not files:
+            # "0 files, all tools installed" reads as a green light while almost
+            # nothing was inspected. Say what scoping actually happened.
+            print("  (scope defaults to CHANGED files, and none are changed — "
+                  "pass paths or --base <ref> to inspect coverage)")
         for r in rows:
             state = "installed" if r["installed"] else "MISSING"
             tier = "" if r["default"] else " (opt-in)"
