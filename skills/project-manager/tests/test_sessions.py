@@ -164,6 +164,20 @@ class TestPaneTextRejoinsHardWraps(unittest.TestCase):
             check=True, capture_output=True,
         )
         self.addCleanup(sessions.force_stop, session)
+        # The default `window-size` option is "latest", which resizes a
+        # window to match the server's most recently active client -
+        # silently overriding the -x/-y pin above whenever another tmux
+        # client is attached elsewhere on the same server. Pin the window
+        # to manual sizing so the 20-column wrap point this test depends
+        # on actually holds.
+        subprocess.run(
+            ["tmux", "set-window-option", "-t", session, "window-size", "manual"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["tmux", "resize-window", "-t", session, "-x", "20", "-y", "10"],
+            check=True, capture_output=True,
+        )
 
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and "continue" not in sessions.pane_text(session):
