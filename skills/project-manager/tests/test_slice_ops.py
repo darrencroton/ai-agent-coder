@@ -86,6 +86,7 @@ from pm_test_helpers import PmTestCase, parse_init_output, write_fake_harness
 
 from pm_lib import git_ops
 from pm_lib import sessions
+from pm_lib import slice_ops
 from pm_lib import state as state_mod
 
 _HAS_TMUX = shutil.which("tmux") is not None
@@ -1023,9 +1024,10 @@ class TestRealHarnessComposition(SliceOpsTestCase):
             real_start_session(session, repo, "sleep 30", env)
 
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        code, out, _err = self.run_cli_in_repo(
-            ["init", "--repo", str(self.repo), "--plan", str(plan_path), "--harness", "codex"]
-        )
+        with mock.patch.object(slice_ops, "_executable_exists", return_value=True):
+            code, out, _err = self.run_cli_in_repo(
+                ["init", "--repo", str(self.repo), "--plan", str(plan_path), "--harness", "codex"]
+            )
         self.assertEqual(code, 0, out)
         run_id, token = parse_init_output(out)
 
