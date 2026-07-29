@@ -94,16 +94,25 @@ def render_developer_prompt(
     notes_path: Path,
     result_path: Path,
     reference_path: Path | None = None,
+    skills_root: Path | None = None,
 ) -> str:
     """Render the Developer prompt for one slice launch.
 
     Section texts (`intended_change`, `acceptance_criteria`, …) come from
     `plan_slice.sections` verbatim, with only trailing whitespace stripped —
     the plan author's wording and formatting is not otherwise touched.
+
+    `lint_script` is resolved to an absolute path here rather than left as a
+    bare `lint.py` in the template: a Developer given an unrunnable command
+    substitutes a plausible one, and the observed substitution
+    (`ruff check --diff HEAD`, which treats the ref as a path, lints nothing
+    and exits 0) recorded a false pass in `validation.md`.
     """
     template = load_template(reference_path)
     sections = plan_slice.sections
+    lint_script = (skills_root or _DEFAULT_SKILLS_ROOT) / "lint" / "scripts" / "lint.py"
     fields: dict[str, Any] = {
+        "lint_script": str(lint_script),
         "plan_path": str(plan_path),
         "slice_id": plan_slice.slice_id,
         "slice_title": plan_slice.title,
