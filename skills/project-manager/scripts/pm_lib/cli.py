@@ -1,13 +1,10 @@
 """Command-line parsing and dispatch (target-design §12).
 
-All eleven commands are wired: `init`, `status` (incl. `--report`),
-`approve`, `start-slice`, `observe`, `send`, `finalize` (bare, and its
-`--accept`/`--steer`/`--stop` decision paths), `review`, `notes`, and
-`stop`. This
-module stays thin: argument parsing, resolving the repo/run/token,
-dispatching into `slice_ops`/`review`, and formatting output. The actual
-mechanics (state mutation, session control, git facts, review commissioning)
-live in the modules that own them; nothing here decides anything semantic.
+Every subcommand below (see `_HANDLERS`) is wired the same thin way:
+argument parsing, resolving the repo/run/token, dispatching into
+`slice_ops`/`review`, and formatting output. The actual mechanics (state
+mutation, session control, git facts, review commissioning) live in the
+modules that own them; nothing here decides anything semantic.
 """
 
 from __future__ import annotations
@@ -141,6 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
     notes_group.add_argument("--set", dest="set_text", help="replace the whole notes file with this text")
     notes.add_argument("--run")
     notes.add_argument("--token")
+
+    rate = subparsers.add_parser(
+        "rate", help="Record the run's harness/model performance rubric (once per run, before status --report)"
+    )
+    rate.add_argument(
+        "--text",
+        required=True,
+        help="the rubric text to record (see references/model-performance-rubric.md)",
+    )
+    rate.add_argument("--run")
+    rate.add_argument("--token")
 
     stop = subparsers.add_parser("stop", help="End the run, preserving evidence")
     stop.add_argument("--reason", required=True)
@@ -553,6 +561,23 @@ def _run_notes(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- rate -------------------------------------------------------------------
+
+
+def _run_rate(args: argparse.Namespace) -> int:
+    repo = _repo_from_cwd()
+    token = _require_token(args)
+    run_dir = state_mod.resolve_run_dir(repo, args.run)
+    # MAC-verify state to keep rating a PM-only write (Developers hold no
+    # token) and to source the run id from authenticated state.
+    state = slice_ops.load_writable_state(run_dir, token)
+    original = slice_ops.write_model_performance(repo, run_dir, state["run_id"], text=args.text)
+    print(f"model-performance recorded: {original}")
+    mirror = slice_ops.model_performance_path(repo, state["run_id"])
+    print(f"mirror: {mirror}")
+    return 0
+
+
 _HANDLERS = {
     "check-plan": _run_check_plan,
     "init": _run_init,
@@ -564,6 +589,7 @@ _HANDLERS = {
     "finalize": _run_finalize,
     "review": _run_review,
     "notes": _run_notes,
+    "rate": _run_rate,
     "stop": _run_stop,
 }
 

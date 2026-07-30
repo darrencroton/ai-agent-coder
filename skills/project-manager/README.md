@@ -32,6 +32,7 @@ All commands: `python3 skills/project-manager/scripts/pm.py <command> …`, run 
 | `finalize --accept "reasoning" \| --steer "correction" \| --stop "reason" [--risk elevated]` | PM's recorded decision; accept requires a passing floor (+ both fresh reviews when elevated); steer costs an attempt |
 | `review --slice ID --skill drift-audit\|code-review [--tool T] [--model M] [--effort E] [--timeout N] [--adjudicated TEXT …]` | commission an independent review pinned to `before_head..HEAD` (`--tool` ∈ codex/claude/copilot/opencode/qwen); prints the report path, stderr path, and reviewer process-group id at launch, before waiting. `--adjudicated` (repeatable) names rulings PM already settled so a reviewer stops re-raising them — it bounds attention only, still gets a full dissenting finding from a reviewer that disagrees, and the rendered prompt is persisted for audit |
 | `notes --append TEXT \| --set TEXT [--run ID]` | update the run's curated `notes.md` — writes the state-dir original then re-mirrors; never hand-edit the `.pm/` mirror |
+| `rate --text TEXT [--run ID]` | record the run's harness/model performance rating once, per [references/model-performance-rubric.md](references/model-performance-rubric.md) — writes `model-performance.md` the same way as `notes`, included verbatim in `run-report.md` |
 | `stop --reason R [--slice-status stopped] [--scavenge]` | end the run preserving evidence; `--scavenge` sweeps sessions even with state destroyed |
 
 The attempt budget defaults to 10 per slice — the initial launch plus ten steers or relaunches. Lower it at `init` (`--max-attempts N`) for a strong Developer model where you want autonomy measured tightly; a slice that needs more than 10 rounds is itself the finding, and the human should see it rather than have more budget granted. Weak or unproven Developer models fail by exhausting the budget, not by shipping bad code. `status` and `finalize` print attempts against the ceiling so the PM can pace steering decisions without reading `run.json`.
@@ -42,7 +43,7 @@ If a harness displays a directory-trust or permission prompt, the PM stops and l
 
 ## Layout: who owns what
 
-- **`<git-dir>/pm/<run-id>/`** — authoritative state (`run.json`, HMAC-authenticated) and every PM-authored original (assessments, reviews, notes, report — plain files, protected by living outside the worktree, not by the MAC). See [references/run-state.md](references/run-state.md).
+- **`<git-dir>/pm/<run-id>/`** — authoritative state (`run.json`, HMAC-authenticated) and every PM-authored original (assessments, reviews, notes, performance rating, report — plain files, protected by living outside the worktree, not by the MAC). See [references/run-state.md](references/run-state.md).
 - **`<repo>/.pm/runs/<run-id>/`** — the human-facing mirror of PM artifacts plus Developer-authored evidence (`result.json`, `validation.md`, pane captures, diffs, prompts). Self-ignoring via `.pm/.gitignore`. The boundary, precisely: PM's records and decisions live in the controller originals and are never read back from this mirror — but Developer-authored evidence here (`result.json`, `validation.md`) *is* input to the floor and to PM's assessment. Vandalizing it damages the Developer's own case and fails the slice closed (floor fact 4); it can never forge an acceptance or alter PM state.
 - Per slice: `prompt.md` (the rendered authorization), `steer-attempt-<n>.md` (each `finalize --steer` correction, verbatim — PM injects only a one-line pointer to it, so a long or multi-line correction cannot be truncated or split by a harness TUI), `pane-live.txt`/`pane.txt`, `status-before/after.txt`, `diff.patch`, `validation.md`, `result.json`, `attempt-<n>/` for superseded launches, `assessment.md` + `review-*.md` mirrors, and `review-*-prompt.md` — the exact prompt each reviewer was commissioned with, so any PM adjudication that narrowed a review is visible to the human rather than inferable only from what the report omits.
 
@@ -114,6 +115,10 @@ python3 $PM start-slice
 python3 $PM observe --wait 30
 python3 $PM finalize                       # expect: eight PASS lines
 python3 $PM finalize --accept "Trial slice: diff creates hello.txt exactly per contract; validation output shows the expected content; floor 8/8."
+python3 $PM rate --text "Developer (fake harness):
+Process discipline: 5/5 — no incidents.
+Reporting reliability: 5/5 — result matched.
+Output quality: 5/5 — trial slice exactly per contract."
 python3 $PM status --report                # then read .pm/runs/<id>/run-report.md
 ```
 

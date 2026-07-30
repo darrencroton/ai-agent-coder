@@ -47,12 +47,16 @@ matching Stage 3's convention; tmux-gated scenarios use a tiny fake-harness
 8. Controller-owned `notes.md`: content written into the run's original
    `notes.md` before a launch is mirrored into `.pm/` at `start-slice`; a
    notes file over the 512 KiB cap prints a prominent (non-fatal) warning
-   at `start-slice`.
+   at `start-slice`. Controller-owned `model-performance.md` (`pm rate`)
+   mirrors `notes.md`'s write/mirror/token-required/non-empty-text contract,
+   but always replaces the whole file (no append mode — the rating is once
+   per run) and renders verbatim into `run-report.md` under
+   `## Harness/Model Performance`, or `(not recorded)` when absent.
 9. Report-from-controller-data (AC): after an acceptance, deleting
    `.pm/` entirely and running `status --report` still exits 0, recreates
    `run-report.md` (original and mirror) from state + events + the
-   assessment file under the state dir alone, and the regenerated report
-   contains the assessment text.
+   assessment file and `model-performance.md` under the state dir alone,
+   and the regenerated report contains the assessment text and rating.
 10. `stop` reaps a hung reviewer: a `review --reviewer-command` fake that
     sleeps in the background is launched as a real subprocess; once its
     process group is recorded in `current_slice.reviewer_pids`, `stop`
@@ -268,6 +272,10 @@ class TestFullAcceptance(FinalizeTestCase):
         # The report must render the run as complete, not merely exist — this
         # is the human-facing statement that the run finished.
         self.assertIn("complete", report_text)
+        # No `pm rate` was recorded on this run: the section still renders,
+        # naming the gap rather than omitting it silently.
+        self.assertIn("## Harness/Model Performance", report_text)
+        self.assertIn("(not recorded)", report_text)
         report_mirror = self.repo / ".pm" / "runs" / run_id / "run-report.md"
         self.assertTrue(report_mirror.is_file())
 
@@ -782,6 +790,59 @@ class TestNotesCommand(FinalizeTestCase):
         self.assertIn("non-empty", err.lower())
 
 
+# `rate` needs no tmux (init only), so it is deliberately not tmux-gated,
+# same as `notes` above.
+class TestRateCommand(FinalizeTestCase):
+    _RATING = (
+        "Process discipline: 5/5 — no incidents.\n"
+        "Reporting reliability: 5/5 — validation matched every check.\n"
+        "Output quality: 4/5 — accepted work correct throughout."
+    )
+
+    def test_set_writes_authoritative_original_and_mirror(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        original = run_dir / "model-performance.md"
+        mirror = self.repo / ".pm" / "runs" / run_id / "model-performance.md"
+
+        code, _out, err = self.run_cli_in_repo(["rate", "--text", self._RATING, "--token", token])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(original.read_text(encoding="utf-8"), self._RATING + "\n")
+        self.assertEqual(mirror.read_text(encoding="utf-8"), self._RATING + "\n")
+
+        # A second `rate` replaces the whole file — there is nothing to
+        # append to a once-per-run rating.
+        code, _out, err = self.run_cli_in_repo(["rate", "--text", "Process discipline: 3/5 — revised.", "--token", token])
+        self.assertEqual(code, 0, err)
+        text = original.read_text(encoding="utf-8")
+        self.assertEqual(text, "Process discipline: 3/5 — revised.\n")
+        self.assertNotIn("5/5", text)
+
+    def test_requires_a_token(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, _token = parse_init_output(out)
+        code, _out, err = self.run_cli_in_repo(["rate", "--text", self._RATING, "--run", run_id])
+        self.assertEqual(code, 2)
+        self.assertIn("token", err.lower())
+
+    def test_empty_or_whitespace_text_is_refused(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        code, _out, err = self.run_cli_in_repo(["rate", "--text", "   ", "--token", token])
+        self.assertEqual(code, 2)
+        self.assertIn("non-empty", err.lower())
+
+
 # --- 9: report regenerates with .pm/ deleted ------------------------------
 
 
@@ -805,6 +866,10 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, out + err)
 
+        rating = "Process discipline: 5/5 — no incidents, whole run."
+        code, out, err = self.run_cli_in_repo(["rate", "--text", rating, "--token", token])
+        self.assertEqual(code, 0, out + err)
+
         shutil.rmtree(self.repo / ".pm")
         self.assertFalse((self.repo / ".pm").exists())
 
@@ -815,6 +880,10 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
         self.assertTrue(report_path.is_file())
         report_text = report_path.read_text(encoding="utf-8")
         self.assertIn(_LONG_REASONING, report_text)
+        # `model-performance.md`'s original lives under the state dir, not
+        # `.pm/`, so regeneration must recover it exactly like every other
+        # controller-owned original this test proves survives deletion.
+        self.assertIn(rating, report_text)
 
         mirror_path = self.repo / ".pm" / "runs" / run_id / "run-report.md"
         self.assertTrue(mirror_path.is_file())
