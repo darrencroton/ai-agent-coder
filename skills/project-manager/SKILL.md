@@ -90,7 +90,7 @@ Stop the run and tell me whenever the plan or the mechanical floor requires a hu
 
 Confirm before starting: plan file read, harness (and model, if given), and the first slice. Then begin.
 
-When every slice is decided, report from the run record: what was accepted and on what evidence, what stopped and why, and any residual risk I should know about.
+When every slice is decided, report from the run record: total run time (double check this), what was accepted and on what evidence, what stopped and why, and any residual risk I should know about.
 ```
 
 Details the launcher relies on: CLI reference and state layout in [README.md](README.md) and [references/run-state.md](references/run-state.md); prompt contracts in [references/developer-prompt.md](references/developer-prompt.md) and [references/reviewer-prompt.md](references/reviewer-prompt.md).
