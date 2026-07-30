@@ -1,13 +1,18 @@
-"""Shared fixtures for the PM Stage 1 test suite.
+"""Shared fixtures for the PM test suite.
 
-Provides `PmTestCase`: a temp git repo per test, a valid-minimal-plan
-writer (parameterizable per slice), an in-process CLI runner, and a
-run-creation helper built on `state.create_run`. Kept deliberately minimal
-— there is no fake harness here; Stage 1 has no session lifecycle to fake.
+Provides `PlanTestCase` (a plain temp directory) and `PmTestCase` (that plus
+a temp git repo), a valid-minimal-plan writer (parameterizable per slice), an
+in-process CLI runner, a run-creation helper built on `state.create_run`, and
+the fake-harness script builders the tmux-gated modules share.
+
+Importing this module also confines every tmux call this suite makes — the
+production ones through `pm_lib.sessions` and any the tests issue directly —
+to a private tmux server. See `TEST_TMUX_SOCKET`.
 """
 
 from __future__ import annotations
 
+import atexit
 import io
 import os
 import re
@@ -15,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -25,7 +31,57 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from pm_lib import cli  # noqa: E402
 from pm_lib import plan as plan_mod  # noqa: E402
+from pm_lib import sessions as sessions_mod  # noqa: E402
 from pm_lib import state as state_mod  # noqa: E402
+
+# --- tmux isolation ----------------------------------------------------------
+#
+# Every tmux-touching test drives a private tmux server, named per test
+# process, rather than the developer's or CI runner's default one. Three
+# reasons, all of them observed rather than hypothetical:
+#
+# 1. A session sweep is prefix- or shape-matched over the WHOLE server. A
+#    stray match, or a bare `stop --scavenge` sweep, reaches sessions the
+#    suite did not create — including the terminal the engineer is running
+#    the tests from.
+# 2. `TestStartSessionStripsInheritedToken` sets a tmux SERVER-global
+#    variable; on a shared server that mutates the caller's environment.
+# 3. Two test processes on one server collide by session name, which is what
+#    blocked running the suite in parallel.
+#
+# `-L` (via PM_TMUX_SOCKET) is the mechanism, not TMUX_TMPDIR: tmux ignores
+# TMUX_TMPDIR whenever $TMUX is already set, so a suite run from inside tmux
+# would silently fall back to the caller's real server.
+TEST_TMUX_SOCKET = f"pm-tests-{os.getpid()}"
+os.environ["PM_TMUX_SOCKET"] = TEST_TMUX_SOCKET
+
+
+def tmux_argv(*args: str) -> list[str]:
+    """`tmux` argv pinned to this process's private server.
+
+    Built here from the frozen `TEST_TMUX_SOCKET` rather than delegating to
+    `sessions.tmux_argv`, which reads the mutable `PM_TMUX_SOCKET` at call
+    time. A test that cleared or repointed that variable would otherwise send
+    these calls — including the teardown `kill-server` below — to the caller's
+    default tmux server. That is not a theoretical failure: an earlier
+    isolation attempt here did exactly that (via `TMUX_TMPDIR`, which tmux
+    ignores when `$TMUX` is set) and destroyed a live operator's sessions.
+    """
+    return ["tmux", "-L", TEST_TMUX_SOCKET, *args]
+
+
+@atexit.register
+def _kill_test_tmux_server() -> None:
+    """Tear this process's private server down when the process exits.
+
+    Always `-L`-scoped to the frozen socket, never a bare `tmux kill-server`.
+    Best effort by construction: tmux may be absent (the tmux-gated tests
+    self-skip, but this still runs) or the server may already be gone.
+    """
+    try:
+        subprocess.run(tmux_argv("kill-server"), check=False, capture_output=True)
+    except OSError:
+        pass
 
 # Stage 3 additions -----------------------------------------------------------
 #
@@ -64,6 +120,143 @@ def write_fake_harness(path: Path, body: str) -> Path:
     path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+# --- fake harness script builders --------------------------------------------
+#
+# Shared by every tmux-gated module. These were duplicated per module, which
+# let the same fixture drift into several slightly different versions of
+# itself — the trigger-gated variants in particular exist precisely because
+# the fixed-delay ones were subtly wrong, and a copy that kept the old shape
+# kept the old race.
+#
+# Fixtures come in two families:
+#
+# * Fixed-delay, for events that only need to happen "soon" and that nothing
+#   is timed against (a harness that commits and writes its result).
+# * TRIGGER-GATED, for events a test must place at a specific moment relative
+#   to something it is measuring. A launch-relative delay cannot do this:
+#   `start-slice` takes several seconds (readiness settle plus two 1s
+#   `send_prompt` settles), so the event either races the launch or has to be
+#   padded until it is slow as well as racy.
+#
+# All of them must come up with a pane clear of hard-stop markers:
+# `send_prompt` refuses to inject the launch pointer into a visible
+# credential/approval/side-effect prompt, so a harness that printed a marker
+# before injection would fail `start-slice` and never reach the behaviour
+# under test.
+
+_READY = "echo FAKE_HARNESS_READY"
+
+
+def trigger_wait(trigger_path: Path) -> str:
+    """Shell that blocks until `trigger_path` exists."""
+    return f'while [ ! -f "{trigger_path}" ]; do sleep 0.05; done'
+
+
+def result_heredoc(status: str = "done", summary: str = "did the work") -> str:
+    return (
+        'cat > "$PM_RESULT_PATH" <<EOF\n'
+        '{"slice": "$PM_SLICE_ID", "status": "' + status + '", "summary": "' + summary + '"}\n'
+        "EOF"
+    )
+
+
+def commit_and_result_script(
+    repo: Path,
+    *,
+    authorized_file: str = "a.py",
+    unauthorized_file: str | None = None,
+    delay: float = 1.0,
+    tail_sleep: float = 3.0,
+) -> str:
+    """Echoes readiness, waits, commits (optionally touching an unauthorized
+    file too), writes result.json, then idles briefly before exiting."""
+    lines = [
+        _READY,
+        f"sleep {delay}",
+        f'echo "authorized change" >> "{repo}/{authorized_file}"',
+        f'git -C "{repo}" add "{authorized_file}"',
+    ]
+    if unauthorized_file:
+        lines.append(f'echo "oops" >> "{repo}/{unauthorized_file}"')
+        lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
+    lines.append(f'git -C "{repo}" commit -q -m "slice work"')
+    lines.append(result_heredoc())
+    lines.append(f"sleep {tail_sleep}")
+    return "\n".join(lines)
+
+
+def result_only_script(*, delay: float = 0.5, tail_sleep: float = 3.0) -> str:
+    return "\n".join([_READY, f"sleep {delay}", result_heredoc(), f"sleep {tail_sleep}"])
+
+
+def idle_script(*, sleep_seconds: float = 30.0) -> str:
+    return f"{_READY}\nsleep {sleep_seconds}"
+
+
+def stdin_draining_idle_script() -> str:
+    """Actively reads (and echoes) stdin, unlike a bare `sleep`. Injected text
+    would otherwise sit unread in the pty's canonical-mode input queue and, if
+    it accumulates, silently drop a *later* `send_line` steer — the same reason
+    a real coding CLI (which does read stdin) doesn't hit this."""
+    return f"{_READY}\nexec cat -"
+
+
+def trigger_gated_credential_prompt_script(trigger_path: Path) -> str:
+    """Comes up clean; reveals a credential prompt once `trigger_path` exists.
+
+    The watcher is backgrounded and `cat -` runs in the foreground, so stdin is
+    both drained and echoed: a `send_line` steer shows up in the pane and never
+    accumulates unread.
+    """
+    return (
+        f"{_READY}\n"
+        f"( {trigger_wait(trigger_path)}; echo 'Enter API key to continue' ) &\n"
+        "exec cat -"
+    )
+
+
+def trigger_gated_result_script(trigger_path: Path, *, tail_sleep: float = 10.0) -> str:
+    """Writes result.json once `trigger_path` exists, then idles."""
+    return (
+        f"{_READY}\n"
+        "cat - >/dev/null &\n"
+        f"{trigger_wait(trigger_path)}\n"
+        f"{result_heredoc()}\n"
+        f"sleep {tail_sleep}"
+    )
+
+
+def trigger_gated_exit_script(trigger_path: Path) -> str:
+    """Stays alive until `trigger_path` exists, then exits, so the session's
+    death is timed by the test rather than by a launch-relative clock."""
+    return f"{_READY}\ncat - >/dev/null &\n{trigger_wait(trigger_path)}"
+
+
+def trigger_gated_churn_script(trigger_path: Path) -> str:
+    """Holds the pane still until `trigger_path` exists, then changes it every
+    0.3s forever. Never writes result.json and never prints a hard-stop marker.
+
+    The quiet period is load-bearing. Readiness for a non-codex/opencode
+    harness is inferred from the pane HOLDING STILL for 1.5s
+    (`sessions._wait_stable_pane_ready`), so a harness churning from launch can
+    never be detected ready: `wait_until_ready` burns its full 60s deadline and
+    gives up — non-fatally, so a test stays green while spending 60s a run on
+    nothing. Gating on a trigger rather than a fixed sleep means the quiet
+    period cannot silently become too short if the process is descheduled.
+    """
+    return (
+        f"{_READY}\n"
+        "cat - >/dev/null &\n"
+        f"{trigger_wait(trigger_path)}\n"
+        "i=0\n"
+        "while true; do\n"
+        "  i=$((i+1))\n"
+        "  echo tick-$i\n"
+        "  sleep 0.3\n"
+        "done"
+    )
 
 
 def render_slice(
@@ -123,28 +316,23 @@ def render_slice(
 """
 
 
-class PmTestCase(unittest.TestCase):
-    """Base test case: a temp git repo, plan-writing and CLI-running helpers."""
+class PlanTestCase(unittest.TestCase):
+    """A plain temp directory, plus the plan-writing and CLI-running helpers.
+
+    For tests whose `repo` is only ever a filesystem location — plan parsing,
+    surface lint, report rendering. `PmTestCase` adds a real git repository on
+    top, and that costs roughly 165ms per test (six git subprocesses) against
+    2ms here. Paid across a module of pure parser tests it dominates the
+    module's entire runtime, so the git fixture belongs only to tests that
+    actually read git state.
+    """
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.repo = Path(self._tmp.name) / "repo"
         self.repo.mkdir()
-        self._git("init", "-q", "-b", "main")
-        self._git("config", "user.email", "pm-test@example.com")
-        self._git("config", "user.name", "PM Test")
         (self.repo / "README.md").write_text("hello\n", encoding="utf-8")
-        self._git("add", "README.md")
-        self._git("commit", "-q", "-m", "initial commit")
-
-    def _git(self, *args: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", "-C", str(self.repo), *args],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
 
     def write_plan(self, path: Path | None = None, *, slices: list[dict] | None = None) -> Path:
         """Write a valid minimal plan. `slices` is a list of render_slice() kwargs dicts."""
@@ -179,6 +367,31 @@ class PmTestCase(unittest.TestCase):
             return self.run_cli(argv)
         finally:
             os.chdir(previous)
+
+
+class PmTestCase(PlanTestCase):
+    """`PlanTestCase` plus a real temp git repository at `self.repo`.
+
+    Required by anything that reads or writes git state: run creation (state
+    lives under the worktree's git dir), the floor's git facts, and every
+    tmux-gated lifecycle test.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.email", "pm-test@example.com")
+        self._git("config", "user.name", "PM Test")
+        self._git("add", "README.md")
+        self._git("commit", "-q", "-m", "initial commit")
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
 
     def make_run(
         self,
@@ -262,3 +475,69 @@ class PmTestCase(unittest.TestCase):
         updated["approvals"] = approvals
         state_mod.save_state(run_dir, updated, token)
         return state_mod.load_state(run_dir, token)
+
+
+class TmuxRunTestCase(PmTestCase):
+    """Base for the tmux-gated lifecycle modules: a feature-branch repo, a
+    session reaper, and the `init` / wait helpers those tests all need.
+
+    Subclasses add their own cleanups (a reviewer-subprocess reaper, say) on
+    top of `setUp`; they must not re-implement what is here, which is how these
+    helpers previously drifted into several near-copies of themselves.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Operate on a dedicated feature branch, as a real run does — the
+        # implicit-current-branch init path refuses main/master.
+        self._git("checkout", "-q", "-b", "pm-work")
+        self._sessions_to_reap: list[str] = []
+        self.addCleanup(self._reap_sessions)
+
+    def _reap_sessions(self) -> None:
+        for name in self._sessions_to_reap:
+            sessions_mod.force_stop(name)
+
+    def _track_current_session(self, run_id: str, token: str) -> str | None:
+        """Register the run's live session for cleanup and return its name."""
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        state = state_mod.load_state(run_dir, token)
+        current = state.get("current_slice") or {}
+        session = current.get("tmux_session")
+        if session:
+            self._sessions_to_reap.append(session)
+        return session
+
+    def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(interval)
+        return predicate()
+
+    def _wait_for_result(self, run_id: str, token: str, *, timeout: float = 15.0) -> bool:
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        state = state_mod.load_state(run_dir, token)
+        artifact_dir = Path(state["current_slice"]["artifact_dir"])
+        return self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=timeout)
+
+    def _plan_path(self) -> Path:
+        # Deliberately outside self.repo: an untracked plan.md inside the
+        # worktree is itself an unclean worktree entry, tripping init's
+        # clean-worktree preflight (and the floor's surface/cleanliness facts)
+        # for reasons unrelated to the behaviour under test. The real CLI takes
+        # an arbitrary --plan path, so this is faithful, not merely convenient.
+        return self.repo.parent / "plan.md"
+
+    def _init(self, plan_path: Path, harness_script: Path, *, extra: list[str] | None = None) -> tuple[int, str, str]:
+        argv = [
+            "init",
+            "--repo", str(self.repo),
+            "--plan", str(plan_path),
+            "--harness", "fake",
+            "--harness-command", str(harness_script),
+        ]
+        if extra:
+            argv += extra
+        return self.run_cli_in_repo(argv)

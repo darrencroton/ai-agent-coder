@@ -57,13 +57,16 @@ import ast
 import unittest
 from pathlib import Path
 
-from pm_test_helpers import PmTestCase, render_slice
+# PlanTestCase, not PmTestCase: every test in this module treats `repo` as a
+# plain directory to write a plan into. None of them read git state, and the
+# git fixture cost ~165ms per test — more than the parsing they exist to test.
+from pm_test_helpers import PlanTestCase, render_slice
 
 from pm_lib import PmError
 from pm_lib import plan as plan_mod
 
 
-class TestCheckPlanCleanAndMultiDefect(PmTestCase):
+class TestCheckPlanCleanAndMultiDefect(PlanTestCase):
     def test_clean_plan_passes_check_plan(self) -> None:
         path = self.write_plan(slices=[{}, {}])
         report = plan_mod.plan_check_report(path)
@@ -97,7 +100,7 @@ class TestCheckPlanCleanAndMultiDefect(PmTestCase):
         self.assertEqual(report["approval_gated"], ["Slice 1"])
 
 
-class TestHeadingDefects(PmTestCase):
+class TestHeadingDefects(PlanTestCase):
     def test_malformed_slice_heading_rejected(self) -> None:
         text = "# Plan\n\n" + render_slice(1) + "# Slice 2: Wrong Level\n\n" + render_slice(2)
         path = self.repo / "plan.md"
@@ -148,7 +151,7 @@ class TestHeadingDefects(PmTestCase):
         self.assertTrue(any("duplicate slice numbers" in error for error in report["errors"]))
 
 
-class TestSectionsAndSurfaceDefects(PmTestCase):
+class TestSectionsAndSurfaceDefects(PlanTestCase):
     def test_missing_sections_rejected(self) -> None:
         text = (
             "# Plan\n\n## Slice 1: Bare\n\n### Intended Change\nDo it.\n\n"
@@ -180,7 +183,7 @@ class TestSectionsAndSurfaceDefects(PmTestCase):
         self.assertEqual(slices[0].authorized_files, [])
 
 
-class TestAuthorizedEntryValidity(PmTestCase):
+class TestAuthorizedEntryValidity(PlanTestCase):
     def test_invalid_entries_rejected(self) -> None:
         cases = {
             "/abs/path.py": "absolute",
@@ -212,7 +215,7 @@ class TestAuthorizedEntryValidity(PmTestCase):
         self.assertEqual(report["warnings"], [])
 
 
-class TestApprovalFlag(PmTestCase):
+class TestApprovalFlag(PlanTestCase):
     def test_approval_exact_no_runs(self) -> None:
         slices = plan_mod.parse_plan(self.write_plan(slices=[{"approval": "no"}]))
         self.assertIs(slices[0].approval_needed, False)
@@ -257,7 +260,7 @@ class TestApprovalFlag(PmTestCase):
         self.assertTrue(any("must be exactly 'yes' or 'no'" in e for e in report["errors"]))
 
 
-class TestIndependentAudit(PmTestCase):
+class TestIndependentAudit(PlanTestCase):
     def test_independent_audit_exact_yes_arms_gate(self) -> None:
         plan_slice = plan_mod.parse_plan(self.write_plan(slices=[{"audit": "yes"}]))[0]
         self.assertTrue(plan_slice.independent_audit_required)
@@ -278,7 +281,7 @@ class TestIndependentAudit(PmTestCase):
         self.assertFalse(plan_slice.independent_audit_required)
 
 
-class TestRiskySurfacesAndPlanRisk(PmTestCase):
+class TestRiskySurfacesAndPlanRisk(PlanTestCase):
     def test_risky_surfaces_exact_none_is_clear(self) -> None:
         plan_slice = plan_mod.parse_plan(self.write_plan(slices=[{"risky": "none"}]))[0]
         self.assertTrue(plan_slice.risky_surfaces_clear)
@@ -334,7 +337,7 @@ class TestRiskySurfacesAndPlanRisk(PmTestCase):
         self.assertEqual(plan_slice.plan_risk, "standard")
 
 
-class TestSurfaceLintWarnings(PmTestCase):
+class TestSurfaceLintWarnings(PlanTestCase):
     def test_dependency_lint_warning(self) -> None:
         path = self.write_plan(slices=[{"files": ["package.json"]}])
         report = plan_mod.plan_check_report(path)
@@ -367,7 +370,7 @@ class TestSurfaceLintWarnings(PmTestCase):
         self.assertFalse(any("names an existing directory" in w for w in report_no_repo["warnings"]))
 
 
-class TestDigestFreeze(PmTestCase):
+class TestDigestFreeze(PlanTestCase):
     def test_verify_plan_unchanged_passes_untouched(self) -> None:
         path = self.write_plan()
         state = {"plan": {"sha256": plan_mod.plan_digest(path)}}
@@ -383,7 +386,7 @@ class TestDigestFreeze(PmTestCase):
         self.assertIn("start a new run", message)
 
 
-class TestNextSliceAndEligibility(PmTestCase):
+class TestNextSliceAndEligibility(PlanTestCase):
     def test_next_slice_skips_accepted_and_attested_and_orders_by_number(self) -> None:
         path = self.write_plan(slices=[{}, {}, {}])
         slices = plan_mod.parse_plan(path)

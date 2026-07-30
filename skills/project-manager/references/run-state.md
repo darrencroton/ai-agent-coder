@@ -20,12 +20,16 @@ Authoritative run state is a **single copy outside the worktree**: `<worktree-gi
 
 Writes are atomic (temp file + rename) under an advisory `fcntl` lock (`.lock`); a held lock is reported after ~5 s and never stolen.
 
+A run id is `<UTC timestamp>-<random nonce>`. The nonce is load-bearing, not decoration: the timestamp has one-second resolution and the collision check can only see run directories under a single state root, while every linked worktree deliberately gets its own. Two runs started in the same second in two worktrees could otherwise mint the same id — and therefore the same `pm-<run-id>-s<NN>a<N>` tmux session name, on a tmux server that is global to the machine. Sessions are recovered by matching that full shape, never by `pm-<run-id>` as a string prefix, which could not tell run `X` from run `X-2`.
+
+`PM_TMUX_SOCKET`, when set, confines every PM tmux call to that named server (`tmux -L`). Unset — the default — PM uses the caller's default server, so an operator can `tmux attach` to a Developer session as usual.
+
 ## `run.json` shape
 
 ```json
 {
   "schema": "lite-1",
-  "run_id": "20260718T090000Z",
+  "run_id": "20260718T090000Z-3f9a1c",
   "created_at": "…", "updated_at": "…",
   "status": "active | needs-human | complete | stopped",
   "repo": "/abs/path", "branch": "feature/x",
@@ -61,5 +65,5 @@ Validation is tolerant: only the fields PM reads are checked; unknown extras pas
 - **Attempts:** 0 on the initial launch; +1 per relaunch (`start-slice` again) and per steer (`finalize --steer`); pure observation and `send` nudges are free. `attempts > policy.max_attempts` forces a genuine stop: the live session is killed, and `send`, `finalize --steer`, and `finalize --accept` are refused for the slice — only `finalize --stop` (record the story) and `stop` remain. Persisted in the slice entry, so budgets survive process restarts. Known semantics to be aware of: re-running a slice that was explicitly stopped (`finalize --stop`, then `start-slice` after human review) starts a fresh budget — the reset is the recorded stop/re-run pair, visible in events and the assessment.
 - **Review freshness:** each review records the HEAD it reviewed and the report's sha256. Any tree change after a mandatory review invalidates it for acceptance; re-commission against the new HEAD.
 - **`wake_at`:** a reserved slot for a persisted resume time for whoever continues the run (PM agent or human). The toolkit initializes it and carries it in state; it has no setter command and no scheduler — multi-hour autonomous recovery depends on the PM harness's own scheduling, a declared dependency.
-- **Recovery:** `run.json` + the artifact dir + git are sufficient. `status` reconstructs the situation and checks session liveness. With state deleted or unreadable, `stop --scavenge` still sweeps `pm-<run-id>-*` (or all `pm-*`) tmux sessions.
+- **Recovery:** `run.json` + the artifact dir + git are sufficient. `status` reconstructs the situation and checks session liveness. With state deleted or unreadable, `stop --scavenge` still sweeps that run's sessions (or, with no run id, all `pm-*`).
 - **Superseded attempts** live in `attempt-<n>/` subdirectories of the slice's `.pm/` artifact dir and in the event log — never as state rows.

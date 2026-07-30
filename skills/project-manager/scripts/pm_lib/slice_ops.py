@@ -235,10 +235,6 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _run_id_session_prefix(run_id: str) -> str:
-    return f"pm-{run_id}"
-
-
 # --- Risk ratchet (target-design §4) ------------------------------------------
 
 
@@ -619,7 +615,7 @@ def start_slice(
         _rotate_prior_attempt(artifact_dir, attempts - 1)
 
     reaped: list[str] = []
-    for name in sessions.sessions_with_prefix(_run_id_session_prefix(run_id)):
+    for name in sessions.sessions_for_run(run_id):
         sessions.force_stop(name)
         reaped.append(name)
 
@@ -704,8 +700,26 @@ def start_slice(
     session_name = sessions.session_name(run_id, slice_number(plan_slice.slice_id), attempts)
     sessions.start_session(session_name, repo, command, env)
     launch_executable = shlex.split(command)[0] if command.strip() else ""
-    sessions.wait_until_ready(session_name, launch_executable, expected_model_display=expected_model_display)
-    sessions.send_prompt(session_name, prompts.render_launch_pointer(prompt_path))
+    # The session is live from here but is not recorded in `current_slice`
+    # until `save_state` below, so anything that raises in between would
+    # otherwise strand a running Developer session that no state names —
+    # invisible to `observe`, `finalize`, and `stop`'s recorded-session path.
+    # Readiness and injection both fail closed on a trust prompt, a
+    # credential/approval prompt, or a session that exits early, so this is a
+    # reachable path, not a theoretical one.
+    try:
+        sessions.wait_until_ready(session_name, launch_executable, expected_model_display=expected_model_display)
+        sessions.send_prompt(session_name, prompts.render_launch_pointer(prompt_path))
+    except BaseException:
+        # Best-effort cleanup that must never replace the launch failure it is
+        # cleaning up after: the operator needs the trust prompt or credential
+        # prompt that actually stopped the launch, not whatever tmux said on
+        # the way out.
+        try:
+            sessions.force_stop(session_name)
+        except BaseException:
+            pass
+        raise
 
     now = _utc_now_iso()
     new_current: dict[str, Any] = {
@@ -1400,7 +1414,7 @@ def stop(
         current["reviewer_pids"] = []
 
     killed: list[str] = []
-    for name in sessions.sessions_with_prefix(_run_id_session_prefix(run_id)):
+    for name in sessions.sessions_for_run(run_id):
         sessions.force_stop(name)
         killed.append(name)
 
@@ -1428,9 +1442,9 @@ def stop_scavenge_sweep(*, run_id: str | None) -> list[str]:
     """State-independent tmux sweep for `stop --scavenge` when state cannot be
     trusted or read at all. Narrows to the given run id's sessions when one
     is known; otherwise sweeps every PM session regardless of run."""
-    prefix = _run_id_session_prefix(run_id) if run_id else "pm-"
+    names = sessions.sessions_for_run(run_id) if run_id else sessions.sessions_with_prefix("pm-")
     killed: list[str] = []
-    for name in sessions.sessions_with_prefix(prefix):
+    for name in names:
         sessions.force_stop(name)
         killed.append(name)
     return killed

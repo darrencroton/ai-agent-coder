@@ -61,9 +61,10 @@ matching Stage 3's convention; tmux-gated scenarios use a tiny fake-harness
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
-import stat
 import subprocess
 import sys
 import time
@@ -74,7 +75,17 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from pm_test_helpers import PmTestCase, parse_init_output, write_fake_harness
+from pm_test_helpers import (
+    PmTestCase,
+    TmuxRunTestCase,
+    commit_and_result_script,
+    idle_script,
+    parse_init_output,
+    result_heredoc,
+    stdin_draining_idle_script,
+    trigger_gated_credential_prompt_script,
+    write_fake_harness,
+)
 
 from pm_lib import sessions
 from pm_lib import slice_ops
@@ -90,49 +101,10 @@ _LONG_REASONING = (
 
 
 # --- fake harness / reviewer script builders ----------------------------------
-
-
-def _result_heredoc(status: str = "done", summary: str = "did the work") -> str:
-    return (
-        'cat > "$PM_RESULT_PATH" <<EOF\n'
-        '{"slice": "$PM_SLICE_ID", "status": "' + status + '", "summary": "' + summary + '"}\n'
-        "EOF"
-    )
-
-
-def _commit_and_result_script(
-    repo: Path, *, authorized_file: str = "a.py", unauthorized_file: str | None = None,
-    delay: float = 1.0, tail_sleep: float = 2.0,
-) -> str:
-    lines = [
-        "echo FAKE_HARNESS_READY",
-        f"sleep {delay}",
-        f'echo "authorized change" >> "{repo}/{authorized_file}"',
-        f'git -C "{repo}" add "{authorized_file}"',
-    ]
-    if unauthorized_file:
-        lines.append(f'echo "oops" >> "{repo}/{unauthorized_file}"')
-        lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
-    lines.append(f'git -C "{repo}" commit -q -m "slice work"')
-    lines.append(_result_heredoc())
-    lines.append(f"sleep {tail_sleep}")
-    return "\n".join(lines)
-
-
-def _idle_script(*, sleep_seconds: float = 30.0) -> str:
-    return f"echo FAKE_HARNESS_READY\nsleep {sleep_seconds}"
-
-
-def _stdin_draining_idle_script() -> str:
-    return "echo FAKE_HARNESS_READY\nexec cat -"
-
-
-def _credential_prompt_after_ready_script(*, reveal_after: float = 3.0, sleep_seconds: float = 20.0) -> str:
-    """Comes up clean so the initial slice-prompt injection succeeds, then
-    reveals a credential prompt `reveal_after` seconds later — the pane must
-    be clear of hard-stop markers at injection time (`send_prompt` refuses
-    into one), so the prompt has to appear strictly after start-slice."""
-    return f"echo FAKE_HARNESS_READY\nsleep {reveal_after}\necho 'Enter API key to continue'\nsleep {sleep_seconds}"
+#
+# The shared builders (readiness, commit-and-result, idle, stdin-draining,
+# trigger-gated credential prompt) live in pm_test_helpers. Only the
+# steer-specific harnesses and the reviewer fakes are local to this module.
 
 
 def _steer_then_complete_script(repo: Path, *, authorized_file: str = "a.py") -> str:
@@ -153,7 +125,7 @@ def _steer_then_complete_script(repo: Path, *, authorized_file: str = "a.py") ->
         f'echo "authorized change" >> "{repo}/{authorized_file}"',
         f'git -C "{repo}" add "{authorized_file}"',
         f'git -C "{repo}" commit -q -m "slice work"',
-        _result_heredoc(),
+        result_heredoc(),
         "sleep 2",
     ]
     return "\n".join(lines)
@@ -164,21 +136,15 @@ def _result_then_drain_script() -> str:
     a steer can be delivered while a now-stale completion signal already
     exists on disk (Stage 7 Test 21: the pre-steer result must be rotated
     aside so observe --wait can't mistake it for the steered attempt's)."""
-    return "echo FAKE_HARNESS_READY\n" + _result_heredoc() + "\nexec cat -"
-
-
-def _write_fake(path: Path, body: str) -> Path:
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+    return "echo FAKE_HARNESS_READY\n" + result_heredoc() + "\nexec cat -"
 
 
 def _fake_reviewer_ok(path: Path, marker: str) -> Path:
-    return _write_fake(path, f'echo "FAKE REVIEW OK: {marker}"\nexit 0')
+    return write_fake_harness(path, f'echo "FAKE REVIEW OK: {marker}"\nexit 0')
 
 
 def _fake_reviewer_sleep(path: Path, seconds: int = 300) -> Path:
-    return _write_fake(path, f"sleep {seconds}")
+    return write_fake_harness(path, f"sleep {seconds}")
 
 
 def _pgid_alive(pgid: int) -> bool:
@@ -194,20 +160,17 @@ def _pgid_alive(pgid: int) -> bool:
 # --- shared base ---------------------------------------------------------------
 
 
-class FinalizeTestCase(PmTestCase):
+class FinalizeTestCase(TmuxRunTestCase):
+    """`TmuxRunTestCase` plus a reviewer-subprocess reaper.
+
+    Only the extra cleanup is local: this module launches real `review`
+    subprocesses, which the shared base has no reason to know about.
+    """
+
     def setUp(self) -> None:
         super().setUp()
-        # Operate on a dedicated feature branch, as a real run does — the
-        # implicit-current-branch init path now refuses main/master.
-        self._git("checkout", "-q", "-b", "pm-work")
-        self._sessions_to_reap: list[str] = []
         self._subprocesses_to_reap: list[subprocess.Popen] = []
-        self.addCleanup(self._reap_sessions)
         self.addCleanup(self._reap_subprocesses)
-
-    def _reap_sessions(self) -> None:
-        for name in self._sessions_to_reap:
-            sessions.force_stop(name)
 
     def _reap_subprocesses(self) -> None:
         for proc in self._subprocesses_to_reap:
@@ -218,41 +181,6 @@ class FinalizeTestCase(PmTestCase):
                 except Exception:
                     pass
 
-    def _track_current_session(self, run_id: str, token: str) -> str | None:
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        state = state_mod.load_state(run_dir, token)
-        current = state.get("current_slice") or {}
-        session = current.get("tmux_session")
-        if session:
-            self._sessions_to_reap.append(session)
-        return session
-
-    def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return True
-            time.sleep(interval)
-        return predicate()
-
-    def _plan_path(self) -> Path:
-        return self.repo.parent / "plan.md"
-
-    def _init(self, plan_path: Path, harness_script: Path, *, extra: list[str] | None = None) -> tuple[int, str, str]:
-        argv = [
-            "init", "--repo", str(self.repo), "--plan", str(plan_path),
-            "--harness", "fake", "--harness-command", str(harness_script),
-        ]
-        if extra:
-            argv += extra
-        return self.run_cli_in_repo(argv)
-
-    def _wait_for_result(self, run_id: str, token: str) -> bool:
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        state = state_mod.load_state(run_dir, token)
-        artifact_dir = Path(state["current_slice"]["artifact_dir"])
-        return self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=15.0)
-
 
 # --- 1: full end-to-end acceptance -------------------------------------------
 
@@ -262,21 +190,46 @@ class TestFullAcceptance(FinalizeTestCase):
     def test_accept_writes_assessment_clears_slice_and_regenerates_report(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
 
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
+        self.assertIn("launched", out)
         self._track_current_session(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
+        # `observe --wait` is how an operator actually reaches this point, and
+        # it must report the completed slice: it returns as soon as
+        # result.json exists, so with the result already on disk this is a
+        # cheap assertion on the real command rather than another timed wait.
+        code, out, _err = self.run_cli_in_repo(["observe", "--wait", "20"])
+        self.assertEqual(code, 0)
+        self.assertIn("result present: True", out)
+
+        # Bare `finalize` reports the floor and changes nothing. Two other
+        # tests drove their own full launch to assert exactly this; the
+        # numbered facts, evidence pointers, and state-neutrality checks are
+        # asserted here instead, on the prologue this test already pays for.
+        before_bytes = (run_dir / "run.json").read_bytes()
         code, out, _err = self.run_cli_in_repo(["finalize", "--token", token])
         self.assertEqual(code, 0, out)
         self.assertEqual(out.count(" PASS "), 8)
+        for number in range(1, 9):
+            self.assertRegex(out, re.compile(rf"^{number} \S+ PASS", re.MULTILINE))
+        self.assertIn("evidence: diff=", out)
+        self.assertIn("evidence: pane=", out)
+        self.assertIn("evidence: result=", out)
+
+        after = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        before = json.loads(before_bytes.decode("utf-8"))
+        after.pop("updated_at")
+        before.pop("updated_at")
+        self.assertEqual(after, before, "bare finalize must not mutate run state")
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, err)
@@ -288,6 +241,14 @@ class TestFullAcceptance(FinalizeTestCase):
         self.assertEqual(entry["status"], "accepted")
         self.assertEqual(entry["commit"], head)
         self.assertIsNone(state["current_slice"])
+        # Accepting the LAST undecided slice completes the run there and then —
+        # a different production branch from `start_slice` finding nothing left
+        # to do, so it is asserted on the accept itself, not on the
+        # `start-slice` call at the end of this test.
+        self.assertEqual(state["status"], "complete")
+        self.assertIsNone(state["stop_reason"])
+        events = state_mod.read_events(run_dir)
+        self.assertTrue(any(event["kind"] == "complete" for event in events))
 
         assessment_path = Path(entry["assessment"])
         self.assertTrue(str(assessment_path).startswith(str(run_dir)))
@@ -302,7 +263,11 @@ class TestFullAcceptance(FinalizeTestCase):
 
         report_path = run_dir / "run-report.md"
         self.assertTrue(report_path.is_file())
-        self.assertIn(_LONG_REASONING, report_path.read_text(encoding="utf-8"))
+        report_text = report_path.read_text(encoding="utf-8")
+        self.assertIn(_LONG_REASONING, report_text)
+        # The report must render the run as complete, not merely exist — this
+        # is the human-facing statement that the run finished.
+        self.assertIn("complete", report_text)
         report_mirror = self.repo / ".pm" / "runs" / run_id / "run-report.md"
         self.assertTrue(report_mirror.is_file())
 
@@ -320,7 +285,7 @@ class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh",
-            _commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=2.0),
+            commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=2.0),
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -367,7 +332,7 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
             self._plan_path(), slices=[{"files": ["a.py"], "risky": "touches auth"}]
         )
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -437,7 +402,7 @@ class TestRiskRatchet(FinalizeTestCase):
     def test_ratchet_arms_review_requirement_rejects_lowering_and_persists(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -475,7 +440,7 @@ class TestRiskRatchet(FinalizeTestCase):
 class TestSteer(FinalizeTestCase):
     def test_steer_files_the_correction_sends_a_pointer_and_exhausts_budget(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", stdin_draining_idle_script())
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "1"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -538,7 +503,7 @@ class TestSteer(FinalizeTestCase):
         would hand the Developer words the run never recorded, and the earlier
         unlink-on-refusal would delete a file its pointer already named."""
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", stdin_draining_idle_script())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -588,8 +553,13 @@ class TestSteer(FinalizeTestCase):
 
     def test_steer_refuses_into_visible_hard_stop_prompt(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        # Trigger-gated: the marker must appear strictly AFTER injection
+        # (`send_prompt` refuses into a visible one, which would fail
+        # `start-slice` itself), and a fixed post-launch delay to achieve that
+        # was racing the launch it was trying to follow.
+        trigger = self.repo.parent / "credential_trigger"
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _credential_prompt_after_ready_script(sleep_seconds=15.0)
+            self.repo.parent / "fake.sh", trigger_gated_credential_prompt_script(trigger)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -599,6 +569,7 @@ class TestSteer(FinalizeTestCase):
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         session = self._track_current_session(run_id, token)
+        trigger.write_text("go\n", encoding="utf-8")
         self.assertTrue(
             self._wait_for(lambda: "Enter API key" in sessions.pane_text(session), timeout=10.0)
         )
@@ -645,35 +616,9 @@ class TestSteer(FinalizeTestCase):
         self.assertIn("Please rename the helper.", assessment_text)
         self.assertIn("Also add a docstring.", assessment_text)
 
-    def test_stopped_assessment_retains_full_correction_narrative(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
-
-        correction = "Try the other approach entirely.\nSee the notes for why."
-        code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
-        self.assertEqual(code, 0, out + err)
-
-        code, out, err = self.run_cli_in_repo(
-            ["finalize", "--stop", "a human is needed to decide the approach", "--token", token]
-        )
-        self.assertEqual(code, 0, out + err)
-
-        state = state_mod.load_state(run_dir, token)
-        assessment_text = Path(state["slices"][0]["assessment"]).read_text(encoding="utf-8")
-        self.assertIn("Try the other approach entirely.", assessment_text)
-        self.assertIn("See the notes for why.", assessment_text)
-
     def test_steer_dead_session_raises_relaunch_error(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -698,8 +643,17 @@ class TestSteer(FinalizeTestCase):
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestStopDecision(FinalizeTestCase):
     def test_stop_writes_stopped_assessment_and_regenerates_report(self) -> None:
+        """The stop decision end to end, including the correction narrative.
+
+        The narrative assertions were a separate test that steered and then
+        stopped on its own launched session — the same prologue as this one.
+        They are not redundant with the accepted-path test, though: acceptance
+        and stopping reach `_attempts_summary` through independent call sites,
+        so only stopping proves the stop path is wired to it. Merged rather
+        than deleted, onto a stdin-draining harness so the steer is read.
+        """
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", stdin_draining_idle_script())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -709,6 +663,10 @@ class TestStopDecision(FinalizeTestCase):
         self.assertEqual(code, 0)
         session = self._track_current_session(run_id, token)
         self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+
+        correction = "Try the other approach entirely.\nSee the notes for why."
+        code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
+        self.assertEqual(code, 0, out + err)
 
         code, out, err = self.run_cli_in_repo(
             ["finalize", "--stop", "giving up on this approach", "--token", token]
@@ -727,6 +685,10 @@ class TestStopDecision(FinalizeTestCase):
         text = assessment_path.read_text(encoding="utf-8")
         self.assertIn("STOPPED", text)
         self.assertIn("giving up on this approach", text)
+        # The full multi-line correction survives into the stopped assessment,
+        # not just its first line.
+        self.assertIn("Try the other approach entirely.", text)
+        self.assertIn("See the notes for why.", text)
 
         self.assertTrue((run_dir / "run-report.md").is_file())
 
@@ -738,7 +700,7 @@ class TestStopDecision(FinalizeTestCase):
 class TestNotesMirrorAndTripwire(FinalizeTestCase):
     def test_notes_mirrored_at_start_slice_and_large_notes_warn(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=20.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=20.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -757,7 +719,7 @@ class TestNotesMirrorAndTripwire(FinalizeTestCase):
 
     def test_oversized_notes_prints_tripwire_warning(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=20.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=20.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -776,7 +738,7 @@ class TestNotesMirrorAndTripwire(FinalizeTestCase):
 class TestNotesCommand(FinalizeTestCase):
     def test_set_then_append_write_authoritative_original_and_mirror(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -801,7 +763,7 @@ class TestNotesCommand(FinalizeTestCase):
 
     def test_requires_a_token(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, _token = parse_init_output(out)
@@ -811,7 +773,7 @@ class TestNotesCommand(FinalizeTestCase):
 
     def test_empty_or_whitespace_text_is_refused(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -828,7 +790,7 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
     def test_status_report_recreates_mirror_after_pm_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -870,7 +832,7 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
 class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
     def test_budget_exhaustion_kills_session_and_closes_steer_send_accept(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", stdin_draining_idle_script())
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "0"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -925,41 +887,6 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
         assessment_path = Path(entry["assessment"])
         self.assertTrue(assessment_path.is_file())
         self.assertIn("STOPPED", assessment_path.read_text(encoding="utf-8"))
-
-
-# --- 12: accepting the last undecided slice completes the run ---------------
-
-
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
-class TestAcceptingFinalSliceCompletesRun(FinalizeTestCase):
-    def test_accepting_final_slice_marks_run_complete(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
-        self.assertTrue(self._wait_for_result(run_id, token))
-
-        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
-        self.assertEqual(code, 0, out + err)
-        self.assertIn("ACCEPTED", out)
-
-        state = state_mod.load_state(run_dir, token)
-        self.assertEqual(state["status"], "complete")
-        self.assertIsNone(state["stop_reason"])
-
-        report_text = (run_dir / "run-report.md").read_text(encoding="utf-8")
-        self.assertIn("complete", report_text)
-
-        events = state_mod.read_events(run_dir)
-        self.assertTrue(any(event["kind"] == "complete" for event in events))
 
 
 class TestStopReapsHungReviewer(PmTestCase):

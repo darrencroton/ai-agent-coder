@@ -38,8 +38,40 @@ jobs:
           python3 -m py_compile skills/orchestrator/scripts/delegate_contract.py skills/orchestrator/scripts/delegate_sessions.py skills/orchestrator/scripts/delegate_jobs.py
           python3 -m py_compile skills/lint/scripts/lint.py
 
+      # Run the PM modules concurrently. They are independent, and each test
+      # process pins its own tmux server (PM_TMUX_SOCKET) and mints run ids
+      # carrying a random nonce, so two modules cannot collide over a session
+      # name. The suite is dominated by sleeping rather than CPU (readiness
+      # settles, injection settles, poll intervals), so this is ~2.5x faster
+      # than serial discovery even on a small runner.
+      #
+      # Every module's exit status is collected and the step fails if ANY
+      # module failed: a bare `wait` reports only the last job's status, which
+      # would turn a real failure into a green build.
       - name: Project Manager tests
-        run: python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'
+        run: |
+          cd skills/project-manager/tests
+          pids=""
+          for module in test_*.py; do
+            python3 -m unittest "${module%.py}" > "/tmp/${module%.py}.log" 2>&1 &
+            pids="$pids $!:${module%.py}"
+          done
+          failed=""
+          for entry in $pids; do
+            pid="${entry%%:*}"
+            name="${entry#*:}"
+            if ! wait "$pid"; then
+              failed="$failed $name"
+            fi
+          done
+          for module in test_*.py; do
+            echo "===== ${module%.py} ====="
+            cat "/tmp/${module%.py}.log"
+          done
+          if [ -n "$failed" ]; then
+            echo "FAILED modules:$failed"
+            exit 1
+          fi
 
       - name: Orchestrator tests
         run: python3 -m unittest discover -s skills/orchestrator/tests -p 'test_*.py'

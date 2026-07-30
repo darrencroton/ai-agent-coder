@@ -16,8 +16,10 @@ Pins:
   hit your limit" phrasing, a marker embedded in an unrelated word) and a
   prompt wrapped across terminal lines that still matches after whitespace
   normalization.
-- `session_name` always starts with `pm-<run_id>` (the scavenge sweep
-  prefix) in the frozen `pm-<run_id>-s<NN>a<N>` shape.
+- `session_name` always starts with `pm-<run_id>` in the frozen
+  `pm-<run_id>-s<NN>a<N>` shape, and `sessions_for_run` recovers exactly
+  that run's sessions — never a run whose id merely extends it (`X` vs
+  `X-2`), which a string-prefix sweep could not distinguish.
 - `start_session` refuses (PmError) when the caller's env dict contains
   `PM_RUN_TOKEN` — the Developer session must never receive the run
   capability token.
@@ -25,7 +27,7 @@ Pins:
   `send_prompt` injection landing in the pane, `send_line` refusing to send
   into a visible credential prompt, `capture_to` writing pane text,
   `detect_activity` flagging a pane change, `force_stop` killing a session,
-  `sessions_with_prefix` finding sessions by prefix, and `wait_until_ready`
+  `sessions_for_run` finding a run's sessions, and `wait_until_ready`
   raising when the session exits before becoming ready.
 - `send_prompt` and `send_line` both refuse a newline: no injection path sends
   more than one line into a pane, so multi-line content can only reach a
@@ -36,7 +38,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,11 @@ from pathlib import Path
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# Imported for its side effect as much as its helper: pm_test_helpers pins
+# PM_TMUX_SOCKET, so both the code under test and the direct tmux calls below
+# drive this process's private tmux server rather than the caller's.
+from pm_test_helpers import tmux_argv, write_fake_harness
 
 from pm_lib import PmError
 from pm_lib import sessions
@@ -176,8 +182,8 @@ class TestPaneTextRejoinsHardWraps(unittest.TestCase):
         session = "pm-test-hardwrap-s01a0"
         padding = "x" * 19  # pushes the wrap boundary inside "Enter"
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", session, "-x", "20", "-y", "10",
-             f"sh -c 'printf \"{padding}Enter API key to continue\\n\"; sleep 30'"],
+            tmux_argv("new-session", "-d", "-s", session, "-x", "20", "-y", "10",
+                      f"sh -c 'printf \"{padding}Enter API key to continue\\n\"; sleep 30'"),
             check=True, capture_output=True,
         )
         self.addCleanup(sessions.force_stop, session)
@@ -188,11 +194,11 @@ class TestPaneTextRejoinsHardWraps(unittest.TestCase):
         # to manual sizing so the 20-column wrap point this test depends
         # on actually holds.
         subprocess.run(
-            ["tmux", "set-window-option", "-t", session, "window-size", "manual"],
+            tmux_argv("set-window-option", "-t", session, "window-size", "manual"),
             check=True, capture_output=True,
         )
         subprocess.run(
-            ["tmux", "resize-window", "-t", session, "-x", "20", "-y", "10"],
+            tmux_argv("resize-window", "-t", session, "-x", "20", "-y", "10"),
             check=True, capture_output=True,
         )
 
@@ -203,7 +209,7 @@ class TestPaneTextRejoinsHardWraps(unittest.TestCase):
         # The fixture must still be adversarial: an unjoined capture splits
         # the marker, so this test cannot silently stop pinning anything.
         unjoined = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", session], capture_output=True, text=True, check=True
+            tmux_argv("capture-pane", "-p", "-t", session), capture_output=True, text=True, check=True
         ).stdout
         self.assertNotIn("Enter API key", unjoined)
 
@@ -239,11 +245,6 @@ class TestStartSessionEnvTokenAssertion(unittest.TestCase):
 
 
 # --- tmux-gated behaviour ------------------------------------------------
-
-
-def _write_fake_harness(path: Path, body: str) -> None:
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for session lifecycle tests")
@@ -285,16 +286,41 @@ class TestStartSessionAndBasicLifecycle(TmuxSessionTestCase):
         sessions.force_stop(name)
         self.assertTrue(self._wait_for(lambda: not sessions.session_exists(name)))
 
-    def test_sessions_with_prefix_finds_by_prefix(self) -> None:
-        prefix = "pm-test-prefix-sweep"
-        name_a = f"{prefix}-s01a0"
-        name_b = f"{prefix}-s02a0"
+    def test_sessions_for_run_finds_every_slice_and_attempt_of_that_run(self) -> None:
+        run_id = "pm-test-run-sweep"
+        name_a = sessions.session_name(run_id, 1, 0)
+        name_b = sessions.session_name(run_id, 2, 3)
         self._start(name_a, "bash -c 'sleep 30'")
         self._start(name_b, "bash -c 'sleep 30'")
         self.assertTrue(self._wait_for(lambda: sessions.session_exists(name_a) and sessions.session_exists(name_b)))
-        found = sessions.sessions_with_prefix(prefix)
+        found = sessions.sessions_for_run(run_id)
         self.assertIn(name_a, found)
         self.assertIn(name_b, found)
+
+    def test_sessions_for_run_does_not_match_a_run_whose_id_extends_this_one(self) -> None:
+        """`pm-<run_id>` as a string prefix cannot tell run `X` from run `X-2`,
+        and `-2` is exactly the suffix `state.new_run_id` appends on a local id
+        collision. Reaping (`start-slice`) and stopping both sweep by run, so a
+        prefix match there would kill a different, live run's Developer
+        session."""
+        run_id = "pm-test-run-boundary"
+        mine = sessions.session_name(run_id, 1, 0)
+        theirs = sessions.session_name(f"{run_id}-2", 1, 0)
+        self._start(mine, "bash -c 'sleep 30'")
+        self._start(theirs, "bash -c 'sleep 30'")
+        self.assertTrue(self._wait_for(lambda: sessions.session_exists(mine) and sessions.session_exists(theirs)))
+
+        self.assertEqual(sessions.sessions_for_run(run_id), [mine])
+        self.assertEqual(sessions.sessions_for_run(f"{run_id}-2"), [theirs])
+
+    def test_sessions_for_run_ignores_unrelated_session_names(self) -> None:
+        run_id = "pm-test-run-unrelated"
+        mine = sessions.session_name(run_id, 1, 0)
+        stray = f"pm-{run_id}-not-a-slice-session"
+        self._start(mine, "bash -c 'sleep 30'")
+        self._start(stray, "bash -c 'sleep 30'")
+        self.assertTrue(self._wait_for(lambda: sessions.session_exists(mine) and sessions.session_exists(stray)))
+        self.assertEqual(sessions.sessions_for_run(run_id), [mine])
 
     def test_capture_to_writes_pane_text(self) -> None:
         name = "pm-test-capture-s01a0"
@@ -427,15 +453,40 @@ class TestStartSessionStripsInheritedToken(TmuxSessionTestCase):
 
         self.addCleanup(_restore_env)
 
-        subprocess.run(
-            ["tmux", "set-environment", "-g", "PM_RUN_TOKEN", "secret-inherit-test"], check=False
+        # Scoped to this process's private tmux server (pm_test_helpers pins
+        # PM_TMUX_SOCKET), so seeding a SERVER-global variable cannot reach the
+        # caller's own tmux server. Restore whatever the variable was rather
+        # than unconditionally unsetting it: `-gu` on a shared server would
+        # silently delete a value the suite did not set.
+        previous_server_env = subprocess.run(
+            tmux_argv("show-environment", "-g", "PM_RUN_TOKEN"),
+            check=False, capture_output=True, text=True,
         )
-        self.addCleanup(
-            lambda: subprocess.run(["tmux", "set-environment", "-gu", "PM_RUN_TOKEN"], check=False)
+        had_server_env = previous_server_env.returncode == 0 and "=" in previous_server_env.stdout
+        previous_server_value = (
+            previous_server_env.stdout.strip().split("=", 1)[1] if had_server_env else None
         )
 
+        def _restore_server_env() -> None:
+            if previous_server_value is None:
+                subprocess.run(
+                    tmux_argv("set-environment", "-gu", "PM_RUN_TOKEN"),
+                    check=False, capture_output=True,
+                )
+            else:
+                subprocess.run(
+                    tmux_argv("set-environment", "-g", "PM_RUN_TOKEN", previous_server_value),
+                    check=False, capture_output=True,
+                )
+
+        subprocess.run(
+            tmux_argv("set-environment", "-g", "PM_RUN_TOKEN", "secret-inherit-test"),
+            check=False, capture_output=True,
+        )
+        self.addCleanup(_restore_server_env)
+
         script_path = self.repo / "fake_harness.sh"
-        _write_fake_harness(script_path, 'echo "TOKEN_IS=${PM_RUN_TOKEN:-ABSENT}"\nsleep 15')
+        write_fake_harness(script_path, 'echo "TOKEN_IS=${PM_RUN_TOKEN:-ABSENT}"\nsleep 15')
 
         name = "pm-test-striptoken-s01a0"
         self._start(name, str(script_path), {})

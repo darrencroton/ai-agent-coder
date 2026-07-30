@@ -43,14 +43,30 @@ def state_root(repo: Path) -> Path:
     return worktree_git_dir(repo) / "pm"
 
 
-def new_run_id(existing: Iterable[str] | None = None) -> str:
-    """UTC-timestamp run id; on collision against `existing`, append -2, -3, ...
+RUN_ID_NONCE_BYTES = 3
 
-    With no `existing` set given, the bare timestamp is returned — collision
-    checking is the caller's responsibility (create_run performs it against
-    the run directories already present under state_root).
+
+def new_run_id(existing: Iterable[str] | None = None) -> str:
+    """`<UTC timestamp>-<random nonce>` run id; on collision against
+    `existing`, append -2, -3, ...
+
+    The nonce is what makes the id unique, and it is not optional. The
+    timestamp alone has one-second resolution, and the `existing` check can
+    only see run directories under ONE state root — while every linked
+    worktree deliberately gets its own root. Two runs started in the same
+    second in two worktrees (or two repositories) therefore could not see
+    each other, and produced the same id and, through
+    `sessions.session_name`, the same tmux session name on a server that is
+    global to the machine — so one run could observe, steer, or kill the
+    other's Developer session. A PID would not fix this: PIDs are reused,
+    and a tmux session outlives the controller process that created it.
+
+    With no `existing` set given, collision checking is the caller's
+    responsibility (create_run performs it against the run directories
+    already present under state_root).
     """
-    base = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = f"{stamp}-{secrets.token_hex(RUN_ID_NONCE_BYTES)}"
     if not existing:
         return base
     taken = set(existing)

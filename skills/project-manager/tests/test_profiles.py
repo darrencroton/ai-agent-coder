@@ -112,9 +112,6 @@ class TestComposeCommandOverrides(unittest.TestCase):
             profiles.compose_command("qwen", effort="high")
         self.assertIn("qwen", str(ctx.exception))
 
-    def test_no_overrides_leaves_base_command_untouched(self) -> None:
-        self.assertEqual(profiles.compose_command("claude"), "claude --permission-mode auto")
-
 
 class TestComposeCommandCodexSpecific(unittest.TestCase):
     def test_reviewer_network_flag(self) -> None:

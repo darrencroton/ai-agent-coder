@@ -19,6 +19,7 @@ field observations of external tools; the code around them is independent.
 from __future__ import annotations
 
 import functools
+import os
 import re
 import shlex
 import shutil
@@ -179,11 +180,29 @@ def scan_hard_stop(text: str) -> dict[str, Any]:
 # --- tmux process plumbing --------------------------------------------------
 
 
+def tmux_argv(*args: str) -> list[str]:
+    """The `tmux` argv to run, honouring the `PM_TMUX_SOCKET` server override.
+
+    Unset (the default), PM uses the caller's default tmux server, so an
+    operator can `tmux attach` to a Developer session in the usual way. Set,
+    every PM tmux call is confined to that named server via `-L`.
+
+    `-L` is the reliable spelling: `TMUX_TMPDIR` is ignored whenever `$TMUX`
+    is already set, which is exactly the case when PM itself runs inside
+    tmux — so a run that believed it was isolated would silently operate on
+    the caller's real server, where a session sweep can destroy the
+    operator's own windows.
+    """
+    socket = os.environ.get("PM_TMUX_SOCKET", "").strip()
+    return ["tmux", *(("-L", socket) if socket else ()), *args]
+
+
 def _run_tmux(*args: str) -> subprocess.CompletedProcess:
+    argv = tmux_argv(*args)
     try:
-        return subprocess.run(["tmux", *args], check=False, text=True, capture_output=True)
+        return subprocess.run(argv, check=False, text=True, capture_output=True)
     except OSError:
-        return subprocess.CompletedProcess(args=["tmux", *args], returncode=127, stdout="", stderr="tmux not found")
+        return subprocess.CompletedProcess(args=argv, returncode=127, stdout="", stderr="tmux not found")
 
 
 def _tmux_or_raise(args: list[str], error_prefix: str) -> subprocess.CompletedProcess:
@@ -195,8 +214,21 @@ def _tmux_or_raise(args: list[str], error_prefix: str) -> subprocess.CompletedPr
 
 
 def session_name(run_id: str, slice_number: int, attempt: int) -> str:
-    """`pm-<run_id>-s<NN>a<N>` — the scavenge path sweeps the `pm-<run_id>` prefix."""
+    """`pm-<run_id>-s<NN>a<N>` — `sessions_for_run` recovers a run's sessions."""
     return f"pm-{run_id}-s{slice_number:02d}a{attempt}"
+
+
+def sessions_for_run(run_id: str) -> list[str]:
+    """Live sessions belonging to exactly `run_id`.
+
+    Matched against the full `session_name` shape rather than by string
+    prefix. A `pm-<run_id>` prefix test is not equivalent: run `X` would
+    also match run `X-2`'s sessions, and `-2` is precisely the suffix
+    `state.new_run_id` appends on a local id collision — so reaping one run
+    could kill a different, live run's Developer session.
+    """
+    pattern = re.compile(rf"^pm-{re.escape(run_id)}-s\d+a\d+$")
+    return [name for name in _session_names() if pattern.match(name)]
 
 
 def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -> None:
@@ -250,13 +282,20 @@ def session_exists(session: str) -> bool:
     return _run_tmux("has-session", "-t", session).returncode == 0
 
 
-def sessions_with_prefix(prefix: str) -> list[str]:
+def _session_names() -> list[str]:
     if not shutil.which("tmux"):
         return []
     result = _run_tmux("list-sessions", "-F", "#{session_name}")
     if result.returncode != 0:
         return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip().startswith(prefix)]
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def sessions_with_prefix(prefix: str) -> list[str]:
+    """Prefix sweep, for the state-independent `stop --scavenge` bare `pm-`
+    case only. Prefer `sessions_for_run` whenever a run id is known: a
+    prefix cannot tell run `X` from run `X-2`."""
+    return [name for name in _session_names() if name.startswith(prefix)]
 
 
 def detect_activity(session: str, previous_capture: str) -> dict[str, Any]:

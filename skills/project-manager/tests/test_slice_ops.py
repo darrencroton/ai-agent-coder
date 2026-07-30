@@ -27,12 +27,10 @@ the retained fake-harness pattern (replacement-ledger §9.1/§9.3). Pins:
 4. `approve`: records reason + timestamp for an approval-flagged slice; a
    non-gated slice is refused; a slice with an unclear approval flag is
    refused even though it is not exactly "no".
-5. Full fake-harness flow (tmux): `init` → `start-slice` (the fake harness
-   makes an authorized commit and writes `result.json`) → `observe --wait`
-   until the result appears → `finalize`: exits 0, prints all eight floor
-   facts as PASS plus evidence paths; state is unchanged except
-   `updated_at`. (Stage 4's `finalize --accept/--steer/--stop` decision
-   paths are pinned in `test_finalize.py`, not here.)
+5. The full fake-harness flow — bare `finalize` printing eight PASS facts
+   and evidence paths without mutating state — is pinned in
+   `test_finalize.py`'s `TestFullAcceptance`, which already drives the same
+   launch through to acceptance.
 6. `finalize` with a floor failure (the fake harness also touches an
    unauthorized file): exits 1, the surface fact prints FAIL, a `floor`
    event is recorded.
@@ -46,17 +44,22 @@ the retained fake-harness pattern (replacement-ledger §9.1/§9.3). Pins:
    run status becomes `needs-human`, a `plan-changed` event is recorded.
 9. Dead session: `observe` reports the session as not running (never
    raises); `send` refuses to drive it.
-10. `send` nudge (tmux): a live fake session receives a steered line that
-    appears in the pane, and a `send` event is recorded without touching
-    `attempts`; sending into a pane showing a credential prompt is refused
-    by the sessions hard-stop floor.
+10. `send` nudge (tmux): on ONE launched session, a steered line reaches
+    the pane and is recorded as a `send` event without touching `attempts`;
+    then, once a trigger-gated credential prompt becomes visible, the same
+    command is refused by the sessions hard-stop floor.
 11. `stop` (tmux): captures `pane.txt`, kills the run's sessions, sets
     status `stopped` with the given reason. `stop --scavenge` against a
     **deleted** state directory still finds and kills a stray
     `pm-<run-id>-…` session and exits 0.
-12. All slices already complete: `start-slice` prints a completion message
-    and exits 0 without touching tmux.
-13. Real-harness composition (tmux): `start-slice` with no
+12. All slices already complete: `start-slice` completes the run, prints a
+    completion message, and exits 0 without launching a session (asserted
+    against a patched `start_session`, not merely implied).
+13. A failed launch leaves no orphan session (tmux): when readiness or
+    prompt injection raises, the session started moments earlier is killed
+    rather than stranded outside `current_slice`, where no command could
+    see it.
+14. Real-harness composition (tmux): `start-slice` with no
     `--harness-command` override composes an actual codex launch argv,
     carrying the linked-worktree git directory that `commit_required`
     requires. Every other lifecycle scenario overrides the command, so this
@@ -82,8 +85,20 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 import shutil
 
-from pm_test_helpers import PmTestCase, parse_init_output, write_fake_harness
+from pm_test_helpers import (
+    TmuxRunTestCase,
+    commit_and_result_script,
+    idle_script,
+    parse_init_output,
+    result_only_script,
+    trigger_gated_churn_script,
+    trigger_gated_credential_prompt_script,
+    trigger_gated_exit_script,
+    trigger_gated_result_script,
+    write_fake_harness,
+)
 
+from pm_lib import PmError
 from pm_lib import git_ops
 from pm_lib import sessions
 from pm_lib import slice_ops
@@ -92,177 +107,14 @@ from pm_lib import state as state_mod
 _HAS_TMUX = shutil.which("tmux") is not None
 
 
-# --- fake harness script builders --------------------------------------------
-
-
-def _result_heredoc(status: str = "done", summary: str = "did the work") -> str:
-    return (
-        'cat > "$PM_RESULT_PATH" <<EOF\n'
-        '{"slice": "$PM_SLICE_ID", "status": "' + status + '", "summary": "' + summary + '"}\n'
-        "EOF"
-    )
-
-
-def _commit_and_result_script(
-    repo: Path,
-    *,
-    authorized_file: str = "a.py",
-    unauthorized_file: str | None = None,
-    delay: float = 1.0,
-    tail_sleep: float = 3.0,
-) -> str:
-    """A fake harness that echoes a readiness marker, waits, makes a commit
-    (optionally touching an unauthorized file too), writes result.json, then
-    idles briefly before exiting."""
-    lines = [
-        "echo FAKE_HARNESS_READY",
-        f"sleep {delay}",
-        f'echo "authorized change" >> "{repo}/{authorized_file}"',
-        f'git -C "{repo}" add "{authorized_file}"',
-    ]
-    if unauthorized_file:
-        lines.append(f'echo "oops" >> "{repo}/{unauthorized_file}"')
-        lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
-    lines.append(f'git -C "{repo}" commit -q -m "slice work"')
-    lines.append(_result_heredoc())
-    lines.append(f"sleep {tail_sleep}")
-    return "\n".join(lines)
-
-
-def _result_only_script(*, delay: float = 0.5, tail_sleep: float = 3.0) -> str:
-    lines = ["echo FAKE_HARNESS_READY", f"sleep {delay}", _result_heredoc(), f"sleep {tail_sleep}"]
-    return "\n".join(lines)
-
-
-def _idle_script(*, sleep_seconds: float = 30.0) -> str:
-    return f"echo FAKE_HARNESS_READY\nsleep {sleep_seconds}"
-
-
-def _credential_prompt_script(*, reveal_after: float = 5.0, sleep_seconds: float = 30.0) -> str:
-    """A harness that comes up clean, then reveals a credential prompt only
-    *after* the developer prompt has been injected.
-
-    The pane must be clear of hard-stop markers at injection time —
-    `send_prompt` refuses to send the launch pointer into a visible
-    credential/approval/side-effect prompt (the launch-time hard-prompt
-    floor), so a harness that
-    printed the marker as its first line would fail `start-slice` itself and
-    never reach the live-session `send`-refusal this scenario exercises.
-    The readiness wait settles on the clean `FAKE_HARNESS_READY` pane and
-    injects; `reveal_after` seconds later the credential prompt appears, and
-    a subsequent `send` is what must refuse."""
-    return f"echo FAKE_HARNESS_READY\nsleep {reveal_after}\necho 'Enter API key to continue'\nsleep {sleep_seconds}"
-
-
-def _trigger_gated_credential_prompt_script(trigger_path: Path, *, sleep_seconds: float = 30.0) -> str:
-    """Like `_credential_prompt_script`, but the credential-prompt marker
-    appears only once `trigger_path` exists on disk, rather than after a
-    fixed delay from harness launch. This makes the marker's appearance
-    OBSERVATION-relative — the test controls exactly when it fires, mid-
-    `observe --wait` — instead of launch-relative, removing the race where
-    a slow `start-slice` could let a fixed-delay marker appear before
-    `observe` ever starts polling (in which case an early return would
-    prove nothing about *mid-wait* detection). Same launch-time-clean
-    requirement as `_credential_prompt_script`: the pane must show nothing
-    but `FAKE_HARNESS_READY` until the trigger appears, or `start-slice`'s
-    launch-time hard-prompt floor would refuse to inject."""
-    return (
-        "echo FAKE_HARNESS_READY\n"
-        f'while [ ! -f "{trigger_path}" ]; do sleep 0.1; done\n'
-        "echo 'Enter API key to continue'\n"
-        f"sleep {sleep_seconds}"
-    )
-
-
-def _dies_quickly_script(*, delay: float = 3.0) -> str:
-    return f"echo FAKE_HARNESS_READY\nsleep {delay}"
-
-
-def _stdin_draining_idle_script() -> str:
-    """A harness that actively reads (and echoes) stdin, unlike a bare
-    `sleep`. Injected text (the launch pointer, then any `send_line` steer)
-    would otherwise sit unread in the pty's canonical-mode input queue and,
-    if it accumulates, silently drop a *later* `send_line` steer — the same
-    reason a real coding CLI (which does read stdin) doesn't hit this."""
-    return "echo FAKE_HARNESS_READY\nexec cat -"
-
-
-def _cosmetic_churn_script() -> str:
-    """A harness that keeps changing the pane (a ticking counter) for as
-    long as `observe --wait` might run, draining stdin in the background
-    (`cat -`) so the injected developer prompt is still read per the
-    documented Developer-fake convention. Never writes result.json and
-    never prints a hard-stop marker: a wait against this harness must run
-    to (near) its full deadline, proving `detect_activity`'s any-byte-
-    change `active` flag is no longer used as a wait-exit condition."""
-    return (
-        "echo FAKE_HARNESS_READY\n"
-        "cat - >/dev/null &\n"
-        "i=0\n"
-        "while true; do\n"
-        "  i=$((i+1))\n"
-        "  echo tick-$i\n"
-        "  sleep 0.3\n"
-        "done"
-    )
-
-
 # --- shared base -------------------------------------------------------------
+#
+# The feature-branch repo, session reaper, wait helpers, `_plan_path`, and
+# `_init` all live on `TmuxRunTestCase` in pm_test_helpers, shared with
+# test_finalize.
 
 
-class SliceOpsTestCase(PmTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        # Operate on a dedicated feature branch, as a real run does — the
-        # implicit-current-branch init path now refuses main/master.
-        self._git("checkout", "-q", "-b", "pm-work")
-        self._sessions_to_reap: list[str] = []
-        self.addCleanup(self._reap_sessions)
-
-    def _reap_sessions(self) -> None:
-        for name in self._sessions_to_reap:
-            sessions.force_stop(name)
-
-    def _track_current_session(self, run_id: str, token: str) -> str | None:
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        state = state_mod.load_state(run_dir, token)
-        current = state.get("current_slice") or {}
-        session = current.get("tmux_session")
-        if session:
-            self._sessions_to_reap.append(session)
-        return session
-
-    def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return True
-            time.sleep(interval)
-        return predicate()
-
-    def _plan_path(self) -> Path:
-        # Deliberately outside self.repo: a plan.md living untracked inside
-        # the repo would itself show up as a dirty (untracked) worktree
-        # entry, tripping init's clean-worktree preflight for reasons that
-        # have nothing to do with the behaviour under test (see
-        # FloorTestCase._plan_path in test_floor.py for the same reasoning).
-        return self.repo.parent / "plan.md"
-
-    def _init(self, plan_path: Path, harness_script: Path, *, extra: list[str] | None = None) -> tuple[int, str, str]:
-        argv = [
-            "init",
-            "--repo",
-            str(self.repo),
-            "--plan",
-            str(plan_path),
-            "--harness",
-            "fake",
-            "--harness-command",
-            str(harness_script),
-        ]
-        if extra:
-            argv += extra
-        return self.run_cli_in_repo(argv)
+SliceOpsTestCase = TmuxRunTestCase
 
 
 # --- 1. init happy path --------------------------------------------------
@@ -271,7 +123,7 @@ class SliceOpsTestCase(PmTestCase):
 class TestInitHappyPath(SliceOpsTestCase):
     def test_init_creates_state_pm_skeleton_and_prints_token_once(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["requirements.txt"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
 
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -297,7 +149,7 @@ class TestInitHappyPath(SliceOpsTestCase):
 
     def test_reinit_creates_second_run_and_repoints_current(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
 
         code1, out1, _err1 = self._init(plan_path, harness)
         self.assertEqual(code1, 0)
@@ -319,7 +171,7 @@ class TestInitHappyPath(SliceOpsTestCase):
 class TestInitFailures(SliceOpsTestCase):
     def test_plan_with_errors_exits_two_nothing_created(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": None}])  # empty authorized surface -> error
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
 
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -331,7 +183,7 @@ class TestInitFailures(SliceOpsTestCase):
     def test_dirty_worktree_exits_two(self) -> None:
         plan_path = self.write_plan(self._plan_path())
         (self.repo / "untracked.txt").write_text("oops\n", encoding="utf-8")
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
 
         code, _out, err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -349,7 +201,7 @@ class TestInitFailures(SliceOpsTestCase):
 
     def test_attest_unknown_slice_exits_two_nothing_created(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
         code, _out, err = self._init(plan_path, harness, extra=["--attest", "Slice 99"])
         self.assertEqual(code, 2)
         self.assertIn("unknown slice", err)
@@ -357,14 +209,14 @@ class TestInitFailures(SliceOpsTestCase):
 
     def test_branch_nonexistent_exits_two(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
         code, _out, err = self._init(plan_path, harness, extra=["--branch", "does-not-exist"])
         self.assertEqual(code, 2)
         self.assertIn("does not exist", err)
 
     def test_create_branch_creates_and_switches(self) -> None:
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
         code, out, _err = self._init(plan_path, harness, extra=["--create-branch", "feature/new-branch"])
         self.assertEqual(code, 0)
         self.assertIn("feature/new-branch", out)
@@ -376,7 +228,7 @@ class TestInitFailures(SliceOpsTestCase):
         # PM Test 20 footgun; refuse it, but honour an explicit --branch main.
         self._git("checkout", "-q", "main")
         plan_path = self.write_plan(self._plan_path())
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
 
         code, _out, err = self._init(plan_path, harness)
         self.assertEqual(code, 2)
@@ -531,56 +383,12 @@ class TestApprove(SliceOpsTestCase):
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
-class TestFullFakeHarnessFlow(SliceOpsTestCase):
-    def test_full_flow_finalize_all_pass_and_accept_refused(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-
-        code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        self.assertIn("launched", out)
-        self._track_current_session(run_id, token)
-
-        code, out, _err = self.run_cli_in_repo(["observe", "--wait", "20"])
-        self.assertEqual(code, 0)
-        self.assertTrue(self._wait_for_result(run_id, token))
-
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        before_bytes = (run_dir / "run.json").read_bytes()
-
-        code, out, _err = self.run_cli_in_repo(["finalize", "--token", token])
-        self.assertEqual(code, 0, out)
-        for number in range(1, 9):
-            self.assertRegex(out, re.compile(rf"^{number} \S+ PASS", re.MULTILINE))
-        self.assertIn("evidence: diff=", out)
-        self.assertIn("evidence: pane=", out)
-        self.assertIn("evidence: result=", out)
-
-        after = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        before = json.loads(before_bytes.decode("utf-8"))
-        after.pop("updated_at")
-        before.pop("updated_at")
-        self.assertEqual(after, before)
-
-    def _wait_for_result(self, run_id: str, token: str) -> bool:
-        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
-        state = state_mod.load_state(run_dir, token)
-        artifact_dir = Path(state["current_slice"]["artifact_dir"])
-        return self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=15.0)
-
-
-@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestFinalizeFloorFailure(SliceOpsTestCase):
     def test_unauthorized_file_change_fails_finalize(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh",
-            _commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=2.0),
+            commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=2.0),
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -610,7 +418,7 @@ class TestFinalizeFloorFailure(SliceOpsTestCase):
 class TestAttemptAccounting(SliceOpsTestCase):
     def test_relaunch_persists_attempts_rotates_prior_result_and_exhausts_budget(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_only_script(delay=0.5, tail_sleep=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", result_only_script(delay=0.5, tail_sleep=30.0))
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "1"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -660,7 +468,7 @@ class TestAttemptAccounting(SliceOpsTestCase):
 class TestMidRunPlanEdit(SliceOpsTestCase):
     def test_plan_edited_mid_run_stops_before_next_slice(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -683,7 +491,11 @@ class TestMidRunPlanEdit(SliceOpsTestCase):
 class TestDeadSession(SliceOpsTestCase):
     def test_observe_reports_not_running_and_send_refuses(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _dies_quickly_script(delay=7.0))
+        # Trigger-gated rather than a fixed post-launch delay: the session must
+        # still be alive when `start-slice` injects, and a launch-relative
+        # timer left barely a second of margin over the launch itself.
+        trigger = self.repo.parent / "exit_trigger"
+        harness = write_fake_harness(self.repo.parent / "fake.sh", trigger_gated_exit_script(trigger))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -693,6 +505,7 @@ class TestDeadSession(SliceOpsTestCase):
         session = self._track_current_session(run_id, token)
         self.assertIsNotNone(session)
 
+        trigger.write_text("go\n", encoding="utf-8")
         self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=15.0))
 
         code, out, _err = self.run_cli_in_repo(["observe"])
@@ -730,11 +543,9 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertIsNotNone(match, out)
         return code, out, err, test_elapsed, float(match.group(1))
 
-    def test_cosmetic_pane_churn_does_not_end_wait_early(self) -> None:
-        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
-
+    def _launch(self, harness_body: str) -> tuple[str, str]:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _cosmetic_churn_script())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", harness_body)
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -742,6 +553,62 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         self._track_current_session(run_id, token)
+        return run_id, token
+
+    def _wait_then_trigger(self, trigger: Path, *, wait_seconds: float = 20.0) -> dict:
+        """Run `observe --wait` on a thread, wait until it has actually polled
+        at least once, then fire `trigger`.
+
+        The "has polled" gate is a `threading.Event` set from a wrapper around
+        `sessions.detect_activity`, which every poll calls. Sleeping a beat and
+        inferring the poll from elapsed time would not do: the worker starts
+        its clock before entering the CLI, so a scheduling or setup stall could
+        satisfy the lower bound with `observe` not yet having looked at
+        anything — and the whole point of these tests is that the event is
+        detected MID-wait rather than found already true on the first look.
+
+        `elapsed < wait_seconds` then proves the wait broke early. Elapsed is
+        measured test-side, so an `observe` that returned instantly while
+        printing a full elapsed value cannot pass.
+        """
+        polled = threading.Event()
+        real_detect_activity = sessions.detect_activity
+
+        def _detect_and_signal(*args, **kwargs):
+            try:
+                return real_detect_activity(*args, **kwargs)
+            finally:
+                polled.set()
+
+        result: dict = {}
+
+        def _run() -> None:
+            start = time.monotonic()
+            code, out, err = self.run_cli_in_repo(["observe", "--wait", str(wait_seconds)])
+            result["elapsed"] = time.monotonic() - start
+            result["code"], result["out"], result["err"] = code, out, err
+
+        with mock.patch.object(sessions, "detect_activity", _detect_and_signal):
+            thread = threading.Thread(target=_run)
+            thread.start()
+            self.assertTrue(polled.wait(timeout=30.0), "observe --wait never polled the session")
+            trigger.write_text("go\n", encoding="utf-8")
+            thread.join(timeout=wait_seconds + 15.0)
+            self.assertFalse(thread.is_alive(), "observe --wait did not return in time")
+
+        self.assertEqual(result["code"], 0, result.get("err"))
+        self.assertLess(result["elapsed"], wait_seconds)
+        return result
+
+    def test_cosmetic_pane_churn_does_not_end_wait_early(self) -> None:
+        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
+
+        # Churn starts only once the trigger exists, so readiness can settle
+        # on a still pane first; it then runs continuously for the whole wait,
+        # which is the condition under test.
+        trigger = self.repo.parent / "churn_trigger"
+        self._launch(trigger_gated_churn_script(trigger))
+        trigger.write_text("go\n", encoding="utf-8")
 
         wait_seconds = 3 * _OBSERVE_POLL_SECONDS
         code, out, _err, test_elapsed, reported_elapsed = self._observe_wait(wait_seconds)
@@ -760,123 +627,44 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertLess(abs(reported_elapsed - test_elapsed), 2.0)
 
     def test_result_json_appearing_mid_wait_ends_wait_early(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        # The harness's own delay clock starts at session launch, not at
-        # `observe`'s first check — start-slice's readiness wait plus prompt
-        # injection alone can take several seconds, so the delay must clear
-        # that bar with margin, or result.json is already there by the time
-        # `observe --wait` runs its first check and elapsed would trivially
-        # be ~0, proving nothing about mid-wait behaviour.
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _result_only_script(delay=9.0, tail_sleep=5.0)
-        )
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
-
-        wait_seconds = 25.0
-        code, out, _err, test_elapsed, _reported_elapsed = self._observe_wait(wait_seconds)
-        self.assertEqual(code, 0)
-        self.assertIn("result present: True", out)
-        # Returned early: proven by the TEST-SIDE measurement being well
-        # short of the full requested wait, paired with the result-present
-        # signal above. (A parsed-elapsed lower bound proves nothing beyond
-        # a launch-relative race and has been dropped.)
-        self.assertLess(test_elapsed, 20.0)
+        trigger = self.repo.parent / "result_trigger"
+        self._launch(trigger_gated_result_script(trigger))
+        result = self._wait_then_trigger(trigger)
+        self.assertIn("result present: True", result["out"])
 
     def test_session_death_mid_wait_ends_wait_early(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        # A short delay would race start-slice's own readiness/prompt-
-        # injection wait (see TestDeadSession, which uses the same 7.0s for
-        # the same reason) — too short and start-slice itself fails before
-        # observe ever gets a live session to watch die.
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _dies_quickly_script(delay=7.0))
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
-
-        wait_seconds = 20.0
-        code, out, _err, test_elapsed, _reported_elapsed = self._observe_wait(wait_seconds)
-        self.assertEqual(code, 0)
-        self.assertIn("session running: False", out)
-        # Returned early: TEST-SIDE elapsed well short of the full wait, plus
-        # the session-death signal above.
-        self.assertLess(test_elapsed, 15.0)
+        trigger = self.repo.parent / "exit_trigger"
+        self._launch(trigger_gated_exit_script(trigger))
+        result = self._wait_then_trigger(trigger)
+        self.assertIn("session running: False", result["out"])
 
     def test_hard_stop_marker_mid_wait_ends_wait_early(self) -> None:
-        """Deterministic, OBSERVATION-relative version (no launch-relative
-        race): the credential marker is gated on a trigger file that this
-        test touches explicitly partway through the wait, rather than on a
-        fixed delay from harness launch. A fixed launch-relative delay
-        could let a slow `start-slice` cause the marker to appear before
-        `observe` ever starts polling — an early return would then prove
-        nothing about *mid-wait* detection, only an upper bound. Here,
-        `observe --wait` runs on a background thread; the main thread
-        sleeps a short beat (comfortably more than one poll cycle) to give
-        it time to have polled at least once, THEN creates the trigger
-        file. TEST-SIDE elapsed must be both greater than that pre-trigger
-        beat (proving the wait was genuinely still running — i.e. had not
-        already returned — when the marker appeared) and less than the
-        full requested wait (proving it broke early upon detecting the
-        marker)."""
-        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
-
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         trigger = self.repo.parent / "credential_trigger"
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _trigger_gated_credential_prompt_script(trigger, sleep_seconds=30.0)
-        )
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        self._track_current_session(run_id, token)
-
-        wait_seconds = 20.0
-        result: dict = {}
-
-        def _run() -> None:
-            start = time.monotonic()
-            code, out, err = self.run_cli_in_repo(["observe", "--wait", str(wait_seconds)])
-            result["elapsed"] = time.monotonic() - start
-            result["code"], result["out"], result["err"] = code, out, err
-
-        thread = threading.Thread(target=_run)
-        thread.start()
-
-        # A short beat, comfortably longer than one poll cycle, before we
-        # create the trigger file — this is what proves `observe` was still
-        # actually mid-wait (had already polled at least once and not yet
-        # returned) at the moment the marker appeared.
-        pre_trigger_beat = 2 * _OBSERVE_POLL_SECONDS
-        time.sleep(pre_trigger_beat)
-        trigger.write_text("go\n", encoding="utf-8")
-        thread.join(timeout=wait_seconds + 15.0)
-        self.assertFalse(thread.is_alive(), "observe --wait did not return in time")
-
-        self.assertEqual(result["code"], 0)
+        self._launch(trigger_gated_credential_prompt_script(trigger))
+        result = self._wait_then_trigger(trigger)
         self.assertIn("session running: True", result["out"])
         self.assertIn("hard-stop scan:", result["out"])
         self.assertNotIn("hard-stop scan: clear", result["out"])
-        self.assertGreater(result["elapsed"], pre_trigger_beat - 0.5)
-        self.assertLess(result["elapsed"], wait_seconds)
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestSendNudge(SliceOpsTestCase):
-    def test_send_line_appears_in_pane_and_logs_event_without_touching_attempts(self) -> None:
+    def test_send_delivers_a_nudge_then_refuses_once_a_credential_prompt_appears(self) -> None:
+        """Both `send` outcomes on one launched session.
+
+        They were two tests, each paying a full `start-slice` (readiness settle
+        plus two 1s injection settles) to reach the same live session. The
+        refusal cannot be reached from a pane that shows the marker at launch —
+        `send_prompt` would refuse to inject and `start-slice` itself would
+        fail — so the marker has to appear after injection either way. Gating
+        it on a trigger, rather than on a fixed delay racing the launch, is
+        what lets one session serve both halves.
+        """
+        trigger = self.repo.parent / "credential_trigger"
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", trigger_gated_credential_prompt_script(trigger)
+        )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -889,6 +677,8 @@ class TestSendNudge(SliceOpsTestCase):
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
         attempts_before = state_mod.load_state(run_dir, token)["current_slice"]["attempts"]
 
+        # 1. A clean pane accepts the nudge: it reaches the session, is
+        #    recorded as a `send` event, and is not an attempt.
         code, _out, _err = self.run_cli_in_repo(
             ["send", "--text", "PM_STEER_MARKER_XYZ", "--reason", "nudge along", "--token", token]
         )
@@ -900,16 +690,8 @@ class TestSendNudge(SliceOpsTestCase):
         events = state_mod.read_events(run_dir)
         self.assertTrue(any(event["kind"] == "send" and event["note"] == "nudge along" for event in events))
 
-    def test_send_refuses_into_visible_credential_prompt(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _credential_prompt_script(sleep_seconds=15.0))
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, token = parse_init_output(out)
-
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        session = self._track_current_session(run_id, token)
+        # 2. Once a credential prompt is visible, the same command refuses.
+        trigger.write_text("go\n", encoding="utf-8")
         self.assertTrue(self._wait_for(lambda: "Enter API key" in sessions.pane_text(session), timeout=10.0))
 
         code, _out, err = self.run_cli_in_repo(
@@ -923,7 +705,7 @@ class TestSendNudge(SliceOpsTestCase):
 class TestStop(SliceOpsTestCase):
     def test_stop_captures_pane_kills_session_and_sets_status(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -947,7 +729,7 @@ class TestStop(SliceOpsTestCase):
 
     def test_stop_scavenge_finds_run_prefixed_session_with_state_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", _idle_script(sleep_seconds=30.0))
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=30.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -970,26 +752,26 @@ class TestStop(SliceOpsTestCase):
 
 
 class TestAllSlicesComplete(SliceOpsTestCase):
-    def test_start_slice_reports_complete_without_touching_tmux(self) -> None:
+    def test_nothing_left_to_run_completes_the_run_without_launching_a_session(self) -> None:
+        """One `start-slice` against an all-attested plan, asserted whole.
+
+        This was two tests with identical setup and action. The one named
+        "without_touching_tmux" asserted only output and state — it never
+        checked that no session was launched, which is the claim in its name
+        and the reason a no-work `start-slice` is safe to call. `start_session`
+        is patched here so that claim is actually enforced.
+        """
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         _state, token, run_dir = self.make_run(plan_path=plan_path, slice_statuses={"Slice 1": "attested"})
 
-        code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        with mock.patch.object(sessions, "start_session") as start_session:
+            code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         self.assertIn("all slices complete", out)
+        start_session.assert_not_called()
 
         state = state_mod.load_state(run_dir, token)
         self.assertIsNone(state["current_slice"])
-
-    def test_all_attested_run_transitions_to_complete(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        _state, token, run_dir = self.make_run(plan_path=plan_path, slice_statuses={"Slice 1": "attested"})
-
-        code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
-        self.assertEqual(code, 0)
-        self.assertIn("all slices complete", out)
-
-        state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "complete")
 
         events = state_mod.read_events(run_dir)
@@ -998,7 +780,51 @@ class TestAllSlicesComplete(SliceOpsTestCase):
         self.assertTrue((run_dir / "run-report.md").is_file())
 
 
-# --- 13. real-harness composition ---------------------------------------
+# --- 13. a failed launch leaves no orphan session -------------------------
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestFailedLaunchLeavesNoSession(SliceOpsTestCase):
+    """`start_slice` starts the tmux session before it records the session name
+    in `current_slice`. Anything raising in that window leaves a live Developer
+    session that no state names: `observe`, `finalize`, and `stop`'s
+    recorded-session path all read `current_slice.tmux_session`, so the session
+    is invisible to every one of them while still holding a running harness.
+
+    Both failing steps are reachable in production — readiness raises on a
+    trust prompt or an early exit, and injection refuses into a visible
+    credential prompt.
+    """
+
+    def _init_and_fail(self, failing_call: str) -> tuple[int, str]:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=30.0))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+
+        with mock.patch.object(sessions, failing_call, side_effect=PmError("boom")):
+            code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 2, err)
+        return run_id, token
+
+    def _assert_no_session_survives(self, run_id: str) -> None:
+        self.assertEqual(
+            sessions.sessions_for_run(run_id),
+            [],
+            "a failed launch left a live tmux session that no run state names",
+        )
+
+    def test_readiness_failure_leaves_no_session(self) -> None:
+        run_id, _token = self._init_and_fail("wait_until_ready")
+        self._assert_no_session_survives(run_id)
+
+    def test_injection_failure_leaves_no_session(self) -> None:
+        run_id, _token = self._init_and_fail("send_prompt")
+        self._assert_no_session_survives(run_id)
+
+
+# --- 14. real-harness composition ---------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")

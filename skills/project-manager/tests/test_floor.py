@@ -124,18 +124,14 @@ class TestFloorHappyPath(FloorTestCase):
         for fact in report.facts:
             self.assertTrue(fact.passed, f"{fact.name} unexpectedly failed: {fact.detail}")
 
-    def test_empty_pane_text_passes_hard_stop_fact(self) -> None:
-        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
-        self._commit_authorized_change()
-        self._write_result()
-        state = self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        # An empty pane is also clear, on the same fixture rather than a second
+        # full git-repo test: a pane the harness never wrote to must not read
+        # as a hard stop.
+        empty_pane_report = floor_mod.evaluate_floor(
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
         )
-
-        report = floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text="")
-
-        self.assertTrue(report.passed)
-        self.assertTrue(_facts_by_name(report)["hard-stop-scan"].passed)
+        self.assertTrue(empty_pane_report.passed)
+        self.assertTrue(_facts_by_name(empty_pane_report)["hard-stop-scan"].passed)
 
 
 class TestFactPlanDigest(FloorTestCase):

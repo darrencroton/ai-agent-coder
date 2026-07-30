@@ -28,8 +28,10 @@ Pins the single-copy authenticated state model (target-design §8):
 - `save_state` writes atomically (no temp file survives) and refuses a
   wrong token; holding the advisory lock externally makes a concurrent
   `save_state` fail with the stale-lock message without deleting the lock.
-- `new_run_id` appends `-2`, `-3`, ... on collision against a supplied
-  existing-id set.
+- `new_run_id` returns `<UTC timestamp>-<random nonce>`; ids minted in the
+  same second still differ (the nonce is what keeps two runs in separate
+  state roots from sharing a tmux session name), and it appends `-2`, `-3`,
+  ... on collision against a supplied existing-id set.
 - A slice entry may be created with status "attested" (operator-attested
   prior completion) directly at creation time.
 - `check-plan` exercised end-to-end through the CLI on a good and a bad
@@ -41,11 +43,14 @@ from __future__ import annotations
 import fcntl
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
-from pm_test_helpers import PmTestCase
+from pm_test_helpers import PlanTestCase, PmTestCase
 
 from pm_lib import IntegrityError, PmError
+from pm_lib import sessions as sessions_mod
 from pm_lib import state as state_mod
 
 
@@ -254,8 +259,17 @@ class TestLinkedWorktreeIsolation(PmTestCase):
             self.assertNotEqual(main_run_dir.parent, linked_run_dir.parent)
             self.assertEqual(state_mod.resolve_run_dir(self.repo), main_run_dir)
             self.assertEqual(state_mod.resolve_run_dir(linked_path), linked_run_dir)
-            self.assertNotEqual(main_state["run_id"], "collide-with-linked")  # sanity: no crash/collision
             self.assertEqual(linked_state["branch"], "linked-branch")
+            # Separate state roots are exactly why neither run's collision
+            # check can see the other, so the ids must differ on their own —
+            # they name the tmux sessions, on a server shared machine-wide.
+            # (This replaces a comparison against an unused literal, which
+            # could not have failed for any behaviour of the code.)
+            self.assertNotEqual(main_state["run_id"], linked_state["run_id"])
+            self.assertNotEqual(
+                sessions_mod.session_name(main_state["run_id"], 1, 0),
+                sessions_mod.session_name(linked_state["run_id"], 1, 0),
+            )
 
 
 class TestAtomicSaveAndLocking(PmTestCase):
@@ -335,24 +349,60 @@ class TestAtomicSaveAndLocking(PmTestCase):
         self.assertTrue(lock_path.exists())  # never stolen or deleted
 
 
-class TestNewRunIdCollisions(unittest.TestCase):
-    def test_new_run_id_bare_call_has_no_suffix(self) -> None:
-        run_id = state_mod.new_run_id()
-        self.assertNotIn("-2", run_id)
+class _FrozenClock:
+    """Stands in for `state.datetime` so a run id's timestamp is predictable."""
 
-    def test_new_run_id_appends_suffix_on_collision(self) -> None:
-        # new_run_id() derives "now" internally with no seam to freeze it, so
-        # exercise the collision/suffix logic by pre-populating an
-        # existing-id set with the timestamp it would produce right now.
-        import datetime as _dt
-
-        now_base = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        collided = {now_base, f"{now_base}-2"}
-        run_id = state_mod.new_run_id(collided)
-        self.assertEqual(run_id, f"{now_base}-3")
+    @staticmethod
+    def now(tz=None):
+        return datetime(2026, 7, 30, 12, 24, 23, tzinfo=timezone.utc)
 
 
-class TestRunReportHeader(PmTestCase):
+class TestNewRunId(unittest.TestCase):
+    def test_shape_is_timestamp_plus_random_nonce(self) -> None:
+        """Asserted as a whole shape, not as the absence of one suffix. The
+        previous `"-2" not in run_id` could only ever have caught an
+        unconditional suffix bug, since the timestamp contains no hyphen at
+        all — it did not check the format it was named for."""
+        self.assertRegex(state_mod.new_run_id(), r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+
+    def test_ids_minted_in_the_same_second_still_differ(self) -> None:
+        """The reason the nonce exists. Two runs in two worktrees or
+        repositories cannot see each other's state roots, so the timestamp and
+        the `existing` check can both agree while the ids collide — and a
+        collision means one shared `sessions.session_name`, on a tmux server
+        that is global to the machine.
+
+        The nonce is injected rather than drawn for real: sampling live 24-bit
+        nonces and demanding they all differ is a birthday bet the suite would
+        lose about once in fourteen thousand runs, and it could not have
+        established randomness quality anyway. What must be pinned is that the
+        nonce reaches the id at all — so a same-second pair with different
+        nonces must produce different ids, and different session names."""
+        with mock.patch.object(state_mod, "datetime", _FrozenClock):
+            with mock.patch.object(state_mod.secrets, "token_hex", return_value="aaaaaa"):
+                first = state_mod.new_run_id()
+            with mock.patch.object(state_mod.secrets, "token_hex", return_value="bbbbbb"):
+                second = state_mod.new_run_id()
+
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(
+            sessions_mod.session_name(first, 1, 0), sessions_mod.session_name(second, 1, 0)
+        )
+
+    def test_appends_suffix_on_collision(self) -> None:
+        """Clock AND nonce frozen, so `base` is exactly predictable. Deriving
+        the expected base from a live `datetime.now()` beside production's own
+        independent `now()` call made this flake whenever the two landed either
+        side of a UTC-second boundary."""
+        with mock.patch.object(state_mod, "datetime", _FrozenClock), mock.patch.object(
+            state_mod.secrets, "token_hex", return_value="abcdef"
+        ):
+            base = "20260730T122423Z-abcdef"
+            self.assertEqual(state_mod.new_run_id(), base)
+            self.assertEqual(state_mod.new_run_id({base, f"{base}-2"}), f"{base}-3")
+
+
+class TestRunReportHeader(PlanTestCase):
     """The report header is the run's own record of its configuration.
 
     Harness, reviewer, and attempt budget are the three controls that decide
@@ -470,7 +520,7 @@ class TestRunElapsed(unittest.TestCase):
         self.assertEqual(elapsed[2], "0s")
 
 
-class TestCliCheckPlanAndStubs(PmTestCase):
+class TestCliCheckPlanAndStubs(PlanTestCase):
     def test_check_plan_cli_exits_zero_on_good_plan(self) -> None:
         plan_path = self.write_plan()
         code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path)])
