@@ -216,6 +216,20 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
         # No brace-wrapped identifier survives rendering.
         self.assertIsNone(re.search(r"\{[a-z_]+\}", rendered))
 
+    def test_lint_base_is_the_slices_starting_commit(self) -> None:
+        # The lint ref must be before_head, not HEAD: once the Developer has
+        # committed, `--base HEAD` scopes nothing and lints nothing.
+        rendered = prompts.render_developer_prompt(
+            _make_plan_slice(3),
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/a"),
+            notes_path=Path("/repo/n.md"),
+            result_path=Path("/repo/r.json"),
+            before_head="d5676715b19d9fa12fa46856ca97a179da19756a",
+        )
+        self.assertIn("check --base d5676715b19d9fa12fa46856ca97a179da19756a", rendered)
+        self.assertNotIn("check --base HEAD", rendered)
+
     def test_stray_unescaped_brace_raises_pm_error_naming_the_file(self) -> None:
         import tempfile
 

@@ -93,6 +93,7 @@ def render_developer_prompt(
     artifact_dir: Path,
     notes_path: Path,
     result_path: Path,
+    before_head: str | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
 ) -> str:
@@ -107,12 +108,18 @@ def render_developer_prompt(
     substitutes a plausible one, and the observed substitution
     (`ruff check --diff HEAD`, which treats the ref as a path, lints nothing
     and exits 0) recorded a false pass in `validation.md`.
+
+    `lint_base` is interpolated for the same reason: the template used to
+    hardcode `--base HEAD`, which is correct only until the Developer commits.
+    The slice's `before_head` is correct on every attempt.
     """
     template = load_template(reference_path)
     sections = plan_slice.sections
     lint_script = (skills_root or _DEFAULT_SKILLS_ROOT) / "lint" / "scripts" / "lint.py"
     fields: dict[str, Any] = {
         "lint_script": str(lint_script),
+        # Absent before_head means no commit to diff against; HEAD is then correct.
+        "lint_base": before_head or "HEAD",
         "plan_path": str(plan_path),
         "slice_id": plan_slice.slice_id,
         "slice_title": plan_slice.title,

@@ -391,8 +391,10 @@ def run_review(
 
     with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:
         process = subprocess.Popen(
+            # stdin=DEVNULL: `codex exec` blocks on inherited stdin ("Reading
+            # additional input from stdin...") and the hang looks like a slow model.
             command, cwd=str(repo), stdout=stdout_handle, stderr=stderr_handle,
-            start_new_session=True, env=reviewer_env,
+            stdin=subprocess.DEVNULL, start_new_session=True, env=reviewer_env,
         )
         # start_new_session=True makes the child its own process-group
         # leader, so its pgid equals its pid at creation time — no

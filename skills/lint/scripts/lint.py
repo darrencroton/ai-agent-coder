@@ -21,7 +21,9 @@ Exit codes:
   0  pass            no new findings (differential) / no findings (absolute)
   1  findings        new findings present
   2  error           usage, git, or internal failure
-  3  coverage        --require-coverage given and some changed language is uncovered
+  3  coverage        --require-coverage given and some changed language is
+                     uncovered, or a differential scope empty because nothing
+                     differs from the base ref (nothing was linted)
 """
 
 from __future__ import annotations
@@ -488,6 +490,19 @@ def changed_files(root: str, base: str | None) -> list[str]:
     return [n for n in uniq if os.path.isfile(os.path.join(root, n))]
 
 
+def any_change(root: str, base: str) -> bool:
+    """True if anything at all differs from `base`, deletions included.
+
+    `changed_files` filters to paths that still exist, so a deletion-only change
+    yields an empty scope with nothing to lint. That is a real (empty) answer,
+    unlike an empty scope caused by a stale base ref.
+    """
+    names = git(["diff", "--name-only", f"{base}...HEAD"], root).splitlines()
+    names += git(["diff", "--name-only", "HEAD"], root).splitlines()
+    names += git(["ls-files", "--others", "--exclude-standard"], root).splitlines()
+    return any(n.strip() for n in names)
+
+
 def rename_map(root: str, base: str | None) -> dict[str, str]:
     """new path -> old path for files renamed since `base`.
 
@@ -739,6 +754,8 @@ def report(payload: dict[str, Any], as_json: bool) -> None:
             print(f"  ERROR    {msg}")
 
     print(f"\nverdict: {payload['verdict']}")
+    if payload.get("reason"):
+        print(f"reason: {payload['reason']}")
     if payload["uncovered"]:
         print(f"uncovered languages: {', '.join(payload['uncovered'])} "
               "-- treat as N/A, not as a pass")
@@ -887,6 +904,10 @@ def resolve_files(args, root: str) -> list[str]:
                         out.append(_rel(root, os.path.join(dirpath, fn)))
             elif os.path.isfile(ap):
                 out.append(_rel(root, ap))
+            else:
+                # Silently dropping a path the caller named (a typo, a stale or
+                # deleted file) lints less than asked and still reports a pass.
+                raise RuntimeError(f"path not found: {p}")
         return sorted(set(out))
     if getattr(args, "all", False) and not args.base:
         # Absolute mode over no explicit paths: the whole tracked tree.
@@ -897,16 +918,33 @@ def resolve_files(args, root: str) -> list[str]:
 
 def cmd_check(args) -> int:
     root = repo_root(args.repo)
-    files = resolve_files(args, root)
+    try:
+        files = resolve_files(args, root)
+    except RuntimeError as e:
+        print(f"lint: {e}")
+        return EXIT_ERROR
     differential = bool(args.base) and not args.all
 
     if not files:
+        # An empty differential scope is a coverage gap when nothing differs from
+        # the base at all, because then nothing was linted and the usual cause is
+        # a stale ref (`--base HEAD` after committing) -- a check that did not
+        # happen, never a pass. If the ref is good and the change simply has no
+        # lintable file (deletions only), that is a real answer: pass.
+        gap = differential and not any_change(root, args.base)
+        if gap:
+            reason = (f"nothing differs between {args.base} and the working tree"
+                      " -- check the base ref")
+        elif differential:
+            reason = "changes exist but none is a lintable file (e.g. deletions only)"
+        else:
+            reason = "no files in scope"
         payload = {"mode": "differential" if differential else "absolute",
                    "repo": root, "file_count": 0, "coverage": {}, "tools": [],
                    "new_findings": [], "uncovered": [], "missing_binaries": [],
-                   "verdict": "pass", "reason": "no files in scope"}
+                   "verdict": "coverage-gap" if gap else "pass", "reason": reason}
         report(payload, args.json)
-        return EXIT_PASS
+        return EXIT_COVERAGE if gap else EXIT_PASS
 
     tools = select_tools(files, args.enable, args.skip)
     head_results = lint_tree(tools, files, root, args.timeout)

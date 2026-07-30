@@ -447,6 +447,44 @@ class TestExitCodes(unittest.TestCase):
                 rc = lint.cmd_check(a)
             self.assertEqual(rc, lint.EXIT_PASS)
 
+    def _differential(self, repo, base):
+        """Run cmd_check differentially; return (exit code, json payload)."""
+        import contextlib
+        import io
+        import json as _json
+
+        class A:
+            paths, enable, skip = [], [], []
+            json, timeout = True, 30
+            all, require_coverage = False, False
+        a = A(); a.repo = repo.dir; a.base = base
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = lint.cmd_check(a)
+        return rc, _json.loads(buf.getvalue())
+
+    def test_empty_differential_scope_is_a_coverage_gap(self):
+        # A stale base ref (classically `--base HEAD` after committing) lints
+        # nothing, and reporting that as a pass is the false pass to avoid.
+        with TempRepo() as repo:
+            repo.write("a.py", "x = 1\n")
+            base = repo.commit("base")
+            rc, payload = self._differential(repo, base)
+            self.assertEqual(rc, lint.EXIT_COVERAGE)
+            self.assertEqual(payload["verdict"], "coverage-gap")
+
+    def test_deletion_only_change_still_passes(self):
+        # changed_files excludes deletions by design, so the scope is empty even
+        # though the ref is good: a real answer, not a gap.
+        with TempRepo() as repo:
+            repo.write("a.py", "x = 1\n")
+            repo.write("b.py", "y = 2\n")
+            base = repo.commit("base")
+            sh(["git", "rm", "-q", "b.py"], repo.dir)
+            rc, payload = self._differential(repo, base)
+            self.assertEqual(rc, lint.EXIT_PASS)
+            self.assertEqual(payload["verdict"], "pass")
+
 
 class FakeTool:
     """Install a fake binary on PATH and register a Tool that uses it, so the

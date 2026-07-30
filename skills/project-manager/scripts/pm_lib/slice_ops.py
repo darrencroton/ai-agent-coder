@@ -657,6 +657,7 @@ def start_slice(
         artifact_dir=artifact_dir,
         notes_path=slice_notes_path,
         result_path=result_path,
+        before_head=before_head,
     )
     prompt_path = artifact_dir / "prompt.md"
     prompt_path.write_text(prompt_text, encoding="utf-8")

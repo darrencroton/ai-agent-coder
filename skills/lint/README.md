@@ -67,7 +67,7 @@ Prints the plan; executes only with `--yes`. `--all-tools` for full setup.
 | 0 | pass — no new findings (differential) / no findings (absolute) |
 | 1 | new findings present |
 | 2 | error — bad usage, git failure, or a linter that exited unexpectedly with nothing parseable (at head or at the base ref) |
-| 3 | coverage gap, and `--require-coverage` was given |
+| 3 | coverage gap: `--require-coverage` was given, or a differential run where nothing differs from the base ref, so nothing was linted (usually a stale ref, e.g. `--base HEAD` after committing). A deletion-only change is an empty scope with a good ref, and still passes. |
 
 Precedence is **error > coverage gap > findings**: an incomplete check is a worse
 answer than a complete one that found something. Callers should treat 2 and 3 as

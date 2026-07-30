@@ -86,12 +86,15 @@ python3 <skill-dir>/scripts/lint.py check --all             # absolute: every fi
 ```
 
 `check` always sees uncommitted and untracked work as well as any committed
-range, so `--base HEAD` before a commit is the correct pre-commit call. There is
+range, so `--base HEAD` before a commit is the correct pre-commit call — but only
+before: once the work is committed, `--base HEAD` scopes nothing, which exits `3`
+rather than reporting a hollow pass. There is
 deliberately no `--staged` mode: listing staged paths but linting worktree
 content would let a staged defect pass behind an unstaged fix.
 
 Exit codes: `0` pass · `1` new findings · `2` error · `3` coverage gap (with
-`--require-coverage`). Precedence is error > coverage gap > findings: an
+`--require-coverage`, or a differential run where nothing differs from the base
+ref). Precedence is error > coverage gap > findings: an
 incomplete check is a worse answer than a complete one that found something.
 Treat `2` and `3` as "this check did not happen", never as a pass. Add `--json`
 for machine-readable output.
