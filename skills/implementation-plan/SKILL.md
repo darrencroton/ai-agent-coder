@@ -109,6 +109,15 @@ For slices specifying numerical functions, declare the expected input domain onc
 
 Declare the domain; do not instruct reviewers how to rate findings. Severity is the `code-review` skill's contract, and it already caps out-of-domain behaviour below the blocking levels.
 
+## Keep The Contract Self-Consistent
+
+The contract reaches an implementer and a reviewer verbatim, and both read it literally, so a clause that disagrees with another clause costs a real implementation round. Before finalising, and especially before finalising a *revision*, check that:
+
+- no `Intended Change` sentence requires behaviour the plan's own conventions, `Explicit Non-Goals`, or `Authorized Surface` forbid — a requirement whose every implementation is prohibited elsewhere cannot be satisfied at all;
+- prose describing a design you later reversed is *deleted*, not left standing. This is the most common defect in a revised plan: the new decision is added, the sentence it replaced survives a section above it, and the two now contradict.
+
+Reviewers surface such a conflict; only the deciding seat resolves it. Every one you leave behind costs execution and review attention to rediscover.
+
 ## Machine-Consumed Fields
 
 `project-manager` parses these plan fields mechanically, so keep their labels and shapes exact:

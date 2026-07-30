@@ -36,6 +36,7 @@ Frozen contract the change must satisfy:
 
 Rules:
 - Judge the pinned diff and the repository state at the reviewed commit, not any later or uncommitted work.
+- The frozen contract can itself be defective — prose left behind by a plan revision, a requirement its own conventions forbid satisfying. Report those per the embedded skill's contract-defect rule, addressed to PM, rather than as findings against the implementer; PM alone resolves which reading binds.
 - Cite file and line evidence for every finding; do not soften or upgrade a verdict to satisfy anyone — PM reads your reasoning, not a sentinel string.
 - If you cannot complete the review (missing inputs, tool failure), say exactly why and stop; an honest partial report beats a confident empty one.
 

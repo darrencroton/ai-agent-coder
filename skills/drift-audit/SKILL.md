@@ -45,12 +45,20 @@ Report drift when the implementation includes:
 
 Do not report drift for incidental formatting or import ordering unless it changes behaviour, coupling, public surface, or reviewability.
 
+## Contract Defects Are Not Drift
+
+Before recording a requirement as unsatisfied, check whether the contract can be satisfied at all. Plans get revised, and prose a later decision superseded often survives in an earlier section; a requirement may also be forbidden by the contract's own stated conventions, leaving no implementation that honours it without violating something else.
+
+Report that under `Contract Defects`: quote the clauses that conflict and say which reading appears coherent, then audit the change against that reading. Do not prescribe a fix the contract prohibits elsewhere, and do not fail the implementer for declining to write one. Whoever decides acceptance resolves which reading binds — your job is to surface the conflict, not settle it.
+
 ## Verdicts
 
 - `PASS`: no material drift found.
 - `PASS WITH RISKS`: no clear unauthorized behaviour, but the contract or evidence is incomplete enough that a human should review before accepting.
 - `FAIL`: unapproved scope expansion, behaviour removal, hidden rewrite, risky coupling, or required tests missing.
 - `BLOCKED`: no frozen contract, unusable diff, or missing evidence prevents an audit.
+
+A contract defect alone does not decide the verdict: report it, then rate the change on the coherent reading.
 
 ## Output
 
@@ -77,6 +85,9 @@ Use this format:
 - ...
 
 ## New Coupling
+- ...
+
+## Contract Defects
 - ...
 
 ## Non-Goals Check

@@ -54,6 +54,7 @@ Every review must do all of the following:
 - Extract acceptance criteria from the plan/spec/ticket when present.
 - If no formal spec exists, infer intended behaviour from tests, docs, code structure, and the user request.
 - State important assumptions when they materially affect confidence.
+- A frozen contract can be self-contradictory: prose a later revision superseded, a requirement the contract's own conventions forbid satisfying. Report that under `Contract Defects`, addressed to whoever decides acceptance — quote the conflicting clauses, say which reading appears coherent, and review against that reading. Do not prescribe a fix the contract prohibits elsewhere, and do not rate it as a finding against the implementer. Resolving which reading binds is the decider's call; naming the conflict is yours.
 
 ### 4. Run the review matrix
 - Use [references/review-matrix.md](references/review-matrix.md).
@@ -84,7 +85,7 @@ Before finishing, ask:
 
 ## Severity
 
-- `P0 Critical`: definite correctness, safety, security, data-loss, or reproducibility failure; or a stated requirement is unmet.
+- `P0 Critical`: definite correctness, safety, security, data-loss, or reproducibility failure; or a stated requirement is unmet and its absence causes a failure of that severity. Rate an unmet requirement by what its absence actually causes, not by the fact that a document stated it.
 - `P1 High`: strong evidence of a bug or major risk that should block completion until fixed.
 - `P2 Medium`: important weakness in tests, validation, maintainability, portability, or performance that should be addressed soon.
 - `P3 Low`: minor clarity, documentation, or style issue. Mention only if it adds signal.
@@ -121,6 +122,9 @@ When a `drift-audit` result exists, or the commissioning context states that aut
 
 1. [P1] `path/to/file:123` Title
    Why this is a problem, what behaviour or requirement it breaks, and the fix direction.
+
+## Contract Defects
+- Conflicting clauses, the reading that appears coherent, and the decision left to the decider. `- none` when the contract is self-consistent or absent.
 
 ## Open Questions / Assumptions
 - Only include items that materially affect confidence.
