@@ -139,8 +139,8 @@ def _parse_ruff_check(out: str, err: str, cwd: str) -> list[Finding]:
         return []
     try:
         rows = json.loads(out)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"ruff check produced unparsable JSON: {out[:200]}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ruff check produced unparsable JSON: {out[:200]}") from exc
     findings = []
     for r in rows:
         loc = r.get("location") or {}

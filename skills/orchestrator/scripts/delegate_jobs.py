@@ -36,14 +36,12 @@ from delegate_contract import (
     DELEGATE_PROFILES,
     LABEL_RE,
     compose_delegate_command,
-    compile_skill_bundle,
     load_json_object,
     render_delegate_prompt,
     sha256_path,
     validate_contract,
 )
 from delegate_sessions import (
-    claude_project_root,
     configured_session_id,
     extract_session_text,
     infer_tool_name,
@@ -368,7 +366,7 @@ def ensure_manifest(run_dir: Path) -> dict[str, Any]:
 
 
 def derive_run_dir(root: Path, prefix: str) -> Path:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     return root / f"{prefix}-{stamp}-{os.getpid()}"
 
 

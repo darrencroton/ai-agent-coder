@@ -65,7 +65,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import os
 import re
 import stat
@@ -83,7 +82,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from pm_test_helpers import PmTestCase, parse_init_output
+from pm_test_helpers import PmTestCase
 
 from pm_lib import PmError
 from pm_lib import review as review_mod
@@ -388,7 +387,7 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
     def test_successful_fake_reviewer_records_review_and_clears_pids(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        updated = self.set_current_slice(
+        self.set_current_slice(
             state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
         )
         self._advance_head()

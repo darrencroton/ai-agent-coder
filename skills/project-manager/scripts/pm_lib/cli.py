@@ -218,7 +218,7 @@ def _run_init(args: argparse.Namespace) -> int:
     print(f"state dir: {result.run_dir}")
     print(f"branch: {result.branch}")
     print("slices:")
-    for entry, plan_slice in zip(result.state["slices"], result.slices):
+    for entry, plan_slice in zip(result.state["slices"], result.slices, strict=True):
         print(
             f"  {entry['id']:<10} {plan_slice.title:<40} risk={entry['risk']:<9} "
             f"status={entry['status'] or 'pending'}"

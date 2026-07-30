@@ -40,8 +40,6 @@ from __future__ import annotations
 
 import fcntl
 import json
-import os
-import time
 import unittest
 from pathlib import Path
 
