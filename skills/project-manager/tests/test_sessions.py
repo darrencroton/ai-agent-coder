@@ -11,10 +11,11 @@ Pins:
   (all three directory-trust strings), approval_prompt, credential_prompt,
   permission_prompt, external_side_effect_request (a "push to remote …?"
   shape), and usage_limit_hard_stop (weekly, monthly, account/billing,
-  and the generic reached/exceeded/exhausted phrasing) — plus the two
-  mandatory negative fixtures (an informational sub-100% usage warning, a
-  conditional "if you hit your limit" phrasing) and a prompt wrapped across
-  terminal lines that still matches after whitespace normalization.
+  and the generic reached/exceeded/exhausted phrasing) — plus the negative
+  fixtures (an informational sub-100% usage warning, a conditional "if you
+  hit your limit" phrasing, a marker embedded in an unrelated word) and a
+  prompt wrapped across terminal lines that still matches after whitespace
+  normalization.
 - `session_name` always starts with `pm-<run_id>` (the scavenge sweep
   prefix) in the frozen `pm-<run_id>-s<NN>a<N>` shape.
 - `start_session` refuses (PmError) when the caller's env dict contains
@@ -79,6 +80,14 @@ class TestScanHardStopPositiveFixtures(unittest.TestCase):
         self.assertTrue(result["present"])
         self.assertIn("credential_prompt", result["kinds"])
 
+    def test_hyphenated_marker_matches_flush_against_other_characters(self) -> None:
+        """"two-factor" is a hyphenated phrase, not a bare word, so it keeps
+        substring matching. Bounding it would lose a prompt a pane renders
+        flush against padding — the same mid-token wrap case `-J` protects."""
+        result = sessions.scan_hard_stop("xxxTwo-factor authentication required")
+        self.assertTrue(result["present"])
+        self.assertIn("credential_prompt", result["kinds"])
+
     def test_permission_prompt(self) -> None:
         result = sessions.scan_hard_stop("Permission denied")
         self.assertTrue(result["present"])
@@ -123,6 +132,14 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
 
     def test_conditional_if_you_hit_your_limit_is_not_stopping(self) -> None:
         result = sessions.scan_hard_stop("If you hit your limit, you can continue on usage credits.")
+        self.assertFalse(result["present"])
+        self.assertEqual(result["kinds"], [])
+
+    def test_bare_word_marker_inside_an_unrelated_word_is_not_stopping(self) -> None:
+        """A one-word marker matches on boundaries: "MFA" inside a temp path is
+        not a credential prompt, and a false hard stop refuses every send,
+        fails floor fact 8, and ends `observe --wait` early."""
+        result = sessions.scan_hard_stop("PM_TMPDIR=/tmp/tmpq8mfa2z1/fake.sh")
         self.assertFalse(result["present"])
         self.assertEqual(result["kinds"], [])
 

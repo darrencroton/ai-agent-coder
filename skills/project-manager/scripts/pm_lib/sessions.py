@@ -11,6 +11,7 @@ field observations of external tools; the code around them is independent.
 
 from __future__ import annotations
 
+import functools
 import re
 import shlex
 import shutil
@@ -99,6 +100,29 @@ _INFORMATIONAL_USAGE_RE = re.compile(
 _CONDITIONAL_LIMIT_RE = re.compile(r"\bif you hit your limit\b")
 
 
+@functools.lru_cache(maxsize=None)
+def _literal_marker_re(marker: str) -> re.Pattern[str]:
+    """A marker that is one bare word matches on boundaries; all others stay
+    substrings.
+
+    "MFA" as a substring matched inside unrelated words — any pane showing a
+    path like `/tmp/tmpq8mfa2z1/` scanned as a credential prompt, and a false
+    hard stop refuses every send, fails floor fact 8, and ends `observe
+    --wait` early. Everything else keeps substring matching so a real prompt
+    a pane renders flush against other characters ("xxxEnter API key", the
+    mid-token wrap case) still matches; the accepted cost is that negated or
+    quoted prose can match too ("no approval required", "disallow access"),
+    which fails toward stopping and is the safer direction here.
+
+    The test is a pure word token, not the absence of spaces: "two-factor" is
+    a hyphenated phrase, and bounding it would lose "xxxTwo-factor".
+    """
+    body = re.escape(marker.lower())
+    if not marker.isalnum():
+        return re.compile(body)
+    return re.compile(rf"\b{body}\b")
+
+
 def scan_hard_stop(text: str) -> dict[str, Any]:
     """The hard-stop marker floor, shared by send_line, observe, and floor fact 8.
 
@@ -121,7 +145,7 @@ def scan_hard_stop(text: str) -> dict[str, Any]:
 
     for kind, markers in _LITERAL_MARKERS.items():
         for marker in markers:
-            if marker.lower() in lowered:
+            if _literal_marker_re(marker).search(lowered):
                 _add(kind, marker)
 
     external_match = EXTERNAL_SIDE_EFFECT_PROMPT_RE.search(normalized)
