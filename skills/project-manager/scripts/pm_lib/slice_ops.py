@@ -1180,6 +1180,7 @@ class SteerOutcome:
     slice_id: str
     attempts: int | None = None
     message: str = ""
+    correction_path: Path | None = None
 
 
 def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, risk: str | None = None) -> SteerOutcome:
@@ -1233,30 +1234,55 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # mistaken for complete on the pre-steer result.json — observe --wait,
     # which breaks the instant result.json exists, would otherwise return
     # immediately on stale evidence (target-design §9; Stage 7 Test 21).
-    # This must stay BEFORE send_correction: rotating after delivery would
+    # This must stay BEFORE the send below: rotating after delivery would
     # race the live session, which may write its fresh post-steer result
     # before we rotate — archiving the NEW result instead of the stale one.
-    # If send_correction below raises (dead-session race, hard-stop refusal)
-    # the rotation is harmless: the result is preserved under attempt-<n>/,
-    # the attempt increment is not persisted, and a later relaunch re-rotates
+    # If the send below raises (dead-session race, hard-stop refusal) the
+    # rotation is harmless: the result is preserved under attempt-<n>/, the
+    # attempt increment is not persisted, and a later relaunch re-rotates
     # idempotently (nothing left at top level → no-op).
-    _rotate_prior_attempt(Path(current["artifact_dir"]), attempts - 1)
+    artifact_dir = Path(current["artifact_dir"])
+    _rotate_prior_attempt(artifact_dir, attempts - 1)
 
-    # Direct live-session injection, not a persistent numbered artifact: the
-    # correction is rendered from the reference-sourced wrapper and pasted
-    # straight into the pane, verbatim.
-    message = prompts.render_steer_message(correction)
-    sessions.send_correction(session, message)
+    # File plus one-line pointer, the split `start_slice` uses for prompt.md:
+    # no harness TUI is trusted with long multi-line input (sessions.send_prompt).
+    #
+    # Exclusive create, so a retry reusing an attempt number `save_state`
+    # failed to persist can never rewrite a correction already pointed at.
+    # Unlinked when the send raises, which normally means nothing was typed;
+    # a failed submit leaves it typed-but-unsubmitted, and a cleanup that
+    # fails leaves the file. So a collision means delivery is *uncertain*,
+    # not proven — hence a stop for a human rather than either default.
+    correction_path = artifact_dir / f"steer-attempt-{attempts}.md"
+    try:
+        with correction_path.open("x", encoding="utf-8") as handle:
+            handle.write(correction)
+    except FileExistsError as exc:
+        raise PmError(
+            f"{correction_path} already exists: a correction for attempt {attempts} was written but "
+            "its attempt was never persisted, so whether the Developer received it is unknown. Read "
+            "that file and the pane, then decide as a human — accept, stop, or relaunch; this will "
+            "not overwrite it"
+        ) from exc
+    try:
+        sessions.send_line(session, prompts.render_steer_pointer(correction_path))
+    except PmError:
+        try:
+            correction_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
     state_mod.save_state(run_dir, state, token)
-    # The complete, verbatim correction lives in the event's note (no
-    # truncation, no stripping, no evidence path) — it is the only durable
-    # record of what was said, now that no steer file exists to point to.
+    # The note carries the complete verbatim correction and stays the
+    # authoritative record; `correction_path` is a delivery artifact, not a
+    # second source of truth, so no evidence path is recorded.
     state_mod.append_event(run_dir, "steer", slice_id=slice_id, note=correction)
 
     return SteerOutcome(
         kind="steered", slice_id=slice_id, attempts=attempts,
         message=f"steered {slice_id} (attempt {attempts})",
+        correction_path=correction_path,
     )
 
 

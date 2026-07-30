@@ -31,10 +31,10 @@ matching Stage 3's convention; tmux-gated scenarios use a tiny fake-harness
    is rejected outright with a PmError ("risk can only be raised"); the
    ratchet's effect on the slice entry persists in state even though that
    particular `--accept` call was refused.
-6. `--steer`: a live session receives the full (possibly multiline)
-   correction pasted directly into the pane, wrapped in the reference-
-   sourced steer-message template — no `steer-<attempt>.md` artifact is
-   written, controller-side or in the `.pm/` mirror; the `steer` event's
+6. `--steer`: the full (possibly multiline) correction is written verbatim to
+   `steer-attempt-<n>.md` in the slice artifact directory, and the live
+   session receives only the reference-sourced one-line pointer naming it;
+   the `steer` event's
    `note` carries the complete correction verbatim and the assessment's
    "Attempts / interventions" section renders it legibly; `attempts`
    increments and persists across a fresh state load; exhausting the
@@ -136,8 +136,8 @@ def _credential_prompt_after_ready_script(*, reveal_after: float = 3.0, sleep_se
 
 
 def _steer_then_complete_script(repo: Path, *, authorized_file: str = "a.py") -> str:
-    """Blocks reading stdin until the `finalize --steer` correction actually
-    arrives (the steer wrapper's stable "PM correction" marker), then commits
+    """Blocks reading stdin until the `finalize --steer` pointer actually
+    arrives (its stable "PM correction" marker), then commits
     the authorized change and writes result.json. Completion is thus gated on
     the steer, not raced against a fixed sleep: since a steer now rotates the
     pre-steer result.json into attempt-<n>/ (Stage 7), a harness that finished
@@ -473,7 +473,7 @@ class TestRiskRatchet(FinalizeTestCase):
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestSteer(FinalizeTestCase):
-    def test_steer_injects_correction_directly_increments_attempts_and_exhausts_budget(self) -> None:
+    def test_steer_files_the_correction_sends_a_pointer_and_exhausts_budget(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
         code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "1"])
@@ -491,29 +491,33 @@ class TestSteer(FinalizeTestCase):
         correction = "  Please also update the docstring.\nAnd rerun the tests before committing.  \n"
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("no artifact file written", out)
 
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["current_slice"]["attempts"], 1)
         self.assertEqual(state["slices"][0]["attempts"], 1)
 
-        # No steer artifact anywhere in either tree — the whole run_dir and
-        # the whole .pm/ mirror, not just the one slice subdirectory the old
-        # artifact used to live in.
-        self.assertFalse(any(run_dir.rglob("steer-*.md")))
-        self.assertFalse(any((self.repo / ".pm" / "runs" / run_id).rglob("steer-*.md")))
+        # Filed byte-exact, so the meaningful leading/trailing whitespace
+        # above survives, beside the prompt.md the Developer already reads.
+        correction_path = Path(state["current_slice"]["artifact_dir"]) / "steer-attempt-1.md"
+        self.assertEqual(correction_path.read_text(encoding="utf-8"), correction)
+        self.assertIn(str(correction_path), out)
 
-        # The full multiline correction lands directly in the pane.
+        # Only the pointer reaches the pane, carrying the whole absolute path
+        # (a bare basename would be unopenable). Neither correction line is
+        # injected, so no harness TUI can split or truncate it.
         self.assertTrue(
             self._wait_for(
-                lambda: "Please also update the docstring." in sessions.pane_text(session)
-                and "And rerun the tests before committing." in sessions.pane_text(session),
+                lambda: str(correction_path) in sessions.pane_text(session),
                 timeout=10.0,
             )
         )
+        pane = sessions.pane_text(session)
+        self.assertNotIn("Please also update the docstring.", pane)
+        self.assertNotIn("And rerun the tests before committing.", pane)
 
         # The steer event's note carries the complete correction, not a
-        # truncated first line, and no evidence path (no file to point to).
+        # truncated first line, and deliberately no evidence path: the note is
+        # the authoritative record even though a delivery file now exists.
         events = state_mod.read_events(run_dir)
         steer_events = [e for e in events if e["kind"] == "steer"]
         self.assertEqual(len(steer_events), 1)
@@ -527,6 +531,33 @@ class TestSteer(FinalizeTestCase):
         self.assertEqual(code, 2, err)
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "needs-human")
+
+    def test_steer_refuses_to_overwrite_an_already_delivered_correction(self) -> None:
+        """A send that succeeds while `save_state` fails leaves the attempt
+        unpersisted, so a retry recomputes the same number. Rewriting the file
+        would hand the Developer words the run never recorded, and the earlier
+        unlink-on-refusal would delete a file its pointer already named."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _stdin_draining_idle_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        session = self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+
+        # Stand in for that window: attempt 1's file is already on disk.
+        state = state_mod.load_state(run_dir, token)
+        delivered = Path(state["current_slice"]["artifact_dir"]) / "steer-attempt-1.md"
+        delivered.write_text("the correction already delivered", encoding="utf-8")
+
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "different words", "--token", token])
+        self.assertEqual(code, 2, err)
+        self.assertEqual(delivered.read_text(encoding="utf-8"), "the correction already delivered")
+        self.assertEqual(state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 0)
 
     def test_steer_rotates_stale_pre_steer_result(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
@@ -578,9 +609,11 @@ class TestSteer(FinalizeTestCase):
         self.assertEqual(code, 2, err)
         self.assertIn("credential_prompt", err)
 
-        # Refused before persisting: no steer event recorded, attempts unchanged.
+        # Refused before persisting: no steer event, attempts unchanged, and
+        # no correction file left behind to read as one that was delivered.
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["current_slice"]["attempts"], 0)
+        self.assertFalse((Path(state["current_slice"]["artifact_dir"]) / "steer-attempt-1.md").exists())
         events = state_mod.read_events(run_dir)
         self.assertFalse([e for e in events if e["kind"] == "steer"])
 

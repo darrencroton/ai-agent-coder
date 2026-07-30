@@ -27,9 +27,9 @@ Pins:
   `detect_activity` flagging a pane change, `force_stop` killing a session,
   `sessions_with_prefix` finding sessions by prefix, and `wait_until_ready`
   raising when the session exits before becoming ready.
-- `send_correction`: a multi-line correction lands in the pane verbatim without
-  ever touching disk, it refuses into a visible credential prompt exactly
-  like `send_line`, and it refuses against a dead session.
+- `send_prompt` and `send_line` both refuse a newline: no injection path sends
+  more than one line into a pane, so multi-line content can only reach a
+  session as a file the pointer names. Neither bounds a single line's length.
 """
 
 from __future__ import annotations
@@ -383,49 +383,24 @@ class TestSendLine(TmuxSessionTestCase):
         with self.assertRaises(PmError):
             sessions.send_line("pm-test-definitely-not-running-s01a0", "hello")
 
-
-class TestSendCorrection(TmuxSessionTestCase):
-    def test_send_correction_delivers_multiline_text_without_a_temp_file(self) -> None:
-        name = "pm-test-sendcorrection-s01a0"
-        self._start(name, "cat -")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-
-        correction = "PM_CORRECTION_FIRST_LINE\nPM_CORRECTION_SECOND_LINE"
-        sessions.send_correction(name, correction)
-
-        self.assertTrue(self._wait_for(lambda: "PM_CORRECTION_SECOND_LINE" in sessions.pane_text(name)))
-        pane = sessions.pane_text(name)
-        self.assertIn("PM_CORRECTION_FIRST_LINE", pane)
-        self.assertIn("PM_CORRECTION_SECOND_LINE", pane)
-
-    def test_send_correction_refuses_on_visible_credential_prompt(self) -> None:
-        name = "pm-test-sendcorrection-credential-s01a0"
-        self._start(name, "bash -c 'echo Enter API key to continue; sleep 5'")
-        self.assertTrue(self._wait_for(lambda: "Enter API key" in sessions.pane_text(name)))
-
-        with self.assertRaises(PmError) as ctx:
-            sessions.send_correction(name, "one\ntwo")
-        self.assertIn("credential_prompt", str(ctx.exception))
-
-    def test_send_correction_refuses_when_session_dead(self) -> None:
-        with self.assertRaises(PmError):
-            sessions.send_correction("pm-test-definitely-not-running-s01a0", "one\ntwo")
-
-    def test_send_correction_deletes_its_tmux_buffer_after_delivery(self) -> None:
-        """The correction must not linger in a named tmux server buffer once
-        delivery succeeds — that would be a persistent copy in a different
-        place, defeating the point of not writing a steer artifact file."""
-        name = "pm-test-sendcorrection-cleanup-s01a0"
-        self._start(name, "cat -")
-        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-
-        sessions.send_correction(name, "PM_CLEANUP_CHECK_MARKER")
-        self.assertTrue(self._wait_for(lambda: "PM_CLEANUP_CHECK_MARKER" in sessions.pane_text(name)))
-
-        result = subprocess.run(
-            ["tmux", "list-buffers", "-F", "#{buffer_name}"], check=False, text=True, capture_output=True
+    def test_send_line_withholds_second_enter_when_a_hard_stop_appears(self) -> None:
+        # The steer/nudge counterpart of the send_prompt case above: the first
+        # Enter can itself surface a credential prompt, and a blind second
+        # would answer it. NO_SECOND_ENTER is the expected positive outcome;
+        # waiting for that sentinel keeps the check race-robust, since a
+        # broken impl prints GOT_SECOND_ENTER before the timeout instead.
+        name = "pm-test-sendline-rescan-s01a0"
+        self._start(
+            name,
+            "bash -c 'read a; echo Enter API key to continue; "
+            "if read -t 3 b; then echo GOT_SECOND_ENTER; else echo NO_SECOND_ENTER; fi; sleep 30'",
         )
-        self.assertNotIn(f"{name}_steer", result.stdout.splitlines())
+        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
+
+        sessions.send_line(name, "please continue")
+
+        self.assertTrue(self._wait_for(lambda: "NO_SECOND_ENTER" in sessions.pane_text(name), timeout=8.0))
+        self.assertNotIn("GOT_SECOND_ENTER", sessions.pane_text(name))
 
 
 class TestStartSessionStripsInheritedToken(TmuxSessionTestCase):

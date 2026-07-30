@@ -11,12 +11,10 @@ the package:
   file with no such block, or with more than one, is rejected with a
   `PmError` naming the file. A named `heading` scopes extraction to that
   section instead; an absent heading raises `PmError`.
-- `render_steer_message` sources its fixed wrapper from
-  developer-prompt.md's "## Steer Message
-  Template" section via `load_template(..., heading=...)`, and substitutes
-  `{correction}` — braces inside the correction text itself are never
-  treated as format fields, since they are a substituted value, not part
-  of the template string.
+- `render_steer_pointer` sources its wording from developer-prompt.md's
+  "## Steer Message Template" section via `load_template(..., heading=...)`
+  and renders a single line naming the correction file — the correction text
+  itself never passes through the template.
 - `render_developer_prompt`, against the real
   `skills/project-manager/references/developer-prompt.md` file (the default
   reference path, resolved relative to the pm_lib package), produces text
@@ -118,27 +116,20 @@ class TestLoadTemplate(unittest.TestCase):
             prompts.load_template(_REAL_REFERENCE_PATH, heading="## Not A Real Section")
 
 
-class TestRenderSteerMessage(unittest.TestCase):
-    def test_render_against_real_reference_file_states_frozen_contract_and_includes_correction(self) -> None:
-        rendered = prompts.render_steer_message("Please also update the docstring.")
-        self.assertIn("Please also update the docstring.", rendered)
+class TestRenderSteerPointer(unittest.TestCase):
+    def test_single_line_pointer_names_the_correction_path_and_states_frozen_contract(self) -> None:
+        rendered = prompts.render_steer_pointer(Path("/runs/x/slices/slice-001/steer-attempt-2.md"))
+        # Must be a single line — sessions.send_line refuses a newline, and
+        # the whole point is that the correction stays in the file.
+        self.assertNotIn("\n", rendered)
+        self.assertIn("/runs/x/slices/slice-001/steer-attempt-2.md", rendered)
+        self.assertNotIn("{correction_path}", rendered)
         self.assertIn("frozen slice contract", rendered)
         self.assertIn("never expands your authorized surface", rendered)
-        self.assertNotIn("{correction}", rendered)
 
-    def test_multiline_correction_survives_verbatim(self) -> None:
-        correction = "First line of the correction.\nSecond line with more detail."
-        rendered = prompts.render_steer_message(correction)
-        self.assertIn(correction, rendered)
-
-    def test_braces_in_correction_are_not_treated_as_format_fields(self) -> None:
-        correction = "Use the shape {\"slice\": \"Slice 1\"} exactly."
-        rendered = prompts.render_steer_message(correction)
-        self.assertIn(correction, rendered)
-
-    def test_wrapper_is_sourced_from_the_reference_file_not_hardcoded(self) -> None:
-        """A custom reference file with a distinctive wrapper string proves
-        `render_steer_message` actually reads its wording from disk rather
+    def test_wording_is_sourced_from_the_reference_file_not_hardcoded(self) -> None:
+        """A custom reference file with a distinctive marker proves
+        `render_steer_pointer` actually reads its wording from disk rather
         than duplicating an equivalent wrapper inline in prompts.py."""
         import tempfile
 
@@ -147,12 +138,12 @@ class TestRenderSteerMessage(unittest.TestCase):
             path.write_text(
                 "# Top\n\n```md\nmain: {slice_id}\n```\n\n"
                 "## Steer Message Template\n\n"
-                "```md\nCUSTOM_WRAPPER_MARKER_TEXT_9f3a: {correction}\n```\n",
+                "```md\nCUSTOM_WRAPPER_MARKER_TEXT_9f3a: {correction_path}\n```\n",
                 encoding="utf-8",
             )
-            rendered = prompts.render_steer_message("do the thing", reference_path=path)
+            rendered = prompts.render_steer_pointer(Path("/p/steer-attempt-1.md"), reference_path=path)
             self.assertIn("CUSTOM_WRAPPER_MARKER_TEXT_9f3a", rendered)
-            self.assertIn("do the thing", rendered)
+            self.assertIn("/p/steer-attempt-1.md", rendered)
 
 
 class TestRenderLaunchPointer(unittest.TestCase):
@@ -174,7 +165,7 @@ class TestRenderLaunchPointer(unittest.TestCase):
                 "## Launch Pointer\n\n"
                 "```md\nCUSTOM_POINTER_MARKER_4b21 read {prompt_path}\n```\n\n"
                 "## Steer Message Template\n\n"
-                "```md\nsteer: {correction}\n```\n",
+                "```md\nsteer: {correction_path}\n```\n",
                 encoding="utf-8",
             )
             rendered = prompts.render_launch_pointer(Path("/p/prompt.md"), reference_path=path)

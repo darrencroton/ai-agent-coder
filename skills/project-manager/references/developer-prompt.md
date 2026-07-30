@@ -71,10 +71,8 @@ Read your complete frozen slice contract at {prompt_path} now, in full, before d
 
 ## Steer Message Template
 
-PM renders this to deliver a corrective nudge directly into your live session — no new file is written for it. The same escaping note above applies: the only braces in the block below are the `{correction}` field.
+PM renders this one-line pointer into your live session to deliver a corrective nudge; the correction itself is written verbatim to `steer-attempt-<n>.md` in the slice artifact directory and you read it from there — a correction can be long and multi-line, so it goes in a file for exactly the reason the launch contract does. The rendered block must stay a single line — `send_line` refuses a newline — and the only brace in it is the `{correction_path}` field.
 
 ```md
-PM correction — this stays inside your frozen slice contract above. It may narrow, clarify, or redirect how you proceed, but it never expands your authorized surface, adds scope, or grants new authority:
-
-{correction}
+PM correction — read it at {correction_path} now, in full, before doing anything else. It stays inside your frozen slice contract: it may narrow, clarify, or redirect how you proceed, but it never expands your authorized surface, adds scope, or grants new authority.
 ```

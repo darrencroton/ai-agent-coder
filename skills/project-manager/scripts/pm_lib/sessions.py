@@ -5,6 +5,13 @@ this package shells out to tmux. It never judges anything beyond the
 hard-stop marker scan (`scan_hard_stop`), which is pure text parsing shared
 by `send_line`, `observe`, and `floor.py`'s fact 8.
 
+No injection path here sends more than one line into a pane: both `send_prompt`
+and `send_line` refuse a newline, so multi-line content only ever reaches a
+session as a file the pointer names. Neither bounds a line's length: the
+newline refusal defeats paste splitting outright, while truncation is only
+defeated by pointers staying far below any observed input limit — a guarantee
+of practice, not of code. See `send_prompt` for both failure modes.
+
 The recorded readiness banners and hard-stop marker/phrasing strings preserve
 field observations of external tools; the code around them is independent.
 """
@@ -172,15 +179,15 @@ def scan_hard_stop(text: str) -> dict[str, Any]:
 # --- tmux process plumbing --------------------------------------------------
 
 
-def _run_tmux(*args: str, input_text: str | None = None) -> subprocess.CompletedProcess:
+def _run_tmux(*args: str) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(["tmux", *args], input=input_text, check=False, text=True, capture_output=True)
+        return subprocess.run(["tmux", *args], check=False, text=True, capture_output=True)
     except OSError:
         return subprocess.CompletedProcess(args=["tmux", *args], returncode=127, stdout="", stderr="tmux not found")
 
 
-def _tmux_or_raise(args: list[str], error_prefix: str, *, input_text: str | None = None) -> subprocess.CompletedProcess:
-    result = _run_tmux(*args, input_text=input_text)
+def _tmux_or_raise(args: list[str], error_prefix: str) -> subprocess.CompletedProcess:
+    result = _run_tmux(*args)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise PmError(f"{error_prefix}: {detail}" if detail else error_prefix)
@@ -375,6 +382,12 @@ def send_prompt(session: str, pointer: str) -> None:
     below any such limit and is sent as literal keystrokes, not a paste, so
     the delivery path can no longer drop contract content.
 
+    Staying single-line also avoids a second, independent failure mode:
+    opencode's TUI (opentui) loses bracketed-paste state when a paste spans
+    more than one OS read, taking embedded newlines as Enter presses and
+    submitting one message as several fragments. A line with no newline has
+    nothing to misread; a chunk boundary inside it merely appends.
+
     Refuses outright when any hard-stop marker is visible in the pane — the
     initial injection is a send like any other (target-design §3.2's
     "hard-prompt refusal on any send"), and submitting anything blind into a
@@ -407,8 +420,17 @@ def send_prompt(session: str, pointer: str) -> None:
 
 
 def send_line(session: str, text: str) -> None:
-    """A single steering line: refuses newlines, a dead session, and a visible
-    hard-stop prompt; otherwise `send-keys -l -- <text>` then double-C-m."""
+    """A single steering line — a free `send` nudge or a `finalize --steer`
+    correction pointer: refuses newlines, a dead session, and a visible
+    hard-stop prompt; otherwise `send-keys -l -- <text>` then double-C-m.
+
+    The first C-m is checked, unlike `send_prompt`'s: callers treat a return
+    as delivery, and a pane exiting before it leaves the text typed but never
+    submitted. The second is withheld when the pane has died or now shows a
+    hard stop — the first C-m can itself surface a credential/approval/trust
+    prompt, and a blind second would answer it. Withholding is safe: if the
+    first already submitted, the second was redundant.
+    """
     if "\n" in text or "\r" in text:
         raise PmError("send text must be a single line; write multi-line content to a file and send a one-line pointer")
     if not session_exists(session):
@@ -419,35 +441,7 @@ def send_line(session: str, text: str) -> None:
         raise PmError("refusing to send into hard prompt on screen: " + ", ".join(hard_stop["kinds"]))
     _tmux_or_raise(["send-keys", "-t", session, "-l", "--", text], "tmux literal send failed")
     time.sleep(1.0)
-    _run_tmux("send-keys", "-t", session, "C-m")
+    _tmux_or_raise(["send-keys", "-t", session, "C-m"], "tmux submit failed; text typed but not sent")
     time.sleep(1.0)
-    _run_tmux("send-keys", "-t", session, "C-m")
-
-
-def send_correction(session: str, text: str) -> None:
-    """A multi-line `finalize --steer` correction, delivered straight into
-    the live pane: refuses a dead session and a visible hard-stop prompt
-    exactly like `send_line`, then loads `text` into a tmux paste buffer via
-    stdin (no temp file, no persistent artifact) and submits it with the
-    same settle-and-double-C-m discipline as `send_prompt`.
-    """
-    if not session_exists(session):
-        raise PmError(f"tmux session is not running: {session}")
-    hard_stop = scan_hard_stop(pane_text(session))
-    if hard_stop["present"]:
-        raise PmError(
-            "refusing to inject correction into hard prompt on screen: " + ", ".join(hard_stop["kinds"])
-        )
-    buffer_name = f"{session}_steer"
-    _tmux_or_raise(["load-buffer", "-b", buffer_name, "-"], "tmux correction buffer load failed", input_text=text)
-    try:
-        _tmux_or_raise(["paste-buffer", "-b", buffer_name, "-t", session], "tmux correction paste failed")
-    finally:
-        # Guaranteed cleanup: a paste failure (e.g. the session exits between
-        # load and paste) must not leave the correction sitting in a named
-        # tmux server buffer indefinitely.
-        _run_tmux("delete-buffer", "-b", buffer_name)
-    time.sleep(1.0)
-    _run_tmux("send-keys", "-t", session, "C-m")
-    time.sleep(1.0)
-    _run_tmux("send-keys", "-t", session, "C-m")
+    if session_exists(session) and not scan_hard_stop(pane_text(session))["present"]:
+        _run_tmux("send-keys", "-t", session, "C-m")

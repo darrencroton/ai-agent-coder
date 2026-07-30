@@ -167,16 +167,21 @@ def render_launch_pointer(prompt_path: Path, *, reference_path: Path | None = No
         ) from exc
 
 
-def render_steer_message(correction: str, *, reference_path: Path | None = None) -> str:
-    """Render a `finalize --steer` correction for direct live-session
-    injection without an artifact file. Sourced from the "## Steer Message
-    Template" section of `references/developer-prompt.md` so the fixed wrapper
-    wording lives in exactly one place, not inline here.
+def render_steer_pointer(correction_path: Path, *, reference_path: Path | None = None) -> str:
+    """Render the one-line steer pointer that tells a live Developer session
+    to read a `finalize --steer` correction from `correction_path`.
+
+    The correction is written verbatim to `correction_path` for the same
+    reason the launch contract is (see `render_launch_pointer`): it can be
+    long and multi-line, and no harness TUI is trusted with such a paste.
+    Wording is sourced from the "## Steer Message Template" section of
+    `references/developer-prompt.md` so it lives in exactly one place. The
+    result must be one line — `sessions.send_line` rejects a newline.
     """
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_STEER_MESSAGE_HEADING)
     try:
-        return template.format(correction=correction)
+        return template.format(correction_path=str(correction_path))
     except (KeyError, IndexError, ValueError) as exc:
         raise PmError(
             f"steer message template {path} has an unresolved or stray brace "
