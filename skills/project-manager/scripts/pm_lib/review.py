@@ -192,6 +192,43 @@ def _tail(path: Path, max_chars: int = _STDERR_TAIL_CHARS) -> str:
     return text[-max_chars:]
 
 
+def _next_commission_seq(slice_dir: Path, recorded_reviews: int) -> int:
+    """Next collision-free artifact sequence for a commissioned review.
+
+    `recorded_reviews` alone undercounts: a reviewer that times out or exits
+    non-zero never gets a review record, so a retry would reuse its number and
+    overwrite the artifacts proving what that attempt was commissioned with.
+    Any `review-<n>-*` file already present therefore raises the floor, whether
+    or not the attempt it belongs to succeeded.
+    """
+    highest = recorded_reviews
+    try:
+        existing = list(slice_dir.iterdir())
+    except FileNotFoundError:
+        # No artifacts yet: the first commission for this slice.
+        existing = []
+    except OSError as exc:
+        # Fail CLOSED. Treating an unreadable directory as empty would restore
+        # the very collision this function exists to prevent: a failed
+        # commission records no review, so the fallback would reuse its
+        # sequence and overwrite the prompt proving what it was told — while a
+        # known pathname stays writable even when listing is denied.
+        raise PmError(
+            f"cannot enumerate existing review artifacts in {slice_dir} ({exc}); "
+            "refusing to commission a review that could overwrite a previous "
+            "attempt's evidence"
+        ) from exc
+    for path in existing:
+        parts = path.name.split("-", 2)
+        if len(parts) < 3 or parts[0] != "review":
+            continue
+        try:
+            highest = max(highest, int(parts[1]))
+        except ValueError:
+            continue
+    return highest + 1
+
+
 # --- the review command --------------------------------------------------
 
 
@@ -221,6 +258,7 @@ def run_review(
     effort: str | None = None,
     reviewer_command: str | None = None,
     timeout: float | None = None,
+    pm_adjudications: str | None = None,
 ) -> ReviewOutcome:
     """Commission one independent review against the slice's pinned range.
 
@@ -233,6 +271,13 @@ def run_review(
     expiry the process group is killed and the call fails closed (PmError).
     There is deliberately no default — a legitimately slow cold local model
     is the PM's judgement call, not a hard ceiling.
+
+    `pm_adjudications` is PM-authored free text naming rulings already settled
+    in this run, so a reviewer stops re-raising them. It is the only
+    PM-authored prose the reviewer ever sees, which is precisely why the
+    rendered prompt is persisted beside the report: a channel that can narrow
+    what a reviewer reports must leave the human an audit trail of what it
+    was told.
     """
     state = slice_ops.load_writable_state(run_dir, token)
     current = state.get("current_slice")
@@ -292,6 +337,7 @@ def run_review(
         drift_audit_report=None if skill == "drift-audit" else _fresh_drift_audit_report(
             repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head
         ),
+        pm_adjudications=pm_adjudications,
         skill_name=skill,
         repo=str(repo),
         slice_id=slice_id,
@@ -317,12 +363,26 @@ def run_review(
     entry = slice_ops.slice_entry(state, slice_id)
     if entry is None:
         raise PmError(f"{slice_id} is not present in the run's slice entries")
-    seq = len(entry.get("reviews") or []) + 1
+    # Numbered off COMMISSIONS, not recorded reviews. A timeout or non-zero
+    # exit returns before appending a review record, so numbering from
+    # `len(reviews)` alone made a retry reuse the failed attempt's sequence and
+    # overwrite its artifacts — silently destroying the evidence of what the
+    # first commission was told. Existing artifacts on disk are the only
+    # durable record of a failed attempt, so they set the floor.
+    seq = _next_commission_seq(original_slice_dir, len(entry.get("reviews") or []))
 
     report_relative = f"slices/slice-{slice_ops.slice_number(slice_id):03d}/review-{seq}-{skill}-{resolved_tool}.md"
     report_original = run_dir / report_relative
     report_original.parent.mkdir(parents=True, exist_ok=True)
     stderr_path = original_slice_dir / f"review-{seq}-{skill}-{resolved_tool}-stderr.txt"
+
+    # The rendered prompt is the only record of what this reviewer was told,
+    # including any PM adjudications that narrowed where it spent attention.
+    # Written BEFORE the reviewer runs so a timeout, crash, or non-zero exit
+    # still leaves the commission auditable rather than only its silence.
+    # Derived from the report's own path so the two can never diverge.
+    prompt_relative = report_relative[: -len(".md")] + "-prompt.md"
+    slice_ops.write_controller_artifact(repo, run_dir, run_id, prompt_relative, prompt_text)
 
     # The reviewer process must not inherit the PM run capability token from
     # the controller's exported environment (target-design §8: the token is

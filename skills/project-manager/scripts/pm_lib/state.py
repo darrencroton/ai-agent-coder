@@ -348,6 +348,51 @@ def set_current(repo: Path, run_id: str) -> None:
     _atomic_write_bytes(pointer, run_id.encode("utf-8"))
 
 
+def run_elapsed(events: list[dict[str, Any]]) -> tuple[str, str, str] | None:
+    """Return `(first_ts, last_ts, duration)` spanned by the run's events.
+
+    Total run time is derived here, once, rather than left to whoever writes
+    the closing report: the event log already timestamps `init` through the
+    final decision, so a PM should never be hand-parsing `events.jsonl` to
+    answer "how long did this take". Returns None when no event carries a
+    parseable timestamp, so a malformed log degrades to an honest "unknown"
+    instead of a fabricated figure.
+    """
+    stamps: list[datetime] = []
+    for event in events:
+        raw = event.get("ts")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        # Offset-naive values are malformed here, not merely imprecise: mixing
+        # them with the aware stamps `append_event` writes makes min/max raise
+        # TypeError, and interpreting them alone would silently adopt the host's
+        # local zone and make the endpoints machine-dependent.
+        if parsed.tzinfo is None:
+            continue
+        stamps.append(parsed)
+    if not stamps:
+        return None
+    first, last = min(stamps), max(stamps)
+    total = int(round((last - first).total_seconds()))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        duration = f"{hours}h {minutes}m {seconds}s"
+    elif minutes:
+        duration = f"{minutes}m {seconds}s"
+    else:
+        duration = f"{seconds}s"
+    return (
+        first.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        last.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        duration,
+    )
+
+
 def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_dir: Path) -> str:
     """Render `run-report.md` from controller-owned data alone.
 
@@ -386,6 +431,15 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     lines.append(f"- Attempt budget: {policy_info.get('max_attempts', 10)} per slice")
     lines.append(f"- Status: {state.get('status')}")
     lines.append(f"- Stop reason: {state.get('stop_reason')}")
+    # Endpoints accompany the duration so the figure is self-auditing: a reader
+    # (or a PM asked to double-check it) can verify the span without reopening
+    # the event log.
+    elapsed = run_elapsed(events)
+    if elapsed is None:
+        lines.append("- Total run time: unknown (no timestamped events)")
+    else:
+        first_ts, last_ts, duration = elapsed
+        lines.append(f"- Total run time: {duration} ({first_ts} → {last_ts}, first to last recorded event)")
     lines.append("")
 
     lines.append("## Slices")

@@ -87,6 +87,7 @@ from pm_test_helpers import PmTestCase, parse_init_output
 
 from pm_lib import PmError
 from pm_lib import review as review_mod
+from pm_lib import slice_ops
 from pm_lib import state as state_mod
 from pm_lib import prompts
 
@@ -239,22 +240,30 @@ class TestComposeReviewerCommand(unittest.TestCase):
 
 
 class TestRenderReviewerPrompt(unittest.TestCase):
-    def test_renders_contract_and_pinned_range_with_no_unresolved_placeholders(self) -> None:
-        rendered = prompts.render_reviewer_prompt(
+    def _render(self, **overrides) -> str:
+        fields = dict(
             skill_name="code-review",
             repo="/repo",
             slice_id="Slice 3",
             slice_title="Do the thing",
             before_head="a" * 40,
             reviewed_head="b" * 40,
-            diff_path="/repo/.pm/runs/run-a/slices/slice-003/review-input-code-review.patch",
-            changed_files=["a.py", "b.py"],
+            diff_path="/x.patch",
+            changed_files=["a.py"],
             intended_change="Change the thing.",
             acceptance_criteria="It works.",
             authorized_surface="- a.py",
             explicit_non_goals="Nothing else.",
             risk_flags="- Risky surfaces touched: none.",
             skills_root=_REAL_SKILLS_ROOT,
+        )
+        fields.update(overrides)
+        return prompts.render_reviewer_prompt(**fields)
+
+    def test_renders_contract_and_pinned_range_with_no_unresolved_placeholders(self) -> None:
+        rendered = self._render(
+            diff_path="/repo/.pm/runs/run-a/slices/slice-003/review-input-code-review.patch",
+            changed_files=["a.py", "b.py"],
         )
         self.assertIn("code-review", rendered)
         self.assertIn("/repo", rendered)
@@ -275,6 +284,53 @@ class TestRenderReviewerPrompt(unittest.TestCase):
         # No leftover unresolved placeholder field names.
         for field in ("skill_name", "repo", "slice_id", "before_head", "reviewed_head", "diff_path"):
             self.assertNotIn("{" + field + "}", rendered)
+
+    def test_absent_adjudications_render_as_the_literal_none(self) -> None:
+        rendered = self._render()
+        self.assertNotIn("{pm_adjudications}", rendered)
+        self.assertIn("PM adjudications already settled earlier in this run", rendered)
+
+    def test_adjudications_render_verbatim_and_keep_the_dissent_channel(self) -> None:
+        rendered = self._render(
+            pm_adjudications="- Unlisted-input coercion holes: out of scope per the plan's conventions."
+        )
+        self.assertIn("Unlisted-input coercion holes: out of scope", rendered)
+        # The template must never present an adjudication as licence to
+        # suppress: PM may narrow attention, never silence a reviewer.
+        self.assertIn("settled **only for as long as you agree with it**", rendered)
+        # Dissent must carry full severity and evidence, not a truncated note:
+        # overturning a mistaken ruling is where PM most needs the reasoning.
+        self.assertIn("normal severity, reachability, evidence, and fix direction", rendered)
+        self.assertIn("label it as dissent", rendered)
+
+    def test_adjudications_cannot_inject_a_stray_placeholder(self) -> None:
+        """PM-authored text is substituted, never re-formatted, so a brace in
+        an adjudication is inert rather than a template error."""
+        rendered = self._render(pm_adjudications="- Reject {not_a_field} inputs")
+        self.assertIn("{not_a_field}", rendered)
+
+    def test_a_failed_commission_does_not_lose_its_prompt_to_a_retry(self) -> None:
+        """A timeout/non-zero exit records no review, so numbering from
+        `len(reviews)` alone made a retry overwrite the failed attempt's
+        artifacts — destroying the evidence of what it was commissioned with."""
+        with tempfile.TemporaryDirectory() as tmp:
+            slice_dir = Path(tmp)
+            # First commission: no review recorded yet, nothing on disk.
+            self.assertEqual(review_mod._next_commission_seq(slice_dir, 0), 1)
+            # It failed, but left artifacts behind.
+            (slice_dir / "review-1-code-review-codex-prompt.md").write_text("x", encoding="utf-8")
+            (slice_dir / "review-1-code-review-codex.md").write_text("x", encoding="utf-8")
+            self.assertEqual(review_mod._next_commission_seq(slice_dir, 0), 2)
+            # Recorded reviews still raise the floor on their own.
+            self.assertEqual(review_mod._next_commission_seq(slice_dir, 5), 6)
+
+    def test_commission_seq_ignores_non_numbered_review_inputs(self) -> None:
+        """`review-input-<skill>.patch` shares the prefix but carries no
+        sequence; it must not be parsed as one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            slice_dir = Path(tmp)
+            (slice_dir / "review-input-code-review.patch").write_text("x", encoding="utf-8")
+            self.assertEqual(review_mod._next_commission_seq(slice_dir, 0), 1)
 
     def test_stray_brace_in_custom_template_raises_naming_the_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -486,6 +542,60 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self.assertEqual(entry.get("reviews") or [], [])
         events = state_mod.read_events(run_dir)
         self.assertFalse(any(e["kind"] == "review" for e in events))
+
+    def test_a_failed_commissions_prompt_survives_its_retry(self) -> None:
+        """The whole point of persisting the prompt is auditing what a reviewer
+        was told — including one that failed. A failed commission records no
+        review, so numbering off recorded reviews alone let the retry overwrite
+        it. Both prompts must survive, in the state dir and the mirror, each
+        carrying its own adjudication."""
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+
+        failing = _write_fake_reviewer(self.repo.parent / "fake_rv_fail.sh", 'echo "boom" 1>&2\nexit 1')
+        passing = _write_fake_reviewer(self.repo.parent / "fake_rv_pass.sh", 'echo "## Verdict\n- PASS"')
+
+        def commission(command: Path, adjudication: str) -> int:
+            code, _out, _err = self.run_cli_in_repo(
+                [
+                    "review", "--slice", "Slice 1", "--skill", "code-review",
+                    "--tool", "faketool", "--reviewer-command", str(command),
+                    "--adjudicated", adjudication, "--token", token,
+                ]
+            )
+            return code
+
+        # A multi-line ruling also proves newline collapsing: the block sits
+        # above the frozen contract, so an embedded newline could otherwise
+        # imitate a later prompt section.
+        self.assertEqual(commission(failing, "first ruling\nsmuggled second line"), 2)
+        self.assertEqual(commission(passing, "second ruling"), 0)
+
+        slice_dir = run_dir / "slices" / "slice-001"
+        mirror_dir = slice_ops.run_artifact_dir(self.repo, state["run_id"]) / "slices" / "slice-001"
+        first = "review-1-code-review-faketool-prompt.md"
+        second = "review-2-code-review-faketool-prompt.md"
+        for directory in (slice_dir, mirror_dir):
+            self.assertTrue((directory / first).is_file(), f"missing {first} in {directory}")
+            self.assertTrue((directory / second).is_file(), f"missing {second} in {directory}")
+
+        first_text = (slice_dir / first).read_text(encoding="utf-8")
+        second_text = (slice_dir / second).read_text(encoding="utf-8")
+        self.assertIn("- first ruling smuggled second line", first_text)
+        self.assertNotIn("first ruling\nsmuggled", first_text)
+        self.assertIn("- second ruling", second_text)
+        self.assertNotIn("first ruling", second_text)
+
+    def test_unreadable_artifact_dir_fails_closed(self) -> None:
+        """Treating an unenumerable directory as empty would restore the
+        collision: a known prompt pathname stays writable even when listing is
+        denied, so the retry would overwrite the earlier attempt's evidence."""
+        with mock.patch.object(Path, "iterdir", side_effect=PermissionError("denied")):
+            with self.assertRaises(PmError) as ctx:
+                review_mod._next_commission_seq(Path("/nonexistent-slice-dir"), 0)
+        self.assertIn("overwrite", str(ctx.exception))
 
 
 class TestReviewRefusals(ReviewCommandTestCase):

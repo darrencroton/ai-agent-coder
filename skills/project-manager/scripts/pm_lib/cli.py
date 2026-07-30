@@ -118,6 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
         "e.g. an opencode-namespaced model is --tool opencode --model opencode-go/<model>",
     )
     review.add_argument("--effort")
+    review.add_argument(
+        "--adjudicated", action="append", metavar="TEXT",
+        help="one ruling PM has already settled in this run, so the reviewer stops re-raising it; "
+        "repeatable. Bounds reviewer attention only — it can never widen the authorized surface "
+        "or weaken a criterion, and a reviewer that disagrees still files a full finding",
+    )
     review.add_argument("--reviewer-command", help="override the whole reviewer command (tests/unsupported tools)")
     review.add_argument(
         "--timeout", type=_positive_seconds,
@@ -252,6 +258,17 @@ def _run_status(args: argparse.Namespace) -> int:
     plan_info = state.get("plan") or {}
     print(f"plan: {plan_info.get('path')}  sha256: {(plan_info.get('sha256') or '')[:12]}…")
     print(f"stop reason: {state.get('stop_reason')}")
+
+    # Same derivation the report uses, so run time never needs events.jsonl
+    # parsed by hand. Labelled "recorded event span" rather than "elapsed":
+    # `status` appends no event, so on a quiet live run this ends at the last
+    # recorded activity, not now — calling that elapsed time would overstate it.
+    elapsed = state_mod.run_elapsed(state_mod.read_events(run_dir))
+    if elapsed is None:
+        print("recorded event span: unknown (no timestamped events)")
+    else:
+        first_ts, last_ts, duration = elapsed
+        print(f"recorded event span: {duration} ({first_ts} → {last_ts})")
 
     # The attempt ceiling is printed alongside every attempt count so pacing a
     # steer never requires reading run.json directly.
@@ -467,6 +484,16 @@ def _run_review(args: argparse.Namespace) -> int:
         effort=args.effort,
         reviewer_command=args.reviewer_command,
         timeout=args.timeout,
+        # Rendered one-per-line so the reviewer reads a list, not a run-on
+        # sentence; None when unused, which the template shows as `none`.
+        # Newlines inside an item are collapsed: the block sits above the frozen
+        # contract in the prompt, so a multi-line item could otherwise imitate a
+        # later prompt section rather than read as one ruling.
+        pm_adjudications=(
+            "\n".join(f"- {' '.join(item.split())}" for item in args.adjudicated)
+            if args.adjudicated
+            else None
+        ),
     )
     print(f"slice: {outcome.slice_id}")
     print(f"skill: {outcome.skill}  tool: {outcome.tool}")

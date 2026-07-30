@@ -382,6 +382,29 @@ class TestRunReportHeader(PmTestCase):
         self.assertIn("- Reviewer (run default): codex model=gpt-5.6-sol effort=high", text)
         self.assertIn("- Attempt budget: 10 per slice", text)
 
+    def test_header_reports_total_run_time_with_its_endpoints(self) -> None:
+        """The report is the single source for run time so PM never hand-parses
+        events.jsonl; the endpoints ship with it so the figure is checkable."""
+        state = {
+            "run_id": "r", "repo": "/repo", "branch": "b", "status": "complete",
+            "plan": {"path": "/plan.md", "sha256": "a" * 64}, "harness": {},
+            "reviewer": {}, "policy": {}, "slices": [], "approvals": {},
+            "stop_reason": None,
+        }
+        events = [
+            {"kind": "init", "ts": "2026-07-30T02:17:16Z"},
+            {"kind": "accept", "ts": "2026-07-30T03:10:30Z"},
+        ]
+        text = state_mod.render_run_report(state, events, Path(self.repo))
+        self.assertIn(
+            "- Total run time: 53m 14s (2026-07-30T02:17:16Z → 2026-07-30T03:10:30Z, "
+            "first to last recorded event)",
+            text,
+        )
+
+    def test_header_says_unknown_rather_than_zero_without_timestamps(self) -> None:
+        self.assertIn("- Total run time: unknown (no timestamped events)", self._header())
+
     def test_header_survives_a_run_with_no_reviewer_configured(self) -> None:
         text = self._header(reviewer={}, policy={})
         self.assertIn("- Reviewer (run default): None", text)
@@ -392,6 +415,61 @@ class TestRunReportHeader(PmTestCase):
         state a budget no command would apply."""
         text = self._header(policy={})
         self.assertIn("- Attempt budget: 10 per slice", text)
+
+
+class TestRunElapsed(unittest.TestCase):
+    def _duration(self, first: str, last: str) -> str:
+        elapsed = state_mod.run_elapsed([{"ts": first}, {"ts": last}])
+        assert elapsed is not None
+        return elapsed[2]
+
+    def test_formats_seconds_minutes_and_hours(self) -> None:
+        self.assertEqual(self._duration("2026-07-30T00:00:00Z", "2026-07-30T00:00:09Z"), "9s")
+        self.assertEqual(self._duration("2026-07-30T00:00:00Z", "2026-07-30T00:05:07Z"), "5m 7s")
+        self.assertEqual(self._duration("2026-07-30T00:00:00Z", "2026-07-30T02:03:04Z"), "2h 3m 4s")
+
+    def test_spans_min_to_max_not_first_to_last_line(self) -> None:
+        """Events are appended, but an out-of-order line must not yield a
+        negative or truncated span."""
+        elapsed = state_mod.run_elapsed([
+            {"ts": "2026-07-30T01:00:00Z"},
+            {"ts": "2026-07-30T00:30:00Z"},
+            {"ts": "2026-07-30T00:45:00Z"},
+        ])
+        assert elapsed is not None
+        self.assertEqual(elapsed, ("2026-07-30T00:30:00Z", "2026-07-30T01:00:00Z", "30m 0s"))
+
+    def test_ignores_malformed_and_missing_timestamps(self) -> None:
+        elapsed = state_mod.run_elapsed([
+            {"kind": "init"},
+            {"ts": "not-a-timestamp"},
+            {"ts": 12345},
+            {"ts": "2026-07-30T00:00:00Z"},
+            {"ts": "2026-07-30T00:01:00Z"},
+        ])
+        assert elapsed is not None
+        self.assertEqual(elapsed[2], "1m 0s")
+
+    def test_returns_none_rather_than_a_fabricated_zero(self) -> None:
+        self.assertIsNone(state_mod.run_elapsed([]))
+        self.assertIsNone(state_mod.run_elapsed([{"kind": "init"}, {"ts": "bad"}]))
+
+    def test_offset_naive_timestamps_are_skipped_not_mixed(self) -> None:
+        """A naive stamp beside the aware ones `append_event` writes would make
+        min/max raise TypeError; alone it would adopt the host's local zone."""
+        elapsed = state_mod.run_elapsed([
+            {"ts": "2026-07-30T00:00:00Z"},
+            {"ts": "2026-07-30T09:00:00"},
+            {"ts": "2026-07-30T00:02:00Z"},
+        ])
+        assert elapsed is not None
+        self.assertEqual(elapsed[2], "2m 0s")
+        self.assertIsNone(state_mod.run_elapsed([{"ts": "2026-07-30T09:00:00"}]))
+
+    def test_single_event_is_a_zero_span_not_none(self) -> None:
+        elapsed = state_mod.run_elapsed([{"ts": "2026-07-30T00:00:00Z"}])
+        assert elapsed is not None
+        self.assertEqual(elapsed[2], "0s")
 
 
 class TestCliCheckPlanAndStubs(PmTestCase):
