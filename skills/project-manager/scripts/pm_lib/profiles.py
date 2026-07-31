@@ -51,7 +51,10 @@ HARNESS_PROFILES: dict[str, dict[str, Any]] = {
         "model_inventory_command": ["opencode", "models", "{provider}", "--verbose"],
     },
     "qwen": {
-        "base_command": ["qwen"],
+        # --yolo: bare qwen defaults to classifier-gated Auto mode, which
+        # blocks on an interactive confirmation whenever the classifier is
+        # unavailable — a PM session has nobody to answer it.
+        "base_command": ["qwen", "--yolo"],
         "model_flag": "-m",
         # Qwen Code's interactive command exposes no reasoning-effort flag.
         # An effort request therefore fails closed through _append_effort.

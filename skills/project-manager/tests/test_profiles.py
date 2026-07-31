@@ -73,7 +73,7 @@ class TestComposeCommandBaseCommands(unittest.TestCase):
         self.assertEqual(profiles.compose_command("opencode"), "opencode --auto")
 
     def test_qwen_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("qwen"), "qwen")
+        self.assertEqual(profiles.compose_command("qwen"), "qwen --yolo")
 
 
 class TestComposeCommandOverrides(unittest.TestCase):
@@ -105,7 +105,7 @@ class TestComposeCommandOverrides(unittest.TestCase):
         self.assertIn("opencode", str(ctx.exception))
 
     def test_qwen_model_only(self) -> None:
-        self.assertEqual(profiles.compose_command("qwen", model="qwen/qwen3.6"), "qwen -m qwen/qwen3.6")
+        self.assertEqual(profiles.compose_command("qwen", model="qwen/qwen3.6"), "qwen --yolo -m qwen/qwen3.6")
 
     def test_qwen_effort_fails_closed(self) -> None:
         with self.assertRaises(PmError) as ctx:

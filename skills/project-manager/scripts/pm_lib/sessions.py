@@ -48,6 +48,8 @@ _LITERAL_MARKERS: dict[str, tuple[str, ...]] = {
         "Do you want to proceed?",
         "Approve this action",
         "Allow this command",
+        "Allow execution of",
+        "Waiting for user confirmation",
         "requires approval",
         "requires manual approval",
         "approval required",
