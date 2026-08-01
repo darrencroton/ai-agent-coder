@@ -229,6 +229,22 @@ def _next_commission_seq(slice_dir: Path, recorded_reviews: int) -> int:
     return highest + 1
 
 
+def _claim_commission_seq(slice_dir: Path, recorded_reviews: int, skill: str, tool: str) -> tuple[int, Path]:
+    """Atomically claim the next sequence via its stderr artifact.
+
+    Scanning then writing raced: concurrent commissions picked the same
+    sequence and the loser overwrote the winner's evidence.
+    """
+    seq = _next_commission_seq(slice_dir, recorded_reviews)
+    while True:
+        stderr_path = slice_dir / f"review-{seq}-{skill}-{tool}-stderr.txt"
+        try:
+            os.close(os.open(stderr_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+            return seq, stderr_path
+        except FileExistsError:
+            seq += 1
+
+
 # --- the review command --------------------------------------------------
 
 
@@ -315,7 +331,21 @@ def run_review(
     original_slice_dir = slice_ops.slice_state_dir(run_dir, slice_id)
     original_slice_dir.mkdir(parents=True, exist_ok=True)
 
-    diff_path = original_slice_dir / f"review-input-{skill}.patch"
+    has_override = bool(reviewer_command)
+    resolved_tool = _resolve_tool(state, tool, has_override=has_override)
+
+    entry = slice_ops.slice_entry(state, slice_id)
+    if entry is None:
+        raise PmError(f"{slice_id} is not present in the run's slice entries")
+    # Failed commissions also reserve their artifact sequence: they record no
+    # review, so numbering from `len(reviews)` alone would overwrite them.
+    seq, stderr_path = _claim_commission_seq(
+        original_slice_dir, len(entry.get("reviews") or []), skill, resolved_tool
+    )
+
+    # Per-commission, so a later commission cannot replace the pinned diff a
+    # running reviewer has not opened yet.
+    diff_path = original_slice_dir / f"review-{seq}-{skill}-{resolved_tool}.patch"
     git_ops.write_git_diff(repo, before_head, reviewed_head, diff_path)
     if before_head and before_head != reviewed_head:
         changed_files = sorted(
@@ -353,28 +383,14 @@ def run_review(
         risk_flags=sections.get("Risk Flags", "").rstrip(),
     )
 
-    has_override = bool(reviewer_command)
-    resolved_tool = _resolve_tool(state, tool, has_override=has_override)
     command = _build_reviewer_command(
         resolved_tool, prompt_text, model=resolved_model, effort=resolved_effort, repo=repo,
         reviewer_command_override=reviewer_command,
     )
 
-    entry = slice_ops.slice_entry(state, slice_id)
-    if entry is None:
-        raise PmError(f"{slice_id} is not present in the run's slice entries")
-    # Numbered off COMMISSIONS, not recorded reviews. A timeout or non-zero
-    # exit returns before appending a review record, so numbering from
-    # `len(reviews)` alone made a retry reuse the failed attempt's sequence and
-    # overwrite its artifacts — silently destroying the evidence of what the
-    # first commission was told. Existing artifacts on disk are the only
-    # durable record of a failed attempt, so they set the floor.
-    seq = _next_commission_seq(original_slice_dir, len(entry.get("reviews") or []))
-
     report_relative = f"slices/slice-{slice_ops.slice_number(slice_id):03d}/review-{seq}-{skill}-{resolved_tool}.md"
     report_original = run_dir / report_relative
     report_original.parent.mkdir(parents=True, exist_ok=True)
-    stderr_path = original_slice_dir / f"review-{seq}-{skill}-{resolved_tool}-stderr.txt"
 
     # The rendered prompt is the only record of what this reviewer was told,
     # including any PM adjudications that narrowed where it spent attention.
@@ -400,11 +416,11 @@ def run_review(
         # leader, so its pgid equals its pid at creation time — no
         # getpgid() race against a fast-exiting process.
         pgid = process.pid
-        reviewer_pids = list(current.get("reviewer_pids") or [])
-        reviewer_pids.append(pgid)
-        current["reviewer_pids"] = reviewer_pids
-        # Saved BEFORE waiting so `stop` can reap a hung reviewer.
-        state_mod.save_state(run_dir, state, token)
+        # Persist before waiting so `stop` can reap every parallel reviewer.
+        with state_mod.locked_update(run_dir, token) as live_state:
+            live_current = live_state.get("current_slice")
+            if live_current is not None:
+                live_current["reviewer_pids"] = [*(live_current.get("reviewer_pids") or []), pgid]
         # Printed before the (possibly long) wait begins — a slow-but-alive
         # local reviewer and a hung one are otherwise indistinguishable from
         # the PM seat (target-design §12, Amended post-implementation).
@@ -440,14 +456,13 @@ def run_review(
     # process-group id behind for a later `stop` to SIGKILL after PID reuse.
     # (Re-reading also avoids relying on the in-memory state staying
     # accurate across the potentially long subprocess wait above.)
-    state = slice_ops.load_writable_state(run_dir, token)
-    current = state.get("current_slice")
-    if current is not None and current.get("reviewer_pids"):
-        current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
     # Persisted BEFORE any fallible post-processing (mirror/hash below): if
     # either raises, the cleared pgid must already be on disk so a later
     # `stop` cannot SIGKILL a reused pgid recorded as still-live.
-    state_mod.save_state(run_dir, state, token)
+    with state_mod.locked_update(run_dir, token) as state:
+        current = state.get("current_slice")
+        if current is not None and current.get("reviewer_pids"):
+            current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
 
     if timed_out:
         state_mod.append_event(
@@ -468,24 +483,23 @@ def run_review(
     report_original = slice_ops.mirror_artifact(repo, run_dir, run_id, report_relative)
     sha256 = _sha256_report(report_original)
 
-    entry = slice_ops.slice_entry(state, slice_id)
-    if entry is not None:
-        reviews = list(entry.get("reviews") or [])
-        reviews.append(
-            {
-                "skill": skill,
-                "tool": resolved_tool,
-                "model": resolved_model,
-                "head": reviewed_head,
-                "before_head": before_head,
-                "artifact": str(report_original),
-                "sha256": sha256,
-                "at": _utc_now_iso(),
-            }
-        )
-        entry["reviews"] = reviews
-
-    state_mod.save_state(run_dir, state, token)
+    # Locked: preserve reviews completed concurrently.
+    with state_mod.locked_update(run_dir, token) as state:
+        entry = slice_ops.slice_entry(state, slice_id)
+        if entry is not None:
+            entry["reviews"] = [
+                *(entry.get("reviews") or []),
+                {
+                    "skill": skill,
+                    "tool": resolved_tool,
+                    "model": resolved_model,
+                    "head": reviewed_head,
+                    "before_head": before_head,
+                    "artifact": str(report_original),
+                    "sha256": sha256,
+                    "at": _utc_now_iso(),
+                },
+            ]
     state_mod.append_event(
         run_dir, "review", slice_id=slice_id, note=f"{skill} via {resolved_tool}", evidence=str(report_original)
     )

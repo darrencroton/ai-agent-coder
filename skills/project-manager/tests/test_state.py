@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,55 @@ from pm_test_helpers import PlanTestCase, PmTestCase
 from pm_lib import IntegrityError, PmError
 from pm_lib import sessions as sessions_mod
 from pm_lib import state as state_mod
+
+
+class TestLockedUpdate(PmTestCase):
+    def test_concurrent_updates_do_not_lose_each_other(self) -> None:
+        """save_state locks only its own write, so an unguarded
+        load-mutate-save drops a concurrent writer's update."""
+        plan_path = self.write_plan()
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        state["current_slice"] = {"id": "Slice 1", "reviewer_pids": []}
+        state_mod.save_state(run_dir, state, token)
+
+        barrier = threading.Barrier(12)
+
+        def append(pid: int) -> None:
+            barrier.wait()
+            with state_mod.locked_update(run_dir, token) as live:
+                current = live["current_slice"]
+                current["reviewer_pids"] = [*(current.get("reviewer_pids") or []), pid]
+
+        threads = [threading.Thread(target=append, args=(1000 + i,)) for i in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        final = state_mod.load_state(run_dir, token)["current_slice"]["reviewer_pids"]
+        self.assertEqual(sorted(final), [1000 + i for i in range(12)])
+
+    def test_verified_load_of_a_missing_run_creates_nothing(self) -> None:
+        """_advisory_lock creates run_dir and .lock, so the existence check
+        must stay ahead of it or a later create_run for this id refuses."""
+        missing = state_mod.state_root(self.repo) / "no-such-run"
+        with self.assertRaises(PmError):
+            state_mod.load_state(missing, "a" * 64)
+        self.assertFalse(missing.exists())
+
+    def test_a_failed_mutation_neither_writes_nor_holds_the_lock(self) -> None:
+        plan_path = self.write_plan()
+        _state, token, run_dir = self.make_run(plan_path=plan_path)
+        before = (run_dir / "run.json").read_bytes()
+        with self.assertRaises(RuntimeError):
+            with state_mod.locked_update(run_dir, token) as live:
+                live["status"] = "stopped"
+                raise RuntimeError("boom")
+        self.assertEqual((run_dir / "run.json").read_bytes(), before)
+        # The lock was released, so a later update still succeeds.
+        with state_mod.locked_update(run_dir, token) as live:
+            live["status"] = "stopped"
+        self.assertEqual(state_mod.load_state(run_dir, token)["status"], "stopped")
 
 
 class TestCreateRunRoundTrip(PmTestCase):

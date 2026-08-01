@@ -234,16 +234,33 @@ def create_run(
 
 def save_state(run_dir: Path, state: dict[str, Any], token: str) -> None:
     """Verify the token, bump updated_at, write run.json and its MAC atomically."""
+    payload = _state_payload(state, token)
+    with _advisory_lock(run_dir / ".lock"):
+        _write_state_payload(run_dir, payload, token)
+
+
+def _state_payload(state: dict[str, Any], token: str) -> bytes:
     if token_sha256(token) != state.get("auth", {}).get("token_sha256"):
         raise PmError("run capability token does not match this run's state")
     state = dict(state)
     state["updated_at"] = _utc_now_iso()
     _validate_shape(state)
-    payload = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _write_state_payload(run_dir: Path, payload: bytes, token: str) -> None:
+    _atomic_write_bytes(run_dir / "run.json", payload)
+    mac = hmac.new(token.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    _atomic_write_bytes(run_dir / "run.json.mac", (mac + "\n").encode("utf-8"))
+
+
+@contextmanager
+def locked_update(run_dir: Path, token: str) -> Iterator[dict[str, Any]]:
+    """Yield verified state under its lock, then save the mutation."""
     with _advisory_lock(run_dir / ".lock"):
-        _atomic_write_bytes(run_dir / "run.json", payload)
-        mac = hmac.new(token.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-        _atomic_write_bytes(run_dir / "run.json.mac", (mac + "\n").encode("utf-8"))
+        state = _load_state_unlocked(run_dir, token)
+        yield state
+        _write_state_payload(run_dir, _state_payload(state, token), token)
 
 
 def load_state(run_dir: Path, token: str | None = None) -> dict[str, Any]:
@@ -258,21 +275,32 @@ def load_state(run_dir: Path, token: str | None = None) -> dict[str, Any]:
     edited by something that didn't hold the token, i.e. tampered.
     Callers that mutate state MUST pass the token.
     """
+    # Checked before locking: _advisory_lock creates run_dir and .lock, which
+    # would make a later create_run for this id refuse an existing directory.
+    run_json = run_dir / "run.json"
+    if not run_json.exists():
+        raise PmError(f"run state not found: {run_json}")
+    if token is None:
+        return _load_state_unlocked(run_dir, token)
+    # Verified reads take the same advisory lock the writer holds:
+    # save_state replaces run.json and its MAC as two files, so an
+    # unlocked reader could pair new JSON with the old MAC and report a
+    # false — and terminal — integrity breach.
+    with _advisory_lock(run_dir / ".lock"):
+        return _load_state_unlocked(run_dir, token)
+
+
+def _load_state_unlocked(run_dir: Path, token: str | None) -> dict[str, Any]:
+    """Load and validate state without acquiring the state lock."""
     run_json = run_dir / "run.json"
     if not run_json.exists():
         raise PmError(f"run state not found: {run_json}")
 
-    if token is None:
-        payload = run_json.read_bytes()
-    else:
-        # Verified reads take the same advisory lock the writer holds:
-        # save_state replaces run.json and its MAC as two files, so an
-        # unlocked reader could pair new JSON with the old MAC and report a
-        # false — and terminal — integrity breach.
-        with _advisory_lock(run_dir / ".lock"):
-            payload = run_json.read_bytes()
-            mac_path = run_dir / "run.json.mac"
-            recorded_mac = mac_path.read_text(encoding="utf-8").strip() if mac_path.exists() else None
+    payload = run_json.read_bytes()
+    recorded_mac = None
+    if token is not None:
+        mac_path = run_dir / "run.json.mac"
+        recorded_mac = mac_path.read_text(encoding="utf-8").strip() if mac_path.exists() else None
 
     try:
         state = json.loads(payload.decode("utf-8"))

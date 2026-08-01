@@ -323,6 +323,37 @@ class TestRenderReviewerPrompt(unittest.TestCase):
             # Recorded reviews still raise the floor on their own.
             self.assertEqual(review_mod._next_commission_seq(slice_dir, 5), 6)
 
+    def test_concurrent_commissions_never_share_a_sequence(self) -> None:
+        """Scanning then writing raced: parallel commissions picked the same
+        number and the loser overwrote the winner's evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            slice_dir = Path(tmp)
+            claimed: list[int] = []
+            lock = threading.Lock()
+            barrier = threading.Barrier(16)
+
+            def claim() -> None:
+                barrier.wait()
+                seq, path = review_mod._claim_commission_seq(slice_dir, 0, "code-review", "opencode")
+                self.assertTrue(path.exists())
+                with lock:
+                    claimed.append(seq)
+
+            threads = [threading.Thread(target=claim) for _ in range(16)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(sorted(claimed), list(range(1, 17)))
+
+    def test_claim_reserves_its_stderr_path_and_advances_the_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            slice_dir = Path(tmp)
+            seq, path = review_mod._claim_commission_seq(slice_dir, 0, "drift-audit", "codex")
+            self.assertEqual(path.name, f"review-{seq}-drift-audit-codex-stderr.txt")
+            next_seq, _ = review_mod._claim_commission_seq(slice_dir, 0, "drift-audit", "codex")
+            self.assertEqual(next_seq, seq + 1)
+
     def test_commission_seq_ignores_non_numbered_review_inputs(self) -> None:
         """`review-input-<skill>.patch` shares the prefix but carries no
         sequence; it must not be parsed as one."""
@@ -1090,26 +1121,17 @@ class TestReviewLaunchVisibilityOrdering(ReviewCommandTestCase):
         self.assertNotIn("error", result, result.get("error"))
         outcome = result["outcome"]
         self.assertEqual(outcome.slice_id, "Slice 1")
+        # Per-commission, so a parallel commission cannot replace the pinned
+        # diff this reviewer was given.
+        self.assertRegex(outcome.diff_path.name, r"^review-\d+-code-review-.+\.patch$")
 
         reloaded = state_mod.load_state(run_dir, token)
         entry = reloaded["slices"][0]
         self.assertEqual(len(entry["reviews"]), 1)
 
     def test_reviewer_pgid_persisted_to_state_before_wait_begins(self) -> None:
-        """Fix-B regression: the reviewer's pgid must be written to disk
-        (`run.json`, via `reviewer_pids`) BEFORE `run_review` blocks on the
-        subprocess wait — not merely by the time it returns — so a
-        concurrent `stop` can reap a hung reviewer mid-run.
-
-        This is deterministic, not a timing race: in `run_review`,
-        `state_mod.save_state(...)` (persisting the pgid) happens
-        strictly before the `print(...)` of the launch line, in the same
-        thread of execution — so the instant we observe the launch line in
-        captured stdout, the save has already definitely happened. We also
-        assert the reviewer thread is still alive (still blocked on the
-        sentinel, i.e. still inside — or not yet past — the wait) at the
-        moment we read the state back from disk, so this cannot be
-        satisfied by a `run_review` that happened to finish first."""
+        """The launch line follows the locked PID update, proving the
+        still-running reviewer's PGID is already persisted before the wait."""
         thread, captured, result, sentinel, run_dir, token = self._start_sentinel_gated_reviewer()
         try:
             match = self._wait_for_launch_line(captured)
