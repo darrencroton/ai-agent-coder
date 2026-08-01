@@ -8,7 +8,8 @@ harness shell script — no real coding CLI.
 Pins:
 
 - `scan_hard_stop`: at least one positive fixture per marker class — trust_prompt
-  (all three directory-trust strings), approval_prompt, credential_prompt,
+  (every directory-trust string, plus qwen's dialog pinned verbatim),
+  approval_prompt, credential_prompt,
   permission_prompt, external_side_effect_request (a "push to remote …?"
   shape), and usage_limit_hard_stop (weekly, monthly, account/billing,
   and the generic reached/exceeded/exhausted phrasing) — plus the negative
@@ -70,6 +71,14 @@ class TestScanHardStopPositiveFixtures(unittest.TestCase):
                 result = sessions.scan_hard_stop(f"{marker}?")
                 self.assertTrue(result["present"])
                 self.assertIn("trust_prompt", result["kinds"])
+
+    def test_qwen_folder_trust_dialog(self) -> None:
+        """Pinned to the observed string, not to the marker tuple: qwen's dialog
+        defaults to "Trust folder", so a phrasing the tuple stops covering would
+        be confirmed by the launch injection's Enter rather than merely missed."""
+        result = sessions.scan_hard_stop("Do you trust this folder?\n> 1. Trust folder\n  2. Don't trust")
+        self.assertTrue(result["present"])
+        self.assertIn("trust_prompt", result["kinds"])
 
     def test_approval_prompt(self) -> None:
         result = sessions.scan_hard_stop("Do you want to proceed?")

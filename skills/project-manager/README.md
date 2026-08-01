@@ -15,6 +15,10 @@ To start a Mode B run, paste the launcher prompt from [SKILL.md](SKILL.md#launch
 
 All five supported harnesses are equally eligible for either seat; the operator chooses what fits the plan. Profiles encode factual CLI differences only: for example, OpenCode and Qwen expose no tested interactive effort override, so `--effort` fails closed for those harnesses rather than being silently ignored.
 
+Every **Developer** seat launches at its harness's fullest autonomy (codex `--dangerously-bypass-approvals-and-sandbox`, claude `--permission-mode bypassPermissions`, copilot `--allow-all`, opencode `--auto`, qwen `--yolo`). An unattended Developer has nobody to answer a permission prompt, so a prompt is a silent stall, not a safety feature. Reviewer seats are the deliberate exception: a reviewer emits a report rather than edits, so codex, claude, and opencode reviewers keep their read-only modes.
+
+**Run PM inside real process and filesystem isolation** — a container or VM. The harnesses no longer constrain what a Developer can touch outside the repository, and the floor cannot see it either (see *Trust model*), so a separate checkout is not containment: nothing stops a Developer reaching the rest of the host.
+
 ## CLI
 
 All commands: `python3 skills/project-manager/scripts/pm.py <command> …`, run from inside the target repository (except `check-plan`/`init`, which take paths). Mutating commands need the run capability token (`--token` or `PM_RUN_TOKEN` in your environment).
@@ -39,7 +43,7 @@ The attempt budget defaults to 10 per slice — the initial launch plus ten stee
 
 Exit codes: 0 success; 1 = a `finalize` refusal — a floor fact failed, or `--accept` was refused for another recorded reason (e.g. a missing or stale mandatory review on an elevated slice); 2 = error/refusal (integrity failures are prefixed `INTEGRITY:` and are terminal — start a new run).
 
-If a harness displays a directory-trust or permission prompt, the PM stops and leaves that approval to the human. The human may configure trust through the harness's own supported mechanism, then rerun `start-slice`; the PM must not acknowledge the dialog with `tmux send-keys` or change user-global harness configuration itself.
+If a harness displays a directory-trust or permission prompt, the PM stops and leaves that approval to the human. The human may configure trust through the harness's own supported mechanism, then rerun `start-slice`; the PM must not acknowledge the dialog with `tmux send-keys` or change user-global harness configuration itself. Autonomy flags do not clear a folder-trust dialog — Copilot still asks on a folder it has not been told to remember — so that one stays a human decision.
 
 ## Layout: who owns what
 
@@ -51,7 +55,7 @@ If a harness displays a directory-trust or permission prompt, the PM stops and l
 
 Mechanical and non-waivable: the eight floor facts (frozen plan digest; repo/branch identity; recorded approvals; result presence/identity; changed files ⊆ frozen surface; commit ancestry and branch head; clean worktree; no visible hard-stop prompt). Everything semantic — is the change good, is the evidence sufficient — is the PM agent's recorded judgement; read the assessments.
 
-Known limits, inherited and stated: the floor sees final Git-visible worktree state only (ignored files, Git hooks/metadata, and write-then-revert effects escape it); dependency/license/side-effect stops are heuristic (pane markers + prompt prohibitions + plan-level surface exclusion); role authority is capability-token-raised, not OS-enforced — a same-user process that steals the token or subverts the PM agent is outside the threat model; `attested` slices are operator narration; PM-seat quality is load-bearing — a weak model in the PM seat weakens the judgement layer itself.
+Known limits, inherited and stated: the floor sees final Git-visible worktree state only (ignored files, Git hooks/metadata, write-then-revert effects, and anything a Developer writes outside the repository escape it — containment is your sandbox around the run, not the harness); dependency/license/side-effect stops are heuristic (pane markers + prompt prohibitions + plan-level surface exclusion); role authority is capability-token-raised, not OS-enforced — a same-user process that steals the token or subverts the PM agent is outside the threat model; `attested` slices are operator narration; PM-seat quality is load-bearing — a weak model in the PM seat weakens the judgement layer itself.
 
 ## Privacy & sensitive artifacts
 

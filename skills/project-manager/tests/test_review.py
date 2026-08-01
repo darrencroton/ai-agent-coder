@@ -202,7 +202,7 @@ class TestComposeReviewerCommand(unittest.TestCase):
             [
                 "copilot",
                 "--model", "gpt-5", "--effort", "high",
-                "-p", "PROMPT", "--allow-all-tools", "--autopilot", "--silent", "--add-dir", "/repo",
+                "-p", "PROMPT", "--allow-all", "--autopilot", "--silent", "--add-dir", "/repo",
             ],
         )
 
@@ -223,7 +223,7 @@ class TestComposeReviewerCommand(unittest.TestCase):
         command = review_mod.compose_reviewer_command("qwen", "PROMPT", model="qwen-max", repo=Path("/repo"))
         self.assertEqual(
             command,
-            ["qwen", "--prompt", "PROMPT", "--model", "qwen-max", "--sandbox", "--output-format", "text"],
+            ["qwen", "--prompt", "PROMPT", "--model", "qwen-max", "--yolo", "--sandbox", "--output-format", "text"],
         )
 
     def test_qwen_effort_fails_closed(self) -> None:

@@ -777,7 +777,13 @@ def compose_delegate_command(
             command.extend(["--resume", resume_session_id])
         if model != "default":
             command.extend(["--model", model])
-        command.extend(["--sandbox", "--output-format", "text"])
+        # --yolo in both access modes: without it qwen gates every tool call on
+        # a confirmation a headless delegate cannot answer. It removes a
+        # mechanical approval barrier without widening authorization — this
+        # profile was never mechanically differentiated between modes. Qwen
+        # reverts it to the gated mode in an untrusted folder; see
+        # references/qwen.md.
+        command.extend(["--yolo", "--sandbox", "--output-format", "text"])
         return command
 
     if tool == "claude":

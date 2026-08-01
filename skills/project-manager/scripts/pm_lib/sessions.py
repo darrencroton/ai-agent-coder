@@ -40,6 +40,9 @@ TRUST_PROMPT_MARKERS: tuple[str, ...] = (
     "Do you trust the contents of this directory",
     "Do you trust the files in this folder",
     "Do you trust the files in this directory",
+    # Qwen's phrasing, and its dialog defaults to "Trust folder" — an
+    # unrecognized one would be confirmed by the launch injection's Enter.
+    "Do you trust this folder",
 )
 
 _LITERAL_MARKERS: dict[str, tuple[str, ...]] = {

@@ -522,6 +522,16 @@ class DelegateContractTests(unittest.TestCase):
                     write_command = delegate_contract.compose_delegate_command(self.validate_write(tool=tool), "prompt")
                 self.assertEqual(read_only_command, write_command)
 
+    def test_qwen_carries_yolo_in_every_mode_and_on_resume(self):
+        """Without --yolo qwen gates every tool call on a confirmation a headless
+        delegate cannot answer, and the launch hangs until cancelled. Nothing
+        else asserts the flag, so its removal would restore that hang green."""
+        for contract in (self.validate(tool="qwen"), self.validate_write(tool="qwen")):
+            for resume in (None, "12345678-1234-1234-1234-123456789abc"):
+                with self.subTest(access=contract["access"], resume=resume):
+                    command = delegate_contract.compose_delegate_command(contract, "prompt", resume_session_id=resume)
+                    self.assertIn("--yolo", command)
+
     def test_opencode_nondefault_effort_fails_closed(self):
         policy = dict(self.policy, required_effort="high")
         request = dict(self.request, effort="high")

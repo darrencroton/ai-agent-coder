@@ -60,10 +60,9 @@ the retained fake-harness pattern (replacement-ledger §9.1/§9.3). Pins:
     rather than stranded outside `current_slice`, where no command could
     see it.
 14. Real-harness composition (tmux): `start-slice` with no
-    `--harness-command` override composes an actual codex launch argv,
-    carrying the linked-worktree git directory that `commit_required`
-    requires. Every other lifecycle scenario overrides the command, so this
-    is the only test that executes that branch at all.
+    `--harness-command` override composes an actual codex launch argv.
+    Every other lifecycle scenario overrides the command, so this is the
+    only test that executes that branch at all.
 """
 
 from __future__ import annotations
@@ -99,7 +98,6 @@ from pm_test_helpers import (
 )
 
 from pm_lib import PmError
-from pm_lib import git_ops
 from pm_lib import sessions
 from pm_lib import slice_ops
 from pm_lib import state as state_mod
@@ -832,10 +830,7 @@ class TestRealHarnessComposition(SliceOpsTestCase):
     def test_launch_without_an_override_composes_a_real_harness_command(self) -> None:
         """The composition branch this reaches hid a lost local binding on the
         sibling headless branch: `start-slice` raised NameError there while the
-        whole suite stayed green. Codex is the harness under test because it is
-        the only one whose composition reads run policy (`commit_required` adds
-        the linked-worktree git directory, without which the slice commit cannot
-        be made from inside the sandbox).
+        whole suite stayed green.
 
         `start_session` is wrapped to record the composed command and start a
         stand-in in its place; readiness is stubbed because it waits on the
@@ -866,9 +861,7 @@ class TestRealHarnessComposition(SliceOpsTestCase):
 
         self.assertEqual(len(composed), 1)
         argv = shlex.split(composed[0])
-        self.assertEqual(argv[:6], ["codex", "--no-alt-screen", "-s", "workspace-write", "-a", "never"])
-        self.assertIn("--add-dir", argv)
-        self.assertEqual(argv[argv.index("--add-dir") + 1], str(git_ops.worktree_git_dir(self.repo)))
+        self.assertEqual(argv, ["codex", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"])
 
 
 if __name__ == "__main__":

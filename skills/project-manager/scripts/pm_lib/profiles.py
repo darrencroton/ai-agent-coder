@@ -15,29 +15,31 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
-from pathlib import Path
 from typing import Any
 
 from . import PmError
 
 SUPPORTED_HARNESSES: tuple[str, ...] = ("codex", "claude", "copilot", "opencode", "qwen")
 
+# Every base command carries its harness's fullest autonomy flag: a PM
+# Developer seat runs unattended, so any residual approval prompt is a
+# silent stall. Containment is the operator's sandbox around the whole run,
+# not the harness's own permission mode.
 HARNESS_PROFILES: dict[str, dict[str, Any]] = {
     "codex": {
-        "base_command": ["codex", "--no-alt-screen", "-s", "workspace-write", "-a", "never"],
+        "base_command": ["codex", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"],
         "model_flag": "-m",
         "effort_config_key": "model_reasoning_effort",
-        "reviewer_network_flag": ["-c", "sandbox_workspace_write.network_access=true"],
-        "commit_git_access_flag": "--add-dir",
     },
     "claude": {
-        "base_command": ["claude", "--permission-mode", "auto"],
+        "base_command": ["claude", "--permission-mode", "bypassPermissions"],
         "model_flag": "--model",
         "effort_flag": "--effort",
         "session_id_flag": "--session-id",
     },
     "copilot": {
-        "base_command": ["copilot", "--allow-all-tools", "--autopilot"],
+        # --allow-all is --allow-all-tools plus paths and URLs.
+        "base_command": ["copilot", "--allow-all", "--autopilot"],
         "model_flag": "--model",
         "effort_flag": "--effort",
     },
@@ -51,9 +53,8 @@ HARNESS_PROFILES: dict[str, dict[str, Any]] = {
         "model_inventory_command": ["opencode", "models", "{provider}", "--verbose"],
     },
     "qwen": {
-        # --yolo: bare qwen defaults to classifier-gated Auto mode, which
-        # blocks on an interactive confirmation whenever the classifier is
-        # unavailable — a PM session has nobody to answer it.
+        # Bare qwen defaults to classifier-gated Auto mode, which blocks on a
+        # confirmation whenever the classifier is unavailable.
         "base_command": ["qwen", "--yolo"],
         "model_flag": "-m",
         # Qwen Code's interactive command exposes no reasoning-effort flag.
@@ -95,19 +96,14 @@ def compose_command(
     *,
     model: str | None = None,
     effort: str | None = None,
-    reviewer_network: bool = False,
-    git_access_dir: Path | None = None,
     session_id: str | None = None,
 ) -> str:
     """Compose one harness's launch command from the profile table.
 
-    Only the codex profile applies ``reviewer_network`` and
-    ``git_access_dir`` (its reviewer-network sandbox flag and commit
-    git-directory access flag); only the claude profile applies
-    ``session_id`` (its transcript-capture flag). Passing those keyword
-    arguments for a different harness is silently a no-op rather than an
-    error — Stage 3's caller composes per-slice, and not every harness has
-    an equivalent flag.
+    Only the claude profile applies ``session_id`` (its transcript-capture
+    flag). Passing it for a different harness is silently a no-op rather
+    than an error — Stage 3's caller composes per-slice, and not every
+    harness has an equivalent flag.
     """
     profile = HARNESS_PROFILES.get(harness)
     if profile is None:
@@ -117,11 +113,6 @@ def compose_command(
     _append_model(command, profile, model)
     _append_effort(command, profile, effort, harness)
 
-    if harness == "codex":
-        if reviewer_network:
-            command.extend(profile["reviewer_network_flag"])
-        if git_access_dir is not None:
-            command.extend([profile["commit_git_access_flag"], str(git_access_dir)])
     if harness == "claude" and session_id:
         command.extend([profile["session_id_flag"], session_id])
 

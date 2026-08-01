@@ -6,21 +6,17 @@ the composing code is written fresh):
 
 - `HARNESS_PROFILES` has exactly the five supported harnesses: codex,
   claude, copilot, opencode, qwen.
-- `compose_command` builds each harness's base command exactly as observed:
-  codex `codex --no-alt-screen -s workspace-write -a never`; claude
-  `claude --permission-mode auto`; copilot `copilot --allow-all-tools
-  --autopilot`; opencode `opencode --auto`.
+- `compose_command` builds each harness's base command exactly as observed,
+  each at its harness's fullest autonomy: codex `codex --no-alt-screen
+  --dangerously-bypass-approvals-and-sandbox`; claude `claude
+  --permission-mode bypassPermissions`; copilot `copilot --allow-all
+  --autopilot`; opencode `opencode --auto`; qwen `qwen --yolo`.
 - Model overrides: codex/opencode use `-m <model>`; claude/copilot use
   `--model <model>`; qwen uses `-m <model>`.
 - Effort overrides: codex composes `-c model_reasoning_effort="<effort>"`;
   claude/copilot use `--effort <effort>`; opencode/qwen have no effort
   mechanism, so an effort request fails closed with a `PmError` at compose
   time (never silently dropped, never a broken launch command).
-- codex-only composition: `reviewer_network=True` appends `-c
-  sandbox_workspace_write.network_access=true`; a `git_access_dir` appends
-  `--add-dir <path>`. Both are no-ops (not errors) for the other four
-  harnesses, since Stage 3's caller composes generically and not every
-  harness has an equivalent flag.
 - claude-only composition: a `session_id` appends `--session-id <uuid>`;
   a no-op for the other four harnesses.
 - An unknown harness name raises `PmError` naming all five supported harnesses.
@@ -60,20 +56,21 @@ class TestHarnessProfileTable(unittest.TestCase):
 
 
 class TestComposeCommandBaseCommands(unittest.TestCase):
-    def test_codex_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("codex"), "codex --no-alt-screen -s workspace-write -a never")
+    BASE_COMMANDS = {
+        "codex": "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox",
+        "claude": "claude --permission-mode bypassPermissions",
+        "copilot": "copilot --allow-all --autopilot",
+        "opencode": "opencode --auto",
+        "qwen": "qwen --yolo",
+    }
 
-    def test_claude_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("claude"), "claude --permission-mode auto")
+    def test_base_commands(self) -> None:
+        for harness, expected in self.BASE_COMMANDS.items():
+            with self.subTest(harness=harness):
+                self.assertEqual(profiles.compose_command(harness), expected)
 
-    def test_copilot_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("copilot"), "copilot --allow-all-tools --autopilot")
-
-    def test_opencode_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("opencode"), "opencode --auto")
-
-    def test_qwen_base_command(self) -> None:
-        self.assertEqual(profiles.compose_command("qwen"), "qwen --yolo")
+    def test_every_supported_harness_is_pinned(self) -> None:
+        self.assertEqual(set(self.BASE_COMMANDS), set(profiles.SUPPORTED_HARNESSES))
 
 
 class TestComposeCommandOverrides(unittest.TestCase):
@@ -83,17 +80,18 @@ class TestComposeCommandOverrides(unittest.TestCase):
         # double quotes; the underlying token is still model_reasoning_effort="high".
         self.assertEqual(
             composed,
-            "codex --no-alt-screen -s workspace-write -a never -m o3 -c 'model_reasoning_effort=\"high\"'",
+            "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox "
+            "-m o3 -c 'model_reasoning_effort=\"high\"'",
         )
         self.assertIn('model_reasoning_effort="high"', composed)
 
     def test_claude_model_and_effort(self) -> None:
         composed = profiles.compose_command("claude", model="sonnet", effort="medium")
-        self.assertEqual(composed, "claude --permission-mode auto --model sonnet --effort medium")
+        self.assertEqual(composed, "claude --permission-mode bypassPermissions --model sonnet --effort medium")
 
     def test_copilot_model_and_effort(self) -> None:
         composed = profiles.compose_command("copilot", model="gpt-5", effort="low")
-        self.assertEqual(composed, "copilot --allow-all-tools --autopilot --model gpt-5 --effort low")
+        self.assertEqual(composed, "copilot --allow-all --autopilot --model gpt-5 --effort low")
 
     def test_opencode_model_only(self) -> None:
         composed = profiles.compose_command("opencode", model="local/qwen3.6")
@@ -113,44 +111,16 @@ class TestComposeCommandOverrides(unittest.TestCase):
         self.assertIn("qwen", str(ctx.exception))
 
 
-class TestComposeCommandCodexSpecific(unittest.TestCase):
-    def test_reviewer_network_flag(self) -> None:
-        composed = profiles.compose_command("codex", reviewer_network=True)
-        self.assertIn("-c sandbox_workspace_write.network_access=true", composed)
-
-    def test_git_access_dir_flag(self) -> None:
-        composed = profiles.compose_command("codex", git_access_dir=Path("/abs/repo/.git"))
-        self.assertIn("--add-dir /abs/repo/.git", composed)
-
-    def test_reviewer_network_and_git_access_combined(self) -> None:
-        composed = profiles.compose_command(
-            "codex", model="o3", reviewer_network=True, git_access_dir=Path("/abs/repo/.git")
-        )
-        self.assertEqual(
-            composed,
-            "codex --no-alt-screen -s workspace-write -a never -m o3 "
-            "-c sandbox_workspace_write.network_access=true --add-dir /abs/repo/.git",
-        )
-
-    def test_reviewer_network_is_a_noop_for_other_harnesses(self) -> None:
-        composed = profiles.compose_command("claude", reviewer_network=True)
-        self.assertEqual(composed, "claude --permission-mode auto")
-
-    def test_git_access_dir_is_a_noop_for_other_harnesses(self) -> None:
-        composed = profiles.compose_command("opencode", git_access_dir=Path("/abs/repo/.git"))
-        self.assertEqual(composed, "opencode --auto")
-
-
 class TestComposeCommandClaudeSpecific(unittest.TestCase):
     def test_session_id_flag(self) -> None:
         composed = profiles.compose_command("claude", session_id="11111111-1111-1111-1111-111111111111")
         self.assertEqual(
-            composed, "claude --permission-mode auto --session-id 11111111-1111-1111-1111-111111111111"
+            composed, "claude --permission-mode bypassPermissions --session-id 11111111-1111-1111-1111-111111111111"
         )
 
     def test_session_id_is_a_noop_for_other_harnesses(self) -> None:
         composed = profiles.compose_command("codex", session_id="11111111-1111-1111-1111-111111111111")
-        self.assertEqual(composed, "codex --no-alt-screen -s workspace-write -a never")
+        self.assertEqual(composed, "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox")
 
 
 class TestComposeCommandUnknownHarness(unittest.TestCase):

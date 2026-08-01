@@ -691,12 +691,7 @@ def start_slice(
     if effective_override:
         command = effective_override
     else:
-        git_access_dir = None
-        session_id = None
-        if harness_name == "codex" and bool(policy.get("commit_required", True)):
-            git_access_dir = git_ops.worktree_git_dir(repo)
-        if harness_name == "claude":
-            session_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4()) if harness_name == "claude" else None
         if harness_name == "opencode" and launch_model:
             identity = profiles.query_model_identity(harness_name, launch_model)
             if identity:
@@ -705,7 +700,6 @@ def start_slice(
             harness_name,
             model=launch_model,
             effort=launch_effort,
-            git_access_dir=git_access_dir,
             session_id=session_id,
         )
 

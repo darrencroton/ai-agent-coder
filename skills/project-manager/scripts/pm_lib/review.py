@@ -94,7 +94,7 @@ def compose_reviewer_command(
             command.extend(["--model", model])
         if effort:
             command.extend(["--effort", effort])
-        command.extend(["-p", prompt, "--allow-all-tools", "--autopilot", "--silent", "--add-dir", repo_str])
+        command.extend(["-p", prompt, "--allow-all", "--autopilot", "--silent", "--add-dir", repo_str])
         return command
 
     if tool == "opencode":
@@ -118,7 +118,10 @@ def compose_reviewer_command(
         command = ["qwen", "--prompt", prompt]
         if model:
             command.extend(["--model", model])
-        command.extend(["--sandbox", "--output-format", "text"])
+        # --yolo for the same reason the Developer seat carries it: without it
+        # qwen gates every tool call on a confirmation a one-shot run cannot
+        # answer, and the reviewer hangs until --timeout.
+        command.extend(["--yolo", "--sandbox", "--output-format", "text"])
         return command
 
     raise PmError(
