@@ -81,6 +81,27 @@ class TestLockedUpdate(PmTestCase):
         final = state_mod.load_state(run_dir, token)["current_slice"]["reviewer_pids"]
         self.assertEqual(sorted(final), [1000 + i for i in range(12)])
 
+    def test_integrity_failure_records_a_stop_event(self) -> None:
+        """Tampering detected inside a transaction must leave the same evidence
+        load_writable_state records, without deadlocking on its own lock."""
+        plan_path = self.write_plan()
+        _state, token, run_dir = self.make_run(plan_path=plan_path)
+        (run_dir / "run.json.mac").write_text("0" * 64 + "\n", encoding="utf-8")
+        with self.assertRaises(IntegrityError):
+            with state_mod.locked_update(run_dir, token):
+                pass  # pragma: no cover - load fails first
+        notes = [event.get("note", "") for event in state_mod.read_events(run_dir)]
+        self.assertTrue(any("integrity check failed" in note for note in notes), notes)
+
+    def test_a_failed_event_write_never_masks_the_integrity_error(self) -> None:
+        plan_path = self.write_plan()
+        _state, token, run_dir = self.make_run(plan_path=plan_path)
+        (run_dir / "run.json.mac").write_text("0" * 64 + "\n", encoding="utf-8")
+        with mock.patch.object(state_mod, "_append_event_unlocked", side_effect=PermissionError("nope")):
+            with self.assertRaises(IntegrityError):
+                with state_mod.locked_update(run_dir, token):
+                    pass  # pragma: no cover - load fails first
+
     def test_verified_load_of_a_missing_run_creates_nothing(self) -> None:
         """_advisory_lock creates run_dir and .lock, so the existence check
         must stay ahead of it or a later create_run for this id refuses."""

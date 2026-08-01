@@ -258,7 +258,15 @@ def _write_state_payload(run_dir: Path, payload: bytes, token: str) -> None:
 def locked_update(run_dir: Path, token: str) -> Iterator[dict[str, Any]]:
     """Yield verified state under its lock, then save the mutation."""
     with _advisory_lock(run_dir / ".lock"):
-        state = _load_state_unlocked(run_dir, token)
+        try:
+            state = _load_state_unlocked(run_dir, token)
+        except IntegrityError as exc:
+            # append_event would reacquire this non-reentrant lock.
+            try:
+                _append_event_unlocked(run_dir, "stop", note=f"state integrity check failed: {exc}")
+            except OSError:
+                pass  # never mask the integrity failure with an I/O error
+            raise
         yield state
         _write_state_payload(run_dir, _state_payload(state, token), token)
 
@@ -346,13 +354,19 @@ def append_event(
     run_dir: Path, kind: str, *, slice_id: str | None = None, note: str = "", evidence: str | None = None
 ) -> None:
     """Append one JSON line to events.jsonl. Never rewrites run.json."""
+    with _advisory_lock(run_dir / ".lock"):
+        _append_event_unlocked(run_dir, kind, slice_id=slice_id, note=note, evidence=evidence)
+
+
+def _append_event_unlocked(
+    run_dir: Path, kind: str, *, slice_id: str | None = None, note: str = "", evidence: str | None = None
+) -> None:
+    """Append one event without acquiring the state lock."""
     event: dict[str, Any] = {"ts": _utc_now_iso(), "kind": kind, "slice": slice_id, "note": note}
     if evidence is not None:
         event["evidence"] = evidence
-    line = json.dumps(event, sort_keys=True) + "\n"
-    with _advisory_lock(run_dir / ".lock"):
-        with open(run_dir / "events.jsonl", "a", encoding="utf-8") as handle:
-            handle.write(line)
+    with open(run_dir / "events.jsonl", "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
 
 
 def read_events(run_dir: Path) -> list[dict[str, Any]]:
