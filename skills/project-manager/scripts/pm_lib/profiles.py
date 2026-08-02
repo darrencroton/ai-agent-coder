@@ -119,14 +119,15 @@ def compose_command(
     return shlex.join(command)
 
 
-def query_model_identity(harness: str, model: str) -> dict[str, str] | None:
+def query_model_identity(harness: str, model: str) -> dict[str, Any] | None:
     """Resolve an exact model id through a harness-owned inventory when available.
 
     ``None`` means the profile has no queryable inventory contract (codex,
     claude, copilot, qwen). A configured inventory (opencode) is fail-closed: a
     failed query, a model id absent from the inventory, or unparseable/empty
     display-name metadata all raise ``PmError`` rather than letting the
-    harness silently select a different model.
+    harness silently select a different model. The returned ``variants`` serve
+    the same purpose for reasoning effort (see ``assert_opencode_variant_supported``).
     """
     profile = HARNESS_PROFILES.get(harness)
     if profile is None:
@@ -137,7 +138,10 @@ def query_model_identity(harness: str, model: str) -> dict[str, str] | None:
 
     provider = model.split("/", 1)[0] if "/" in model else model
     command = [str(part).format(provider=provider) for part in command_template]
-    result = subprocess.run(command, check=False, text=True, capture_output=True)
+    try:
+        result = subprocess.run(command, check=False, text=True, capture_output=True)
+    except OSError as exc:  # harness missing or not executable
+        raise PmError(f"{harness} model inventory query could not run: {exc}") from exc
     if result.returncode != 0:
         detail = (result.stderr or "").strip() or (result.stdout or "").strip() or f"exit {result.returncode}"
         raise PmError(f"{harness} model inventory query failed: {detail}")
@@ -159,12 +163,38 @@ def query_model_identity(harness: str, model: str) -> dict[str, str] | None:
     if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str) or not metadata["name"].strip():
         raise PmError(f"{harness} model metadata has no display name for {model!r}")
 
+    variants = metadata.get("variants")
     return {
         "requested": model,
         "resolved_id": model,
         "display_name": metadata["name"].strip(),
         "inventory_command": shlex.join(command),
+        # Reasoning-effort names this model declares, for callers passing
+        # opencode's --variant. Empty tuple means the model declares none.
+        "variants": tuple(sorted(variants)) if isinstance(variants, dict) else (),
     }
+
+
+def assert_opencode_variant_supported(model: str | None, variant: str) -> None:
+    """Fail closed unless `model` declares `variant` in opencode's inventory.
+
+    opencode accepts an unknown ``--variant`` silently and runs the model at
+    its default effort, so an unverified variant is a silent effort downgrade —
+    exactly what refusing an unsupported effort was meant to prevent. Verifying
+    it against the inventory is what makes passing effort through honest.
+    """
+    if not model:
+        raise PmError(
+            "a non-default opencode effort needs an explicit model: the effort is sent as "
+            "--variant, which is per-model and cannot be verified without one"
+        )
+    supported = query_model_identity("opencode", model)["variants"]
+    if variant not in supported:
+        offered = ", ".join(supported) if supported else "none"
+        raise PmError(
+            f"opencode model {model!r} does not offer variant {variant!r} (offers: {offered}); "
+            "it would be accepted silently and run at the model's default effort"
+        )
 
 
 def parse_reviewer_tools(value: str | None) -> tuple[str, ...]:

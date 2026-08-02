@@ -783,6 +783,67 @@ def write_contract_feedback(run_dir: Path, label: str, exc: DelegateContractErro
     return payload
 
 
+def _effort_issue(code: str, detail: str, remediation: str) -> DelegateContractError:
+    return DelegateContractError([ContractIssue(code, "effort", detail, remediation)])
+
+
+def assert_opencode_variant_supported(contract: dict[str, Any]) -> None:
+    """Fail closed unless the requested effort is a variant the model declares.
+
+    OpenCode sends effort as ``--variant`` but accepts an unknown name
+    silently and runs at the model's default, so an unverified variant is a
+    silent effort downgrade. Checked here rather than in
+    ``compose_delegate_command``, which stays pure and I/O-free.
+    """
+    effort = contract["effort"]
+    model = contract["model"]
+    if contract["tool"] != "opencode" or effort == "default":
+        return
+    if model == "default":
+        raise _effort_issue(
+            "unverifiable-effort",
+            "a non-default OpenCode effort needs an explicit model: effort is sent as --variant, "
+            "which is per-model and cannot be verified against 'default'",
+            "Name the exact model, or set effort to 'default'.",
+        )
+    try:
+        result = subprocess.run(
+            ["opencode", "models", model.split("/", 1)[0], "--verbose"], check=False, capture_output=True, text=True
+        )
+    except OSError as exc:  # opencode missing or not executable
+        raise _effort_issue(
+            "unverifiable-effort",
+            f"the OpenCode model inventory query could not run: {exc}",
+            "Install/authenticate OpenCode, or set effort to 'default'.",
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        raise _effort_issue(
+            "unverifiable-effort",
+            f"could not read the OpenCode model inventory to verify variant {effort!r}: {detail}",
+            "Fix the inventory query, or set effort to 'default'.",
+        )
+    lines = (result.stdout or "").splitlines()
+    try:
+        index = next(i for i, line in enumerate(lines) if line.strip() == model)
+        metadata, _ = json.JSONDecoder().raw_decode("\n".join(lines[index + 1 :]).lstrip())
+    except (StopIteration, json.JSONDecodeError, TypeError) as exc:
+        raise _effort_issue(
+            "unverifiable-effort",
+            f"OpenCode model {model!r} is absent from the inventory or its metadata did not parse",
+            "Use the exact configured model id, or set effort to 'default'.",
+        ) from exc
+    variants = metadata.get("variants") if isinstance(metadata, dict) else None
+    supported = tuple(sorted(variants)) if isinstance(variants, dict) else ()
+    if effort not in supported:
+        raise _effort_issue(
+            "unsupported-effort",
+            f"OpenCode model {model!r} does not offer variant {effort!r} "
+            f"(offers: {', '.join(supported) if supported else 'none'})",
+            "Choose an offered variant, or set effort to 'default'.",
+        )
+
+
 def resolve_continuation_parent(run_dir: Path, contract: dict[str, Any]) -> dict[str, Any] | None:
     """Validate and return lineage for an explicitly requested continuation."""
     parent_label = contract.get("parent_label")
@@ -917,6 +978,7 @@ def command_launch(args: argparse.Namespace) -> int:
             label = request["label"].strip()
         contract = validate_contract(policy, request, run_dir)
         label = contract["label"]
+        assert_opencode_variant_supported(contract)
         continuation = resolve_continuation_parent(run_dir, contract)
         prompt = render_delegate_prompt(contract)
         command = compose_delegate_command(

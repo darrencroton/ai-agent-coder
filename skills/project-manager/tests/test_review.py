@@ -18,10 +18,10 @@ one-shot reviewer command table and the end-to-end `review` command):
 4. One-shot reviewer command composition, per tool, from `review.
    compose_reviewer_command` (review.py's own table — never imported from
    orchestrator): codex, claude, copilot compose with optional model/effort
-   flags; opencode and qwen compose with an optional model flag but raise
-   `PmError` the moment a non-default effort is requested (their tested
-   one-shot commands have no effort flag); an unsupported tool name raises
-   `PmError`.
+   flags; opencode maps effort onto `--variant`; qwen composes with an
+   optional model flag but raises `PmError` the moment a non-default effort
+   is requested (its tested one-shot command has no effort flag); an
+   unsupported tool name raises `PmError`.
 5. `render_reviewer_prompt` renders the full contract (pinned range,
    before/after heads, diff path, changed files, contract sections, the
    embedded skill bundle) with no unresolved `{placeholder}` left over.
@@ -85,6 +85,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from pm_test_helpers import PmTestCase
 
 from pm_lib import PmError
+from pm_lib import profiles
 from pm_lib import review as review_mod
 from pm_lib import slice_ops
 from pm_lib import state as state_mod
@@ -215,9 +216,17 @@ class TestComposeReviewerCommand(unittest.TestCase):
             ["opencode", "run", "PROMPT", "-m", "my-model", "--agent", "plan", "--auto", "--dir", "/repo"],
         )
 
-    def test_opencode_effort_fails_closed(self) -> None:
-        with self.assertRaises(PmError):
-            review_mod.compose_reviewer_command("opencode", "PROMPT", effort="high", repo=Path("/repo"))
+    def test_opencode_effort_becomes_variant(self) -> None:
+        command = review_mod.compose_reviewer_command(
+            "opencode", "PROMPT", model="my-model", effort="high", repo=Path("/repo")
+        )
+        self.assertEqual(
+            command,
+            [
+                "opencode", "run", "PROMPT", "-m", "my-model", "--variant", "high",
+                "--agent", "plan", "--auto", "--dir", "/repo",
+            ],
+        )
 
     def test_qwen_with_model_no_effort(self) -> None:
         command = review_mod.compose_reviewer_command("qwen", "PROMPT", model="qwen-max", repo=Path("/repo"))
@@ -415,6 +424,34 @@ class ReviewCommandTestCase(PmTestCase):
 
 
 class TestReviewEndToEnd(ReviewCommandTestCase):
+    def test_unsupported_opencode_variant_refused_before_launching(self) -> None:
+        """The launch-path wiring, not just the validator: opencode runs an
+        unknown --variant silently at the model's default effort, so `review`
+        must refuse before spawning. Deleting the call in run_review would
+        leave profiles' own tests green and reopen that hole."""
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+
+        # Patch the inventory query, not subprocess: patching a module
+        # attribute would also capture this path's git calls.
+        identity = {"variants": ("max",)}
+        with mock.patch.object(profiles, "query_model_identity", return_value=identity), mock.patch.object(
+            review_mod, "_build_reviewer_command"
+        ) as build:
+            with self.assertRaises(PmError) as ctx:
+                review_mod.run_review(
+                    self.repo, run_dir, token,
+                    slice_id="Slice 1", skill="code-review", tool="opencode",
+                    model="prov/m", effort="high",
+                )
+        self.assertIn("does not offer variant", str(ctx.exception))
+        # The point of the test: it refused BEFORE building/spawning anything.
+        build.assert_not_called()
+
     def test_successful_fake_reviewer_records_review_and_clears_pids(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)

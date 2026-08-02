@@ -31,6 +31,7 @@ from typing import Any
 from . import PmError
 from . import git_ops
 from . import plan as plan_mod
+from . import profiles
 from . import prompts
 from . import slice_ops
 from . import state as state_mod
@@ -49,9 +50,11 @@ def compose_reviewer_command(
     tool: str, prompt: str, *, model: str | None = None, effort: str | None = None, repo: Path
 ) -> list[str]:
     """Compose a one-shot reviewer invocation for `tool`. Unsupported tool
-    names, and a non-default `effort` for opencode/qwen (whose tested
-    one-shot commands have no effort/reasoning flag), fail closed with
-    `PmError` rather than silently dropping the request."""
+    names, and a non-default `effort` for qwen (whose tested one-shot command
+    has no effort/reasoning flag), fail closed with `PmError` rather than
+    silently dropping the request. opencode takes effort as `--variant`; note
+    this is the one-shot `opencode run` only, so it does NOT apply to the
+    Developer seat's interactive TUI (see profiles.py)."""
     repo_str = str(repo)
 
     if tool == "codex":
@@ -98,14 +101,12 @@ def compose_reviewer_command(
         return command
 
     if tool == "opencode":
-        if effort:
-            raise PmError(
-                "opencode's tested one-shot review command has no effort/reasoning flag; "
-                "omit --effort for this tool or choose the configured model explicitly"
-            )
         command = ["opencode", "run", prompt]
         if model:
             command.extend(["-m", model])
+        # opencode's reasoning-effort control; the launch path verifies it.
+        if effort:
+            command.extend(["--variant", effort])
         command.extend(["--agent", "plan", "--auto", "--dir", repo_str])
         return command
 
@@ -385,6 +386,12 @@ def run_review(
         explicit_non_goals=sections.get("Explicit Non-Goals", "").rstrip(),
         risk_flags=sections.get("Risk Flags", "").rstrip(),
     )
+
+    # Checked here, not in compose_reviewer_command, which stays pure and
+    # I/O-free. opencode is the only tool whose effort flag needs verifying
+    # against the model; the others take effort verbatim or refuse it.
+    if resolved_tool == "opencode" and resolved_effort and not reviewer_command:
+        profiles.assert_opencode_variant_supported(resolved_model, resolved_effort)
 
     command = _build_reviewer_command(
         resolved_tool, prompt_text, model=resolved_model, effort=resolved_effort, repo=repo,

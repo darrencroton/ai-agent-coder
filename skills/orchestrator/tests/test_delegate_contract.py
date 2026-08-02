@@ -532,14 +532,65 @@ class DelegateContractTests(unittest.TestCase):
                     command = delegate_contract.compose_delegate_command(contract, "prompt", resume_session_id=resume)
                     self.assertIn("--yolo", command)
 
-    def test_opencode_nondefault_effort_fails_closed(self):
+    def test_opencode_nondefault_effort_becomes_variant(self):
         policy = dict(self.policy, required_effort="high")
         request = dict(self.request, effort="high")
         contract = delegate_contract.validate_contract(policy, request, self.run_dir)
-        with self.assertRaises(delegate_contract.DelegateContractError) as raised:
-            delegate_contract.compose_delegate_command(contract, "prompt")
+        command = delegate_contract.compose_delegate_command(contract, "prompt")
+        self.assertIn("--variant", command)
+        self.assertEqual(command[command.index("--variant") + 1], "high")
+
+    def _opencode_effort_contract(self, effort="high", model="provider/model"):
+        policy = dict(self.policy, required_effort=effort, required_model=model)
+        request = dict(self.request, effort=effort, model=model)
+        return delegate_contract.validate_contract(policy, request, self.run_dir)
+
+    def _inventory(self, returncode, stdout=""):
+        return mock.Mock(returncode=returncode, stdout=stdout, stderr="")
+
+    def test_launch_refuses_unsupported_variant_before_starting_delegate(self):
+        """The launch-layer wiring, not just the validator: OpenCode runs an
+        unknown --variant silently at the model's default effort, so a delegate
+        must never start with one. Deleting the call in command_launch would
+        leave the validator's own tests green and reopen that hole."""
+        delegate_jobs = load_delegate_jobs()
+        policy = dict(self.policy, required_effort="high", required_model="provider/model")
+        request = dict(self.request, effort="high", model="provider/model")
+        policy_path = self.repo / "delegate-policy.json"
+        request_path = self.repo / "delegate-request.json"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        args = mock.Mock(run_dir=str(self.run_dir), policy=str(policy_path), request=str(request_path), depends_on=None)
+        stdout = 'provider/model\n{"name": "M", "variants": {"max": {}}}\n'
+
+        with mock.patch.dict(os.environ, {delegate_jobs.ARTIFACT_ROOT_ENV: str(self.artifact_root)}), mock.patch.object(
+            delegate_jobs.subprocess, "run", return_value=self._inventory(0, stdout)
+        ), mock.patch.object(delegate_jobs, "start_tracked_delegate") as start, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(delegate_jobs.command_launch(args), 2)
+        start.assert_not_called()
+        feedback = json.loads((self.run_dir / f"{request['label']}-request-feedback.json").read_text())
+        self.assertIn("unsupported-effort", {issue["code"] for issue in feedback["issues"]})
+
+    def test_opencode_variant_absent_from_model_fails_closed(self):
+        stdout = 'provider/model\n{"name": "M", "variants": {"max": {}}}\n'
+        delegate_jobs = load_delegate_jobs()
+        with mock.patch.object(delegate_jobs.subprocess, "run", return_value=self._inventory(0, stdout)):
+            with self.assertRaises(delegate_contract.DelegateContractError) as raised:
+                delegate_jobs.assert_opencode_variant_supported(self._opencode_effort_contract())
         self.assertEqual(raised.exception.issues[0].code, "unsupported-effort")
-        self.assertEqual(raised.exception.issues[0].field, "effort")
+
+    def test_opencode_unreadable_inventory_fails_closed(self):
+        delegate_jobs = load_delegate_jobs()
+        with mock.patch.object(delegate_jobs.subprocess, "run", return_value=self._inventory(1, "")):
+            with self.assertRaises(delegate_contract.DelegateContractError) as raised:
+                delegate_jobs.assert_opencode_variant_supported(self._opencode_effort_contract())
+        self.assertEqual(raised.exception.issues[0].code, "unverifiable-effort")
+
+    def test_opencode_default_effort_skips_the_inventory_query(self):
+        delegate_jobs = load_delegate_jobs()
+        with mock.patch.object(delegate_jobs.subprocess, "run") as run:
+            delegate_jobs.assert_opencode_variant_supported(self.validate(tool="opencode"))
+        run.assert_not_called()
 
     def test_qwen_nondefault_effort_fails_closed(self):
         policy = dict(self.policy, required_tools=["qwen"], required_effort="high")

@@ -6,12 +6,12 @@ OpenCode is eligible as Developer or delegate, in either access mode, regardless
 
 ## Read-only delegate launch
 
-Write schema-v3 policy/request JSON as documented in [delegate-contract.md](delegate-contract.md), then use `delegate_jobs.py launch`. The launcher owns `opencode run`, prompt placement, the model flag, agent choice, auto approval, repository directory, and capture. The tested `opencode run` command has no effort/variant flag, so a non-default effort request fails closed before launch.
+Write schema-v3 policy/request JSON as documented in [delegate-contract.md](delegate-contract.md), then use `delegate_jobs.py launch`. The launcher owns `opencode run`, prompt placement, the model flag, agent choice, auto approval, repository directory, and capture. A non-default effort is sent as `--variant`, and the launcher verifies it against the model's inventory before launching.
 
 Read-only command shape:
 
 ```text
-opencode run <prompt> [-m <provider/model>] --agent plan --auto --dir <repo>
+opencode run <prompt> [-m <provider/model>] [--variant <effort>] --agent plan --auto --dir <repo>
 ```
 
 Direct testing established that `--agent plan --auto` is the unattended read-only configuration. The plan agent denies edit tools, but shell execution remains available and is constrained by the read-only prompt. Enforcement is therefore partial. `--auto` prevents a headless approval hang; it does not convert the delegate into an editor.
@@ -21,7 +21,7 @@ Direct testing established that `--agent plan --auto` is the unattended read-onl
 Only valid against a policy whose `required_access` includes `read-write`. The launcher selects `--agent build` instead of `--agent plan`:
 
 ```text
-opencode run <prompt> [-m <provider/model>] --agent build --auto --dir <repo>
+opencode run <prompt> [-m <provider/model>] [--variant <effort>] --agent build --auto --dir <repo>
 ```
 
 `build` is OpenCode's primary agent; `opencode agent list` reports it with an unconditional `"permission": "*", "action": "allow"` rule, i.e. no built-in restriction on tool use. Enforcement of the request's `authorized_surface` is therefore entirely prompt-based — there is no mechanical write boundary for this harness in either access mode. `--auto` remains required to avoid a headless approval hang; it does not add any restriction on what `build` may touch.
@@ -34,4 +34,4 @@ Use `delegate_jobs.py activity`, `wait`, `extract`, and `cancel`. A validated co
 
 ## Configuration
 
-Discover exact model identifiers from the caller's OpenCode configuration or `opencode models`; do not guess. Pass explicit model choices through without capability ranking. OpenCode effort must remain `default` because the tested CLI exposes no effort flag; unsupported selections fail before launch.
+Discover exact model identifiers from the caller's OpenCode configuration or `opencode models`; do not guess. Pass explicit model choices through without capability ranking. Effort maps onto `--variant`, OpenCode's provider-specific reasoning control. OpenCode itself does not validate the name — an unknown variant is accepted silently and the model runs at its default — so the launcher verifies the request against the model's `variants` in `opencode models <provider> --verbose`, failing closed when the variant is absent, when no explicit model was named, or when the inventory cannot be read.

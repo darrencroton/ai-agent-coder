@@ -15,8 +15,9 @@ the composing code is written fresh):
   `--model <model>`; qwen uses `-m <model>`.
 - Effort overrides: codex composes `-c model_reasoning_effort="<effort>"`;
   claude/copilot use `--effort <effort>`; opencode/qwen have no effort
-  mechanism, so an effort request fails closed with a `PmError` at compose
-  time (never silently dropped, never a broken launch command).
+  mechanism on their *interactive* launch command (opencode's one-shot
+  `run` does — see test_review.py), so an effort request fails closed with a
+  `PmError` at compose time (never silently dropped, never a broken command).
 - claude-only composition: a `session_id` appends `--session-id <uuid>`;
   a no-op for the other four harnesses.
 - An unknown harness name raises `PmError` naming all five supported harnesses.
@@ -27,7 +28,9 @@ the composing code is written fresh):
   model line when found; fails closed (`PmError`) when the query process
   exits non-zero, when the requested model id is absent from the
   inventory output, and when the JSON metadata following the model line is
-  malformed or missing a non-empty `name` field.
+  malformed or missing a non-empty `name` field. It also exposes the
+  model's declared `variants`, which `assert_opencode_variant_supported`
+  checks so an unsupported `--variant` cannot silently downgrade effort.
 - `parse_reviewer_tools` splits a comma-separated string, lowercases and
   strips each entry, and returns an empty tuple for `None`/empty input.
 """
@@ -202,6 +205,34 @@ class TestQueryModelIdentityOpencode(unittest.TestCase):
             profiles.query_model_identity("opencode", "bare-model")
         called_command = run.call_args[0][0]
         self.assertEqual(called_command, ["opencode", "models", "bare-model", "--verbose"])
+
+    _WITH_VARIANTS = 'local/m\n{"name": "M", "variants": {"high": {}, "max": {}}}\n'
+
+    def test_variants_are_exposed(self) -> None:
+        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, self._WITH_VARIANTS)):
+            identity = profiles.query_model_identity("opencode", "local/m")
+        self.assertEqual(identity["variants"], ("high", "max"))
+
+    def test_variants_empty_when_model_declares_none(self) -> None:
+        stdout = 'local/m\n{"name": "M"}\n'
+        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, stdout)):
+            identity = profiles.query_model_identity("opencode", "local/m")
+        self.assertEqual(identity["variants"], ())
+
+    def test_assert_opencode_variant_supported_accepts_declared_variant(self) -> None:
+        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, self._WITH_VARIANTS)):
+            profiles.assert_opencode_variant_supported("local/m", "max")
+
+    def test_assert_opencode_variant_supported_rejects_undeclared_variant(self) -> None:
+        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, self._WITH_VARIANTS)):
+            with self.assertRaises(PmError) as ctx:
+                profiles.assert_opencode_variant_supported("local/m", "xhigh")
+        self.assertIn("does not offer variant", str(ctx.exception))
+
+    def test_assert_opencode_variant_supported_requires_explicit_model(self) -> None:
+        with self.assertRaises(PmError) as ctx:
+            profiles.assert_opencode_variant_supported(None, "max")
+        self.assertIn("explicit", str(ctx.exception))
 
 
 class TestParseReviewerTools(unittest.TestCase):

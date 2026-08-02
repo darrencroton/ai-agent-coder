@@ -66,7 +66,6 @@ DELEGATE_PROFILES: dict[str, dict[str, Any]] = {
     "opencode": {
         "read_only_enforcement": "partial-edit-tools-denied",
         "read_write_enforcement": "prompt-enforced-build-agent",
-        "effort_override": "unsupported",
     },
     "qwen": {
         "read_only_enforcement": "prompt-enforced-sandbox-requested",
@@ -741,22 +740,14 @@ def compose_delegate_command(
         )
 
     if tool == "opencode":
-        if effort != "default":
-            raise DelegateContractError(
-                [
-                    ContractIssue(
-                        "unsupported-effort",
-                        "effort",
-                        "the tested OpenCode run command has no effort/variant flag",
-                        "Set effort to 'default'; choose the configured model explicitly if a different capability level is required.",
-                    )
-                ]
-            )
         command = ["opencode", "run", prompt]
         if resume_session_id is not None:
             command.extend(["--session", resume_session_id])
         if model != "default":
             command.extend(["-m", model])
+        # OpenCode's reasoning-effort control; the launcher verifies it.
+        if effort != "default":
+            command.extend(["--variant", effort])
         command.extend(["--agent", "build" if write else "plan", "--auto", "--dir", repo])
         return command
 
