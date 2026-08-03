@@ -498,8 +498,31 @@ class TestRunReportHeader(PlanTestCase):
     def test_header_records_harness_reviewer_and_budget(self) -> None:
         text = self._header()
         self.assertIn("- Harness: opencode model=qwen3.6-27b-bf16", text)
-        self.assertIn("- Reviewer (run default): codex model=gpt-5.6-sol effort=high", text)
+        self.assertIn(
+            "- Reviewers (run default, none completed): codex model=gpt-5.6-sol effort=high", text
+        )
         self.assertIn("- Attempt budget: 10 per slice", text)
+
+    def test_header_names_the_reviewers_that_actually_reviewed(self) -> None:
+        """The recorded reviews replace the init default outright — a stale
+        default alongside them would be exactly the claim this line drops."""
+        text = self._header(
+            slices=[
+                {"id": "Slice 1", "reviews": [
+                    {"skill": "drift-audit", "tool": "opencode", "model": "minimax-m3"},
+                    {"skill": "code-review", "tool": "qwen", "model": "qwen3.6-27b-bf16"},
+                ]},
+                {"id": "Slice 2", "reviews": [
+                    # A repeat of a pair already named, plus a mid-run swap.
+                    {"skill": "drift-audit", "tool": "opencode", "model": "minimax-m3"},
+                    {"skill": "code-review", "tool": "copilot", "model": None},
+                ]},
+            ]
+        )
+        self.assertIn(
+            "- Reviewers (completed): opencode/minimax-m3, qwen/qwen3.6-27b-bf16, copilot", text
+        )
+        self.assertNotIn("run default", text)
 
     def test_header_reports_total_run_time_with_its_endpoints(self) -> None:
         """The report is the single source for run time so PM never hand-parses
@@ -524,9 +547,17 @@ class TestRunReportHeader(PlanTestCase):
     def test_header_says_unknown_rather_than_zero_without_timestamps(self) -> None:
         self.assertIn("- Total run time: unknown (no timestamped events)", self._header())
 
-    def test_header_survives_a_run_with_no_reviewer_configured(self) -> None:
+    def test_header_states_an_unconfigured_reviewer_rather_than_printing_None(self) -> None:
         text = self._header(reviewer={}, policy={})
-        self.assertIn("- Reviewer (run default): None", text)
+        self.assertIn("- Reviewers: none completed; no run default configured", text)
+
+    def test_header_reports_a_reviewer_default_configured_without_tools(self) -> None:
+        """`--reviewer-model` alone still applies to a `review --tool …`, so it
+        is a configured default, not an unconfigured run."""
+        text = self._header(reviewer={"tools": [], "model": "gpt-5.6-sol", "effort": None})
+        self.assertIn(
+            "- Reviewers (run default, none completed): no tool model=gpt-5.6-sol effort=None", text
+        )
 
     def test_absent_policy_renders_the_budget_the_toolkit_actually_enforces(self) -> None:
         """`max_attempts` is absent-tolerant in enforcement (`cli.py`,

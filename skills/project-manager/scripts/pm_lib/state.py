@@ -451,6 +451,40 @@ def run_elapsed(events: list[dict[str, Any]]) -> tuple[str, str, str] | None:
     )
 
 
+def _reviewer_line(state: dict[str, Any]) -> str:
+    """The report's reviewer line, derived from the reviews state recorded.
+
+    The run-level `reviewer` block holds only what `init` was told, and
+    `review --tool/--model` overrides it per commission — so a panel run, or
+    one whose reviewer was swapped mid-run, leaves that block stale or empty
+    while the report presented it as the run's configuration. Only a review
+    that produced a report is recorded (`review.py` raises before the state
+    write on timeout or non-zero exit), hence "completed" rather than
+    "commissioned".
+    """
+    completed: list[str] = []
+    for entry in state.get("slices") or []:
+        for review in entry.get("reviews") or []:
+            model = review.get("model")
+            label = f"{review.get('tool')}/{model}" if model else str(review.get("tool"))
+            if label not in completed:
+                completed.append(label)
+    if completed:
+        return f"- Reviewers (completed): {', '.join(completed)}"
+
+    default = state.get("reviewer") or {}
+    tools = ", ".join(default.get("tools") or [])
+    # `--reviewer-model`/`--reviewer-effort` are accepted independently of
+    # `--reviewer-tools` and still apply to a `review --tool …`, so either one
+    # alone is a configured default.
+    if not (tools or default.get("model") or default.get("effort")):
+        return "- Reviewers: none completed; no run default configured"
+    return (
+        f"- Reviewers (run default, none completed): {tools or 'no tool'} "
+        f"model={default.get('model')} effort={default.get('effort')}"
+    )
+
+
 def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_dir: Path) -> str:
     """Render `run-report.md` from controller-owned data alone.
 
@@ -465,7 +499,6 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     run_id = state.get("run_id")
     plan_info = state.get("plan") or {}
     harness_info = state.get("harness") or {}
-    reviewer_info = state.get("reviewer") or {}
     policy_info = state.get("policy") or {}
     plan_sha = (plan_info.get("sha256") or "")[:12]
 
@@ -478,14 +511,10 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
         f"- Harness: {harness_info.get('name')} model={harness_info.get('model')} "
         f"effort={harness_info.get('effort')}"
     )
-    # Reviewer and budget are the run's other two comparability controls. Labelled
-    # "run default" because `--reviewer-tools`/`--tool` override it per slice; the
+    # Reviewer and budget are the run's other two comparability controls. The
     # budget mirrors the enforcement default so the report cannot state one the
     # toolkit would not apply.
-    lines.append(
-        f"- Reviewer (run default): {', '.join(reviewer_info.get('tools') or []) or None} "
-        f"model={reviewer_info.get('model')} effort={reviewer_info.get('effort')}"
-    )
+    lines.append(_reviewer_line(state))
     lines.append(f"- Attempt budget: {policy_info.get('max_attempts', 10)} per slice")
     lines.append(f"- Status: {state.get('status')}")
     lines.append(f"- Stop reason: {state.get('stop_reason')}")

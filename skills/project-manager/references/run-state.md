@@ -48,7 +48,7 @@ A run id is `<UTC timestamp>-<random nonce>`. The nonce is load-bearing, not dec
   "slices": [
     {"id": "Slice 1", "title": "…", "status": null,
      "risk": "standard", "plan_risk": "standard", "commit": null, "attempts": 0,
-     "decision": "…", "reviews": [{"skill": "code-review", "tool": "…", "head": "…",
+     "decision": "…", "reviews": [{"skill": "code-review", "tool": "…", "model": null, "head": "…",
        "before_head": "…", "artifact": "…", "sha256": "…", "at": "…"}],
      "assessment": "<state-dir>/slices/slice-001/assessment.md", "summary": "…"}
   ],
