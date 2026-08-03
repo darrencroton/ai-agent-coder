@@ -169,6 +169,61 @@ class TestParsers(unittest.TestCase):
         self.assertEqual(got[0].line, 3)
         self.assertIn("receive", got[0].message)
 
+    def test_shellcheck(self):
+        # Captured from `shellcheck --format=json1 --severity=info` (0.11.0).
+        out = json.dumps({"comments": [
+            {"file": "agent-sbx.sh", "line": 67, "endLine": 67, "column": 44,
+             "endColumn": 87, "level": "info", "code": 2016,
+             "message": "Expressions don't expand in single quotes, "
+                        "use double quotes for that.", "fix": None},
+            {"file": "run.sh", "line": 4, "endLine": 4, "column": 6,
+             "endColumn": 10, "level": "info", "code": 2086,
+             "message": "Double quote to prevent globbing and word splitting.",
+             "fix": None},
+        ]})
+        got = lint._parse_shellcheck(out, "", "/repo")
+        self.assertEqual([f.rule for f in got], ["SC2016", "SC2086"])
+        self.assertEqual(got[0].line, 67)
+        self.assertEqual([f.tool for f in got], ["shellcheck", "shellcheck"])
+
+    def test_shellcheck_clean_run_emits_no_findings(self):
+        self.assertEqual(lint._parse_shellcheck('{"comments":[]}', "", "/repo"), [])
+        self.assertEqual(lint._parse_shellcheck("", "", "/repo"), [])
+
+    def test_shellcheck_non_json_output_is_an_error_not_a_pass(self):
+        """SHELLCHECK_OPTS is inherited from the environment and its --format
+        wins over ours, so gcc/quiet output must not read as zero findings."""
+        gcc = "run.sh:4:6: note: Double quote to prevent globbing. [SC2086]\n"
+        with self.assertRaises(RuntimeError):
+            lint._parse_shellcheck(gcc, "", "/repo")
+        with self.assertRaises(RuntimeError):
+            lint._parse_shellcheck('{"notcomments": []}', "", "/repo")
+
+    def test_shellcheck_exit_1_with_no_findings_is_an_error(self):
+        """The suppressed-output case: `SHELLCHECK_OPTS=--format=quiet` exits 1
+        and prints nothing. ok_codes=(0,) makes that an error, not a pass."""
+        tool = lint.TOOLS_BY_NAME["shellcheck"]
+        self.assertEqual(tool.ok_codes, (0,))
+        # FakeTool only supplies a stub binary named `shellcheck` on PATH here;
+        # the Tool under test is the real registry entry.
+        with TempRepo() as repo, FakeTool(name="shellcheck", exit_code=1, stdout=""):
+            repo.write("a.sh", "echo hi\n")
+            res = lint.run_tool(tool, ["a.sh"], repo.dir, 30)
+            self.assertFalse(res.ran)
+            self.assertIsNotNone(res.error)
+
+    def test_shellcheck_exit_1_with_findings_still_passes(self):
+        """The normal found-something case must not become an error."""
+        tool = lint.TOOLS_BY_NAME["shellcheck"]
+        payload = json.dumps({"comments": [
+            {"file": "a.sh", "line": 1, "level": "info", "code": 2086,
+             "message": "Double quote to prevent globbing and word splitting."}]})
+        with TempRepo() as repo, FakeTool(name="shellcheck", exit_code=1, stdout=payload):
+            repo.write("a.sh", "cat $f\n")
+            res = lint.run_tool(tool, ["a.sh"], repo.dir, 30)
+            self.assertTrue(res.ran, res.error)
+            self.assertEqual([f.rule for f in res.findings], ["SC2086"])
+
     def test_clang_format_collapses_to_one_per_file(self):
         err = ("src/a.c:3:1: warning: code should be clang-formatted [-Wclang-format-violations]\n"
                "src/a.c:9:1: warning: code should be clang-formatted [-Wclang-format-violations]\n"

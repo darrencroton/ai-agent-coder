@@ -84,6 +84,7 @@ Default tier runs whenever a matching file is in scope. Opt-in tier needs
 | `ruff-format` | default | Python | `ruff` | Formatting drift (Black-compatible) |
 | `markdownlint` | default | Markdown | `markdownlint-cli2` | Malformed tables (**MD056** — wrong cell count, where the extra cell is silently dropped when rendered), heading structure, list and spacing errors |
 | `codespell` | default | any text | `codespell` | Misspellings in identifiers, comments, and prose |
+| `shellcheck` | default | Shell (`.sh`, `.bash`) | `shellcheck` | Unquoted expansions that word-split (**SC2086**), misused `test` operators, unreachable code, `$?` read after the wrong command |
 | `clang-format` | default | C/C++ | `clang-format` | Formatting drift; needs a `.clang-format` in the project. One finding per file, not per hunk |
 | `cppcheck` | default | C/C++ | `cppcheck` | Static analysis — null dereference, uninitialised use, portability. No compile database needed |
 | `git-diff-check` | built-in | any | `git` | Whitespace errors and conflict markers introduced by the change. Inherently differential |
@@ -100,6 +101,32 @@ a compile database exists.
 will not compile standalone without the right `-I`/`-J` paths. Differential mode
 largely absorbs the resulting noise (the same errors appear at base and cancel),
 but a brand-new file can still report spuriously — hence opt-in.
+
+**Why shell is extension-only:** selection is driven by file extension, so a
+script named `deploy` with a `#!/bin/bash` shebang and no suffix is **not**
+linted, and passing it explicitly does not help — `select_tools` and `files_for`
+both filter on `os.path.splitext`, so the file is dropped either way. Sniffing
+shebangs would mean reading the content of every changed file at both the head
+and the base ref. Until that changes, an extensionless script needs `shellcheck`
+run against it directly, and the shell language will not appear in the coverage
+report at all.
+
+**Why shellcheck runs at `--severity=info`:** the `style` tier is presentational
+advice (backticks versus `$(...)`), which "defects, not taste" excludes. `info`
+is kept because SC2086 — an unquoted expansion that word-splits on a path
+containing a space — lives there and is a real defect. The cap is unconditional
+because `severity` is not a valid `.shellcheckrc` directive (verified against
+0.11.0), so it cannot conflict with a project's own configuration. A project's
+`.shellcheckrc` selects *rules* (`disable=SC2086`), and shellcheck honours it
+regardless of this flag, including rc files found in a script's own directory
+rather than the repository root.
+
+**Why shellcheck alone uses `ok_codes=(0,)`:** shellcheck honours a
+`SHELLCHECK_OPTS` environment variable whose `--format` beats the one this skill
+passes. An inherited `SHELLCHECK_OPTS=--format=quiet` prints nothing and exits 1
+— which under the usual `(0, 1)` would have read as a clean pass. With `(0,)`,
+exit 1 is accepted only when findings were actually parsed, and non-JSON output
+raises instead of parsing to zero findings.
 
 **Why no complexity metric:** cyclomatic complexity is a judgement signal, not a
 defect. Including it would violate the skill's "defects, not taste" invariant and

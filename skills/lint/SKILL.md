@@ -61,7 +61,10 @@ These are load-bearing. Do not work around them.
    project has none. Both exist because the tools' own defaults are broader than
    this rule allows — ruff's default set flags import ordering and rewrites
    `config = dict(...)` to a literal, which on one calibration repo was the
-   documented convention of the project being linted. If a plan mandates
+   documented convention of the project being linted. Shellcheck is capped at
+   `--severity=info` for the same reason, dropping only its presentational
+   `style` tier; a project's `.shellcheckrc` still selects which rules apply and
+   shellcheck honours it regardless of that flag. If a plan mandates
    something a generic rule would flag, the plan is right and the rule must be
    skipped (`--skip <tool>`).
 5. **Nothing is mutated.** No `--fix`, no reformat-in-place. This skill reports;

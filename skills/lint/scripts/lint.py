@@ -208,6 +208,45 @@ def _parse_codespell(out: str, err: str, cwd: str) -> list[Finding]:
     return findings
 
 
+# -- shellcheck -------------------------------------------------------------- #
+
+
+def _parse_shellcheck(out: str, err: str, cwd: str) -> list[Finding]:
+    """Parse `--format=json1`.
+
+    JSON rather than the `gcc` format because a shellcheck message may itself
+    contain a colon, which a positional `path:line:col:` regex mis-splits.
+
+    Malformed JSON raises rather than returning no findings: shellcheck honours
+    a `SHELLCHECK_OPTS` environment variable and its format option wins over
+    this argv, so an inherited `SHELLCHECK_OPTS=--format=gcc` would otherwise
+    turn every real finding into a silent pass (invariant 3).
+    """
+    out = out.strip()
+    if not out:
+        return []
+    try:
+        payload = json.loads(out)
+    except ValueError as e:
+        raise RuntimeError(
+            f"shellcheck did not emit json1 output ({e}); "
+            f"check SHELLCHECK_OPTS in the environment") from e
+    if not isinstance(payload, dict) or "comments" not in payload:
+        raise RuntimeError("shellcheck json1 output has no 'comments' key")
+    findings = []
+    for c in payload.get("comments") or []:
+        findings.append(
+            Finding(
+                "shellcheck",
+                f"SC{c.get('code')}",
+                _rel(cwd, str(c.get("file") or "")),
+                int(c.get("line") or 0),
+                str(c.get("message") or "").strip(),
+            )
+        )
+    return findings
+
+
 # -- clang-format ------------------------------------------------------------ #
 
 _CLANG_FMT = re.compile(
@@ -361,6 +400,9 @@ def _markdownlint_config(cwd: str) -> list[str]:
 PY = (".py", ".pyi")
 MD = (".md", ".markdown")
 C_EXT = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx")
+# Extension-based selection only: an extensionless script with a `#!/bin/sh`
+# shebang is not picked up. See README "Why shell is extension-only".
+SHELL_EXT = (".sh", ".bash")
 FORTRAN = (".f90", ".f95", ".f03", ".f08", ".f", ".for", ".ftn")
 
 # Install recipes keyed by BINARY, not by tool: ruff-check and ruff-format ship
@@ -375,6 +417,8 @@ INSTALL_RECIPES: dict[str, dict[str, list[str]]] = {
                   "brew": ["brew", "install", "codespell"],
                   "pip": [sys.executable, "-m", "pip", "install", "--user", "codespell"]},
     "markdownlint-cli2": {"npm": ["npm", "install", "-g", "markdownlint-cli2"]},
+    "shellcheck": {"brew": ["brew", "install", "shellcheck"],
+                   "apt": ["sudo", "apt-get", "install", "-y", "shellcheck"]},
     "clang-format": {"brew": ["brew", "install", "clang-format"],
                      "apt": ["sudo", "apt-get", "install", "-y", "clang-format"]},
     "cppcheck": {"brew": ["brew", "install", "cppcheck"],
@@ -409,6 +453,20 @@ TOOLS: list[Tool] = [
         build=lambda b, f: [b, "--quiet-level=2", "--"] + f,
         parse=_parse_codespell, ok_codes=(0, 65),
         note="Language-agnostic typo check over identifiers, comments, prose.",
+    ),
+    Tool(
+        name="shellcheck", language="shell", extensions=SHELL_EXT, binary="shellcheck",
+        build=lambda b, f: [b, "--severity=info", "--format=json1", "--"] + f,
+        parse=_parse_shellcheck,
+        # Exit 1 means "ran and found something", so it is accepted only when
+        # findings were actually parsed -- see run_tool's `rc not in ok_codes
+        # and not findings` branch. Exit 1 with nothing parsed is a suppressed
+        # or reformatted run, which must be an error, not a pass.
+        ok_codes=(0,),
+        note="Unquoted expansions, misused test operators, unreachable code. "
+             "Capped at --severity=info: the style tier is presentational "
+             "advice, which 'defects, not taste' excludes. A project's own "
+             "`.shellcheckrc` still governs which rules apply.",
     ),
     Tool(
         name="clang-format", language="c", extensions=C_EXT, binary="clang-format",
