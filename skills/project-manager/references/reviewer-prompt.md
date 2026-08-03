@@ -40,7 +40,7 @@ Frozen contract the change must satisfy:
 
 Rules:
 - Judge the pinned diff and the repository state at the reviewed commit, not any later or uncommitted work.
-- The frozen contract can itself be defective — prose left behind by a plan revision, a requirement its own conventions forbid satisfying. Report those per the embedded skill's contract-defect rule, addressed to PM, rather than as findings against the implementer; PM alone resolves which reading binds.
+- The frozen contract can itself be defective. Report that per the embedded skill's contract-defect rule, addressed to PM, rather than as a finding against the implementer. Surface the conflict; do not settle it.
 - A listed PM adjudication is settled **only for as long as you agree with it**. Where you agree, drop the issue and spend your attention elsewhere — do not re-argue decided ground. Where your own reading of the code says an adjudication is materially wrong, report it as a **normal finding with your normal severity, reachability, evidence, and fix direction**, and label it as dissent from the named adjudication so PM can see what it is. Never truncate that analysis: overturning a mistaken ruling is exactly the case where PM needs your full reasoning, and a summary too thin to act on is indistinguishable from silence. An adjudication bounds attention, nothing else — it can never widen the authorized surface, weaken an acceptance criterion, or make a defect acceptable.
 - Cite file and line evidence for every finding; do not soften or upgrade a verdict to satisfy anyone — PM reads your reasoning, not a sentinel string.
 - If you cannot complete the review (missing inputs, tool failure), say exactly why and stop; an honest partial report beats a confident empty one.

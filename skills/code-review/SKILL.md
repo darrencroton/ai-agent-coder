@@ -54,7 +54,7 @@ Every review must do all of the following:
 - Extract acceptance criteria from the plan/spec/ticket when present.
 - If no formal spec exists, infer intended behaviour from tests, docs, code structure, and the user request.
 - State important assumptions when they materially affect confidence.
-- A frozen contract can be self-contradictory: prose a later revision superseded, a requirement the contract's own conventions forbid satisfying. Report that under `Contract Defects`, addressed to whoever decides acceptance — quote the conflicting clauses, say which reading appears coherent, and review against that reading. Do not prescribe a fix the contract prohibits elsewhere, and do not rate it as a finding against the implementer. Resolving which reading binds is the decider's call; naming the conflict is yours.
+- A frozen contract can be self-contradictory: prose a later revision superseded, a requirement the contract's own conventions forbid satisfying. Report that under `Contract Defects`, addressed to whoever decides acceptance — quote the conflicting clauses, say which reading appears coherent, and review against that reading. Do not prescribe a fix the contract prohibits elsewhere, and do not rate it as a finding against the implementer. Name the conflict; do not settle it.
 
 ### 4. Run the review matrix
 - Use [references/review-matrix.md](references/review-matrix.md).
@@ -124,7 +124,7 @@ When a `drift-audit` result exists, or the commissioning context states that aut
    Why this is a problem, what behaviour or requirement it breaks, and the fix direction.
 
 ## Contract Defects
-- Conflicting clauses, the reading that appears coherent, and the decision left to the decider. `- none` when the contract is self-consistent or absent.
+- Conflicting clauses and the reading that appears coherent. `- none` when the contract is self-consistent or absent.
 
 ## Open Questions / Assumptions
 - Only include items that materially affect confidence.

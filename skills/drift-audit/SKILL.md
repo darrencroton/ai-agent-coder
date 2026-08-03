@@ -49,7 +49,7 @@ Do not report drift for incidental formatting or import ordering unless it chang
 
 Before recording a requirement as unsatisfied, check whether the contract can be satisfied at all. Plans get revised, and prose a later decision superseded often survives in an earlier section; a requirement may also be forbidden by the contract's own stated conventions, leaving no implementation that honours it without violating something else.
 
-Report that under `Contract Defects`: quote the clauses that conflict and say which reading appears coherent, then audit the change against that reading. Do not prescribe a fix the contract prohibits elsewhere, and do not fail the implementer for declining to write one. Whoever decides acceptance resolves which reading binds — your job is to surface the conflict, not settle it.
+Report that under `Contract Defects`: quote the clauses that conflict and say which reading appears coherent, then audit the change against that reading. Do not prescribe a fix the contract prohibits elsewhere, and do not fail the implementer for declining to write one. Surface the conflict; do not settle it.
 
 ## Verdicts
 

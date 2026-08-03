@@ -56,9 +56,9 @@ Hard rules:
 - Do not weaken or delete failing tests to get a pass; a real failure you cannot fix inside the surface is a blocked report, not a workaround.
 - You hold no acceptance authority: report honestly and let the evidence speak. PM independently checks the diff, the commit, and your validation output.
 
-If the contract contradicts itself — prose an obviously later decision superseded, a requirement its own conventions forbid you to satisfy — and one reading is clearly the coherent one, implement that reading rather than stopping. Record it under a `Contract defects` heading in `validation.md`, separate from the per-criterion lines, and in your result `summary`: quote the conflicting clauses and the reading you took. Never resolve such a conflict by widening your authorized surface or adding scope; if the coherent reading needs either, that is a stop. Do not stay silent — PM can only resolve a conflict it knows about, and will otherwise meet it later through a reviewer.
+If the contract contradicts itself — prose an obviously later decision superseded, a requirement its own conventions forbid you to satisfy — and its binding text leaves exactly one implementable reading, implement that reading rather than stopping. Record it under a `Contract defects` heading in `validation.md`, separate from the per-criterion lines, and in your result `summary`: quote the conflicting clauses and the reading you took. Never resolve such a conflict by widening your authorized surface or adding scope; if that reading needs either, that is a stop. Do not stay silent — PM can only act on a conflict it knows about, and will otherwise meet it later through a reviewer.
 
-Stop (status "blocked") when: the contract is ambiguous between two defensible readings that imply materially different work, or contradicts the repository, validation fails and the fix is outside the surface, the work needs an unauthorized file/tool/credential/external effect, or anything requires human judgement beyond the bounded contract-conflict reading described above. A prompt on screen asking for credentials, permissions, or an external side effect is always a stop, never something to answer.
+Stop (status "blocked") when: a second reading is also implementable, or the contract leaves a rule or boundary unstated, or it contradicts the repository, validation fails and the fix is outside the surface, the work needs an unauthorized file/tool/credential/external effect, or anything requires human judgement beyond the bounded contract-conflict reading described above. A prompt on screen asking for credentials, permissions, or an external side effect is always a stop, never something to answer.
 ```
 
 ## Launch Pointer
@@ -74,5 +74,5 @@ Read your complete frozen slice contract at {prompt_path} now, in full, before d
 PM renders this one-line pointer into your live session to deliver a corrective nudge; the correction itself is written verbatim to `steer-attempt-<n>.md` in the slice artifact directory and you read it from there — a correction can be long and multi-line, so it goes in a file for exactly the reason the launch contract does. The rendered block must stay a single line — `send_line` refuses a newline — and the only brace in it is the `{correction_path}` field.
 
 ```md
-PM correction — read it at {correction_path} now, in full, before doing anything else. It stays inside your frozen slice contract: it may narrow, clarify, or redirect how you proceed, but it never expands your authorized surface, adds scope, or grants new authority.
+PM correction — read it at {correction_path} now, in full, before doing anything else. It stays inside your frozen slice contract: it never expands your authorized surface, adds scope, or grants new authority.
 ```
