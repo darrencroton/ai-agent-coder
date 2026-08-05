@@ -93,6 +93,8 @@ The PM seat is a model you choose, including a local one.
 2. Sanity-check the plan: `python3 skills/project-manager/scripts/pm.py check-plan --plan <plan.md>`. This also runs automatically at `init`, so a defective plan stops before any harness launches.
 3. Start the run with the launcher in [`skills/project-manager/SKILL.md`](skills/project-manager/SKILL.md) → "Launcher".
 
+If the PM seat runs in Claude Code, consider installing the optional poll guard (`skills/project-manager/hooks/pm-poll-guard.py`). It blocks a PM re-read of a background task's output that would return bytes identical to the previous read — redundant, because Claude Code already re-invokes the agent when a background command exits, and expensive, because each one resends the whole conversation. Setup: [`skills/project-manager/README.md`](skills/project-manager/README.md) → "Optional: the poll guard".
+
 ### Choosing a level
 
 | Situation | Use |

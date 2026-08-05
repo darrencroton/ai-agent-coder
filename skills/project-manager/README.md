@@ -45,6 +45,35 @@ Exit codes: 0 success; 1 = a `finalize` refusal — a floor fact failed, or `--a
 
 If a harness displays a directory-trust or permission prompt, the PM stops and leaves that approval to the human. The human may configure trust through the harness's own supported mechanism, then rerun `start-slice`; the PM must not acknowledge the dialog with `tmux send-keys` or change user-global harness configuration itself. Autonomy flags do not clear a folder-trust dialog — Copilot still asks on a folder it has not been told to remember — so that one stays a human decision.
 
+## Optional: the poll guard (Claude Code PM seat)
+
+`hooks/pm-poll-guard.py` is an optional cost guard for a PM seat running in Claude Code. A PM session backgrounds long commands — a Developer wait, a commissioned review, a test run — and is tempted to re-read the task's output file to see whether it finished. Claude Code already re-invokes the agent when a background command exits, so those reads are redundant, but each one costs a full model round-trip that resends the entire conversation. On one measured 687-turn run, 346 turns were exactly this: roughly half the bill. The reads are harness calls, not PM commands, so the toolkit cannot see or bound them; the guard has to live in the harness.
+
+It denies only a re-read whose bytes are identical to what the previous read of that same file returned — provably no new information. The first read of a file always passes, as does any read that would return new content. Two gates keep it out of everything else: the path must match Claude Code's scratchpad task-output layout (`.../claude-<uid>/<project>/<session-uuid>/tasks/<id>.output`), and the session's working directory must contain `.pm/`. It fails open on any unexpected input or error, so it can bound spend but never strand a run.
+
+Install:
+
+```sh
+cp skills/project-manager/hooks/pm-poll-guard.py ~/.claude/hooks/
+```
+
+then add to `~/.claude/settings.json` (merging with any existing `hooks` block):
+
+```json
+"hooks": {
+  "PreToolUse": [
+    {
+      "matcher": "Read",
+      "hooks": [
+        { "type": "command", "command": "python3 ~/.claude/hooks/pm-poll-guard.py", "timeout": 10 }
+      ]
+    }
+  ]
+}
+```
+
+Use an absolute path if your harness does not expand `~`. The guard keeps a per-session digest stamp under `~/.claude/hooks/.pm-poll-guard/`; delete that directory any time. Other harnesses in the PM seat have no equivalent, and the run works without the guard — it costs more.
+
 ## Layout: who owns what
 
 - **`<git-dir>/pm/<run-id>/`** — authoritative state (`run.json`, HMAC-authenticated) and every PM-authored original (assessments, reviews, notes, performance rating, report — plain files, protected by living outside the worktree, not by the MAC). See [references/run-state.md](references/run-state.md).
