@@ -46,16 +46,6 @@ _SLICE_ID_RE = re.compile(r"^Slice\s+(?P<number>\d+)$")
 _OBSERVE_POLL_SECONDS = 2.0
 _OBSERVE_TAIL_LINES = 40
 
-# Floor on how long an `observe` that has no news may take to return. A
-# controller that re-issues `observe` in a tight loop costs a full model
-# round-trip per call, so the floor is mechanical rather than a documented
-# cadence: each newsless call absorbs the floor itself, which caps a runaway
-# loop's round-trips without any memory of the previous call — no timestamp,
-# no clock arithmetic, and no state shared between concurrent observers to
-# disagree about. It never delays actual news: the wait loop below breaks the
-# moment a signal lands, so an already-finished slice returns immediately.
-_OBSERVE_MIN_WAIT_SECONDS = 120.0
-
 # Controller-owned notes.md tripwire (target-design §10): a hard cap kept as
 # a non-fatal warning, since a runaway notes file silently degrades every
 # later Developer prompt.
@@ -737,6 +727,9 @@ def start_slice(
             pass
         raise
 
+    # `new_current` below discards the outgoing slice's recorded pgids.
+    _reap_reviewers(current if relaunch else None)
+
     now = _utc_now_iso()
     new_current: dict[str, Any] = {
         "id": plan_slice.slice_id,
@@ -818,15 +811,15 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     initial_running = sessions.session_exists(session)
     result_existed_before = result_path.is_file()
 
+    deadline = time.monotonic() + wait if wait else None
     wait_start = time.monotonic()
-    deadline = wait_start + max(wait or 0.0, _OBSERVE_MIN_WAIT_SECONDS)
     activity = sessions.detect_activity(session, previous_capture)
     # Wait exits early ONLY on a meaningful signal — session death, result.json
     # appearing, or a hard-stop marker in the fresh capture — never on a mere
     # pane byte-change, which `detect_activity`'s "active" flags on any TUI
     # spinner/stream churn and would otherwise defeat the wait almost
     # immediately (target-design §12, Amended post-implementation).
-    while time.monotonic() < deadline:
+    while deadline is not None and time.monotonic() < deadline:
         if (
             not activity["running"]
             or result_path.is_file()
@@ -1176,6 +1169,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     entry["summary"] = first_line
 
     session = current.get("tmux_session")
+    _reap_reviewers(current)
     state["current_slice"] = None
     if session:
         sessions.force_stop(session)
@@ -1369,8 +1363,7 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
     session = current.get("tmux_session")
     if session:
         sessions.force_stop(session)
-    for pgid in list(current.get("reviewer_pids") or []):
-        _kill_reviewer_pgid(pgid)
+    _reap_reviewers(current)
 
     state["status"] = "needs-human"
     state["stop_reason"] = reason
@@ -1384,6 +1377,20 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
 
 
 # --- stop -----------------------------------------------------------------
+
+
+def _reap_reviewers(current: dict[str, Any] | None) -> None:
+    """Kill the reviewer process groups recorded on `current`, and forget them.
+
+    Every path that ends or replaces `current_slice` must call this: dropping
+    the pgids without killing them strands a reviewer running against a
+    checkout nobody is holding still, with nothing able to find it again.
+    """
+    if not current:
+        return
+    for pgid in list(current.get("reviewer_pids") or []):
+        _kill_reviewer_pgid(pgid)
+    current["reviewer_pids"] = []
 
 
 def _kill_reviewer_pgid(pgid: int) -> None:

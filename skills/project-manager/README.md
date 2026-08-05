@@ -30,7 +30,7 @@ All commands: `python3 skills/project-manager/scripts/pm.py <command> …`, run 
 | `status [--report] [--run ID]` | where are we? prints the run's `recorded event span` (last recorded activity, not wall-clock now — `status` logs no event); `--report` regenerates `run-report.md`, whose header carries total run time with its endpoints |
 | `approve --slice ID --reason TEXT` | record a **human** approval for a plan-gated slice |
 | `start-slice [--model M] [--effort E] [--risk elevated] [--reviewer-tools T,…] [--harness-command CMD]` | launch (or relaunch) the next eligible slice in a fresh tmux session |
-| `observe [--wait N]` | evidence: liveness, pane tail, result presence, hard-stop markers; a wait returns early only on session death, `result.json` appearing, or a hard-stop marker (never a mere pane change), and reports elapsed wait time. Every call waits at least 120s, whatever `--wait` asks for, so a controller looping on `observe` cannot spend a model round-trip per second. The floor is charged for silence only: an already-signalled slice returns immediately, and the wait holds no state between calls |
+| `observe [--wait N]` | evidence: liveness, pane tail, result presence, hard-stop markers; a wait returns early only on session death, `result.json` appearing, or a hard-stop marker (never a mere pane change), and reports elapsed wait time |
 | `send --text T --reason R` | one-line nudge into the live session (refused over hard prompts; costs nothing) |
 | `finalize` | run the eight-fact floor and collect evidence (decides nothing) |
 | `finalize --accept "reasoning" \| --steer "correction" \| --stop "reason" [--risk elevated]` | PM's recorded decision; accept requires a passing floor (+ both fresh reviews when elevated); steer costs an attempt |

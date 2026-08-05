@@ -57,10 +57,11 @@ matching Stage 3's convention; tmux-gated scenarios use a tiny fake-harness
    `run-report.md` (original and mirror) from state + events + the
    assessment file and `model-performance.md` under the state dir alone,
    and the regenerated report contains the assessment text and rating.
-10. `stop` reaps a hung reviewer: a `review --reviewer-command` fake that
-    sleeps in the background is launched as a real subprocess; once its
-    process group is recorded in `current_slice.reviewer_pids`, `stop`
-    kills that process group (tolerating ESRCH).
+10. Reaping a hung reviewer: a `review --reviewer-command` fake that sleeps
+    in the background is launched as a real subprocess; once its process
+    group is recorded in `current_slice.reviewer_pids`, both `stop` and
+    `finalize --accept` kill it (tolerating ESRCH). Acceptance matters
+    because it clears `current_slice`, discarding the recorded pgids.
 """
 
 from __future__ import annotations
@@ -958,8 +959,11 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
         self.assertIn("STOPPED", assessment_path.read_text(encoding="utf-8"))
 
 
-class TestStopReapsHungReviewer(PmTestCase):
-    def test_stop_kills_reviewer_process_group(self) -> None:
+class HungReviewerTestCase(PmTestCase):
+    """Shared setup: a reviewer is a detached process group that survives its
+    `review` command, so every path ending or replacing a slice must kill it."""
+
+    def _start_hung_reviewer(self) -> tuple[str, Path, subprocess.Popen, int]:
         # plan.md must live OUTSIDE the worktree: an untracked plan.md inside
         # the repo is a dirty-tree entry, and `review` now refuses on a dirty
         # worktree (the pinned-tree guard), which would fail this test before
@@ -1005,16 +1009,73 @@ class TestStopReapsHungReviewer(PmTestCase):
             time.sleep(0.2)
         self.assertTrue(found, "reviewer pgid never appeared in state")
         self.assertTrue(_pgid_alive(pgid))
+        return token, run_dir, proc, pgid
 
-        code, out, err = self.run_cli_in_repo(["stop", "--reason", "reaping test", "--token", token])
-        self.assertEqual(code, 0, out + err)
-
+    def _assert_reaped(self, pgid: int, proc: subprocess.Popen, *, by: str) -> None:
         self.assertTrue(
             self._wait_for(lambda: not _pgid_alive(pgid), timeout=10.0),
-            "reviewer process group survived stop",
+            f"reviewer process group survived {by}",
         )
-
         proc.wait(timeout=10)
+
+    def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(interval)
+        return predicate()
+
+
+class TestStopReapsHungReviewer(HungReviewerTestCase):
+    def test_stop_kills_reviewer_process_group(self) -> None:
+        token, _run_dir, proc, pgid = self._start_hung_reviewer()
+        code, out, err = self.run_cli_in_repo(["stop", "--reason", "reaping test", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self._assert_reaped(pgid, proc, by="stop")
+
+
+class TestAcceptReapsHungReviewer(FinalizeTestCase):
+    """Acceptance clears `current_slice`, discarding the recorded pgids. Without
+    an explicit kill the reviewer runs on with nothing able to find it again.
+
+    Acceptance needs a passing floor, so this drives the real launch-to-result
+    flow and records a genuinely running process group as the reviewer —
+    `review` itself is not needed to pin "recorded pgids get killed"."""
+
+    def test_accept_kills_reviewer_process_group(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        pgid = os.getpgid(proc.pid)
+        with state_mod.locked_update(run_dir, token) as state:
+            state["current_slice"]["reviewer_pids"] = [pgid]
+        self.assertTrue(_pgid_alive(pgid))
+
+        code, out, err = self.run_cli_in_repo(
+            ["finalize", "--accept", "Diff and validation evidence check out; accepting.", "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+        # `proc.poll()` rather than `_pgid_alive`: the sleeper is this test's
+        # own child, so a killed one lingers as a zombie until it is waited.
+        self.assertTrue(
+            self._wait_for(lambda: proc.poll() is not None, timeout=10.0),
+            "reviewer process group survived finalize --accept",
+        )
+        self.assertIsNone(state_mod.load_state(run_dir, token).get("current_slice"))
 
     def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
         deadline = time.monotonic() + timeout

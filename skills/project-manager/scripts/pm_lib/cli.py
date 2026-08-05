@@ -401,11 +401,8 @@ def _run_observe(args: argparse.Namespace) -> int:
         return 0
 
     print(f"slice: {outcome.slice_id}")
-    # Printed unconditionally: a bare `observe` also pays the minimum wait when
-    # there is no news, so reporting elapsed time only for an explicit --wait
-    # would leave that call silently blocking for two minutes.
-    requested = f"requested {args.wait:g}s" if args.wait else "no --wait requested"
-    print(f"waited: {outcome.elapsed_seconds:.1f}s ({requested})")
+    if args.wait:
+        print(f"waited: {outcome.elapsed_seconds:.1f}s (requested {args.wait:g}s)")
     print(f"session running: {outcome.running}")
     print(f"pane changed: {outcome.pane_changed}")
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
