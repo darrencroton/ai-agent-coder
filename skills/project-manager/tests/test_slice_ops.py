@@ -523,7 +523,19 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
     """`observe --wait` honest-wait semantics (target-design §12, Amended
     post-implementation): the wait runs the full requested duration and
     breaks early ONLY on session death, `result.json` appearing, or a
-    hard-stop marker — never on a mere pane byte-change."""
+    hard-stop marker — never on a mere pane byte-change.
+
+    These use short waits to keep the suite fast, so the minimum-wait floor
+    (`TestObserveMinimumWait`) is patched off for the class: it would otherwise
+    dominate every requested duration and mask the early-break semantics under
+    test. The floor is a spend bound, orthogonal to which events end a wait.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.object(slice_ops, "_OBSERVE_MIN_WAIT_SECONDS", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _observe_wait(self, wait_seconds: float) -> tuple[int, str, str, float, float]:
         """Run `observe --wait` and return (code, out, err, test_elapsed,
@@ -643,6 +655,95 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertIn("session running: True", result["out"])
         self.assertIn("hard-stop scan:", result["out"])
         self.assertNotIn("hard-stop scan: clear", result["out"])
+
+
+class TestObserveMinimumWaitConstant(unittest.TestCase):
+    """The floor's value, pinned where tmux cannot gate it.
+
+    `TestObserveMinimumWait` patches this constant down so its behavioural
+    tests cost seconds instead of minutes, which means a production floor
+    silently set to zero would pass every one of them. This guard is the thing
+    that would fail — so it must not live in a tmux-gated class, or it would
+    vanish on exactly the machines that skip those tests.
+    """
+
+    def test_the_floor_matches_the_documented_two_minutes(self) -> None:
+        # README.md's `observe` row states 120s to operators, and SKILL.md
+        # tells PM "at least two minutes"; a change here must update both.
+        self.assertEqual(slice_ops._OBSERVE_MIN_WAIT_SECONDS, 120.0)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestObserveMinimumWait(SliceOpsTestCase):
+    """The mechanical floor on newsless `observe` calls.
+
+    A controller that re-issues `observe` in a tight loop costs a full model
+    round-trip per call, so every call with nothing to report absorbs at least
+    `_OBSERVE_MIN_WAIT_SECONDS` itself — which bounds a runaway loop without
+    any state carried between calls. The floor's whole justification is that it
+    only ever charges for silence, so both halves are pinned here: it applies
+    even to a bare `observe`, and it yields instantly to real news.
+    """
+
+    def _launch(self, harness_body: str) -> tuple[str, str]:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", harness_body)
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        return run_id, token
+
+    def test_a_bare_observe_with_no_news_still_pays_the_floor(self) -> None:
+        """The load-bearing test: a bare `observe` against a live, silent
+        session must not return promptly. Without this, deleting the floor
+        from `observe` would leave the rest of the suite green — and a bare
+        `observe` is exactly the call a runaway controller loops on.
+
+        The floor is patched down from two minutes so the test costs seconds;
+        `TestObserveMinimumWaitConstant` pins the production value, so a
+        patched floor cannot hide a production one that was set to zero.
+        """
+        session_lifetime = 60.0
+        self._launch(idle_script(sleep_seconds=session_lifetime))
+
+        floor = 3 * slice_ops._OBSERVE_POLL_SECONDS
+        with mock.patch.object(slice_ops, "_OBSERVE_MIN_WAIT_SECONDS", floor):
+            start = time.monotonic()
+            code, out, err = self.run_cli_in_repo(["observe"])
+            elapsed = time.monotonic() - start
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("session running: True", out)
+        self.assertIn("result present: False", out)
+        self.assertGreaterEqual(elapsed, floor - 0.5)
+        # Bounded above as well as below: a lower bound alone would also be
+        # satisfied by an implementation that ignored the deadline entirely and
+        # returned only when the idle session finally died.
+        self.assertLess(elapsed, floor + slice_ops._OBSERVE_POLL_SECONDS + 3.0)
+        self.assertLess(elapsed, session_lifetime / 2)
+
+    def test_the_floor_never_delays_news(self) -> None:
+        """The floor may charge only for silence. A slice that has already
+        signalled returns at once, even from a bare `observe` and even when a
+        much longer explicit wait was requested — otherwise the floor would sit
+        on every finished slice and slow down well-behaved runs too."""
+        run_id, token = self._launch(result_only_script(delay=0.5, tail_sleep=30.0))
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        for argv in (["observe"], ["observe", "--wait", "600"]):
+            start = time.monotonic()
+            code, out, err = self.run_cli_in_repo(argv)
+            elapsed = time.monotonic() - start
+            self.assertEqual(code, 0, err)
+            self.assertIn("result present: True", out)
+            self.assertLess(
+                elapsed,
+                slice_ops._OBSERVE_MIN_WAIT_SECONDS / 2,
+                f"{argv} paid the floor despite result.json already existing",
+            )
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")

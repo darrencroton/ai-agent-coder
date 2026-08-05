@@ -38,10 +38,12 @@ one-shot reviewer command table and the end-to-end `review` command):
 8. `review` refuses a slice that is not the run's current in-flight slice,
    and refuses when HEAD has not advanced past `before_head` (nothing to
    review).
-9. No default timeout: a moderately-slow-but-finite fake reviewer (a few
-   seconds, then exit 0) is left to run to completion and recorded, and a
-   monkeypatch of `subprocess.Popen.wait` proves the call is made with
-   `timeout=None` when `--timeout` is absent.
+9. A default timeout bounds every review: a moderately-slow-but-finite fake
+   reviewer (a few seconds, then exit 0) still runs to completion and is
+   recorded, and a monkeypatch of `subprocess.Popen.wait` proves that an
+   absent `--timeout` passes the CLI's default backstop rather than
+   `timeout=None`, so an unattended run always regains control from a hung
+   reviewer.
 10. A `--timeout` kill takes the whole process GROUP, not just the leader:
     a fake reviewer backgrounds a child, in the same process group, that
     ignores SIGTERM while the leader does not — proven via
@@ -85,6 +87,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from pm_test_helpers import PmTestCase
 
 from pm_lib import PmError
+from pm_lib import cli
 from pm_lib import profiles
 from pm_lib import review as review_mod
 from pm_lib import slice_ops
@@ -995,12 +998,14 @@ class TestReviewTimeout(ReviewCommandTestCase):
         )
 
 
-class TestReviewNoDefaultTimeout(ReviewCommandTestCase):
-    """No `--timeout` means no ceiling at all (target-design §12, Amended
-    post-implementation): a legitimately slow cold local model is the PM's
-    judgement call, not a hard default."""
+class TestReviewDefaultTimeout(ReviewCommandTestCase):
+    """Omitting `--timeout` applies a default hang backstop, not an unbounded
+    wait: an unattended run must always regain control from a stuck reviewer.
+    The default is sized well beyond any healthy review, so a merely slow
+    model still runs to completion; one that genuinely needs longer takes a
+    larger explicit `--timeout`."""
 
-    def test_no_timeout_lets_moderately_slow_reviewer_run_to_completion(self) -> None:
+    def test_default_timeout_lets_moderately_slow_reviewer_run_to_completion(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
         self.set_current_slice(
@@ -1027,21 +1032,22 @@ class TestReviewNoDefaultTimeout(ReviewCommandTestCase):
         entry = reloaded["slices"][0]
         self.assertEqual(len(entry["reviews"]), 1)
 
-    def test_no_timeout_passes_none_to_process_wait(self) -> None:
+    def test_omitted_timeout_passes_the_default_to_process_wait(self) -> None:
         """Direct proof, not just behavioural inference: with no `--timeout`,
         `run_review` calls the REVIEWER subprocess's `.wait(timeout=...)`
-        with `timeout=None` — verified by monkeypatching
-        `subprocess.Popen.wait` to record the `timeout` kwarg it is invoked
-        with.
+        with the default backstop rather than `None` — verified by
+        monkeypatching `subprocess.Popen.wait` to record the `timeout` kwarg
+        it is invoked with. A `None` here would mean an unattended run can
+        hang forever on a stuck reviewer.
 
         The spy must be isolated to the reviewer's own `Popen` instance: a
         global patch would also observe `run_review`'s several `git`
         subprocesses (`git_ops` uses `subprocess.run`, which internally
         constructs its own `Popen` and calls `self.wait(timeout=...)` via
         `communicate()` — with `timeout=None`, since `git_ops` never passes
-        one). Those git waits would satisfy a bare `assertIn(None, ...)`
-        even if the REVIEWER's own wait later gained a default timeout,
-        making the assertion vacuous. `Popen` always exposes the resolved
+        one). Letting those into the recorded list would mix an
+        unrelated `None` into an assertion whose whole point is that the
+        reviewer's own wait is *not* `None`. `Popen` always exposes the resolved
         command as the `.args` attribute, so the spy identifies "the
         reviewer's Popen" by checking whether the fake reviewer script's
         own path appears in `.args` — no other subprocess this test spawns
@@ -1081,8 +1087,8 @@ class TestReviewNoDefaultTimeout(ReviewCommandTestCase):
         self.assertEqual(code, 0, err)
         # Exactly one Popen matched the reviewer (the git subprocesses along
         # the way are filtered out by construction), and its wait received
-        # timeout=None.
-        self.assertEqual(reviewer_wait_timeouts, [None])
+        # the default backstop rather than an unbounded None.
+        self.assertEqual(reviewer_wait_timeouts, [cli._REVIEW_DEFAULT_TIMEOUT_SECONDS])
 
 
 class TestReviewLaunchVisibilityOrdering(ReviewCommandTestCase):

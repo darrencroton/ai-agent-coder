@@ -483,7 +483,8 @@ def run_review(
         )
         raise PmError(
             f"reviewer timed out after {timeout:g}s and was killed (process group {pgid}); "
-            "this is not proof of a hang — a slow cold local model may need a longer or no --timeout"
+            "this is not proof of a hang — a slow cold local model may just need a longer --timeout. "
+            f"Its stderr is at {stderr_path}; re-commission with a larger --timeout to retry"
         )
 
     if returncode != 0:
