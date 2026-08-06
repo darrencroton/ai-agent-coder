@@ -264,6 +264,17 @@ def _run_status(args: argparse.Namespace) -> int:
         print(f"run report regenerated: {report_path}")
         mirror_path = slice_ops.run_artifact_dir(repo, state["run_id"]) / "run-report.md"
         print(f"mirror: {mirror_path}")
+        # Echoed here as well as written into the report: wait cost is the one
+        # figure a PM should see without opening a file, since acting on it
+        # (waiting longer, or acting instead of waiting) is a live decision.
+        metrics = state_mod.wait_discipline(state_mod.read_events(run_dir))
+        if metrics["episode_count"]:
+            per_episode = metrics["observes"] / metrics["episode_count"]
+            print(
+                f"wait discipline: {metrics['observes']} observes over "
+                f"{metrics['episode_count']} episodes ({per_episode:.2f} each); "
+                f"{metrics['repeat_waits']} repeat wait(s) after no signal"
+            )
         return 0
 
     result = slice_ops.status(repo, run_dir, token)
@@ -411,6 +422,24 @@ def _run_observe(args: argparse.Namespace) -> int:
         print(f"hard-stop scan: {', '.join(outcome.hard_stop['kinds'])}")
     else:
         print("hard-stop scan: clear")
+
+    # Printed, never enforced. Measured across two real runs, the wasteful
+    # pattern was not re-asking an answered question but repeating a too-short
+    # wait — 20/20/20/20 against a Developer that needed 85 minutes. Every one
+    # of those waits was a legitimate thing to do; only the length was wrong,
+    # and that is a judgement the PM has to make. So this says so where the PM
+    # is already reading, and leaves the decision alone.
+    if outcome.prior_timeouts:
+        total = outcome.prior_wait_seconds + outcome.elapsed_seconds
+        suggestion = max(2 * (args.wait or outcome.elapsed_seconds), 60.0)
+        print(
+            f"note: {outcome.prior_timeouts + 1} consecutive waits on this episode have "
+            f"returned no signal ({total / 60:.0f} min total). Re-asking at the same "
+            f"length cannot return anything a longer wait would not have. Either wait "
+            f"once for longer (try --wait {suggestion:g}) or act: send a nudge, "
+            f"finalize --steer, relaunch with start-slice, or stop."
+        )
+
     print("--- pane tail ---")
     print(outcome.tail)
     return 0

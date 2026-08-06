@@ -515,6 +515,126 @@ class TestDeadSession(SliceOpsTestCase):
         self.assertIn("no live session", err)
 
 
+class TestEpisodeTimeouts(unittest.TestCase):
+    """`episode_timeouts` — the backwards scan behind the repeat-wait hint.
+
+    Pure over an event list, so it is tested here rather than through a live
+    session: the shapes that matter (a legacy log, a slice boundary, a signal
+    mid-streak) are one literal list each.
+
+    It is advisory only. Nothing it returns changes an exit code, which is why
+    it is allowed to take no lock and to stop early on anything it cannot
+    classify — a wrong count prints a slightly wrong hint, and that is the
+    worst case by construction.
+    """
+
+    @staticmethod
+    def _observe(slice_id: str, wake: str, elapsed: float = 1200.0) -> dict:
+        return {
+            "ts": "2026-08-04T12:00:00Z",
+            "kind": "observe",
+            "slice": slice_id,
+            "note": f"requested=1200s elapsed={elapsed:.1f}s wake={wake}",
+        }
+
+    def test_no_events_is_zero(self) -> None:
+        self.assertEqual(slice_ops.episode_timeouts([], "Slice 1"), (0, 0.0))
+
+    def test_consecutive_timeouts_accumulate(self) -> None:
+        events = [
+            {"kind": "launch", "slice": "Slice 1", "note": ""},
+            self._observe("Slice 1", "timeout", 900.0),
+            self._observe("Slice 1", "timeout", 1200.0),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1"), (2, 2100.0))
+
+    def test_a_signal_ends_the_streak(self) -> None:
+        events = [
+            {"kind": "launch", "slice": "Slice 1", "note": ""},
+            self._observe("Slice 1", "timeout"),
+            self._observe("Slice 1", "result"),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1"), (0, 0.0))
+
+    def test_an_episode_reset_ends_the_streak(self) -> None:
+        events = [
+            self._observe("Slice 1", "timeout"),
+            self._observe("Slice 1", "timeout"),
+            {"kind": "steer", "slice": "Slice 1", "note": "fix it"},
+            self._observe("Slice 1", "timeout"),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1")[0], 1)
+
+    def test_a_send_resets_it(self) -> None:
+        events = [
+            self._observe("Slice 1", "timeout"),
+            {"kind": "send", "slice": "Slice 1", "note": "nudge"},
+            self._observe("Slice 1", "timeout"),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1")[0], 1)
+
+    def test_intervening_non_reset_events_are_skipped(self) -> None:
+        """A review or floor check does not give the Developer anything new to
+        do, so it neither starts a fresh episode nor breaks the streak."""
+        events = [
+            {"kind": "launch", "slice": "Slice 1", "note": ""},
+            self._observe("Slice 1", "timeout"),
+            {"kind": "floor", "slice": "Slice 1", "note": "8/8 passed"},
+            self._observe("Slice 1", "timeout"),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1")[0], 2)
+
+    def test_another_slices_observe_stops_the_scan(self) -> None:
+        events = [
+            self._observe("Slice 1", "timeout"),
+            self._observe("Slice 2", "timeout"),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1")[0], 0)
+
+    def test_a_legacy_observe_stops_the_scan_rather_than_being_guessed(self) -> None:
+        """Events written before `wake=` existed carry no return cause. Treating
+        them as timeouts would invent a streak; treating them as signals would
+        hide one. Stopping is the only honest option."""
+        events = [
+            {"kind": "observe", "slice": "Slice 1",
+             "note": "pane_changed=True running=True result_present=False elapsed=1200.0s"},
+            self._observe("Slice 1", "timeout"),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1")[0], 1)
+
+    def test_a_missing_elapsed_still_counts_the_wait(self) -> None:
+        events = [{"kind": "observe", "slice": "Slice 1", "note": "wake=timeout"}]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1"), (1, 0.0))
+
+    def test_an_untimed_peek_neither_counts_nor_breaks_the_streak(self) -> None:
+        """A bare `observe` is a glance, not a wait. Counting it would invent a
+        wait nobody requested; letting it break the streak would let a glance
+        between two long waits silently suppress the hint."""
+        events = [
+            {"kind": "launch", "slice": "Slice 1", "note": ""},
+            self._observe("Slice 1", "timeout"),
+            self._observe("Slice 1", "immediate", 0.0),
+            self._observe("Slice 1", "timeout"),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1"), (2, 2400.0))
+
+    def test_only_untimed_peeks_produce_no_streak(self) -> None:
+        events = [
+            {"kind": "launch", "slice": "Slice 1", "note": ""},
+            self._observe("Slice 1", "immediate", 0.0),
+            self._observe("Slice 1", "immediate", 0.0),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 1"), (0, 0.0))
+
+    def test_an_accept_ends_the_episode(self) -> None:
+        events = [
+            self._observe("Slice 1", "timeout"),
+            {"kind": "accept", "slice": "Slice 1", "note": "ACCEPT"},
+            self._observe("Slice 2", "timeout"),
+        ]
+        self.assertEqual(slice_ops.episode_timeouts(events, "Slice 2")[0], 1)
+
+
 _WAITED_RE = re.compile(r"^waited:\s*([\d.]+)s \(requested ([\d.]+)s\)$", re.MULTILINE)
 
 
@@ -643,6 +763,103 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertIn("session running: True", result["out"])
         self.assertIn("hard-stop scan:", result["out"])
         self.assertNotIn("hard-stop scan: clear", result["out"])
+
+    def test_every_observe_logs_and_repeats_are_flagged(self) -> None:
+        """Two properties on one launched session, because each costs a full
+        `start-slice`.
+
+        1. Every completed observe appends an event. Previously an event was
+           written only when the pane, liveness, or result changed — so the
+           no-op wait, the one worth counting, was the one that left no trace,
+           and a run's own log understated its polling.
+        2. From the second consecutive no-signal wait the CLI says so. It is a
+           printed note, never a refusal: measured across two real runs the
+           repeated waits were 20-minute waits on Developers that needed 85
+           minutes, so every one of them was individually the right call and
+           only the length was wrong. Refusing would have blocked correct
+           behaviour; the exit code therefore stays 0.
+        """
+        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
+
+        run_id, _token = self._launch(idle_script(sleep_seconds=120.0))
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        before = len([e for e in state_mod.read_events(run_dir) if e["kind"] == "observe"])
+
+        wait_seconds = 2 * _OBSERVE_POLL_SECONDS
+        code, first_out, _err = self.run_cli_in_repo(["observe", "--wait", str(wait_seconds)])
+        self.assertEqual(code, 0)
+        self.assertNotIn("note:", first_out, "the first wait of an episode is never a repeat")
+
+        code, second_out, _err = self.run_cli_in_repo(["observe", "--wait", str(wait_seconds)])
+        self.assertEqual(code, 0, "the hint must never change the exit code")
+        self.assertIn("2 consecutive waits", second_out)
+        self.assertIn("--wait", second_out, "the hint must name a concrete larger wait")
+
+        observes = [e for e in state_mod.read_events(run_dir) if e["kind"] == "observe"]
+        self.assertEqual(len(observes) - before, 2, "every completed observe must log")
+        for event in observes[-2:]:
+            self.assertIn("wake=timeout", event["note"])
+            self.assertIn("requested=", event["note"])
+            # A pane byte-change is deliberately NOT a signal: the wait loop
+            # ignores it, so classifying churn as informative would reset the
+            # streak on exactly the noise this exists to see through.
+            self.assertNotIn("wake=pane", event["note"])
+
+    def test_telemetry_failure_never_costs_the_observation(self) -> None:
+        """The whole point of this being advisory.
+
+        `read_events` and `append_event` can both raise for reasons that have
+        nothing to do with the session: a five-second lock timeout raises
+        `PmError`, a half-written trailing line raises `JSONDecodeError`, a full
+        or read-only disk raises `OSError`. Letting any of those escape would
+        turn a completed 20-minute wait into `exit 2` — losing the observation
+        to protect a note about it.
+        """
+        self._launch(idle_script(sleep_seconds=120.0))
+
+        for target, boom in (
+            ("read_events", PmError("lock held")),
+            ("read_events", json.JSONDecodeError("half-written line", "", 0)),
+            ("append_event", PmError("lock held")),
+            ("append_event", OSError("disk full")),
+        ):
+            with self.subTest(target=target, error=type(boom).__name__):
+                with mock.patch.object(state_mod, target, side_effect=boom):
+                    code, out, err = self.run_cli_in_repo(["observe", "--wait", "1"])
+                self.assertEqual(code, 0, f"{target} raising {boom!r} must not fail the observe: {err}")
+                self.assertIn("session running: True", out, "the observation itself must still be reported")
+
+    def test_a_result_present_at_death_reports_result_not_death(self) -> None:
+        """A Developer that writes `result.json` and exits has succeeded.
+        Recording that as `wake=death` would hide the signal the slice actually
+        produced behind the fact that the process is gone."""
+        # Trigger-gated so the session is guaranteed alive through injection and
+        # dies only once the test says so, with result.json already written —
+        # a launch-relative timer would race `start-slice` itself.
+        trigger = self.repo.parent / "result_then_exit_trigger"
+        run_id, _token = self._launch(trigger_gated_result_script(trigger, tail_sleep=0))
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        current = state_mod.load_state(run_dir)["current_slice"]
+        result_path = Path(current["artifact_dir"]) / "result.json"
+
+        trigger.write_text("go\n", encoding="utf-8")
+        self.assertTrue(self._wait_for(lambda: result_path.is_file(), timeout=20.0))
+        self.assertTrue(
+            self._wait_for(lambda: not sessions.session_exists(current["tmux_session"]), timeout=20.0)
+        )
+
+        code, _out, _err = self.run_cli_in_repo(["observe"])
+        self.assertEqual(code, 0)
+        latest = [e for e in state_mod.read_events(run_dir) if e["kind"] == "observe"][-1]
+        self.assertIn("wake=result", latest["note"])
+
+    def test_an_untimed_observe_records_no_requested_wait(self) -> None:
+        run_id, _token = self._launch(idle_script(sleep_seconds=120.0))
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        code, _out, _err = self.run_cli_in_repo(["observe"])
+        self.assertEqual(code, 0)
+        latest = [e for e in state_mod.read_events(run_dir) if e["kind"] == "observe"][-1]
+        self.assertIn("requested=none", latest["note"])
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")

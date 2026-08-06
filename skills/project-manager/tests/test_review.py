@@ -33,8 +33,11 @@ one-shot reviewer command table and the end-to-end `review` command):
    is empty again once the subprocess completes, and a `review` event is
    logged.
 7. A failing reviewer command (nonzero exit) raises `PmError` quoting the
-   captured stderr tail and records nothing: no review entry is appended
-   to the slice's `reviews` list and no `review` event is logged.
+   captured stderr tail and records no review EVIDENCE: no entry is appended
+   to the slice's `reviews` list. A terminal `review` event carrying
+   `status=nonzero` is still logged, closing the `review-start` emitted at
+   launch — without it, an unmatched start could not be told apart from a
+   reviewer still running.
 8. `review` refuses a slice that is not the run's current in-flight slice,
    and refuses when HEAD has not advanced past `before_head` (nothing to
    review).
@@ -586,7 +589,16 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
             captured.read_text(encoding="utf-8"),
         )
 
-    def test_failing_fake_reviewer_records_nothing(self) -> None:
+    def test_failing_fake_reviewer_records_no_review_but_closes_its_start(self) -> None:
+        """A reviewer that exits non-zero records no review, and says so.
+
+        No `reviews` entry is the load-bearing half: a failed commission must
+        never look like evidence. But the commission still emitted a
+        `review-start`, and leaving that unmatched would make "died" and "still
+        running" indistinguishable in the log — so a terminal event is written
+        carrying `status=nonzero`, which is not a review and is never mistaken
+        for one.
+        """
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
         self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
@@ -610,8 +622,117 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         reloaded = state_mod.load_state(run_dir, token)
         entry = reloaded["slices"][0]
         self.assertEqual(entry.get("reviews") or [], [])
+
         events = state_mod.read_events(run_dir)
-        self.assertFalse(any(e["kind"] == "review" for e in events))
+        starts = [e for e in events if e["kind"] == "review-start"]
+        terminals = [e for e in events if e["kind"] == "review"]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(len(terminals), 1, "the start must be closed, not left open")
+        self.assertIn("status=nonzero", terminals[0]["note"])
+        # Same (slice, seq), so the pair is unambiguous even with concurrent
+        # commissions on other slices.
+        self.assertEqual(starts[0]["slice"], terminals[0]["slice"])
+        self.assertIn("seq=1", starts[0]["note"])
+        self.assertIn("seq=1", terminals[0]["note"])
+
+    def test_review_start_telemetry_failure_never_orphans_the_reviewer(self) -> None:
+        """`review-start` is appended AFTER `Popen`, so the reviewer is already
+        running when it fires.
+
+        Anything escaping there would skip `process.wait()`: the command returns
+        while its reviewer keeps going, with a stale pgid left in state for a
+        later `stop` to signal after PID reuse. A five-second state-lock timeout
+        raises `PmError`, not `OSError`, so a narrow catch left exactly that
+        hole open — hence the deliberate catch-all at the append site.
+        """
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+        fake = _write_fake_reviewer(self.repo.parent / "ok.sh", 'echo "# Report"')
+
+        real_append = state_mod.append_event
+
+        def _fail_on_start(run_dir_arg, kind, **kwargs):
+            if kind == "review-start":
+                raise PmError("could not acquire the PM state lock")
+            return real_append(run_dir_arg, kind, **kwargs)
+
+        with mock.patch.object(state_mod, "append_event", side_effect=_fail_on_start):
+            code, _out, err = self.run_cli_in_repo(
+                [
+                    "review", "--slice", "Slice 1", "--skill", "code-review",
+                    "--tool", "faketool", "--reviewer-command", str(fake), "--token", token,
+                ]
+            )
+
+        self.assertEqual(code, 0, f"a lost telemetry event must not fail the review: {err}")
+        reloaded = state_mod.load_state(run_dir, token)
+        # Proof the reviewer was waited for and reaped rather than abandoned.
+        self.assertEqual(reloaded["current_slice"]["reviewer_pids"], [])
+        self.assertEqual(len(reloaded["slices"][0].get("reviews") or []), 1)
+
+    def test_a_lost_terminal_event_does_not_fail_a_successful_review(self) -> None:
+        """The terminal append happens after the reviewer has produced and
+        recorded its report. Letting it raise would report a successful review
+        as a failure — telemetry failing the operation it only describes."""
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+        fake = _write_fake_reviewer(self.repo.parent / "ok2.sh", 'echo "# Report"')
+
+        real_append = state_mod.append_event
+
+        def _fail_on_terminal(run_dir_arg, kind, **kwargs):
+            if kind == "review" and "status=success" in (kwargs.get("note") or ""):
+                raise OSError("event log is read-only")
+            return real_append(run_dir_arg, kind, **kwargs)
+
+        with mock.patch.object(state_mod, "append_event", side_effect=_fail_on_terminal):
+            code, _out, err = self.run_cli_in_repo(
+                [
+                    "review", "--slice", "Slice 1", "--skill", "code-review",
+                    "--tool", "faketool", "--reviewer-command", str(fake), "--token", token,
+                ]
+            )
+
+        self.assertEqual(code, 0, f"a lost terminal event must not fail the review: {err}")
+        # The evidence that matters is recorded even though its event was lost.
+        self.assertEqual(len(state_mod.load_state(run_dir, token)["slices"][0]["reviews"]), 1)
+
+    def test_a_lost_terminal_event_does_not_mask_a_reviewer_failure(self) -> None:
+        """The mirror case: swallowing the telemetry error must not also swallow
+        the reviewer's own non-zero exit."""
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+        fake = _write_fake_reviewer(self.repo.parent / "boom2.sh", 'echo "kaboom" >&2\nexit 3')
+
+        real_append = state_mod.append_event
+
+        def _fail_on_terminal(run_dir_arg, kind, **kwargs):
+            if kind == "review":
+                raise PmError("could not acquire the PM state lock")
+            return real_append(run_dir_arg, kind, **kwargs)
+
+        with mock.patch.object(state_mod, "append_event", side_effect=_fail_on_terminal):
+            code, _out, err = self.run_cli_in_repo(
+                [
+                    "review", "--slice", "Slice 1", "--skill", "code-review",
+                    "--tool", "faketool", "--reviewer-command", str(fake), "--token", token,
+                ]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("kaboom", err, "the reviewer's own failure must still surface")
 
     def test_a_failed_commissions_prompt_survives_its_retry(self) -> None:
         """The whole point of persisting the prompt is auditing what a reviewer

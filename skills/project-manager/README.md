@@ -47,9 +47,23 @@ If a harness displays a directory-trust or permission prompt, the PM stops and l
 
 ## Optional: the poll guard (Claude Code PM seat)
 
-`hooks/pm-poll-guard.py` is an optional cost guard for a PM seat running in Claude Code. A PM session backgrounds long commands — a Developer wait, a commissioned review, a test run — and is tempted to re-read the task's output file to see whether it finished. Claude Code already re-invokes the agent when a background command exits, so those reads are redundant, but each one costs a full model round-trip that resends the entire conversation. On one measured 687-turn run, 346 turns were exactly this: roughly half the bill. The reads are harness calls, not PM commands, so the toolkit cannot see or bound them; the guard has to live in the harness.
+`hooks/pm-poll-guard.py` is an optional cost guard for a PM seat running in Claude Code. A PM session backgrounds long commands — a Developer wait, a commissioned review, a test run — and is then tempted to go looking to see whether they finished. Claude Code already re-invokes the agent when a background command exits, so the looking is redundant, but each look costs a full model round-trip that resends the entire conversation. On one measured Claude Code session of 1391 turns supervising two PM runs, about 26% of the turns were exactly this. These are harness calls, not PM commands, so the toolkit cannot see or bound them; the guard has to live in the harness.
 
-It denies only a re-read whose bytes are identical to what the previous read of that same file returned — provably no new information. The first read of a file always passes, as does any read that would return new content. Two gates keep it out of everything else: the path must match Claude Code's scratchpad task-output layout (`.../claude-<uid>/<project>/<session-uuid>/tasks/<id>.output`), and the session's working directory must contain `.pm/`. It fails open on any unexpected input or error, so it can bound spend but never strand a run.
+It denies two shapes, one per tool. Both require the session's working directory to contain `.pm/`, so nothing outside a PM run is ever affected, and it fails open on any unexpected input or error — it bounds spend, and can never strand a run.
+
+**`Read`** — a re-read whose bytes are identical to what the previous read of that same task-output file returned: provably no new information. The first read of a file always passes, as does any read returning new content; a completion notification answers "finished?", not "progressing or hung?", so one interim look is legitimate. The path must match Claude Code's scratchpad task-output layout (`.../claude-<uid>/<project>/<session-uuid>/tasks/<id>.output`), which a repository's own `tasks/` directory cannot. This branch did the heavy lifting on the measured session: 273 of 294 repeat reads.
+
+**`Bash`** — a **backgrounded** command that waits and then inspects a PM artifact. Backgrounding such a command is itself the waste: it schedules a second completion notification for a target that already has one coming, so the agent wakes twice and learns nothing the first wake would not have carried. The measured forms are hand-rolled waiters:
+
+```sh
+until [ -s .../tasks/<id>.output ]; do sleep 30; done; ...
+until grep -qi "^## Verdict" .git/pm/<run-id>/slices/slice-002/review-4-drift-audit-opencode.md; do sleep 60; done
+until [ -f .pm/runs/<run-id>/slices/slice-003/result.json ]; do sleep 60; done
+```
+
+The rule keys on the wait and the target, never on the inspector — across the 32 measured polls the inspectors were `grep` (17), `cat` (13), `head` (8), `git log` (7), `test -s` (5), `test -f` (5), `tail` (3) and `ls` (2), so an allowlist of "reading" commands would have missed most of them. Commands invoking `pm.py` are exempt: `observe --wait` and `review` are the toolkit's own legitimate waiters, and `review` launches the very reviewer it waits on.
+
+A **foreground** wait is always allowed. It blocks the turn but spawns no extra wake, and it is the right tool when no notification is genuinely coming — after a session resume, say. The deny message says so, so the escape hatch is always one edit away.
 
 Install:
 
@@ -67,12 +81,29 @@ then add to `~/.claude/settings.json` (merging with any existing `hooks` block):
       "hooks": [
         { "type": "command", "command": "python3 ~/.claude/hooks/pm-poll-guard.py", "timeout": 10 }
       ]
+    },
+    {
+      "matcher": "Bash",
+      "hooks": [
+        { "type": "command", "command": "python3 ~/.claude/hooks/pm-poll-guard.py", "timeout": 10 }
+      ]
     }
   ]
 }
 ```
 
-Use an absolute path if your harness does not expand `~`. The guard keeps a per-session digest stamp under `~/.claude/hooks/.pm-poll-guard/`; delete that directory any time. Other harnesses in the PM seat have no equivalent, and the run works without the guard — it costs more.
+Installing only the `Read` matcher is supported and still worth doing; the `Bash` matcher is what closes the hand-rolled-waiter route around it. Use an absolute path if your harness does not expand `~`. The guard keeps a per-session digest stamp under `~/.claude/hooks/.pm-poll-guard/`; delete that directory any time. Other harnesses in the PM seat have no equivalent, and the run works without the guard — it costs more.
+
+### What the toolkit does instead of guarding
+
+Two wait costs are the PM's judgement, not the hook's business, so the toolkit reports them rather than refusing them:
+
+- `observe` logs **every** call, with why it returned (`wake=result|death|hard-stop|timeout|immediate`) and how long it waited. From the second consecutive wait that returns no signal it prints a note suggesting a single longer wait, or an action. It never changes the exit code. Measured across two real runs, the wasteful pattern was `20/20/20/20` against a Developer that needed 85 minutes — every one of those waits was individually the right call, and only the length was wrong.
+- `review` emits `review-start` alongside its terminal event, paired by slice and commission sequence, so a reviewer's wait has a duration. Without it a stalled reviewer is just an unexplained gap: one measured run spent 344 minutes inside one, against 1–19 minutes for every other review in the same run.
+
+Both events are best-effort: a busy state lock or an unwritable log costs the telemetry, never the observation or the reviewer. So an unmatched `review-start` means no terminal event was recorded — not that the reviewer is still alive.
+
+Both surface in `status --report` under **Wait Discipline**.
 
 ## Layout: who owns what
 
