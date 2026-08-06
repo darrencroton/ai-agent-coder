@@ -1,54 +1,10 @@
 """Protected behaviours: the plan parser, check-plan report, and risk derivation.
 
-Pins the parser's proven behaviour plus the mechanical `plan_risk`
-derivation. Each test names one frozen scenario:
-
-- A clean plan passes check-plan with no errors; a plan with several
-  independent defects reports every one of them at once (multi-error
-  reporting), never stopping at the first.
-- Slice headings must be exactly "## Slice <N>: <name>"; any other
-  heading that merely looks like one (any level, case-insensitive, "Slice"
-  followed by space/colon/digit/EOL) is a malformed-heading error, except
-  the "Slice Batches" heading, which is a warning (PM ignores batches) at
-  any heading level, as is a "- Batch X: Slices..." bullet.
-- A slice-like heading sitting inside a fenced code block is an error
-  (the parser reads headings literally, so a fenced example could silently
-  change the slice set); an unclosed fence is itself an error, since it
-  makes heading detection ambiguous.
-- Duplicate slice numbers and missing required sections are errors.
-- The authorized surface is parsed from indented sub-bullets under
-  "Files allowed to change:"; a sibling column-0 bullet is never captured;
-  "- none."/"- none" values are filtered out, leaving an empty (and
-  therefore invalid) surface. An empty or invalid surface is an error.
-  Invalid entries (absolute, "./"-prefixed, backslash, "//", "."/".."
-  segments, unwrapped trailing-annotation whitespace) are each rejected
-  with an actionable message; a backtick-wrapped path with a trailing
-  annotation normalizes to the wrapped path and is accepted; an invalid
-  entry is never also lint-warned (it is reported once, as an error).
-- "Approval needed before implementation:" must be exactly "yes" or "no"
-  (case/whitespace/trailing-period insensitive); anything else (free text,
-  blank) is a planning defect — a check-plan error, and never approvable
-  at runtime, unlike an explicit "yes" which merely blocks until approved.
-- "Independent audit required:" arms only on an exact "yes"; absent,
-  blank, or unclear defaults off (fails closed to *off*, the opposite
-  direction from approval).
-- "Risky surfaces touched:" must be exactly "none" (or "none.") to read
-  as clear; anything else, or a missing line, reads as not-clear.
-- `plan_risk` is "elevated" iff approval is required, independent audit
-  is required, or risky surfaces are not clear (each trigger tested in
-  isolation); "standard" only when all three are clear.
-- check-plan warns (never errors) on dependency-shaped, license-shaped,
-  whole-repository, and top-level-only surface entries, and on a plain
-  entry naming an existing directory when repo context is given.
-- `verify_plan_unchanged` passes silently against an untouched plan file
-  and raises PmError naming both digests after an edit.
-- `next_slice` returns slices in plan-number order, skips any slice whose
-  state entry is "accepted" or "attested", and returns None once every
-  slice is done.
-- `eligibility` reports one reason per defect: missing sections, an empty
-  or invalid surface, an approval-required slice without a recorded
-  approval, and an unclear approval flag (which blocks even with an
-  approval recorded, since it is not an approvable condition).
+One class per contract area, each test naming the single frozen scenario it
+pins. Two conventions run throughout: check-plan reports every defect it
+finds rather than stopping at the first, and the risk flags fail in opposite
+directions on purpose — an unclear approval flag blocks, while an unclear
+`Independent audit required:` leaves the opt-in gate unarmed.
 """
 
 from __future__ import annotations
@@ -447,7 +403,7 @@ class TestNextSliceAndEligibility(PlanTestCase):
 
 
 class TestImportHygiene(unittest.TestCase):
-    """pm_lib may only import stdlib modules plus pm_lib internals (blueprint §4, §6)."""
+    """pm_lib may only import stdlib modules plus pm_lib internals."""
 
     def test_pm_lib_imports_only_stdlib_and_internal(self) -> None:
         import sys

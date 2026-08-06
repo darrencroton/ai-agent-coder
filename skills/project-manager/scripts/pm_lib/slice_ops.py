@@ -1,19 +1,17 @@
-"""Command orchestration for the slice lifecycle (target-design §3/§12).
+"""Command orchestration for the slice lifecycle.
 
-This module wires the pieces other `pm_lib` modules already provide —
-`state`, `plan`, `git_ops`, `sessions`, `profiles`, `prompts` — into the
-per-command sequences described in target-design. Most of it still decides
-nothing semantic: `init`/`status`/`approve`/`start-slice`/`observe`/`send`
-and bare `finalize` only mutate state through the token-authenticated
-`state` module, drive tmux through `sessions`, or read git/filesystem facts
-through `git_ops` — `floor.py` computes the facts, never a verdict.
+Wires the pieces other `pm_lib` modules provide — `state`, `plan`,
+`git_ops`, `sessions`, `profiles`, `prompts` — into per-command sequences.
+Most of it decides nothing semantic: `init`/`status`/`approve`/
+`start-slice`/`observe`/`send` and bare `finalize` only mutate state through
+the token-authenticated `state` module, drive tmux through `sessions`, or
+read git/filesystem facts through `git_ops`.
 
-The one place semantic judgement enters this module is `finalize_accept` /
-`finalize_steer` / `finalize_stop`: each is an explicit, recorded act the PM
-agent takes through the CLI (never inferred from evidence alone), gated by
-the floor (never waivable) and, on elevated slices, by review freshness
-(design §5). Assessment text assembles facts around the PM's own reasoning
-text; it never invents that reasoning.
+Semantic judgement enters in `finalize_accept` / `finalize_steer` /
+`finalize_stop` only: each is an explicit, recorded act the PM agent takes
+through the CLI (never inferred from evidence alone), gated by the floor
+(never waivable) and, on elevated slices, by review freshness. Assessment
+text assembles facts around the PM's own reasoning; it never invents it.
 """
 
 from __future__ import annotations
@@ -23,11 +21,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -46,21 +44,29 @@ _SLICE_ID_RE = re.compile(r"^Slice\s+(?P<number>\d+)$")
 _OBSERVE_POLL_SECONDS = 2.0
 _OBSERVE_TAIL_LINES = 40
 
-# Controller-owned notes.md tripwire (target-design §10): a hard cap kept as
-# a non-fatal warning, since a runaway notes file silently degrades every
-# later Developer prompt.
+# Controller-owned notes.md tripwire: a hard cap kept as a non-fatal warning,
+# since a runaway notes file silently degrades every later Developer prompt.
 _NOTES_SIZE_CAP_BYTES = 512 * 1024
 # Branches a run must never land on by *implicit* default (an explicit
-# --branch main is still honoured); per-slice commits piling onto a shared
-# default branch is the PM Test 20 branch-default footgun.
+# --branch main is still honoured): per-slice commits piling onto a shared
+# default branch.
 _PROTECTED_DEFAULT_BRANCHES = frozenset({"main", "master"})
 
 # The stop_reason recorded on attempt-budget exhaustion. Load-bearing: the
 # exhaustion guard below matches on it, which is what makes the budget a
-# genuine terminal stop (design §11 "mandatory stop") rather than a status
-# note — after exhaustion, only `finalize --stop` (record the story) and
-# `stop` remain available for the slice.
+# genuine terminal stop rather than a status note — after exhaustion, only
+# `finalize --stop` (record the story) and `stop` remain available.
 _BUDGET_EXHAUSTED_REASON = "attempt budget exhausted"
+
+
+def _notes_cap_warning(size: int) -> str | None:
+    """The non-fatal over-cap warning for a notes.md of `size` bytes, or None."""
+    if size <= _NOTES_SIZE_CAP_BYTES:
+        return None
+    return (
+        f"notes.md is {size} bytes, over the {_NOTES_SIZE_CAP_BYTES}-byte (512 KiB) cap; "
+        "a runaway notes file silently degrades every later Developer prompt — curate it down"
+    )
 
 
 def _refuse_if_budget_exhausted(state: dict[str, Any]) -> None:
@@ -101,8 +107,13 @@ def slice_number(slice_id: str) -> int:
     return int(match.group("number"))
 
 
+def slice_relative_dir(slice_id: str) -> str:
+    """The `slices/slice-NNN` path segment shared by artifact dirs and mirrors."""
+    return f"slices/slice-{slice_number(slice_id):03d}"
+
+
 def slice_artifact_dir(repo: Path, run_id: str, slice_id: str) -> Path:
-    return run_artifact_dir(repo, run_id) / "slices" / f"slice-{slice_number(slice_id):03d}"
+    return run_artifact_dir(repo, run_id) / slice_relative_dir(slice_id)
 
 
 def write_pm_gitignore(repo: Path) -> None:
@@ -114,13 +125,13 @@ def write_pm_gitignore(repo: Path) -> None:
     gitignore.write_text("*\n", encoding="utf-8")
 
 
-# --- Controller-owned originals + mirrors (target-design §8 item 3, §9) ------
+# --- Controller-owned originals + mirrors -------------------------------------
 #
 # PM-authored artifacts (notes.md, model-performance.md, run-report.md,
-# assessment.md, review reports) have their AUTHORITATIVE ORIGINAL under the run's state dir
-# (outside the worktree, alongside run.json) and are MIRRORED into `.pm/`
-# for human reading. Nothing is ever read back from the mirror for control
-# decisions — only these write helpers touch the mirror side.
+# assessment.md, review reports) have their AUTHORITATIVE ORIGINAL under the
+# run's state dir (outside the worktree, alongside run.json) and are MIRRORED
+# into `.pm/` for human reading. Nothing is ever read back from the mirror for
+# control decisions — only these write helpers touch the mirror side.
 
 
 def notes_original_path(run_dir: Path) -> Path:
@@ -128,7 +139,7 @@ def notes_original_path(run_dir: Path) -> Path:
 
 
 def slice_state_dir(run_dir: Path, slice_id: str) -> Path:
-    return run_dir / "slices" / f"slice-{slice_number(slice_id):03d}"
+    return run_dir / slice_relative_dir(slice_id)
 
 
 def mirror_artifact(repo: Path, run_dir: Path, run_id: str, relative_path: str) -> Path:
@@ -158,11 +169,10 @@ def write_notes(repo: Path, run_dir: Path, run_id: str, *, text: str, mode: str)
 
     This is the only sanctioned writer of `notes.md`. The `.pm/` mirror is
     regenerate-only, so a direct hand-edit to it is silently clobbered by the
-    next `start-slice` re-mirror (PM Test 20 secondary finding); routing every
-    notes update through here removes that footgun. `mode` is "append" (add
-    `text` as a new trailing block, separated by a blank line) or "set"
-    (replace the whole file). Returns the original path and an optional
-    over-cap warning.
+    next `start-slice` re-mirror; routing every notes update through here
+    removes that footgun. `mode` is "append" (add `text` as a new trailing
+    block, separated by a blank line) or "set" (replace the whole file).
+    Returns the original path and an optional over-cap warning.
     """
     if not text.strip():
         raise PmError("notes text must be non-empty (nothing to append or set)")
@@ -180,14 +190,7 @@ def write_notes(repo: Path, run_dir: Path, run_id: str, *, text: str, mode: str)
     else:
         raise PmError(f"unknown notes mode: {mode!r}")
     write_controller_artifact(repo, run_dir, run_id, "notes.md", content)
-    size = original.stat().st_size
-    warning: str | None = None
-    if size > _NOTES_SIZE_CAP_BYTES:
-        warning = (
-            f"notes.md is {size} bytes, over the {_NOTES_SIZE_CAP_BYTES}-byte (512 KiB) cap; "
-            "a runaway notes file silently degrades every later Developer prompt — curate it down"
-        )
-    return original, warning
+    return original, _notes_cap_warning(original.stat().st_size)
 
 
 def write_model_performance(repo: Path, run_dir: Path, run_id: str, *, text: str) -> Path:
@@ -243,11 +246,7 @@ def slice_entry(state: dict[str, Any], slice_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-# --- Risk ratchet (target-design §4) ------------------------------------------
+# --- Risk ratchet -------------------------------------------------------------
 
 
 def apply_risk_ratchet(entry: dict[str, Any], current: dict[str, Any] | None, *, risk_flag: str | None) -> bool:
@@ -306,7 +305,7 @@ def init_run(
     stopped on errors (this function assumes the plan is clean); it does
     not re-check the plan.
     """
-    if not _tmux_present():
+    if not _executable_exists("tmux"):
         raise PmError("tmux is required to run PM; install it before running init")
 
     if harness_command is None and harness not in profiles.SUPPORTED_HARNESSES:
@@ -379,15 +378,7 @@ def init_run(
     return InitResult(run_id=state["run_id"], run_dir=run_dir, token=token, state=state, slices=slices, branch=resolved_branch)
 
 
-def _tmux_present() -> bool:
-    import shutil
-
-    return shutil.which("tmux") is not None
-
-
 def _executable_exists(executable: str) -> bool:
-    import shutil
-
     return shutil.which(executable) is not None
 
 
@@ -487,7 +478,7 @@ def approve(repo: Path, run_dir: Path, token: str, *, slice_id: str, reason: str
             "is a planning defect that approval cannot clear"
         )
     approvals = dict(state.get("approvals") or {})
-    approvals[slice_id] = {"at": _utc_now_iso(), "reason": reason}
+    approvals[slice_id] = {"at": state_mod.utc_now_iso(), "reason": reason}
     state["approvals"] = approvals
     state_mod.save_state(run_dir, state, token)
     state_mod.append_event(run_dir, "approve", slice_id=slice_id, note=reason)
@@ -558,9 +549,9 @@ def start_slice(
     if not relaunch:
         plan_slice = plan_mod.next_slice(slices, state)
         if plan_slice is None:
-            # Design §3.4 (Finish): the run ends honestly with a final state
-            # write and report regeneration — an all-attested run reaches
-            # completion here rather than idling as "active" forever.
+            # The run ends with a final state write and report regeneration,
+            # so an all-attested run reaches completion here rather than
+            # idling as "active" forever.
             if state.get("status") != "complete":
                 state["status"] = "complete"
                 state["stop_reason"] = None
@@ -604,9 +595,9 @@ def start_slice(
     if relaunch:
         attempts = int(entry.get("attempts", 0)) + 1
         if attempts > max_attempts:
-            # Exhaustion is a mandatory stop (design §11): kill the live
-            # session so nothing keeps working past the budget; the slice
-            # stays current so finalize --stop can record the full story.
+            # Exhaustion is a mandatory stop: kill the live session so
+            # nothing keeps working past the budget; the slice stays current
+            # so finalize --stop can record the full story.
             session = current.get("tmux_session") if current else None
             if session:
                 sessions.force_stop(session)
@@ -647,13 +638,7 @@ def start_slice(
     if not original_notes.exists():
         original_notes.parent.mkdir(parents=True, exist_ok=True)
         original_notes.write_text("", encoding="utf-8")
-    notes_size = original_notes.stat().st_size
-    notes_warning: str | None = None
-    if notes_size > _NOTES_SIZE_CAP_BYTES:
-        notes_warning = (
-            f"notes.md is {notes_size} bytes, over the {_NOTES_SIZE_CAP_BYTES}-byte (512 KiB) cap; "
-            "a runaway notes file silently degrades every later Developer prompt — curate it down"
-        )
+    notes_warning = _notes_cap_warning(original_notes.stat().st_size)
     slice_notes_path = notes_path(repo, run_id)
     slice_notes_path.parent.mkdir(parents=True, exist_ok=True)
     slice_notes_path.write_bytes(original_notes.read_bytes())
@@ -730,7 +715,7 @@ def start_slice(
     # `new_current` below discards the outgoing slice's recorded pgids.
     _reap_reviewers(current if relaunch else None)
 
-    now = _utc_now_iso()
+    now = state_mod.utc_now_iso()
     new_current: dict[str, Any] = {
         "id": plan_slice.slice_id,
         "artifact_dir": str(artifact_dir),
@@ -745,8 +730,8 @@ def start_slice(
     }
     launch_overrides: dict[str, Any] = {key: value for key, value in (("model", model), ("effort", effort)) if value}
     if reviewer_tools:
-        # Recorded per slice (design §8); review._resolve_tool prefers it
-        # over the run-level reviewer configuration.
+        # review._resolve_tool prefers this per-slice record over the
+        # run-level reviewer configuration.
         launch_overrides["reviewer_tools"] = list(profiles.parse_reviewer_tools(reviewer_tools))
     if launch_overrides:
         new_current["launch"] = launch_overrides
@@ -820,8 +805,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     # Wait exits early ONLY on a meaningful signal — session death, result.json
     # appearing, or a hard-stop marker in the fresh capture — never on a mere
     # pane byte-change, which `detect_activity`'s "active" flags on any TUI
-    # spinner/stream churn and would otherwise defeat the wait almost
-    # immediately (target-design §12, Amended post-implementation).
+    # spinner/stream churn and would otherwise defeat the wait almost immediately.
     while deadline is not None and time.monotonic() < deadline:
         if (
             not activity["running"]
@@ -867,18 +851,15 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
             f"elapsed={elapsed_seconds:.1f}s"
         )
         evidence = str(pane_live_path) if pane_changed else None
-        if changed:
+        try:
             state_mod.append_event(run_dir, "observe", slice_id=current.get("id"), note=note, evidence=evidence)
-        else:
-            # Best-effort only: a stable no-signal wait otherwise leaves no
-            # trace in events.jsonl, but that trace is nice-to-have, and this
-            # fires on the busiest path (every long stable wait) — it must
-            # never turn a completed wait into a failed observe over lock
-            # contention or a write error.
-            try:
-                state_mod.append_event(run_dir, "observe", slice_id=current.get("id"), note=note, evidence=evidence)
-            except Exception:  # noqa: BLE001 - a no-signal trace must never cost the observation
-                pass
+        except Exception:  # noqa: BLE001 - a no-signal trace must never cost the observation
+            # The append is mandatory for a real change and best-effort for a
+            # stable no-signal wait: that trace is nice-to-have, and it fires
+            # on the busiest path, so lock contention or a write error must
+            # never turn a completed wait into a failed observe.
+            if changed:
+                raise
 
     return ObserveOutcome(
         has_current_slice=True,
@@ -910,12 +891,11 @@ def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> No
 
 # --- finalize -------------------------------------------------------------
 #
-# Bare `finalize` (this section's first function) keeps the Stage 3
-# floor-and-collect behaviour. The three decision paths below —
+# Bare `finalize` (this section's first function) runs the floor and collects
+# evidence; it decides nothing. The three decision paths below —
 # `finalize_accept` / `finalize_steer` / `finalize_stop` — are where
-# acceptance first exists in this toolkit (target-design §3.3/§5): the
-# floor is mechanical and non-waivable, but accept/steer/stop are PM's own
-# recorded acts, never inferred from evidence alone.
+# acceptance lives: the floor is mechanical and non-waivable, but
+# accept/steer/stop are PM's own recorded acts, never inferred from evidence.
 
 
 @dataclass
@@ -934,6 +914,13 @@ class FinalizeOutcome:
 
 _ACCEPT_REASONING_MIN_CHARS = 40
 _REQUIRED_ELEVATED_REVIEW_SKILLS = ("code-review", "drift-audit")
+
+
+def _floor_note(report: FloorReport) -> str:
+    """The one-line floor summary recorded on every `floor` event."""
+    if report.passed:
+        return "8/8 passed"
+    return "failed: " + ", ".join(fact.name for fact in report.facts if not fact.passed)
 
 
 def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[str, Any]) -> tuple[FloorReport, Path]:
@@ -975,10 +962,9 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
 
-    note = "8/8 passed" if report.passed else "failed: " + ", ".join(
-        fact.name for fact in report.facts if not fact.passed
+    state_mod.append_event(
+        run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir)
     )
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=note, evidence=str(artifact_dir))
     # updated_at bump (and, when --risk was given, the ratchet) only — no
     # other semantic field changes in bare finalize.
     state_mod.save_state(run_dir, state, token)
@@ -1000,7 +986,8 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
 # --- finalize decision paths: assessment rendering helpers --------------------
 
 
-def _sha256_file(path: Path) -> str:
+def sha256_file(path: Path) -> str:
+    """The digest recorded with, and re-checked against, every review artifact."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -1013,7 +1000,7 @@ def is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
     artifact = review.get("artifact")
     if not artifact or not Path(artifact).is_file():
         return False
-    return review.get("sha256") == _sha256_file(Path(artifact))
+    return review.get("sha256") == sha256_file(Path(artifact))
 
 
 def _fresh_reviews_for_head(reviews: list[dict[str, Any]], head: str | None) -> dict[str, dict[str, Any]]:
@@ -1067,7 +1054,7 @@ def _render_assessment(
         f"# Assessment: {entry.get('id')} - {entry.get('title')}",
         "",
         f"Decision: {decision}",
-        f"Timestamp: {_utc_now_iso()}",
+        f"Timestamp: {state_mod.utc_now_iso()}",
         f"Commit: {head}",
         "",
         "## Floor",
@@ -1110,12 +1097,12 @@ class AcceptOutcome:
 
 
 def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, risk: str | None = None) -> AcceptOutcome:
-    """`finalize --accept "reasoning"` (target-design §3.3/§5/§8 item 3).
+    """`finalize --accept "reasoning"`.
 
     The floor is re-run in full and is never waivable. On a passing floor,
     an elevated slice additionally requires both a drift-audit and a
-    code-review entry recorded fresh against the current HEAD (design §5's
-    review-freshness rule) before acceptance is recorded.
+    code-review entry recorded fresh against the current HEAD before
+    acceptance is recorded.
     """
     stripped_reasoning = reasoning.strip()
     if len(stripped_reasoning) < _ACCEPT_REASONING_MIN_CHARS:
@@ -1138,10 +1125,9 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=stripped_reasoning.splitlines()[0][:120])
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    floor_note = "8/8 passed" if report.passed else "failed: " + ", ".join(
-        fact.name for fact in report.facts if not fact.passed
+    state_mod.append_event(
+        run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir)
     )
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=floor_note, evidence=str(artifact_dir))
 
     if not report.passed:
         state_mod.save_state(run_dir, state, token)
@@ -1174,7 +1160,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         entry, report, reasoning=stripped_reasoning, decision="ACCEPTED", head=head,
         reviews_text=reviews_text, attempts_summary=attempts_summary,
     )
-    assessment_relative = f"slices/slice-{slice_number(slice_id):03d}/assessment.md"
+    assessment_relative = f"{slice_relative_dir(slice_id)}/assessment.md"
     assessment_original = write_controller_artifact(repo, run_dir, state["run_id"], assessment_relative, assessment_text)
 
     first_line = stripped_reasoning.splitlines()[0][:120]
@@ -1190,9 +1176,8 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     if session:
         sessions.force_stop(session)
 
-    # Accepting the final undecided slice finishes the run (design §3.4):
-    # the state write below is the final one and the report regeneration is
-    # the closing act.
+    # Accepting the final undecided slice finishes the run: the state write
+    # below is the final one and the report regeneration is the closing act.
     slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
     run_complete = plan_mod.next_slice(slices, state) is None
     if run_complete:
@@ -1273,7 +1258,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # as a relaunch does (start_slice), so a steered session can never be
     # mistaken for complete on the pre-steer result.json — observe --wait,
     # which breaks the instant result.json exists, would otherwise return
-    # immediately on stale evidence (target-design §9; Stage 7 Test 21).
+    # immediately on stale evidence.
     # This must stay BEFORE the send below: rotating after delivery would
     # race the live session, which may write its fresh post-steer result
     # before we rotate — archiving the NEW result instead of the stale one.
@@ -1354,10 +1339,9 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    floor_note = "8/8 passed" if report.passed else "failed: " + ", ".join(
-        fact.name for fact in report.facts if not fact.passed
+    state_mod.append_event(
+        run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir)
     )
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=floor_note, evidence=str(artifact_dir))
 
     head = git_ops.git_head(repo)
     reviews = list(entry.get("reviews") or [])
@@ -1367,7 +1351,7 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
         entry, report, reasoning=stripped_reason, decision="STOPPED", head=head,
         reviews_text=reviews_text, attempts_summary=attempts_summary,
     )
-    assessment_relative = f"slices/slice-{slice_number(slice_id):03d}/assessment.md"
+    assessment_relative = f"{slice_relative_dir(slice_id)}/assessment.md"
     assessment_original = write_controller_artifact(repo, run_dir, state["run_id"], assessment_relative, assessment_text)
 
     first_line = stripped_reason.splitlines()[0][:120] if stripped_reason else ""
@@ -1443,14 +1427,12 @@ def stop(
         artifact_dir.mkdir(parents=True, exist_ok=True)
         (artifact_dir / "pane.txt").write_text(pane_text, encoding="utf-8")
 
-    # Reap any recorded reviewer process groups (a hung `review` subprocess)
-    # — ESRCH/EPERM tolerated. Applies whenever state is readable, including
-    # the --scavenge-with-readable-state path (cli.py already routes that
-    # through this same function).
+    # Applies whenever state is readable, including the
+    # --scavenge-with-readable-state path (cli.py routes that through here).
+    # Guarded on a recorded pgid so a `current_slice` that never carried the
+    # key is left exactly as found, rather than gaining an empty one here.
     if current and current.get("reviewer_pids"):
-        for pgid in list(current["reviewer_pids"]):
-            _kill_reviewer_pgid(pgid)
-        current["reviewer_pids"] = []
+        _reap_reviewers(current)
 
     killed: list[str] = []
     for name in sessions.sessions_for_run(run_id):

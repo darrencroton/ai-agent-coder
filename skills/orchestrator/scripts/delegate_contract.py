@@ -617,10 +617,10 @@ def compile_skill_bundle(skill_name: str) -> str:
         rendered.append(f"BEGIN EMBEDDED SKILL FILE: {path}\n{text.rstrip()}\nEND EMBEDDED SKILL FILE: {path}")
         for match in link_re.finditer(text):
             target = match.group("target").split("#", 1)[0].strip()
-            if not target or "://" in target or target.startswith("#"):
+            if not target or "://" in target:
                 continue
             candidate = (path.parent / target).resolve()
-            if candidate.suffix.lower() == ".md" or candidate.name == "SKILL.md":
+            if candidate.suffix.lower() == ".md":
                 pending.append(candidate)
     return "\n\n".join(rendered)
 

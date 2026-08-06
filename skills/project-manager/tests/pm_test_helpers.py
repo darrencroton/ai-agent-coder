@@ -83,16 +83,7 @@ def _kill_test_tmux_server() -> None:
     except OSError:
         pass
 
-# Stage 3 additions -----------------------------------------------------------
-#
-# Most Stage 3 commands (status/approve/start-slice/observe/send/finalize/
-# stop) resolve their repo from the controller's cwd, not a --repo flag
-# (only init/check-plan take one) — `run_cli_in_repo` runs a CLI call with
-# cwd temporarily set to the test repo. `write_fake_harness` builds a tiny
-# `sh` script standing in for a coding CLI in tmux-gated slice_ops tests
-# (the retained fake-harness pattern, replacement-ledger §9.1/§9.3).
-# `parse_init_output` extracts the run id and one-time-printed token from
-# `init`'s stdout so later commands in the same test can use them.
+# --- CLI-driving helpers -----------------------------------------------------
 
 _RUN_ID_RE = re.compile(r"^run id:\s*(?P<run_id>\S+)", re.MULTILINE)
 _TOKEN_RE = re.compile(r"^PM_RUN_TOKEN=(?P<token>\S+)$", re.MULTILINE)
@@ -358,9 +349,9 @@ class PlanTestCase(unittest.TestCase):
 
     def run_cli_in_repo(self, argv: list[str]) -> tuple[int, str, str]:
         """Like `run_cli`, but with cwd set to `self.repo` for the call's
-        duration. Stage 3's non-init commands resolve their repo from the
-        controller's cwd (`git_ops.resolve_repo(Path.cwd())`), matching an
-        operator running `pm` from inside the working tree."""
+        duration. Every command except init/check-plan resolves its repo
+        from the controller's cwd (`git_ops.resolve_repo(Path.cwd())`),
+        matching an operator running `pm` from inside the working tree."""
         previous = os.getcwd()
         os.chdir(self.repo)
         try:
@@ -392,6 +383,14 @@ class PmTestCase(PlanTestCase):
             text=True,
             capture_output=True,
         )
+
+    def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(interval)
+        return predicate()
 
     def make_run(
         self,
@@ -448,7 +447,7 @@ class PmTestCase(PlanTestCase):
         artifact_dir: Path | None = None,
         **overrides,
     ) -> dict:
-        """Set `state['current_slice']` (Stage 2 floor tests) and persist it.
+        """Set `state['current_slice']` and persist it.
 
         `overrides` lets a test add extra current_slice fields (e.g.
         `attempts`); `before_head` and `artifact_dir` cover the fields the
@@ -468,7 +467,7 @@ class PmTestCase(PlanTestCase):
     def record_approval(
         self, state: dict, token: str, run_dir: Path, *, slice_id: str, reason: str = "approved for test"
     ) -> dict:
-        """Record a human approval for `slice_id` (Stage 2 floor tests) and persist it."""
+        """Record a human approval for `slice_id` and persist it."""
         updated = dict(state)
         approvals = dict(updated.get("approvals") or {})
         approvals[slice_id] = {"at": "2026-01-01T00:00:00Z", "reason": reason}
@@ -507,14 +506,6 @@ class TmuxRunTestCase(PmTestCase):
         if session:
             self._sessions_to_reap.append(session)
         return session
-
-    def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return True
-            time.sleep(interval)
-        return predicate()
 
     def _wait_for_result(self, run_id: str, token: str, *, timeout: float = 15.0) -> bool:
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)

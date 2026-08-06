@@ -1,38 +1,14 @@
 """Protected behaviours: tmux session lifecycle and the hard-stop marker floor.
 
 `scan_hard_stop`, `session_name`, and the env-token assertion run without
-tmux. Everything that actually drives a tmux pane is gated with
+tmux. Everything that drives a real pane is gated with
 `@unittest.skipUnless(shutil.which("tmux"), ...)` and drives a tiny fake
-harness shell script — no real coding CLI.
+harness shell script — no real coding CLI is ever launched.
 
-Pins:
-
-- `scan_hard_stop`: at least one positive fixture per marker class — trust_prompt
-  (every directory-trust string, plus qwen's dialog pinned verbatim),
-  approval_prompt, credential_prompt,
-  permission_prompt, external_side_effect_request (a "push to remote …?"
-  shape), and usage_limit_hard_stop (weekly, monthly, account/billing,
-  and the generic reached/exceeded/exhausted phrasing) — plus the negative
-  fixtures (an informational sub-100% usage warning, a conditional "if you
-  hit your limit" phrasing, a marker embedded in an unrelated word) and a
-  prompt wrapped across terminal lines that still matches after whitespace
-  normalization.
-- `session_name` always starts with `pm-<run_id>` in the frozen
-  `pm-<run_id>-s<NN>a<N>` shape, and `sessions_for_run` recovers exactly
-  that run's sessions — never a run whose id merely extends it (`X` vs
-  `X-2`), which a string-prefix sweep could not distinguish.
-- `start_session` refuses (PmError) when the caller's env dict contains
-  `PM_RUN_TOKEN` — the Developer session must never receive the run
-  capability token.
-- (tmux-gated) A fresh session launch, readiness (stable-pane path),
-  `send_prompt` injection landing in the pane, `send_line` refusing to send
-  into a visible credential prompt, `capture_to` writing pane text,
-  `detect_activity` flagging a pane change, `force_stop` killing a session,
-  `sessions_for_run` finding a run's sessions, and `wait_until_ready`
-  raising when the session exits before becoming ready.
-- `send_prompt` and `send_line` both refuse a newline: no injection path sends
-  more than one line into a pane, so multi-line content can only reach a
-  session as a file the pointer names. Neither bounds a single line's length.
+`scan_hard_stop` carries both positive fixtures (one per marker class) and
+the negative ones that stop it over-firing: an informational sub-100% usage
+warning, a conditional "if you hit your limit", and a marker embedded in an
+unrelated word.
 """
 
 from __future__ import annotations

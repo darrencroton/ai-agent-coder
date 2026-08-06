@@ -1,46 +1,30 @@
 """The mechanical floor: eight non-waivable facts.
 
-One function surface, no decisions. Every fact here computes a true/false
+One function surface, no decisions. `evaluate_floor` runs the eight
+`_fact_*` functions below, in order, and each computes a true/false
 condition from git, the filesystem, run state, and a pane-text string handed
 in by the caller — never a model call, never prose semantics, never a tmux
 shell-out (that boundary belongs to `sessions.py`; this module only imports
-its pure `scan_hard_stop` text parser for fact 8). A fact that cannot be
-established (a missing file, a git command that fails) is `passed=False`
-with the reason in `detail` — this module never raises on ordinary
-git/filesystem absence or failure, and it never writes state, contacts a
-session, or renders an accept/reject verdict. That judgement belongs to the
-PM agent, above this floor, in a later stage.
+its pure `scan_hard_stop` text parser for fact 8).
 
-The eight facts are:
+A fact that cannot be established (a missing file, a git command that fails)
+is `passed=False` with the reason in `detail`: this module never raises on
+ordinary git/filesystem absence or failure, and it never writes state,
+contacts a session, or renders an accept/reject verdict. That judgement is
+the PM agent's, above this floor.
 
-1. plan-digest: the plan file's current sha256 matches the run's frozen
-   `plan.sha256`. A missing or unreadable plan file fails the fact.
-2. identity-branch: `resolve_repo(repo)` matches the run's recorded repo,
-   and the current branch matches the run's recorded branch. Detached or
-   unborn HEAD fails (current_branch returns None).
-3. approval: the slice's plan-parsed `approval_needed` is `False` (passes
-   unconditionally), or `True` with a recorded human approval for the slice
-   id in `state.approvals` (passes), or `True` without one (fails). An
-   unclear flag (`None`) always fails, even with a recorded approval —
-   an unclear risk flag is a planning defect, not an approval question.
-4. result: `<artifact_dir>/result.json` exists, parses as JSON, is a JSON
-   object, and its `"slice"` field equals the slice id being evaluated.
-5. surface: changed files (`before_head`..HEAD, unioned with the dirty
-   working tree — `git_ops.changed_files_between`) are a subset of the
-   slice's authorized surface. `before_head` comes from
-   `state.current_slice.before_head`.
-6. commit-ancestry: when `state.policy.commit_required` is true — a HEAD
-   commit exists, it differs from `before_head`, it descends from
-   `before_head`, and it equals the tip of the run's recorded branch
-   (`refs/heads/<state.branch>`). A commit that lands on a different branch
-   which still descends from `before_head` fails this fact even though
-   fact 2's branch check may also fail independently. When
-   `commit_required` is false, the fact passes unconditionally with a
-   detail noting no commit is required.
-7. clean-worktree: no meaningful `git status` lines outside `.pm/`
-   (`git_ops.meaningful_status_lines` already excludes it).
-8. hard-stop-scan: `sessions.scan_hard_stop(pane_text)` reports no marker
-   present. Empty pane text passes (nothing visible to flag).
+The eight facts, in evaluation order — each `_fact_*` function below carries
+the exact pass/fail wording in its `detail` strings:
+
+1. plan-digest — the plan file still hashes to the run's frozen digest.
+2. identity-branch — repo path and current branch match the run's record.
+3. approval — an approval-flagged slice has a recorded human approval.
+4. result — result.json exists, parses, and names this slice.
+5. surface — changed files are a subset of the frozen authorized surface.
+6. commit-ancestry — a commit exists, descends from before_head, and is the
+   recorded branch's tip.
+7. clean-worktree — nothing dirty outside `.pm/`.
+8. hard-stop-scan — no credential/trust/approval/billing marker in the pane.
 """
 
 from __future__ import annotations
@@ -131,6 +115,8 @@ def _fact_identity_branch(repo: Path, state: dict[str, Any]) -> FloorFact:
 
 
 def _fact_approval(state: dict[str, Any], plan_slice: PlanSlice | None, slice_id: str) -> FloorFact:
+    """An unclear flag is checked before the recorded approval and always
+    fails: it is a planning defect, not an approval question."""
     evidence: dict[str, Any] = {"slice": slice_id}
     if plan_slice is None:
         return FloorFact(3, "approval", False, f"{slice_id} was not found in the parsed plan", evidence)

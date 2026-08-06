@@ -1,12 +1,9 @@
 """The `review` command: commissioning an independent review of a pinned diff.
 
-`review.py` shares the five-tool roster with the Developer
-launch path conceptually, but not its code: reviews run one-shot/exec where
-the tool supports it (never the Developer's interactive tmux TUI path), so
-this module composes its own command table — re-specified fresh from
-`skills/orchestrator/scripts/delegate_contract.py`'s `compose_delegate_command`
-as behavioural evidence only. This module shares no code with
-`skills/orchestrator/` and never imports from it.
+This module shares the five-tool roster with the Developer launch path but
+not its code: reviews run one-shot/exec where the tool supports it, never the
+Developer's interactive tmux TUI path, so the command table below is its own.
+It shares no code with `skills/orchestrator/` and never imports from it.
 
 The Reviewer is read-only by instruction and holds no acceptance authority;
 PM reads the report and records the decision itself, in
@@ -18,13 +15,11 @@ cannot race the reviewer.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shlex
 import signal
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +32,6 @@ from . import slice_ops
 from . import state as state_mod
 
 _STDERR_TAIL_CHARS = 4000
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # --- one-shot reviewer command composition (this module's own table) ---------
@@ -143,8 +134,7 @@ def _resolve_tool(state: dict[str, Any], tool_arg: str | None, *, has_override: 
     if tool_arg:
         return tool_arg
     # A per-slice override recorded by `start-slice --reviewer-tools` wins
-    # over the run-level reviewer configuration (target-design §8: per-slice
-    # overrides live in the slice's launch record).
+    # over the run-level reviewer configuration.
     current = state.get("current_slice") or {}
     launch = current.get("launch") or {}
     slice_tools = launch.get("reviewer_tools") or []
@@ -315,10 +305,9 @@ def run_review(
         raise PmError(f"HEAD has not advanced past before_head ({before_head}); nothing to review")
 
     # The reviewer reads the live checkout, so the tree must actually BE the
-    # pinned committed state when the review starts (target-design §10:
-    # review input is pinned, not live; PM quiesces the Developer first). A
-    # dirty tree means the reviewer would judge uncommitted work the range
-    # does not cover — refuse rather than silently review the wrong tree.
+    # pinned committed state when the review starts. A dirty tree means the
+    # reviewer would judge uncommitted work the range does not cover — refuse
+    # rather than silently review the wrong tree.
     dirty = git_ops.meaningful_status_lines(git_ops.git_status_text(repo))
     if dirty:
         raise PmError(
@@ -398,7 +387,7 @@ def run_review(
         reviewer_command_override=reviewer_command,
     )
 
-    report_relative = f"slices/slice-{slice_ops.slice_number(slice_id):03d}/review-{seq}-{skill}-{resolved_tool}.md"
+    report_relative = f"{slice_ops.slice_relative_dir(slice_id)}/review-{seq}-{skill}-{resolved_tool}.md"
     report_original = run_dir / report_relative
     report_original.parent.mkdir(parents=True, exist_ok=True)
 
@@ -411,8 +400,8 @@ def run_review(
     slice_ops.write_controller_artifact(repo, run_dir, run_id, prompt_relative, prompt_text)
 
     # The reviewer process must not inherit the PM run capability token from
-    # the controller's exported environment (target-design §8: the token is
-    # the controller's alone; SKILL.md forbids it in any Reviewer session).
+    # the controller's exported environment: the token is the controller's
+    # alone, and SKILL.md forbids it in any Reviewer session.
     reviewer_env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
 
     with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:
@@ -433,7 +422,7 @@ def run_review(
                 live_current["reviewer_pids"] = [*(live_current.get("reviewer_pids") or []), pgid]
         # Printed before the (possibly long) wait begins — a slow-but-alive
         # local reviewer and a hung one are otherwise indistinguishable from
-        # the PM seat (target-design §12, Amended post-implementation).
+        # the PM seat.
         print(
             f"reviewer launched: pgid={pgid} report={report_original} stderr={stderr_path}",
             flush=True,
@@ -492,7 +481,7 @@ def run_review(
         raise PmError(f"reviewer command failed (exit {returncode}): {stderr_tail}")
 
     report_original = slice_ops.mirror_artifact(repo, run_dir, run_id, report_relative)
-    sha256 = _sha256_report(report_original)
+    sha256 = slice_ops.sha256_file(report_original)
 
     # Locked: preserve reviews completed concurrently.
     with state_mod.locked_update(run_dir, token) as state:
@@ -508,7 +497,7 @@ def run_review(
                     "before_head": before_head,
                     "artifact": str(report_original),
                     "sha256": sha256,
-                    "at": _utc_now_iso(),
+                    "at": state_mod.utc_now_iso(),
                 },
             ]
     state_mod.append_event(
@@ -527,7 +516,3 @@ def run_review(
         artifact_path=report_original,
         sha256=sha256,
     )
-
-
-def _sha256_report(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()

@@ -1,4 +1,4 @@
-"""Lite-1 single-copy authenticated state (target-design §8).
+"""Lite-1 single-copy authenticated state.
 
 Authoritative state lives at ``<worktree_git_dir>/pm/<run-id>/`` — outside
 the worktree, so a Developer session editing tracked files cannot touch it
@@ -35,7 +35,8 @@ _LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.05
 
 
-def _utc_now_iso() -> str:
+def utc_now_iso() -> str:
+    """The single UTC timestamp format every PM record uses."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -189,7 +190,7 @@ def create_run(
         raise PmError(f"PM run directory already exists: {run_dir}")
 
     token = mint_token()
-    now = _utc_now_iso()
+    now = utc_now_iso()
     state: dict[str, Any] = {
         "schema": SCHEMA,
         "run_id": run_id,
@@ -243,7 +244,7 @@ def _state_payload(state: dict[str, Any], token: str) -> bytes:
     if token_sha256(token) != state.get("auth", {}).get("token_sha256"):
         raise PmError("run capability token does not match this run's state")
     state = dict(state)
-    state["updated_at"] = _utc_now_iso()
+    state["updated_at"] = utc_now_iso()
     _validate_shape(state)
     return (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
@@ -362,7 +363,7 @@ def _append_event_unlocked(
     run_dir: Path, kind: str, *, slice_id: str | None = None, note: str = "", evidence: str | None = None
 ) -> None:
     """Append one event without acquiring the state lock."""
-    event: dict[str, Any] = {"ts": _utc_now_iso(), "kind": kind, "slice": slice_id, "note": note}
+    event: dict[str, Any] = {"ts": utc_now_iso(), "kind": kind, "slice": slice_id, "note": note}
     if evidence is not None:
         event["evidence"] = evidence
     with open(run_dir / "events.jsonl", "a", encoding="utf-8") as handle:
@@ -497,7 +498,7 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     Reads only `state`, `events`, and each PM-authored ORIGINAL under
     `run_dir` (per-slice `assessment.md`, the run's `model-performance.md`)
     — never from the `.pm/` mirror. This is what makes the report regenerate
-    correctly with `.pm/` deleted entirely (target-design §9): the caller
+    correctly with `.pm/` deleted entirely: the caller
     (`slice_ops.regenerate_report`) writes this text to the original and
     mirrors it, but nothing in this function itself touches `.pm/`.
     """

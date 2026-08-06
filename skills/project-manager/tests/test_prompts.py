@@ -1,35 +1,10 @@
-"""Protected behaviours: Developer prompt template loading and rendering.
+"""Protected behaviours: Developer and steer prompt template loading and rendering.
 
-Pins prompts.py's rule that there are no inline prompt fragments elsewhere in
-the package:
-
-- `load_template` extracts the single fenced ```md block from a reference
-  file's leading section (heading=None, the file's content before its
-  second heading, or the whole file with at most one heading — this is
-  what keeps the developer/reviewer prompt loaders working unchanged now
-  that developer-prompt.md carries a second, later section). A reference
-  file with no such block, or with more than one, is rejected with a
-  `PmError` naming the file. A named `heading` scopes extraction to that
-  section instead; an absent heading raises `PmError`.
-- `render_steer_pointer` sources its wording from developer-prompt.md's
-  "## Steer Message Template" section via `load_template(..., heading=...)`
-  and renders a single line naming the correction file — the correction text
-  itself never passes through the template.
-- `render_developer_prompt`, against the real
-  `skills/project-manager/references/developer-prompt.md` file (the default
-  reference path, resolved relative to the pm_lib package), produces text
-  that: contains the slice id, contains every contract section's verbatim
-  text (Intended Change, Acceptance Criteria, Authorized Surface, Explicit
-  Non-Goals, Risk Flags, Validation Plan, Rollback Path), contains the
-  plan/artifact/notes/result paths, and has no unresolved `{placeholder}`
-  left over (the JSON example's escaped `{{`/`}}` braces resolve to plain
-  `{`/`}` in the output, not to a stray unresolved field).
-- A template with a stray, unescaped brace (one that is neither a
-  recognized `{placeholder}` nor a doubled `{{`/`}}` escape) raises a
-  `PmError` that names the offending template file.
-- A reference-path override is honored (tests do not have to touch the
-  real references file to exercise the loader/renderer against a
-  custom-built template).
+Pins prompts.py's rule that no prompt fragments live anywhere else in the
+package. Rendering tests run against the real
+`references/developer-prompt.md` (the default reference path) so a template
+edit that breaks interpolation fails here; `reference_path` overrides let the
+loader tests build their own templates instead.
 """
 
 from __future__ import annotations

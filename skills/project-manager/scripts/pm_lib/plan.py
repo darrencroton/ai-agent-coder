@@ -1,8 +1,4 @@
-"""Plan parsing, check-plan, eligibility, and mechanical risk derivation.
-
-The parser preserves the proven plan-format behaviour from the predecessor
-while keeping its implementation independent.
-"""
+"""Plan parsing, check-plan, eligibility, and mechanical risk derivation."""
 
 from __future__ import annotations
 
@@ -110,47 +106,37 @@ class PlanSlice:
             return []
         return _bullet_values(match.group("body"))
 
+    def _risk_flag(self, label: str) -> str | None:
+        """The normalized answer to one "Risk Flags" line, or None if absent.
+
+        Callers compare the answer exactly. A prefix test (startswith("no"))
+        would fail open: "not yet decided", "none", and "not required — ask
+        first" all begin with "no".
+        """
+        match = re.search(
+            rf"{label}:\s*(?P<value>[^\n]+)", self.sections.get("Risk Flags", ""), flags=re.IGNORECASE
+        )
+        return match.group("value").strip().lower().rstrip(".") if match else None
+
     @property
     def approval_needed(self) -> bool | None:
-        section = self.sections.get("Risk Flags", "")
-        match = re.search(
-            r"Approval needed before implementation:\s*(?P<value>[^\n]+)", section, flags=re.IGNORECASE
-        )
-        if not match:
-            return None
-        # Match the answer exactly. A prefix test (startswith("no")) fails
-        # open: "not yet decided", "none", "not required — ask first" all
-        # begin with "no" and would silently be treated as "no approval
-        # required". Anything that is not an unambiguous yes/no returns
-        # None, which callers treat as blocking, never as approvable.
-        value = match.group("value").strip().lower().rstrip(".")
-        if value == "no":
-            return False
-        if value == "yes":
-            return True
-        return None
+        """True/False for an unambiguous yes/no; None when the flag is absent
+        or unclear, which callers treat as blocking, never as approvable."""
+        return {"yes": True, "no": False}.get(self._risk_flag("Approval needed before implementation"))
 
     @property
     def independent_audit_required(self) -> bool:
-        section = self.sections.get("Risk Flags", "")
-        match = re.search(r"Independent audit required:\s*(?P<value>[^\n]+)", section, flags=re.IGNORECASE)
-        if not match:
-            return False
         # Unlike approval_needed, this fails closed to *off*: absent, blank,
         # or anything not an exact "yes" leaves the opt-in gate unarmed.
-        return match.group("value").strip().lower().rstrip(".") == "yes"
+        return self._risk_flag("Independent audit required") == "yes"
 
     @property
     def risky_surfaces_clear(self) -> bool:
-        section = self.sections.get("Risk Flags", "")
-        match = re.search(r"Risky surfaces touched:\s*(?P<value>[^\n]+)", section, flags=re.IGNORECASE)
-        if not match:
-            return False
-        return match.group("value").strip().lower().rstrip(".") == "none"
+        return self._risk_flag("Risky surfaces touched") == "none"
 
     @property
     def plan_risk(self) -> str:
-        """Mechanical, immutable risk derivation (target-design §4).
+        """Mechanical, immutable risk derivation.
 
         Elevated iff approval is explicitly required, independent audit is
         required, or any risky surface is declared touched (including when

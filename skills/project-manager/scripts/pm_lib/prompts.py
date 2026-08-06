@@ -8,10 +8,8 @@ owned by this module: they live in ``references/developer-prompt.md`` and
 can be edited without touching code.
 
 `compile_skill_bundle` independently implements the transitive skill-bundle
-embedding behaviour also exercised by
-``skills/orchestrator/scripts/delegate_contract.py``
-(`compile_skill_bundle` / `compose_delegate_command`) — this module shares
-no code with it and never imports from ``skills/orchestrator/``.
+embedding that ``skills/orchestrator/`` also performs; this module shares no
+code with it and never imports from it.
 """
 
 from __future__ import annotations
@@ -86,6 +84,18 @@ def load_template(reference_path: Path | None = None, *, heading: str | None = N
     return matches[0]
 
 
+def _render(template: str, path: Path, what: str, **fields: Any) -> str:
+    """`template.format(**fields)`, turning a template authoring error into a
+    PmError that names the file and the fix."""
+    try:
+        return template.format(**fields)
+    except (KeyError, IndexError, ValueError) as exc:
+        raise PmError(
+            f"{what} template {path} has an unresolved or stray brace "
+            f"({exc}); escape literal '{{' / '}}' as '{{{{' / '}}}}' per the template's editing note"
+        ) from exc
+
+
 def render_developer_prompt(
     plan_slice: PlanSlice,
     *,
@@ -134,14 +144,7 @@ def render_developer_prompt(
         "validation_plan": sections.get("Validation Plan", "").rstrip(),
         "rollback_path": sections.get("Rollback Path", "").rstrip(),
     }
-    path_for_errors = reference_path or _DEFAULT_REFERENCE_PATH
-    try:
-        return template.format(**fields)
-    except (KeyError, IndexError, ValueError) as exc:
-        raise PmError(
-            f"developer prompt template {path_for_errors} has an unresolved or stray brace "
-            f"({exc}); escape literal '{{' / '}}' as '{{{{' / '}}}}' per the template's editing note"
-        ) from exc
+    return _render(template, reference_path or _DEFAULT_REFERENCE_PATH, "developer prompt", **fields)
 
 
 def render_launch_pointer(prompt_path: Path, *, reference_path: Path | None = None) -> str:
@@ -150,21 +153,15 @@ def render_launch_pointer(prompt_path: Path, *, reference_path: Path | None = No
 
     The complete frozen contract is written to `prompt_path` in the slice
     artifact directory; only this short pointer is injected into the
-    session, so delivery never depends on a harness TUI accepting a
-    multi-KB paste (PM Test 20, Finding 1). Sourced from the "## Launch
-    Pointer" section of `references/developer-prompt.md` so the wording
-    lives in exactly one place. The result must be a single line — a
-    newline would be rejected by `sessions.send_prompt`.
+    session, so delivery never depends on a harness TUI accepting a multi-KB
+    paste — some silently truncate one. Sourced from the "## Launch Pointer"
+    section of `references/developer-prompt.md` so the wording lives in
+    exactly one place. The result must be a single line — a newline would be
+    rejected by `sessions.send_prompt`.
     """
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_LAUNCH_POINTER_HEADING)
-    try:
-        return template.format(prompt_path=str(prompt_path))
-    except (KeyError, IndexError, ValueError) as exc:
-        raise PmError(
-            f"launch pointer template {path} has an unresolved or stray brace "
-            f"({exc}); escape literal '{{' / '}}' as '{{{{' / '}}}}' per the template's editing note"
-        ) from exc
+    return _render(template, path, "launch pointer", prompt_path=str(prompt_path))
 
 
 def render_steer_pointer(correction_path: Path, *, reference_path: Path | None = None) -> str:
@@ -180,13 +177,7 @@ def render_steer_pointer(correction_path: Path, *, reference_path: Path | None =
     """
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_STEER_MESSAGE_HEADING)
-    try:
-        return template.format(correction_path=str(correction_path))
-    except (KeyError, IndexError, ValueError) as exc:
-        raise PmError(
-            f"steer message template {path} has an unresolved or stray brace "
-            f"({exc}); escape literal '{{' / '}}' as '{{{{' / '}}}}' per the template's editing note"
-        ) from exc
+    return _render(template, path, "steer message", correction_path=str(correction_path))
 
 
 # --- Transitive skill-bundle embedding --------------------------------------
@@ -300,11 +291,6 @@ def render_reviewer_prompt(
         "risk_flags": risk_flags,
         "skill_bundle": skill_bundle,
     }
-    path_for_errors = reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH
-    try:
-        return template.format(**fields)
-    except (KeyError, IndexError, ValueError) as exc:
-        raise PmError(
-            f"reviewer prompt template {path_for_errors} has an unresolved or stray brace "
-            f"({exc}); escape literal '{{' / '}}' as '{{{{' / '}}}}' per the template's editing note"
-        ) from exc
+    return _render(
+        template, reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH, "reviewer prompt", **fields
+    )

@@ -573,5 +573,66 @@ class DelegateSessionTests(unittest.TestCase):
                 resolve_path.assert_called_once_with(entry, wait_seconds=0.0)
 
 
+
+
+class JsonlHeadRowsTests(unittest.TestCase):
+    """`jsonl_head_rows` replaced four hand-written read-N-lines loops, and a
+    behaviour mutation in it survived the whole suite. These pin the edges the
+    four callers actually depend on."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def write(self, body: str) -> Path:
+        path = self.root / "session.jsonl"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_yields_non_object_rows_so_callers_still_raise_on_them(self):
+        """Deliberately unfiltered: the loops this replaced passed whatever
+        decoded straight to `row.get(...)`. Filtering non-objects here would
+        turn a caller's AttributeError into a silent no-match."""
+        path = self.write('{"type": "user"}\nnull\n[1, 2]\n')
+        self.assertEqual(list(delegate_sessions.jsonl_head_rows(path, 40)), [{"type": "user"}, None, [1, 2]])
+
+    def test_undecodable_line_is_skipped_but_still_counts_against_max_lines(self):
+        path = self.write('not json\n{"a": 1}\n{"b": 2}\n')
+        self.assertEqual(list(delegate_sessions.jsonl_head_rows(path, 2)), [{"a": 1}])
+
+    def test_stops_at_eof_before_max_lines(self):
+        path = self.write('{"a": 1}\n')
+        self.assertEqual(list(delegate_sessions.jsonl_head_rows(path, 40)), [{"a": 1}])
+
+    def test_unreadable_file_yields_nothing_rather_than_raising(self):
+        self.assertEqual(list(delegate_sessions.jsonl_head_rows(self.root / "missing.jsonl", 40)), [])
+
+    def test_mid_read_oserror_ends_iteration_without_raising(self):
+        path = self.write('{"a": 1}\n{"b": 2}\n')
+        real_open = Path.open
+
+        def failing_open(self_path, *args, **kwargs):
+            handle = real_open(self_path, *args, **kwargs)
+            first = handle.readline()
+            handle.close()
+            return mock.MagicMock(
+                __enter__=lambda _s: mock.MagicMock(side_effect=None, readline=mock.Mock(side_effect=[first, OSError("io")])),
+                __exit__=lambda *_a: False,
+            )
+
+        with mock.patch.object(Path, "open", failing_open):
+            self.assertEqual(list(delegate_sessions.jsonl_head_rows(path, 40)), [{"a": 1}])
+
+    def test_codex_cwd_matcher_returns_on_the_first_session_meta_row(self):
+        """The early return is load-bearing: a later session_meta row must not
+        get a second chance to match."""
+        path = self.write(
+            '{"type": "session_meta", "payload": {"cwd": "/wrong"}}\n'
+            '{"type": "session_meta", "payload": {"cwd": "/right"}}\n'
+        )
+        self.assertFalse(delegate_sessions.codex_candidate_cwd_matches(path, Path("/right")))
+
+
 if __name__ == "__main__":
     unittest.main()

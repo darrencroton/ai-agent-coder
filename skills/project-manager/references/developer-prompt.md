@@ -63,7 +63,7 @@ Stop (status "blocked") when: a second reading is also implementable, or the con
 
 ## Launch Pointer
 
-PM delivers only this one-line pointer into the fresh session at launch; the full contract above is written to `prompt.md` in the slice artifact directory and the Developer reads it from there. This keeps the launch message far below any harness TUI input-buffer limit that silently truncates a multi-KB paste (PM Test 20, Finding 1). The rendered block must stay a single line — `send_prompt` refuses a newline — and the only brace in it is the `{prompt_path}` field.
+PM delivers only this one-line pointer into the fresh session at launch; the full contract above is written to `prompt.md` in the slice artifact directory and the Developer reads it from there. This keeps the launch message far below any harness TUI input-buffer limit that silently truncates a multi-KB paste. The rendered block must stay a single line — `send_prompt` refuses a newline — and the only brace in it is the `{prompt_path}` field.
 
 ```md
 Read your complete frozen slice contract at {prompt_path} now, in full, before doing anything else — it is your only authorization for this slice. Do not read other files, plan, edit, commit, or run anything until you have read it, then follow its Workflow and Hard rules exactly.

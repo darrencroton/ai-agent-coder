@@ -1,34 +1,8 @@
 """Protected behaviours: git facts, status parsing, and surface matching.
 
-Pins the segment-aware surface-matching semantics (PurePosixPath.full_match,
-not fnmatch, so a
-single "*" never crosses a "/"), plus the git-fact helpers PM's floor will
-build on in later stages:
-
-- Surface matching: a trailing "/" entry matches anything with that
-  prefix (subtree); a plain path matches only itself, never anything
-  beneath a same-named directory; a single "*" or "?" is segment-aware
-  (does not cross "/"); "**/*.md" matches recursively; exact strings match
-  exactly; entries are normalized (backtick-unwrapped, trailing period and
-  annotation stripped) before any of the above.
-- `git status --short` parsing: the two-character status code is
-  positional, so a leading space is preserved, never stripped, by
-  `status_path`; a rename line's path is the target; quoted paths lose
-  their surrounding quotes only; `.pm` and `.pm/`-prefixed lines are
-  filtered out of "meaningful" status.
-- `changed_files_between` unions the committed diff (before_head..after_head)
-  with the dirty-tree status, against a real temp repo with an actual
-  commit in it — not string fixtures.
-- `commit_is_descendant` is true only when `after_head` is a real
-  descendant of `before_head` (or `before_head` is None); false otherwise.
-- `require_clean_worktree` raises on any dirty file outside `.pm/` and
-  passes when only `.pm/` litter is dirty.
-- `worktree_git_dir` resolves to a distinct directory for a linked
-  worktree, so PM state never collides between worktrees of the same repo.
-- `write_git_diff` writes a real patch for a working-tree change, and on a
-  bad ref writes an empty (but valid) diff file plus a `git-diff-error.txt`
-  sidecar recording why — never a diff-shaped file that is actually an
-  error message.
+Surface matching is segment-aware (`PurePosixPath.full_match`, not fnmatch,
+so a single "*" never crosses a "/"). The git-fact tests run against a real
+temporary repository with actual commits rather than string fixtures.
 """
 
 from __future__ import annotations

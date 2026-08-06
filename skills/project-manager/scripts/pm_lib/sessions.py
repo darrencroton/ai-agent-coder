@@ -12,8 +12,8 @@ newline refusal defeats paste splitting outright, while truncation is only
 defeated by pointers staying far below any observed input limit — a guarantee
 of practice, not of code. See `send_prompt` for both failure modes.
 
-The recorded readiness banners and hard-stop marker/phrasing strings preserve
-field observations of external tools; the code around them is independent.
+The readiness banners and hard-stop marker strings are field observations of
+external tools; the code around them is independent.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from typing import Any, Callable
 
 from . import PmError
 
-# --- Hard-stop marker floor (target-design §11) -----------------------------
+# --- Hard-stop markers ------------------------------------------------------
 
 # Directory-trust / folder-trust dialogs from the interactive TUIs. If any of
 # these is on screen when PM is about to submit, a blind Enter would confirm
@@ -75,8 +75,7 @@ _LITERAL_MARKERS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Detects "push / create PR / deploy / install dependency / license change"
-# prompts — carried verbatim from old-evidence (constants.EXTERNAL_SIDE_EFFECT_PROMPT_RE).
+# Detects "push / create PR / deploy / install dependency / license change" prompts.
 EXTERNAL_SIDE_EFFECT_PROMPT_RE = re.compile(
     r"\b(?:do you want to|approve|confirm|allow|permission to|shall i|should i|ready to)\b"
     r"[^.\n?]{0,120}\b(?:push(?: to remote)?|create (?:a )?(?:pull request|pr)|open (?:a )?(?:pull request|pr)|"
@@ -92,7 +91,7 @@ EXTERNAL_SIDE_EFFECT_PROMPT_RE = re.compile(
 # reached/exceeded/exhausted" pattern. The weekly/monthly/account patterns are
 # suppressed when the same text carries the informational sub-100% usage
 # warning or the conditional "if you hit your limit" phrasing — both are
-# explicitly non-stopping (design §16; carried from old-evidence hints.py).
+# explicitly non-stopping.
 _WEEKLY_LIMIT_RE = re.compile(r"\bweekly\b[^.\n]{0,80}\b(?:limit|quota|cap)\b|\b(?:limit|quota|cap)\b[^.\n]{0,80}\bweekly\b")
 _MONTHLY_LIMIT_RE = re.compile(
     r"\bmonthly\b[^.\n]{0,80}\b(?:limit|quota|cap)\b|\b(?:limit|quota|cap)\b[^.\n]{0,80}\bmonthly\b"
@@ -104,9 +103,10 @@ _GENERIC_LIMIT_RE = re.compile(r"\b(?:usage|session|rate|quota|limit|cap)\b[^.\n
 _INFORMATIONAL_USAGE_RE = re.compile(
     # Deliberately no \b right after the '%': '%' is punctuation, so a \b
     # there never matches when followed by whitespace (both sides are
-    # non-word characters) — a latent bug in the old-evidence pattern this
-    # is re-specified from, fixed here so the informational fixture ("used
-    # 80% of your weekly limit") is actually recognized as non-stopping.
+    # non-word characters). Adding one would stop the informational fixture
+    # ("used 80% of your weekly limit") being recognized as non-stopping —
+    # and a false usage_limit_hard_stop refuses every send, fails floor
+    # fact 8, and ends `observe --wait` early.
     r"\b(?:you(?:'ve| have)\s+used|used)\s+(\d{1,3})%[^.\n]{0,120}"
     r"\b(?:hourly|daily|weekly|monthly|5[- ]?hour|five[- ]?hour)?\s*(?:usage\s*)?(?:limit|quota|cap)\b"
 )
@@ -139,12 +139,11 @@ def _literal_marker_re(marker: str) -> re.Pattern[str]:
 def scan_hard_stop(text: str) -> dict[str, Any]:
     """The hard-stop marker floor, shared by send_line, observe, and floor fact 8.
 
-    Whitespace-normalizes and lowercases for keyword matching, exactly as the
-    old-evidence tmux adapter did. A prompt wrapped across terminal rows still
-    matches because capture rejoins wrapped lines first (`pane_text`); this
-    normalization alone would not rescue a marker split mid-token. No
-    confidence grades, no subtypes beyond the kind labels, no reset-time
-    parsing — the PM agent reads the pane itself.
+    Whitespace-normalizes and lowercases for keyword matching. A prompt
+    wrapped across terminal rows still matches because capture rejoins wrapped
+    lines first (`pane_text`); this normalization alone would not rescue a
+    marker split mid-token. No confidence grades, no subtypes beyond the kind
+    labels, no reset-time parsing — the PM agent reads the pane itself.
     """
     normalized = re.sub(r"\s+", " ", text or "")
     lowered = normalized.lower()
@@ -240,12 +239,11 @@ def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -
     """`tmux new-session -d -s <session> -c <repo> "unset PM_RUN_TOKEN; <env-prefix> <command>"`.
 
     Env values are shell-quoted. The Developer session's environment must
-    never carry the PM run capability token (target-design §8) — asserted
-    defensively for the explicit map here, AND stripped from the inherited
-    environment: a tmux session inherits the server's (ultimately the
-    controller's) environment, so an exported PM_RUN_TOKEN would otherwise
-    be visible inside every Developer session. The `unset` runs in the
-    session's own shell before anything else.
+    never carry the PM run capability token — asserted defensively for the
+    explicit map here, AND stripped from the inherited environment: a tmux
+    session inherits the server's (ultimately the controller's) environment,
+    so an exported PM_RUN_TOKEN would otherwise be visible inside every
+    Developer session. The `unset` runs in the session's own shell first.
     """
     if "PM_RUN_TOKEN" in env:
         raise PmError("session environment must never contain PM_RUN_TOKEN")
@@ -418,35 +416,29 @@ def send_prompt(session: str, pointer: str) -> None:
 
     `pointer` is the short "read your contract at <path>" line rendered by
     `prompts.render_launch_pointer`; the full multi-KB contract lives in the
-    `prompt.md` file it names, not in this message. Earlier this function
-    pasted the whole contract via `tmux load-buffer`/`paste-buffer`, but PM
-    Test 20 (Finding 1) found some harness TUIs silently truncate a paste at
-    a fixed input-buffer size (~3 KB), leaving the Developer without its
-    validation plan, workflow, or hard rules. A single-line pointer is far
-    below any such limit and is sent as literal keystrokes, not a paste, so
-    the delivery path can no longer drop contract content.
-
-    Staying single-line also avoids a second, independent failure mode:
-    opencode's TUI (opentui) loses bracketed-paste state when a paste spans
-    more than one OS read, taking embedded newlines as Enter presses and
-    submitting one message as several fragments. A line with no newline has
-    nothing to misread; a chunk boundary inside it merely appends.
+    `prompt.md` file it names, not in this message. Pasting the whole contract
+    instead is unsafe twice over: some harness TUIs silently truncate a paste
+    at a fixed input-buffer size (~3 KB), leaving the Developer without its
+    validation plan, workflow, or hard rules; and opencode's TUI loses
+    bracketed-paste state when a paste spans more than one OS read, taking
+    embedded newlines as Enter presses and submitting one message as several
+    fragments. A single line sent as literal keystrokes has nothing to
+    misread, and the short pointer stays far below any observed input
+    limit — a guarantee of practice, not of code.
 
     Refuses outright when any hard-stop marker is visible in the pane — the
-    initial injection is a send like any other (target-design §3.2's
-    "hard-prompt refusal on any send"), and submitting anything blind into a
-    credential/approval/side-effect dialog would answer it. Refuses a
+    initial injection is a send like any other, and submitting anything blind
+    into a credential/approval/side-effect dialog would answer it. Refuses a
     newline: the pointer must stay a single `send-keys -l` line.
 
     A single C-m right after the send can be consumed finalizing the line
     instead of submitting it, so a second is sent after the TUI settles — but
     only after re-scanning the pane, so a credential/approval/side-effect
     prompt the first C-m may have surfaced is never blindly answered by the
-    second (target-design §3.2's "hard-prompt refusal on any send"; when one
-    C-m already submitted, withholding the second is harmless). Both C-m
-    sends tolerate a session that has already exited — a fast-finishing
-    harness can exit before either fires, a normal completion path, not a
-    send_prompt failure.
+    second (when one C-m already submitted, withholding the second is
+    harmless). Both C-m sends tolerate a session that has already exited — a
+    fast-finishing harness can exit before either fires, a normal completion
+    path, not a send_prompt failure.
     """
     if "\n" in pointer or "\r" in pointer:
         raise PmError("launch pointer must be a single line; the contract itself goes in the prompt.md file it names")

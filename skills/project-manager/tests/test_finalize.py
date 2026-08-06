@@ -1,67 +1,15 @@
-"""Protected behaviours: Stage 4's acceptance-bearing `finalize` decision
-paths, the risk ratchet, controller-owned notes, and report regeneration.
+"""Protected behaviours: the acceptance-bearing `finalize` decision paths, the
+risk ratchet, controller-owned notes, and report regeneration.
 
-Everything here drives `pm_lib.cli.main` in-process via `run_cli_in_repo`,
-matching Stage 3's convention; tmux-gated scenarios use a tiny fake-harness
-`sh` script exactly like `test_slice_ops.py`. Pins:
+Same conventions as `test_slice_ops.py`: `pm_lib.cli.main` in-process via
+`run_cli_in_repo`, and a fake-harness `sh` script for tmux-gated scenarios.
 
-1. Full end-to-end acceptance (AC): init -> start-slice (fake dev commits
-   the authorized change + result.json) -> bare `finalize` reports 8/8 ->
-   `finalize --accept "reasoning"` accepts: the slice entry's commit is
-   HEAD, `assessment.md` exists as a controller-owned original (under the
-   state dir) and its `.pm/` mirror, both containing the reasoning text
-   verbatim, all eight floor lines, and "PM assessment only (standard
-   risk)" (no reviews were commissioned on this standard-risk slice);
-   `current_slice` is cleared, the tmux session is gone, and
-   `run-report.md` is regenerated. A second `start-slice` on this
-   single-slice plan reports all slices complete.
-2. `--accept` is refused when the floor fails (an unauthorized file
-   alongside the authorized commit): nothing is accepted, exit 1.
-3. `--accept` is refused when the reasoning is shorter than the 40-
-   character minimum, before any state is touched.
-4. An elevated slice (plan `Risky surfaces touched:` != none): `--accept`
-   is refused naming both missing reviews; after a fake drift-audit and a
-   fake code-review are recorded, an additional commit lands (staleness);
-   `--accept` is refused again, naming the now-stale reviews, until BOTH
-   are re-commissioned against the new HEAD, at which point `--accept`
-   succeeds.
-5. Risk ratchet: a standard-risk slice with `finalize --risk elevated
-   --accept` is refused for missing reviews (proving the ratchet arms the
-   review requirement before acceptance is evaluated); `--risk standard`
-   is rejected outright with a PmError ("risk can only be raised"); the
-   ratchet's effect on the slice entry persists in state even though that
-   particular `--accept` call was refused.
-6. `--steer`: the full (possibly multiline) correction is written verbatim to
-   `steer-attempt-<n>.md` in the slice artifact directory, and the live
-   session receives only the reference-sourced one-line pointer naming it;
-   the `steer` event's
-   `note` carries the complete correction verbatim and the assessment's
-   "Attempts / interventions" section renders it legibly; `attempts`
-   increments and persists across a fresh state load; exhausting the
-   attempt budget refuses the next steer and sets `needs-human`; steering a
-   dead session raises PmError directing the operator to relaunch.
-7. `--stop`: the slice entry becomes "stopped", `assessment.md` records
-   decision STOPPED with the `--stop` reasoning verbatim (even though the
-   floor may be failing — that's the point), the run becomes
-   `needs-human`, the session is killed, and the report regenerates.
-8. Controller-owned `notes.md`: content written into the run's original
-   `notes.md` before a launch is mirrored into `.pm/` at `start-slice`; a
-   notes file over the 512 KiB cap prints a prominent (non-fatal) warning
-   at `start-slice`. Controller-owned `model-performance.md` (`pm rate`)
-   mirrors `notes.md`'s write/mirror/token-required/non-empty-text contract,
-   but always replaces the whole file (no append mode — the rating is once
-   per run) and renders verbatim into `run-report.md` under
-   `## Harness/Model Performance`, or `(not recorded)` when absent.
-9. Report-from-controller-data (AC): after an acceptance, deleting
-   `.pm/` entirely and running `status --report` still exits 0, recreates
-   `run-report.md` (original and mirror) from state + events + the
-   assessment file and `model-performance.md` under the state dir alone,
-   and the regenerated report contains the assessment text and rating.
-10. Reaping a hung reviewer: a `review --reviewer-command` fake that sleeps
-    in the background is launched as a real subprocess; once its process
-    group is recorded in `current_slice.reviewer_pids`, both `stop` and
-    `finalize --accept` kill it (tolerating ESRCH). Acceptance matters
-    because it clears `current_slice`, discarding the recorded pgids.
+Two rules shape most of the module. Acceptance is gated but never inferred:
+the floor must pass, an elevated slice needs both mandatory reviews fresh
+against the current HEAD, and any tree change stales them. And the risk
+ratchet only ever raises — `--risk standard` is refused outright, and a
+raise persists on the slice entry even when the `--accept` it accompanied
+was refused.
 """
 
 from __future__ import annotations
@@ -117,7 +65,7 @@ def _steer_then_complete_script(repo: Path, *, authorized_file: str = "a.py") ->
     arrives (its stable "PM correction" marker), then commits
     the authorized change and writes result.json. Completion is thus gated on
     the steer, not raced against a fixed sleep: since a steer now rotates the
-    pre-steer result.json into attempt-<n>/ (Stage 7), a harness that finished
+    pre-steer result.json into attempt-<n>/, a harness that finished
     *before* the steer would leave no result for finalize to find. The launch
     pointer and any earlier lines are read and ignored until the marker."""
     lines = [
@@ -139,7 +87,7 @@ def _steer_then_complete_script(repo: Path, *, authorized_file: str = "a.py") ->
 def _result_then_drain_script() -> str:
     """Writes result.json immediately, then drains stdin and stays alive, so
     a steer can be delivered while a now-stale completion signal already
-    exists on disk (Stage 7 Test 21: the pre-steer result must be rotated
+    exists on disk (the pre-steer result must be rotated
     aside so observe --wait can't mistake it for the steered attempt's)."""
     return "echo FAKE_HARNESS_READY\n" + result_heredoc() + "\nexec cat -"
 
@@ -187,7 +135,7 @@ class FinalizeTestCase(TmuxRunTestCase):
                     pass
 
 
-# --- 1: full end-to-end acceptance -------------------------------------------
+# --- full end-to-end acceptance ----------------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -285,7 +233,7 @@ class TestFullAcceptance(FinalizeTestCase):
         self.assertIn("all slices complete", out)
 
 
-# --- 2: floor failure refuses acceptance --------------------------------------
+# --- floor failure refuses acceptance ----------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -315,7 +263,7 @@ class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
         self.assertIsNotNone(state["current_slice"])
 
 
-# --- 3: reasoning too short ----------------------------------------------------
+# --- reasoning too short -----------------------------------------------------
 
 
 class TestAcceptRefusedOnShortReasoning(PmTestCase):
@@ -331,7 +279,7 @@ class TestAcceptRefusedOnShortReasoning(PmTestCase):
         self.assertEqual((run_dir / "run.json").read_bytes(), before_bytes)
 
 
-# --- 4: elevated slice review requirement + staleness -------------------------
+# --- elevated slice review requirement + staleness ---------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -403,7 +351,7 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
         self.assertEqual(state["slices"][0]["status"], "accepted")
 
 
-# --- 5: risk ratchet -----------------------------------------------------------
+# --- risk ratchet ------------------------------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -442,7 +390,7 @@ class TestRiskRatchet(FinalizeTestCase):
         self.assertIn("can only be raised", err)
 
 
-# --- 6: steer --------------------------------------------------------------
+# --- steer -------------------------------------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -646,7 +594,7 @@ class TestSteer(FinalizeTestCase):
         self.assertIn("relaunch", err)
 
 
-# --- 7: stop decision -----------------------------------------------------
+# --- stop decision -----------------------------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -702,7 +650,7 @@ class TestStopDecision(FinalizeTestCase):
         self.assertTrue((run_dir / "run-report.md").is_file())
 
 
-# --- 8: notes.md controller-owned + mirror + tripwire --------------------------
+# --- notes.md controller-owned + mirror + tripwire ---------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -844,7 +792,7 @@ class TestRateCommand(FinalizeTestCase):
         self.assertIn("non-empty", err.lower())
 
 
-# --- 9: report regenerates with .pm/ deleted ------------------------------
+# --- report regenerates with .pm/ deleted ------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -891,10 +839,10 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
         self.assertEqual(mirror_path.read_text(encoding="utf-8"), report_text)
 
 
-# --- 10: stop reaps a hung reviewer -------------------------------------------
+# --- stop reaps a hung reviewer ----------------------------------------------
 
 
-# --- 11: attempt-budget exhaustion is a mandatory stop that closes send, ----
+# --- attempt-budget exhaustion is a mandatory stop that closes send, ---------
 # --- steer, and accept, leaving only finalize --stop and stop open ----------
 
 
@@ -1018,14 +966,6 @@ class HungReviewerTestCase(PmTestCase):
         )
         proc.wait(timeout=10)
 
-    def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return True
-            time.sleep(interval)
-        return predicate()
-
 
 class TestStopReapsHungReviewer(HungReviewerTestCase):
     def test_stop_kills_reviewer_process_group(self) -> None:
@@ -1076,14 +1016,6 @@ class TestAcceptReapsHungReviewer(FinalizeTestCase):
             "reviewer process group survived finalize --accept",
         )
         self.assertIsNone(state_mod.load_state(run_dir, token).get("current_slice"))
-
-    def _wait_for(self, predicate, timeout: float = 15.0, interval: float = 0.3) -> bool:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return True
-            time.sleep(interval)
-        return predicate()
 
 
 # --- _attempts_summary: exact multiline formatting, no tmux required --------

@@ -1,68 +1,12 @@
-"""Protected behaviours: the Stage 3 slice lifecycle commands (evidence, not
-acceptance).
+"""Protected behaviours: the slice lifecycle commands (evidence, not acceptance).
 
-Everything here drives `pm_lib.cli.main` in-process (via `run_cli_in_repo`),
-matching an operator invoking the `pm` CLI from inside the working tree.
-No real coding CLI is ever launched — tmux-gated scenarios drive a tiny
-fake-harness `sh` script (`pm_test_helpers.write_fake_harness`), matching
-the retained fake-harness pattern (replacement-ledger §9.1/§9.3). Pins:
+Everything here drives `pm_lib.cli.main` in-process via `run_cli_in_repo`,
+matching an operator invoking `pm` from inside the working tree. No real
+coding CLI is ever launched — tmux-gated scenarios drive a tiny fake-harness
+`sh` script (`pm_test_helpers.write_fake_harness`).
 
-1. `init` happy path: creates run state and prints the run capability token
-   exactly once; writes the `.pm/` skeleton and a self-ignoring
-   `.pm/.gitignore`; slice entries carry `plan_risk`; check-plan warnings
-   are printed and the run still proceeds; an `init` event is recorded.
-   Re-running `init` while a run already exists creates a SECOND run and
-   repoints `current` — both run directories survive.
-2. `init` failures, each exiting 2 with nothing created: a plan with
-   errors; a dirty worktree; an unknown harness with no `--harness-command`
-   override; `--attest` naming an unknown slice id; `--branch` naming a
-   branch that does not exist. `--create-branch` succeeds: it creates the
-   branch and switches to it.
-3. Token gating: `approve`/`start-slice`/`send`/`finalize`/`stop` each exit
-   2 with a "token required" message when no token is supplied (flag or
-   `PM_RUN_TOKEN`); a wrong token exits 2 with a plain (non-INTEGRITY)
-   message; a hand-tampered `run.json` makes every one of those commands
-   exit 2 with an `INTEGRITY:`-prefixed message. `status` and `observe`
-   still work with no token at all.
-4. `approve`: records reason + timestamp for an approval-flagged slice; a
-   non-gated slice is refused; a slice with an unclear approval flag is
-   refused even though it is not exactly "no".
-5. The full fake-harness flow — bare `finalize` printing eight PASS facts
-   and evidence paths without mutating state — is pinned in
-   `test_finalize.py`'s `TestFullAcceptance`, which already drives the same
-   launch through to acceptance.
-6. `finalize` with a floor failure (the fake harness also touches an
-   unauthorized file): exits 1, the surface fact prints FAIL, a `floor`
-   event is recorded.
-7. Attempt accounting (tmux): `start-slice`, kill the session (simulate a
-   dead harness), `start-slice` again → a relaunch, and `attempts` reads
-   back as 1 from a **fresh** `status`/state load (the persistence AC);
-   the prior attempt's `result.json` is rotated into `attempt-0/`;
-   exhausting the budget (`--max-attempts 1`) refuses the next relaunch,
-   sets `needs-human`, and exits 2.
-8. Mid-run plan edit: `init`, edit the plan file, `start-slice` → exits 2,
-   run status becomes `needs-human`, a `plan-changed` event is recorded.
-9. Dead session: `observe` reports the session as not running (never
-   raises); `send` refuses to drive it.
-10. `send` nudge (tmux): on ONE launched session, a steered line reaches
-    the pane and is recorded as a `send` event without touching `attempts`;
-    then, once a trigger-gated credential prompt becomes visible, the same
-    command is refused by the sessions hard-stop floor.
-11. `stop` (tmux): captures `pane.txt`, kills the run's sessions, sets
-    status `stopped` with the given reason. `stop --scavenge` against a
-    **deleted** state directory still finds and kills a stray
-    `pm-<run-id>-…` session and exits 0.
-12. All slices already complete: `start-slice` completes the run, prints a
-    completion message, and exits 0 without launching a session (asserted
-    against a patched `start_session`, not merely implied).
-13. A failed launch leaves no orphan session (tmux): when readiness or
-    prompt injection raises, the session started moments earlier is killed
-    rather than stranded outside `current_slice`, where no command could
-    see it.
-14. Real-harness composition (tmux): `start-slice` with no
-    `--harness-command` override composes an actual codex launch argv.
-    Every other lifecycle scenario overrides the command, so this is the
-    only test that executes that branch at all.
+The acceptance-bearing `finalize` paths live in `test_finalize.py`, which
+drives the same launch through to a recorded decision.
 """
 
 from __future__ import annotations
@@ -85,6 +29,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import shutil
 
 from pm_test_helpers import (
+    PmTestCase,
     TmuxRunTestCase,
     commit_and_result_script,
     idle_script,
@@ -115,7 +60,7 @@ _HAS_TMUX = shutil.which("tmux") is not None
 SliceOpsTestCase = TmuxRunTestCase
 
 
-# --- 1. init happy path --------------------------------------------------
+# --- init happy path ---------------------------------------------------------
 
 
 class TestInitHappyPath(SliceOpsTestCase):
@@ -163,7 +108,7 @@ class TestInitHappyPath(SliceOpsTestCase):
         self.assertTrue(state_mod.resolve_run_dir(self.repo, run_id2).is_dir())
 
 
-# --- 2. init failures -----------------------------------------------------
+# --- init failures -----------------------------------------------------------
 
 
 class TestInitFailures(SliceOpsTestCase):
@@ -223,7 +168,7 @@ class TestInitFailures(SliceOpsTestCase):
 
     def test_default_onto_main_refused_but_explicit_branch_main_allowed(self) -> None:
         # Implicitly landing every slice commit on the default branch is the
-        # PM Test 20 footgun; refuse it, but honour an explicit --branch main.
+        # Refuse the implicit default; honour an explicit --branch main.
         self._git("checkout", "-q", "main")
         plan_path = self.write_plan(self._plan_path())
         harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
@@ -237,7 +182,7 @@ class TestInitFailures(SliceOpsTestCase):
         self.assertIn("branch: main", out)
 
 
-# --- 3. token gating -------------------------------------------------------
+# --- token gating ------------------------------------------------------------
 
 
 class TestTokenGating(SliceOpsTestCase):
@@ -325,7 +270,7 @@ class TestTokenGating(SliceOpsTestCase):
                 os.environ["PM_RUN_TOKEN"] = previous
 
 
-# --- 4. approve -------------------------------------------------------------
+# --- approve -----------------------------------------------------------------
 
 
 class TestApprove(SliceOpsTestCase):
@@ -377,7 +322,7 @@ class TestApprove(SliceOpsTestCase):
         self.assertIn("not approval-gated", err)
 
 
-# --- 5/6/7/9/10/11/12: tmux-gated flows --------------------------------------
+# --- tmux-gated flows --------------------------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -520,10 +465,9 @@ _WAITED_RE = re.compile(r"^waited:\s*([\d.]+)s \(requested ([\d.]+)s\)$", re.MUL
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestObserveWaitSemantics(SliceOpsTestCase):
-    """`observe --wait` honest-wait semantics (target-design §12, Amended
-    post-implementation): the wait runs the full requested duration and
-    breaks early ONLY on session death, `result.json` appearing, or a
-    hard-stop marker — never on a mere pane byte-change."""
+    """`observe --wait` honest-wait semantics: the wait runs the full
+    requested duration and breaks early ONLY on session death, `result.json`
+    appearing, or a hard-stop marker — never on a mere pane byte-change."""
 
     def _observe_wait(self, wait_seconds: float) -> tuple[int, str, str, float, float]:
         """Run `observe --wait` and return (code, out, err, test_elapsed,
@@ -687,6 +631,48 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertNotIn("note:", out, "no wait was requested, so there is nothing to flag")
 
 
+# --- observe's event append: mandatory vs best-effort, no tmux needed --------
+
+
+class TestObserveEventAppendFailure(PmTestCase):
+    """`observe` appends its event on two different triggers, and they carry
+    opposite failure contracts: a real change (pane/liveness/result) MUST be
+    recorded, while the advisory trace for a stable no-signal wait must never
+    cost the observation. Both are driven off one `append_event` call, so only
+    these two tests hold the split in place.
+    """
+
+    def _observe(self, *, capture: str, previous: str, wait: float | None):
+        """Run `observe` against a synthetic live session whose `append_event`
+        always fails. `capture != previous` is what makes the change real."""
+        plan_path = self.write_plan(slices=[{"files": ["a.py"]}])
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        artifact_dir = self.repo / "artifacts"
+        artifact_dir.mkdir()
+        (artifact_dir / "pane-live.txt").write_text(previous, encoding="utf-8")
+        self.set_current_slice(
+            state, token, run_dir,
+            slice_id="Slice 1", before_head=None, artifact_dir=artifact_dir,
+            tmux_session="pm-fake-session",
+        )
+        activity = {"running": True, "active": capture != previous, "capture": capture}
+        with mock.patch.object(sessions, "session_exists", return_value=True), \
+             mock.patch.object(sessions, "detect_activity", return_value=activity), \
+             mock.patch.object(
+                 slice_ops.state_mod, "append_event", side_effect=OSError("events.jsonl unwritable")
+             ):
+            return slice_ops.observe(self.repo, run_dir, wait=wait, token=token)
+
+    def test_a_real_change_propagates_an_append_failure(self) -> None:
+        with self.assertRaises(OSError):
+            self._observe(capture="new pane text", previous="old pane text", wait=None)
+
+    def test_a_stable_no_signal_wait_swallows_an_append_failure(self) -> None:
+        outcome = self._observe(capture="same pane", previous="same pane", wait=0.01)
+        self.assertTrue(outcome.no_signal, "the fixture must reach the best-effort branch")
+        self.assertFalse(outcome.pane_changed)
+
+
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestSendNudge(SliceOpsTestCase):
     def test_send_delivers_a_nudge_then_refuses_once_a_credential_prompt_appears(self) -> None:
@@ -788,7 +774,7 @@ class TestStop(SliceOpsTestCase):
         self.assertIn(session, out)
 
 
-# --- 12. all slices complete --------------------------------------------
+# --- all slices complete -----------------------------------------------------
 
 
 class TestAllSlicesComplete(SliceOpsTestCase):
@@ -820,7 +806,7 @@ class TestAllSlicesComplete(SliceOpsTestCase):
         self.assertTrue((run_dir / "run-report.md").is_file())
 
 
-# --- 13. a failed launch leaves no orphan session -------------------------
+# --- a failed launch leaves no orphan session --------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -864,7 +850,7 @@ class TestFailedLaunchLeavesNoSession(SliceOpsTestCase):
         self._assert_no_session_survives(run_id)
 
 
-# --- 14. real-harness composition ---------------------------------------
+# --- real-harness composition ------------------------------------------------
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")

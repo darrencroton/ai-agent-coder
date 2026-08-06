@@ -566,10 +566,6 @@ def extract_best_result(entry: dict[str, Any]) -> dict[str, str]:
     raise DelegateJobsError(f"No output available for delegate {entry['label']}")
 
 
-def extract_best_text(entry: dict[str, Any]) -> str:
-    return extract_best_result(entry)["text"]
-
-
 def command_init(args: argparse.Namespace) -> int:
     root = default_root()
     if args.root:

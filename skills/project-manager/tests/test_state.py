@@ -1,41 +1,9 @@
 """Protected behaviours: lite-1 state round-trip, authentication, and the CLI stubs.
 
-Pins the single-copy authenticated state model (target-design §8):
-
-- `create_run` writes `run.json`, its `run.json.mac`, and the `current`
-  pointer atomically; the returned token authenticates the run and is
-  never written to disk in the clear (only its SHA-256 is).
-- `load_state` with the correct token verifies the MAC before trusting the
-  content; a hand-edited `run.json` (state tampered by something that
-  didn't hold the token) fails MAC verification and raises
-  `IntegrityError`, both via `load_state(token=...)` and via the explicit
-  `verify_state_mac`. A missing MAC file is the same failure. A *wrong*
-  token is a distinct, non-integrity failure (`PmError`): the token itself
-  doesn't match this run, which is a caller mistake, not evidence of
-  tampering.
-- A token-less `load_state` (read-only commands) skips MAC verification
-  but still shape-validates: schema, run status, plan digest presence,
-  and slice status/risk enums.
-- A future schema version is refused with a message naming the version,
-  not silently migrated.
-- `append_event` never rewrites `run.json` (same bytes, same mtime), and
-  `read_events` round-trips what was appended.
-- Run-dir resolution: the `current` pointer is the default; an explicit
-  run id overrides it; a missing pointer or run directory raises a
-  helpful `PmError`.
-- A linked worktree gets a distinct state root, so two runs created in two
-  worktrees of the same repo never interfere.
-- `save_state` writes atomically (no temp file survives) and refuses a
-  wrong token; holding the advisory lock externally makes a concurrent
-  `save_state` fail with the stale-lock message without deleting the lock.
-- `new_run_id` returns `<UTC timestamp>-<random nonce>`; ids minted in the
-  same second still differ (the nonce is what keeps two runs in separate
-  state roots from sharing a tmux session name), and it appends `-2`, `-3`,
-  ... on collision against a supplied existing-id set.
-- A slice entry may be created with status "attested" (operator-attested
-  prior completion) directly at creation time.
-- `check-plan` exercised end-to-end through the CLI on a good and a bad
-  plan (exit 0 / exit 2).
+The distinction these tests exist to hold: a *wrong* token is a caller
+mistake (`PmError`), while state that fails MAC verification — or is missing
+its MAC entirely — is tampering (`IntegrityError`) and terminal. Token-less
+reads skip MAC verification but still shape-validate.
 """
 
 from __future__ import annotations

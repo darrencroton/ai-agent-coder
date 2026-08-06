@@ -1,38 +1,10 @@
-"""Protected behaviours: the mechanical floor's eight facts (target-design §3.3).
+"""Protected behaviours: the mechanical floor's eight facts.
 
-Pure git + filesystem tests, no tmux. Pins:
-
-- The floor is exactly eight facts, numbered and named per target-design
-  §3.3 / implementation-blueprint §3 Stage 2 AC: plan-digest,
-  identity-branch, approval, result, surface, commit-ancestry,
-  clean-worktree, hard-stop-scan.
-- Each fact is independently failable without the others being coupled to
-  it (a happy-path baseline, then one deliberate perturbation per test):
-  - (1) an edited plan file fails plan-digest.
-  - (2) a switched branch, and separately a repo-path mismatch, fail
-    identity-branch.
-  - (3) an approval-flagged slice without a recorded approval fails; with
-    a recorded approval it passes; an unclear approval flag fails
-    regardless of a recorded approval.
-  - (4) a missing result.json, a wrong-slice result.json, and malformed
-    JSON each fail the result fact.
-  - (5) an unauthorized file change fails the surface fact, whether
-    committed or left dirty in the working tree.
-  - (6) no commit when required fails; a commit landed on a different
-    branch that still descends from before_head fails commit-ancestry
-    (and, independently, identity-branch — the blueprint's named
-    branch-switch scenario) even though the commit is a real descendant;
-    a HEAD that is not a descendant of before_head (reset to an unrelated
-    commit) fails; commit_required=false passes without any commit.
-  - (7) a dirty file outside `.pm/` fails clean-worktree; `.pm/` litter
-    alone passes.
-  - (8) a credential-prompt in the pane text fails ONLY the hard-stop-scan
-    fact even alongside an otherwise fully valid commit (the blueprint's
-    named scenario); an empty pane passes.
-- `FloorReport.passed` is exactly the conjunction of all eight facts'
-  `passed` values.
-- `evaluate_floor` never mutates run state and never writes files outside
-  the artifact directory it is given — it only reads.
+Pure git + filesystem tests, no tmux. One class per fact: a happy-path
+baseline, then one deliberate perturbation per test, so each fact is shown
+independently failable. `TestFloorNeverMutates` pins that `evaluate_floor`
+only reads — it never writes state or touches anything outside the artifact
+directory it is given.
 """
 
 from __future__ import annotations
@@ -81,7 +53,7 @@ class FloorTestCase(PmTestCase):
         # the repo would itself show up as a "changed" (untracked) file in
         # every floor evaluation — a self-inflicted surface/cleanliness
         # failure that has nothing to do with the fact under test. The real
-        # CLI (Stage 3) accepts an arbitrary --plan path, so this is a
+        # The CLI accepts an arbitrary --plan path, so this is a
         # faithful, not merely convenient, test shape.
         return self.repo.parent / "plan.md"
 

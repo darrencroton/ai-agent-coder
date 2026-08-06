@@ -1,4 +1,4 @@
-"""Command-line parsing and dispatch (target-design §12).
+"""Command-line parsing and dispatch.
 
 Every subcommand below (see `_HANDLERS`) is wired the same thin way:
 argument parsing, resolving the repo/run/token, dispatching into
@@ -565,8 +565,8 @@ def _run_notes(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     token = _require_token(args)
     run_dir = state_mod.resolve_run_dir(repo, args.run)
-    # MAC-verify state to keep notes a PM-only write (Developers hold no
-    # token) and to source the run id from authenticated state.
+    # MAC-verified: notes are a PM-only write, and the run id comes from
+    # authenticated state.
     state = slice_ops.load_writable_state(run_dir, token)
     mode, text = ("append", args.append) if args.append is not None else ("set", args.set_text)
     original, warning = slice_ops.write_notes(repo, run_dir, state["run_id"], text=text, mode=mode)
@@ -585,8 +585,8 @@ def _run_rate(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     token = _require_token(args)
     run_dir = state_mod.resolve_run_dir(repo, args.run)
-    # MAC-verify state to keep rating a PM-only write (Developers hold no
-    # token) and to source the run id from authenticated state.
+    # MAC-verified: the rating is a PM-only write, and the run id comes
+    # from authenticated state.
     state = slice_ops.load_writable_state(run_dir, token)
     original = slice_ops.write_model_performance(repo, run_dir, state["run_id"], text=args.text)
     print(f"model-performance recorded: {original}")

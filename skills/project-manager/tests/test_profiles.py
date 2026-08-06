@@ -1,38 +1,12 @@
 """Protected behaviours: harness launch-command composition and model inventory.
 
-Pins the five harness profiles (target-design/replacement-ledger §9.1 — the
-observed base commands and override flags are sanctioned operational data;
-the composing code is written fresh):
-
-- `HARNESS_PROFILES` has exactly the five supported harnesses: codex,
-  claude, copilot, opencode, qwen.
-- `compose_command` builds each harness's base command exactly as observed,
-  each at its harness's fullest autonomy: codex `codex --no-alt-screen
-  --dangerously-bypass-approvals-and-sandbox`; claude `claude
-  --permission-mode bypassPermissions`; copilot `copilot --allow-all
-  --autopilot`; opencode `opencode --auto`; qwen `qwen --yolo`.
-- Model overrides: codex/opencode use `-m <model>`; claude/copilot use
-  `--model <model>`; qwen uses `-m <model>`.
-- Effort overrides: codex composes `-c model_reasoning_effort="<effort>"`;
-  claude/copilot use `--effort <effort>`; opencode/qwen have no effort
-  mechanism on their *interactive* launch command (opencode's one-shot
-  `run` does — see test_review.py), so an effort request fails closed with a
-  `PmError` at compose time (never silently dropped, never a broken command).
-- claude-only composition: a `session_id` appends `--session-id <uuid>`;
-  a no-op for the other four harnesses.
-- An unknown harness name raises `PmError` naming all five supported harnesses.
-- `query_model_identity` returns `None` for codex/claude/copilot/qwen (no
-  inventory contract). For opencode it runs `opencode models <provider>
-  --verbose` (provider = text before the first `/` in the model id) and:
-  parses the verbose-JSON display-name metadata following the matched
-  model line when found; fails closed (`PmError`) when the query process
-  exits non-zero, when the requested model id is absent from the
-  inventory output, and when the JSON metadata following the model line is
-  malformed or missing a non-empty `name` field. It also exposes the
-  model's declared `variants`, which `assert_opencode_variant_supported`
-  checks so an unsupported `--variant` cannot silently downgrade effort.
-- `parse_reviewer_tools` splits a comma-separated string, lowercases and
-  strips each entry, and returns an empty tuple for `None`/empty input.
+The five profiles' base commands and override flags are observed operational
+data pinned verbatim; the composing code is independent of them. Two
+fail-closed rules run through the module: an effort request against a harness
+whose interactive command has no effort mechanism raises rather than being
+dropped, and an opencode model inventory that cannot be read, or that lacks
+the requested model or variant, raises rather than allowing a silent
+substitution.
 """
 
 from __future__ import annotations

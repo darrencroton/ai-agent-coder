@@ -1,66 +1,17 @@
-"""Protected behaviours: the `review` command (Stage 4).
+"""Protected behaviours: the `review` command.
 
-Pins `pm_lib.prompts.compile_skill_bundle` / `render_reviewer_prompt` (the
-transitive skill-bundle embedding spec, re-specified fresh from
-`skills/orchestrator/scripts/delegate_contract.py` as behavioural evidence
-only — nothing here imports orchestrator code) and `pm_lib.review` (the
-one-shot reviewer command table and the end-to-end `review` command):
+Covers `prompts.compile_skill_bundle` / `render_reviewer_prompt` (transitive
+skill-bundle embedding — nothing here imports orchestrator code) and
+`pm_lib.review` (the one-shot reviewer command table and the end-to-end
+command). Bundle tests run against the real `skills/` tree, so an embedding
+that silently truncated a review contract to SKILL.md alone would fail here.
 
-1. `compile_skill_bundle("code-review")` against the real `skills/` tree
-   embeds SKILL.md *and* every locally-linked Markdown resource — asserted
-   by the literal presence of `references/review-matrix.md` content, not
-   just SKILL.md's. (SKILL.md-only embedding would silently truncate the
-   review contract — the exact defect this test exists to catch.)
-2. Path-escape guard: a temporary skill whose SKILL.md links `../outside.md`
-   (a target outside the skill's own directory) raises `PmError` naming the
-   escaping path, even before checking whether that path exists.
-3. A linked-but-missing file raises `PmError`.
-4. One-shot reviewer command composition, per tool, from `review.
-   compose_reviewer_command` (review.py's own table — never imported from
-   orchestrator): codex, claude, copilot compose with optional model/effort
-   flags; opencode maps effort onto `--variant`; qwen composes with an
-   optional model flag but raises `PmError` the moment a non-default effort
-   is requested (its tested one-shot command has no effort flag); an
-   unsupported tool name raises `PmError`.
-5. `render_reviewer_prompt` renders the full contract (pinned range,
-   before/after heads, diff path, changed files, contract sections, the
-   embedded skill bundle) with no unresolved `{placeholder}` left over.
-6. End-to-end via `--reviewer-command` (a fake script that reads the
-   rendered prompt as its final argument and prints a report to stdout):
-   the review is recorded in state — head, sha256 of the written report,
-   and artifact path — the report exists both as the controller-owned
-   original (under the state dir) and its `.pm/` mirror, `reviewer_pids`
-   is empty again once the subprocess completes, and a `review` event is
-   logged.
-7. A failing reviewer command (nonzero exit) raises `PmError` quoting the
-   captured stderr tail and records nothing: no review entry is appended
-   to the slice's `reviews` list and no `review` event is logged.
-8. `review` refuses a slice that is not the run's current in-flight slice,
-   and refuses when HEAD has not advanced past `before_head` (nothing to
-   review).
-9. A default timeout bounds every review: a moderately-slow-but-finite fake
-   reviewer (a few seconds, then exit 0) still runs to completion and is
-   recorded, and a monkeypatch of `subprocess.Popen.wait` proves that an
-   absent `--timeout` passes the CLI's default backstop rather than
-   `timeout=None`, so an unattended run always regains control from a hung
-   reviewer.
-10. A `--timeout` kill takes the whole process GROUP, not just the leader:
-    a fake reviewer backgrounds a child, in the same process group, that
-    ignores SIGTERM while the leader does not — proven via
-    `os.killpg(pgid, 0)` raising `ProcessLookupError` (the group, not
-    merely the leader pid, is gone) after the timeout kill.
-11. The `reviewer launched: ...` line reaches stdout before the reviewer
-    subprocess completes: a sentinel-gated fake reviewer blocks until a
-    file appears, `run_review` runs on a background thread, and the launch
-    line is observed while the reviewer is still alive.
-12. The reviewer's authorization line is always stated, never left to
-    inference: the template's own authorization sentence is present, a
-    code-review commissioned after a fresh drift audit of the same range
-    receives that report's `.pm/` mirror path (inside the repository the
-    reviewer is scoped to read) re-copied over a forged mirror, and `none`
-    is handed both to a second drift audit of the already-audited commit —
-    so it stays independent of the first one's verdict — and to any review
-    whose HEAD has moved past the audited one.
+End-to-end runs go through `--reviewer-command` with a fake script that reads
+the rendered prompt as its final argument, so no real reviewer CLI is
+launched. Every failure path — non-zero exit, timeout, a dirty worktree, a
+HEAD that has not advanced — fails closed. The two that launch a subprocess
+clear `reviewer_pids` on the way out, so a later `stop` cannot SIGKILL a
+reused process group; the other two refuse before any reviewer exists.
 """
 
 from __future__ import annotations
@@ -103,7 +54,7 @@ def _write_fake_reviewer(path: Path, body: str) -> Path:
     return path
 
 
-# --- 1-3: transitive skill-bundle embedding ----------------------------------
+# --- transitive skill-bundle embedding ---------------------------------------
 
 
 class TestCompileSkillBundle(unittest.TestCase):
@@ -115,10 +66,14 @@ class TestCompileSkillBundle(unittest.TestCase):
         self.assertIn("Use this as a required checklist", bundle)
         self.assertIn("review-matrix.md", bundle)
 
-    def test_drift_audit_bundle_embeds_at_least_skill_md(self) -> None:
+    def test_drift_audit_bundle_embeds_its_own_contract(self) -> None:
+        """A second, resource-free skill. The assertions are drift-audit's own
+        text: the delimiter and the filename alone are emitted for any skill,
+        so they cannot tell a correct bundle from a wrong one."""
         bundle = prompts.compile_skill_bundle("drift-audit", skills_root=_REAL_SKILLS_ROOT)
-        self.assertIn("BEGIN EMBEDDED SKILL FILE:", bundle)
-        self.assertIn("SKILL.md", bundle)
+        self.assertIn("name: drift-audit", bundle)  # SKILL.md frontmatter
+        self.assertIn("was the implementation authorized?", bundle)
+        self.assertNotIn("name: code-review", bundle)
 
     def test_path_escape_guard_raises_naming_the_escaping_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,7 +107,7 @@ class TestCompileSkillBundle(unittest.TestCase):
             prompts.compile_skill_bundle("does-not-exist", skills_root=_REAL_SKILLS_ROOT)
 
 
-# --- 4: one-shot reviewer command composition --------------------------------
+# --- one-shot reviewer command composition -----------------------------------
 
 
 class TestComposeReviewerCommand(unittest.TestCase):
@@ -247,7 +202,7 @@ class TestComposeReviewerCommand(unittest.TestCase):
             review_mod.compose_reviewer_command("not-a-real-tool", "PROMPT", repo=Path("/repo"))
 
 
-# --- 5: reviewer prompt rendering --------------------------------------------
+# --- reviewer prompt rendering -----------------------------------------------
 
 
 class TestRenderReviewerPrompt(unittest.TestCase):
@@ -399,7 +354,7 @@ class TestRenderReviewerPrompt(unittest.TestCase):
             self.assertIn(str(path), str(ctx.exception))
 
 
-# --- 6-8: end-to-end review command -------------------------------------------
+# --- end-to-end review command -----------------------------------------------
 
 
 class ReviewCommandTestCase(PmTestCase):
@@ -706,10 +661,8 @@ class TestReviewRefusals(ReviewCommandTestCase):
         self.assertIn("no reviewer tool", err.lower())
 
 
-# --- reviewer env sanitization, pgid clearing on failure, dirty worktree ------
-# --- refusal, and the per-slice reviewer-tool override (new production ------
-# --- behaviour pinned here; see module docstring items 6-8 for the ----------
-# --- surrounding contract) ----------------------------------------------------
+# --- reviewer env sanitization, pgid clearing on failure, dirty-worktree ------
+# --- refusal, and the per-slice reviewer-tool override -----------------------
 
 
 class TestReviewerEnvSanitization(ReviewCommandTestCase):
@@ -817,10 +770,10 @@ _LAUNCH_RE = re.compile(r"reviewer launched: pgid=(\d+) report=(\S+) stderr=(\S+
 
 
 class TestReviewTimeout(ReviewCommandTestCase):
-    """`--timeout` (target-design §12, Amended post-implementation): the
-    launch line (pgid/report/stderr paths) prints before the wait begins,
-    and a reviewer that outlives `--timeout` is killed (process group) and
-    fails closed rather than being confused with a legitimately slow one."""
+    """`--timeout`: the launch line (pgid/report/stderr paths) prints before
+    the wait begins, and a reviewer that outlives `--timeout` is killed
+    (process group) and fails closed rather than being confused with a
+    legitimately slow one."""
 
     def test_slow_reviewer_times_out_kills_process_and_fails_closed(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
@@ -1144,11 +1097,10 @@ class TestReviewLaunchVisibilityOrdering(ReviewCommandTestCase):
         """The `reviewer launched: ...` line must reach stdout BEFORE the
         (possibly long) subprocess wait completes, not merely before
         `run_review` returns — otherwise a slow-but-alive reviewer is
-        indistinguishable from a hung one until it finishes (target-design
-        §12, Amended post-implementation). Sentinel-gated: the fake
-        reviewer blocks until a sentinel file appears, `run_review` runs on
-        a background thread, and the launch line is asserted present while
-        the reviewer subprocess is still alive (thread still running)."""
+        indistinguishable from a hung one until it finishes. Sentinel-gated:
+        the fake reviewer blocks until a sentinel file appears, `run_review`
+        runs on a background thread, and the launch line is asserted present
+        while the reviewer subprocess is still alive (thread still running)."""
         thread, captured, result, sentinel, run_dir, token = self._start_sentinel_gated_reviewer()
         try:
             match = self._wait_for_launch_line(captured)

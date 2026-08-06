@@ -50,9 +50,7 @@ EXIT_COVERAGE = 3
 # Tools colourise their own diagnostics; strip that before quoting them back.
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
-# --------------------------------------------------------------------------- #
-# Data model
-# --------------------------------------------------------------------------- #
+# --- Data model --------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -88,9 +86,7 @@ class ToolResult:
     skipped_reason: str | None = None
 
 
-# --------------------------------------------------------------------------- #
-# Tool registry
-# --------------------------------------------------------------------------- #
+# --- Tool registry -----------------------------------------------------------
 
 
 @dataclass
@@ -501,9 +497,7 @@ TOOLS: list[Tool] = [
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
 
-# --------------------------------------------------------------------------- #
-# git helpers
-# --------------------------------------------------------------------------- #
+# --- git helpers -------------------------------------------------------------
 
 
 def run(argv: Sequence[str], cwd: str, timeout: int = 300) -> tuple[int, str, str]:
@@ -638,9 +632,7 @@ def whitespace_check(root: str, base: str | None) -> list[Finding]:
     return uniq
 
 
-# --------------------------------------------------------------------------- #
-# Tool selection and execution
-# --------------------------------------------------------------------------- #
+# --- Tool selection and execution --------------------------------------------
 
 
 def have(binary: str) -> bool:
@@ -707,9 +699,7 @@ def lint_tree(tools: list[Tool], files: list[str], cwd: str, timeout: int) -> li
     return [run_tool(t, files, cwd, timeout) for t in tools]
 
 
-# --------------------------------------------------------------------------- #
-# Coverage
-# --------------------------------------------------------------------------- #
+# --- Coverage ----------------------------------------------------------------
 
 
 def coverage(files: list[str], results: list[ToolResult]) -> dict[str, str]:
@@ -737,9 +727,7 @@ def coverage(files: list[str], results: list[ToolResult]) -> dict[str, str]:
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Differential comparison
-# --------------------------------------------------------------------------- #
+# --- Differential comparison -------------------------------------------------
 
 
 def diff_findings(head: list[Finding], base: list[Finding]) -> list[Finding]:
@@ -771,9 +759,7 @@ def base_worktree(root: str, base: str):
         shutil.rmtree(path, ignore_errors=True)
 
 
-# --------------------------------------------------------------------------- #
-# Reporting
-# --------------------------------------------------------------------------- #
+# --- Reporting ---------------------------------------------------------------
 
 
 def report(payload: dict[str, Any], as_json: bool) -> None:
@@ -820,9 +806,7 @@ def report(payload: dict[str, Any], as_json: bool) -> None:
     print_missing_hint(payload.get("missing_binaries") or [])
 
 
-# --------------------------------------------------------------------------- #
-# Subcommands
-# --------------------------------------------------------------------------- #
+# --- Subcommands -------------------------------------------------------------
 
 
 def package_managers() -> list[str]:
@@ -1078,9 +1062,7 @@ def cmd_check(args) -> int:
     return EXIT_PASS
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Iterator
 
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 CODEX_SESSION_ID_RE = re.compile(r"^session id:\s*([0-9a-f-]+)\s*$", re.MULTILINE)
@@ -286,80 +286,75 @@ def file_head_contains(path: Path, marker: str | None, *, max_bytes: int = 13107
         return False
 
 
-def candidate_prompt_matches(path: Path, prompt: str | None, *, max_lines: int = 6) -> bool:
-    if not prompt:
-        return False
+def jsonl_head_rows(path: Path, max_lines: int) -> Iterator[Any]:
+    """The first `max_lines` decoded JSON values in a session transcript.
+
+    Undecodable lines are skipped rather than fatal: a transcript being
+    written concurrently can end in a partial line. An unreadable file yields
+    nothing, so every caller degrades to "no match" instead of raising.
+
+    Rows are yielded as decoded, without a mapping check, because that is what
+    the four callers this replaced each did. A line that is valid JSON but not
+    an object therefore still reaches `row.get(...)` and raises, exactly as
+    before. `pm_lib.state.read_events` guards that case; adding the same guard
+    here would be a behaviour change, so it is left as a separate decision.
+    """
     try:
         with path.open(encoding="utf-8", errors="replace") as handle:
             for _ in range(max_lines):
                 line = handle.readline()
                 if not line:
-                    break
+                    return
                 try:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if row.get("type") == "queue-operation" and row.get("content") == prompt:
-                    return True
-                if row.get("type") == "user":
-                    message_content = row.get("message", {}).get("content")
-                    if isinstance(message_content, str) and message_content == prompt:
-                        return True
+                yield row
     except OSError:
+        return
+
+
+def candidate_prompt_matches(path: Path, prompt: str | None, *, max_lines: int = 6) -> bool:
+    if not prompt:
         return False
+    for row in jsonl_head_rows(path, max_lines):
+        if row.get("type") == "queue-operation" and row.get("content") == prompt:
+            return True
+        if row.get("type") == "user":
+            message_content = row.get("message", {}).get("content")
+            if isinstance(message_content, str) and message_content == prompt:
+                return True
     return False
 
 
 def codex_candidate_prompt_matches(path: Path, prompt: str | None, *, max_lines: int = 40) -> bool:
     if not prompt:
         return False
-    try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for _ in range(max_lines):
-                line = handle.readline()
-                if not line:
-                    break
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                row_type = row.get("type")
-                payload = row.get("payload", {})
-                if row_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
-                    for item in payload.get("content", []):
-                        if item.get("type") == "input_text" and item.get("text") == prompt:
-                            return True
-                if row_type == "event_msg" and payload.get("type") == "user_message" and payload.get("message") == prompt:
+    for row in jsonl_head_rows(path, max_lines):
+        row_type = row.get("type")
+        payload = row.get("payload", {})
+        if row_type == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+            for item in payload.get("content", []):
+                if item.get("type") == "input_text" and item.get("text") == prompt:
                     return True
-    except OSError:
-        return False
+        if row_type == "event_msg" and payload.get("type") == "user_message" and payload.get("message") == prompt:
+            return True
     return False
 
 
 def codex_candidate_cwd_matches(path: Path, cwd: Path | None) -> bool:
     if cwd is None:
         return False
-    try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for _ in range(3):
-                line = handle.readline()
-                if not line:
-                    break
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("type") != "session_meta":
-                    continue
-                session_cwd = row.get("payload", {}).get("cwd")
-                if not isinstance(session_cwd, str):
-                    return False
-                try:
-                    return Path(session_cwd).expanduser().resolve() == cwd
-                except OSError:
-                    return session_cwd == str(cwd)
-    except OSError:
-        return False
+    for row in jsonl_head_rows(path, 3):
+        if row.get("type") != "session_meta":
+            continue
+        session_cwd = row.get("payload", {}).get("cwd")
+        if not isinstance(session_cwd, str):
+            return False
+        try:
+            return Path(session_cwd).expanduser().resolve() == cwd
+        except OSError:
+            return session_cwd == str(cwd)
     return False
 
 
@@ -383,12 +378,25 @@ def entry_workdir(entry: dict[str, Any]) -> Path | None:
         return None
 
 
-def resolve_claude_session_path(entry: dict[str, Any], *, wait_seconds: float = 0.0) -> Path | None:
+def recorded_session_path(entry: dict[str, Any]) -> Path | None:
+    """A session path already recorded on `entry` and still present on disk.
+
+    Every per-harness resolver below starts here: once a session has been
+    correlated, re-deriving it risks re-running discovery against a store
+    that has since rotated.
+    """
     existing = entry.get("session_path")
     if isinstance(existing, str) and existing:
         path = Path(existing)
         if path.exists():
             return path
+    return None
+
+
+def resolve_claude_session_path(entry: dict[str, Any], *, wait_seconds: float = 0.0) -> Path | None:
+    recorded = recorded_session_path(entry)
+    if recorded is not None:
+        return recorded
 
     command = entry.get("command", [])
     if not isinstance(command, list):
@@ -447,11 +455,9 @@ def resolve_claude_session_path(entry: dict[str, Any], *, wait_seconds: float = 
 
 
 def resolve_codex_session_path(entry: dict[str, Any], *, wait_seconds: float = 0.0) -> Path | None:
-    existing = entry.get("session_path")
-    if isinstance(existing, str) and existing:
-        path = Path(existing)
-        if path.exists():
-            return path
+    recorded = recorded_session_path(entry)
+    if recorded is not None:
+        return recorded
 
     command = entry.get("command", [])
     if not isinstance(command, list) or has_flag(command, {"--ephemeral"}):
@@ -502,11 +508,9 @@ def resolve_codex_session_path(entry: dict[str, Any], *, wait_seconds: float = 0
 
 
 def resolve_copilot_session_path(entry: dict[str, Any], *, wait_seconds: float = 0.0) -> Path | None:
-    existing = entry.get("session_path")
-    if isinstance(existing, str) and existing:
-        path = Path(existing)
-        if path.exists():
-            return path
+    recorded = recorded_session_path(entry)
+    if recorded is not None:
+        return recorded
 
     command = entry.get("command", [])
     if not isinstance(command, list):
@@ -614,38 +618,25 @@ def _qwen_candidate_session(
     started_at: float,
     latest_start: float,
 ) -> tuple[str, float] | None:
-    try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for _ in range(40):
-                line = handle.readline()
-                if not line:
-                    break
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if row.get("type") != "user" or row.get("cwd") != str(workdir):
-                    continue
-                timestamp = parse_iso(row.get("timestamp"))
-                if timestamp is None or not (started_at - 5 <= timestamp <= latest_start):
-                    continue
-                parts = row.get("message", {}).get("parts", [])
-                if not any(isinstance(part, dict) and part.get("text") == prompt for part in parts):
-                    continue
-                session_id = row.get("sessionId")
-                if isinstance(session_id, str) and session_id and path.stem == session_id:
-                    return session_id, timestamp
-    except OSError:
-        return None
+    for row in jsonl_head_rows(path, 40):
+        if row.get("type") != "user" or row.get("cwd") != str(workdir):
+            continue
+        timestamp = parse_iso(row.get("timestamp"))
+        if timestamp is None or not (started_at - 5 <= timestamp <= latest_start):
+            continue
+        parts = row.get("message", {}).get("parts", [])
+        if not any(isinstance(part, dict) and part.get("text") == prompt for part in parts):
+            continue
+        session_id = row.get("sessionId")
+        if isinstance(session_id, str) and session_id and path.stem == session_id:
+            return session_id, timestamp
     return None
 
 
 def resolve_qwen_session_path(entry: dict[str, Any], *, wait_seconds: float = 0.0) -> Path | None:
-    existing = entry.get("session_path")
-    if isinstance(existing, str) and existing:
-        path = Path(existing)
-        if path.exists():
-            return path
+    recorded = recorded_session_path(entry)
+    if recorded is not None:
+        return recorded
 
     command = entry.get("command", [])
     if not isinstance(command, list):

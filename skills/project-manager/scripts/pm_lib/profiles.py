@@ -22,9 +22,9 @@ from . import PmError
 SUPPORTED_HARNESSES: tuple[str, ...] = ("codex", "claude", "copilot", "opencode", "qwen")
 
 # Every base command carries its harness's fullest autonomy flag: a PM
-# Developer seat runs unattended, so any residual approval prompt is a
-# silent stall. Containment is the operator's sandbox around the whole run,
-# not the harness's own permission mode.
+# Developer seat runs unattended, so any residual approval prompt is a silent
+# stall. Containment is the operator's sandbox around the whole run, not the
+# harness's own permission mode.
 HARNESS_PROFILES: dict[str, dict[str, Any]] = {
     "codex": {
         "base_command": ["codex", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"],
@@ -101,9 +101,9 @@ def compose_command(
     """Compose one harness's launch command from the profile table.
 
     Only the claude profile applies ``session_id`` (its transcript-capture
-    flag). Passing it for a different harness is silently a no-op rather
-    than an error — Stage 3's caller composes per-slice, and not every
-    harness has an equivalent flag.
+    flag). Passing it for a different harness is silently a no-op rather than
+    an error: the caller composes per-slice, and not every harness has an
+    equivalent flag.
     """
     profile = HARNESS_PROFILES.get(harness)
     if profile is None:
