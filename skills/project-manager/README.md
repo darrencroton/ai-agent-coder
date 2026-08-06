@@ -47,13 +47,13 @@ If a harness displays a directory-trust or permission prompt, the PM stops and l
 
 ## Optional: the poll guard (Claude Code PM seat)
 
-`hooks/pm-poll-guard.py` is an optional cost guard for a PM seat running in Claude Code. A PM session backgrounds long commands — a Developer wait, a commissioned review, a test run — and is then tempted to go looking to see whether they finished. Claude Code already re-invokes the agent when a background command exits, so the looking is redundant, but each look costs a full model round-trip that resends the entire conversation. On one measured Claude Code session of 1391 turns supervising two PM runs, about 26% of the turns were exactly this. These are harness calls, not PM commands, so the toolkit cannot see or bound them; the guard has to live in the harness.
+`hooks/pm-poll-guard.py` is an optional cost guard for a PM seat running in Claude Code. A PM session backgrounds long commands — a Developer wait, a commissioned review, a test run — then goes looking to see whether they finished. Claude Code already re-invokes the agent when a background command exits, so the looking is redundant, and each look costs a full model round-trip that resends the entire conversation. Measured on one 1391-turn session supervising two PM runs: about 26% of turns were exactly this. These are harness calls, not PM commands, so the toolkit itself cannot see or bound them; the guard has to live in the harness.
 
-It denies two shapes, one per tool. Both require the session's working directory to contain `.pm/`, so nothing outside a PM run is ever affected, and it fails open on any unexpected input or error — it bounds spend, and can never strand a run.
+It denies two shapes, one per tool. Both require `.pm/` in the session's working directory, so nothing outside a PM run is affected, and it fails open on any unexpected input or error — it bounds spend, and can never strand a run.
 
-**`Read`** — a re-read whose bytes are identical to what the previous read of that same task-output file returned: provably no new information. The first read of a file always passes, as does any read returning new content; a completion notification answers "finished?", not "progressing or hung?", so one interim look is legitimate. The path must match Claude Code's scratchpad task-output layout (`.../claude-<uid>/<project>/<session-uuid>/tasks/<id>.output`), which a repository's own `tasks/` directory cannot. This branch did the heavy lifting on the measured session: 273 of 294 repeat reads.
+**`Read`** — a re-read byte-identical to the file's previous read: provably no new information. The first read of a file, and any read returning new content, still pass. The path must match Claude Code's scratchpad task-output layout (`.../claude-<uid>/<project>/<session-uuid>/tasks/<id>.output`), which a repository's own `tasks/` directory cannot. This branch did the heavy lifting on the measured session: 273 of 294 repeat reads.
 
-**`Bash`** — a **backgrounded** command that waits and then inspects a PM artifact. Backgrounding such a command is itself the waste: it schedules a second completion notification for a target that already has one coming, so the agent wakes twice and learns nothing the first wake would not have carried. The measured forms are hand-rolled waiters:
+**`Bash`** — a **backgrounded** command that waits and then inspects a PM artifact. Backgrounding it is itself the waste: it schedules a second completion notification for a target that already has one coming. The measured forms are hand-rolled waiters:
 
 ```sh
 until [ -s .../tasks/<id>.output ]; do sleep 30; done; ...
@@ -96,14 +96,7 @@ Installing only the `Read` matcher is supported and still worth doing; the `Bash
 
 ### What the toolkit does instead of guarding
 
-Two wait costs are the PM's judgement, not the hook's business, so the toolkit reports them rather than refusing them:
-
-- `observe` logs **every** call, with why it returned (`wake=result|death|hard-stop|timeout|immediate`) and how long it waited. From the second consecutive wait that returns no signal it prints a note suggesting a single longer wait, or an action. It never changes the exit code. Measured across two real runs, the wasteful pattern was `20/20/20/20` against a Developer that needed 85 minutes — every one of those waits was individually the right call, and only the length was wrong.
-- `review` emits `review-start` alongside its terminal event, paired by slice and commission sequence, so a reviewer's wait has a duration. Without it a stalled reviewer is just an unexplained gap: one measured run spent 344 minutes inside one, against 1–19 minutes for every other review in the same run.
-
-Both events are best-effort: a busy state lock or an unwritable log costs the telemetry, never the observation or the reviewer. So an unmatched `review-start` means no terminal event was recorded — not that the reviewer is still alive.
-
-Both surface in `status --report` under **Wait Discipline**.
+Wait *length* is the PM's judgement, not the hook's business, so the toolkit advises rather than refuses: when `observe --wait` elapses with no session-death, result, or hard-stop signal, it prints a note suggesting a longer wait or an action instead. It never changes the exit code. Measured across two real runs, the wasteful pattern was not re-polling an answered question but repeating a too-short wait — `20/20/20/20` against a Developer that needed 85 minutes — so the note nudges toward waiting once, longer.
 
 ## Layout: who owns what
 

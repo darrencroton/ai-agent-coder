@@ -1,25 +1,10 @@
-"""The optional Claude Code poll guard (`hooks/pm-poll-guard.py`).
+"""`hooks/pm-poll-guard.py`, driven as the harness drives it: JSON on stdin,
+a decision off stdout (empty means allow; a deny body still exits 0).
 
-The hook is a standalone script with a process-level contract, so it is driven
-here exactly as the harness drives it: a JSON payload on stdin, and a decision
-read off stdout. Empty stdout means allow; a JSON body carrying
-`permissionDecision: deny` means deny; the exit status is 0 either way, because
-a guard that fails a tool call is a guard that can strand a run.
-
-Two properties are load-bearing enough to be worth stating:
-
-1. **HOME is redirected for every invocation.** The hook keeps its digest
-   stamps under `Path.home()`. A suite that let it write to the real home
-   directory would both pollute the developer's machine and make results depend
-   on stamps left by earlier runs.
-
-2. **The Bash cases use command strings taken verbatim from a real PM session**
-   (Claude Code session `caf72e97`, which supervised two PM runs and spent
-   about a quarter of its 1391 turns polling). Synthetic commands would have
-   validated a matcher against the shapes its author imagined; these are the
-   shapes that actually occurred, and an earlier draft of this guard keyed on
-   an allowlist of "reading" commands that these would have walked straight
-   through — the real polls use grep, test, git log and ls far more than tail.
+HOME is redirected per test so digest stamps never touch the real machine.
+The Bash cases use command strings taken verbatim from a real PM session
+(`caf72e97`, 1391 turns, ~26% spent polling) — an earlier allowlist-of-
+inspectors draft would have missed most of them.
 """
 
 from __future__ import annotations

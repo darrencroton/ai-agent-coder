@@ -793,65 +793,9 @@ class ObserveOutcome:
     tail: str = ""
     slice_id: str | None = None
     elapsed_seconds: float = 0.0
-    # Why the call returned, for telemetry and for the repeat-wait hint. Never
-    # "pane": a pane byte-change deliberately does NOT end a wait (see the loop
-    # below), so treating churn as a signal would call every timed-out wait on a
-    # busy TUI informative — the same mistake that makes a content digest useless
-    # against these polls.
-    wake: str = "timeout"
-    # Consecutive prior observes on this episode that ended in `timeout`. 0 when
-    # this call is the first wait since the last launch/steer/send/signal.
-    prior_timeouts: int = 0
-    # Total seconds already spent waiting across those prior observes.
-    prior_wait_seconds: float = 0.0
-
-
-# Every episode boundary, sourced from state.py so the hint below and the run
-# report's Wait Discipline section can never disagree about where one ends.
-_EPISODE_BOUNDARY_KINDS = frozenset(
-    state_mod.EPISODE_START_KINDS + state_mod.EPISODE_END_KINDS
-)
-
-
-def episode_timeouts(events: list[dict[str, Any]], slice_id: str | None) -> tuple[int, float]:
-    """`(count, total_seconds)` of consecutive timed-out observes ending this log.
-
-    Scans backwards from the most recent event and stops at the first episode
-    reset or at an observe that carried a real signal. Advisory only — it feeds
-    a printed hint, never a refusal — so it deliberately takes no lock and
-    tolerates a partially written trailing line.
-    """
-    count = 0
-    total = 0.0
-    for event in reversed(events):
-        kind = event.get("kind")
-        if kind in _EPISODE_BOUNDARY_KINDS:
-            break
-        if kind != "observe":
-            continue
-        if slice_id is not None and event.get("slice") != slice_id:
-            break
-        note = event.get("note")
-        if not isinstance(note, str):
-            break  # unreadable event: stop rather than guess past it
-        # Legacy events (written before `wake=` existed) have no wake token; they
-        # cannot be classified, so stop rather than guess.
-        match = re.search(r"\bwake=(\S+)", note)
-        if match is None:
-            break
-        wake = match.group(1)
-        # An untimed peek is not a wait: it neither counts toward the streak nor
-        # breaks one, so glancing at the pane between two long waits does not
-        # silently suppress the hint.
-        if wake == "immediate":
-            continue
-        if wake != "timeout":
-            break
-        count += 1
-        elapsed = re.search(r"\belapsed=([\d.]+)s", note)
-        if elapsed:
-            total += float(elapsed.group(1))
-    return count, total
+    # True when a requested wait elapsed with no session-death, result, or
+    # hard-stop signal — the caller should wait longer next time, not re-ask.
+    no_signal: bool = False
 
 
 def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str | None = None) -> ObserveOutcome:
@@ -868,6 +812,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     result_path = artifact_dir / "result.json"
 
     initial_running = sessions.session_exists(session)
+    result_existed_before = result_path.is_file()
 
     deadline = time.monotonic() + wait if wait else None
     wait_start = time.monotonic()
@@ -909,66 +854,31 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     tail = "\n".join(tail_lines)
 
     liveness_changed = activity["running"] != initial_running
-
-    # Why this call ended. Ordered by how decisive the signal is; a pane change
-    # is deliberately not among them (see the wait loop above). `immediate`
-    # keeps an untimed peek honest: nothing timed out, so calling it a timeout
-    # would invent waits that were never requested and make a run look as if it
-    # had been re-asking when it had only glanced.
-    # `result` outranks `death`: a Developer that writes result.json and exits
-    # has succeeded, and reporting that as a death would hide the signal the
-    # slice actually produced.
-    if result_present:
-        wake = "result"
-    elif not activity["running"]:
-        wake = "death"
-    elif hard_stop["present"]:
-        wake = "hard-stop"
-    elif wait:
-        wake = "timeout"
-    else:
-        wake = "immediate"
-
-    # Counted BEFORE this call's own event is appended, so it describes the
-    # history this observe is repeating rather than including itself.
-    #
-    # Best-effort, like the append below: this feeds a printed hint and nothing
-    # else, so a busy lock, an unreadable log, or a half-written trailing line
-    # must cost the hint, never the observation. Turning a completed 20-minute
-    # wait into an exit-2 error to protect a note would be the exact failure
-    # this whole change is meant to avoid.
-    slice_id = current.get("id")
-    prior_timeouts, prior_wait_seconds = 0, 0.0
-    if wake == "timeout":
-        try:
-            prior_timeouts, prior_wait_seconds = episode_timeouts(
-                state_mod.read_events(run_dir), slice_id
-            )
-        except Exception:  # noqa: BLE001 - a hint must never cost the observation
-            pass
-
-    # Logged on EVERY call, not only when something changed. A wait that
-    # returned nothing is exactly the call worth counting, and suppressing it
-    # made repeated polling invisible in the run's own record. The note stays
-    # the existing `key=value` shape, so `wait_discipline` reads it without a
-    # schema change and older logs still parse for the keys they do carry.
-    # Also best-effort: the observation has already happened and the caller
-    # needs it. A telemetry gap is recoverable; losing the wait is not.
-    try:
-        state_mod.append_event(
-            run_dir,
-            "observe",
-            slice_id=slice_id,
-            note=(
-                f"pane_changed={pane_changed} liveness_changed={liveness_changed} "
-                f"running={activity['running']} result_present={result_present} "
-                f"requested={f'{wait:g}s' if wait else 'none'} "
-                f"elapsed={elapsed_seconds:.1f}s wake={wake}"
-            ),
-            evidence=str(pane_live_path) if pane_changed else None,
+    result_newly_appeared = result_present and not result_existed_before
+    # A full requested wait that ended in none of the above is exactly the
+    # pattern worth telling the caller about: re-asking at the same length
+    # cannot return anything a longer wait would not have.
+    no_signal = bool(wait) and activity["running"] and not result_present and not hard_stop["present"]
+    changed = pane_changed or liveness_changed or result_newly_appeared
+    if changed or no_signal:
+        note = (
+            f"pane_changed={pane_changed} liveness_changed={liveness_changed} "
+            f"running={activity['running']} result_present={result_present} "
+            f"elapsed={elapsed_seconds:.1f}s"
         )
-    except Exception:  # noqa: BLE001 - telemetry must never cost the observation
-        pass
+        evidence = str(pane_live_path) if pane_changed else None
+        if changed:
+            state_mod.append_event(run_dir, "observe", slice_id=current.get("id"), note=note, evidence=evidence)
+        else:
+            # Best-effort only: a stable no-signal wait otherwise leaves no
+            # trace in events.jsonl, but that trace is nice-to-have, and this
+            # fires on the busiest path (every long stable wait) — it must
+            # never turn a completed wait into a failed observe over lock
+            # contention or a write error.
+            try:
+                state_mod.append_event(run_dir, "observe", slice_id=current.get("id"), note=note, evidence=evidence)
+            except Exception:  # noqa: BLE001 - a no-signal trace must never cost the observation
+                pass
 
     return ObserveOutcome(
         has_current_slice=True,
@@ -978,11 +888,9 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         result_status=result_status,
         hard_stop=hard_stop,
         tail=tail,
-        slice_id=slice_id,
+        slice_id=current.get("id"),
         elapsed_seconds=elapsed_seconds,
-        wake=wake,
-        prior_timeouts=prior_timeouts,
-        prior_wait_seconds=prior_wait_seconds,
+        no_signal=no_signal,
     )
 
 

@@ -1,89 +1,42 @@
 #!/usr/bin/env python3
 """PreToolUse guard: refuse a poll that can return nothing the harness won't tell you.
 
-Why this exists
----------------
-A supervising PM session backgrounds long commands (a Developer wait, a
-commissioned review, a test run) and then goes looking to see whether they
-finished. Claude Code already re-invokes the agent when a background command
-exits, so that looking is redundant — but each look costs a full model
-round-trip that resends the whole conversation.
+A PM session backgrounds a wait (Developer session, reviewer, test run) and
+then looks to see if it finished — redundant, since Claude Code re-invokes
+the agent on exit, and expensive, since each look resends the whole
+conversation. Measured on one 1391-turn session: 346 task-output re-reads
+(273 byte-identical) plus 32 backgrounded hand-rolled waiters, ~26% of turns.
+These are harness calls, not PM commands, so the toolkit itself cannot see or
+bound them.
 
-Measured on one 1391-turn Claude Code session supervising two PM runs:
-346 task-output Reads (273 of them byte-identical repeats, with same-file
-streaks of 64 and 77) plus 32 backgrounded hand-rolled waiters — together
-about 26% of the session's turns.
+Denies two shapes:
 
-The toolkit cannot see any of this (these are harness calls, not PM
-commands), so the guard has to live here.
+`Read` — a re-read byte-identical to the file's previous read. First read and
+any read returning new bytes still pass.
 
-What it denies
---------------
-Two shapes, one per tool.
+`Bash` — a BACKGROUNDED command that waits then inspects a PM artifact
+(`until [ -s .../tasks/<id>.output ]; do sleep 30; done`, and similarly
+against a review report or result.json). Keyed on the wait plus the target,
+never the inspector — the 32 measured polls used 7 different ones (grep,
+cat, head, git log, test, tail, ls), so an inspector allowlist would miss
+most.
 
-`Read` — a re-read whose content is byte-identical to what the previous read
-of that same task-output file returned. Provably no new information. The
-first read of a file always passes, and so does any read that would return
-new bytes: a notification answers "finished?", not "progressing or hung?",
-and one interim look before nudging is legitimate.
+Scope: both require `.pm/` in cwd. `Read` additionally requires Claude
+Code's own scratchpad task-output path. `Bash` additionally requires
+`run_in_background: true` plus a wait; `pm.py review`/`observe --wait` are
+exempt as the toolkit's own legitimate waiters. Foreground is always
+allowed — no second wake, and the escape hatch when no notification is
+coming.
 
-`Bash` — a BACKGROUNDED command that waits and then inspects a PM artifact.
-Backgrounding such a command is itself the waste: it schedules a second
-completion notification for a target that already has one coming, so the
-agent wakes twice and learns nothing the first wake would not have carried.
-The measured forms are hand-rolled waiters:
+Fails open on any unexpected input or error — this bounds spend, and must
+never be why a run gets stuck.
 
-    until [ -s .../tasks/<id>.output ]; do sleep 30; done; ...
-    until grep -qi "^## Verdict" .git/pm/<run>/slices/slice-002/review-4-*.md; do sleep 60; done
-    until [ -f .pm/runs/<run>/slices/slice-003/result.json ]; do sleep 60; done
-
-Keyed on the WAIT and the TARGET, never on the inspector. Across the 32
-measured polls the inspectors were grep (17), cat (13), head (8), git log
-(7), test -s (5), test -f (5), tail (3) and ls (2) — an allowlist of
-"reading" commands would have missed most of them.
-
-Scope
------
-Gates that keep this out of everything else:
-  * The session's working directory contains `.pm/` — i.e. this really is a
-    PM run. Required for both tools.
-  * `Read`: the path is Claude Code's own scratchpad task-output layout
-    (.../claude-<uid>/<project>/<session-uuid>/tasks/<id>.output). A
-    repository with its own `tasks/` directory cannot match.
-  * `Bash`: `run_in_background` is true, AND the command waits, AND it names
-    a Claude task output or a path under a PM run state dir or its mirror.
-    Commands that invoke pm.py are exempt — `observe --wait` and `review`
-    are the toolkit's own legitimate waiters.
-
-A FOREGROUND wait is always allowed. It blocks the turn but spawns no extra
-wake, and it is the escape hatch when no notification is genuinely coming
-(after a session resume, say). The deny message says so.
-
-Fails open. Any unexpected input, missing field, or error allows the call:
-this bounds spend, and must never be the reason a run gets stuck.
-
-How precise this is, honestly
------------------------------
-The Bash branch matches text; it does not parse shell, and deliberately does
-not try to. A quote-aware scanner would be more machinery than the thing it
-guards: this bounds spend on a seat that is trusted by construction, and the
-threat model here is a PM cutting corners, not one evading a cost guard.
-
-So the following are known and accepted, all of them absent from the 290 real
-Bash calls this was built against:
-
-  * A poll can be exempted by mentioning `pm.py review` in a quoted string
-    (`echo 'pm.py review'; sleep 60; cat <artifact>`). That is evasion, not an
-    accident, and evasion is out of scope.
-  * A directory contrived to look like the mirror after a non-boundary
-    character — `archive".pm/runs/<run-id>/"`, which the shell concatenates —
-    is denied. Recovery is one edit: drop `run_in_background`.
-  * Dynamically built paths (`d=...; sleep 900; tail "$d/report"`), `read -t`,
-    and non-shell sleeps are not recognised.
-
-Both directions are bounded. A missed poll costs the turns this exists to
-save; a wrong deny costs one denied call that the foreground form runs
-unchanged. Neither can stop a run.
+Text-matched, not shell-parsed, by design: quote-aware parsing would be more
+machinery than the guard it serves. Known gaps, none seen in the 290 calls
+this was built against: exemption via a quoted `pm.py review`, a directory
+name that shell-concatenates into the mirror path, dynamically built paths,
+`read -t`, non-shell sleeps, and a non-standard `$GIT_DIR` layout. All fail
+toward allow, and the foreground form is always the fix.
 """
 
 from __future__ import annotations
@@ -94,53 +47,35 @@ import re
 import sys
 from pathlib import Path
 
-# Claude Code's scratchpad task-output layout, anchored tightly enough that a
-# repository's own tasks/ directory cannot match. The `$`-anchored form vets a
-# Read's file_path; the unanchored form searches inside a Bash command string.
+# Claude Code's scratchpad task-output layout. `$`-anchored vets a Read's
+# file_path; unanchored searches inside a Bash command string.
 _TASK_OUTPUT_BODY = r"/claude-\d+/[^/]+/[0-9a-f-]{36}/tasks/(?P<task_id>[A-Za-z0-9_-]+)\.output"
 _TASK_OUTPUT_RE = re.compile(_TASK_OUTPUT_BODY + r"$")
 _TASK_OUTPUT_IN_COMMAND_RE = re.compile(_TASK_OUTPUT_BODY)
 
-# A PM run id: `<UTC stamp>-<3-byte nonce>`, plus the `-2`, `-3`, ... suffix
-# new_run_id appends on collision (pm_lib/state.py).
+# A PM run id: `<UTC stamp>-<3-byte nonce>`, plus the `-2`, `-3`, ... collision
+# suffix (pm_lib/state.py new_run_id).
 _RUN_ID = r"\d{8}T\d{6}Z-[0-9a-f]{6}(?:-\d+)?"
-# Authoritative state dir and its in-repo mirror. The live reviewer report is
-# the ORIGINAL under the state dir — the mirror is only written after the
-# reviewer exits cleanly — so matching just `.pm/` would miss every poll of a
-# review still running. `worktree_git_dir` puts the state dir at
-# `<repo>/.git/pm/<run-id>/`, or `<main>/.git/worktrees/<name>/pm/<run-id>/` for
-# a linked worktree.
-#
-# The run-id shape alone is NOT enough to call a path a PM artifact: an
-# unrelated `/srv/data/pm/<something shaped like a run id>/` would match, and
-# denying that is a wrong answer under fail-open. So the match is anchored to
-# the directory layout the toolkit actually creates. The lookbehind rejects a
-# bare suffix — `archive.pm/runs/...` is somebody else's directory, not the
-# mirror. A repository with a non-standard `$GIT_DIR` simply will not match, and
-# allowing is the right failure direction.
-#
-# `_BOUNDARY` is a single-character negative lookbehind: the match must start the
-# string or follow a separator. Excluding only word characters and dots was not
-# enough — `archive-.pm/runs/...` is somebody else's directory and slipped
-# through on the `-`.
+# Authoritative state dir and its in-repo mirror (pm_lib/state.py
+# worktree_git_dir) — matched by directory layout, not just the run-id shape,
+# so an unrelated path shaped like a run id is never denied. The mirror lags
+# the original, so a still-running review only shows up under `.git/pm/`.
+# `_BOUNDARY`: match must start the string or follow a separator —
+# `archive-.pm/runs/...` previously slipped through on the `-`.
 _BOUNDARY = r"""(?<![^\s;&|()<>"'/])"""
 _PM_ARTIFACT_RE = re.compile(
     rf"{_BOUNDARY}\.git/(?:worktrees/[^/\s]+/)?pm/{_RUN_ID}/"
     rf"|{_BOUNDARY}\.pm/runs/{_RUN_ID}/"
 )
 
-# The toolkit's own waiters, which must never be denied: `observe --wait` blocks
-# on the Developer session and `review` blocks on the reviewer it just launched.
-# Neither matches the wait-plus-artifact shape on its own, so this exists only to
-# keep a compound form like `pm.py review …; sleep 5; cat <report>` working.
+# Toolkit's own waiters — `observe --wait`, `review` — exempt so a compound
+# command like `pm.py review …; sleep 5; cat <report>` still works.
 _PM_COMMAND_RE = re.compile(r"pm\.py\s+(?:review|observe)\b")
 
-# Shell comments, stripped before anything is matched. Without this, appending
-# `# pm.py review` to any poll satisfied the exemption above and disabled the
-# guard entirely — and a commented-out artifact path could equally have caused a
-# deny. Quote tracking is deliberately not attempted: the only cost of stripping
-# a `#` that was really inside a quoted string is a missed deny, which is the
-# safe direction.
+# Stripped before matching: an appended `# pm.py review` would otherwise
+# satisfy the exemption above and disable the guard. Quote-unaware by
+# design — the only cost of stripping a `#` inside a quoted string is a
+# missed deny, the safe direction.
 _COMMENT_RE = re.compile(r"(?:^|(?<=[\s;&|(]))#[^\n]*")
 
 # Every hand-rolled waiter measured used one of these; `until`/`while` loops
