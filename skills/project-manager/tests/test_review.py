@@ -661,7 +661,7 @@ class TestReviewRefusals(ReviewCommandTestCase):
         self.assertIn("no reviewer tool", err.lower())
 
 
-# --- reviewer env sanitization, pgid clearing on failure, dirty-worktree ------
+# --- reviewer env sanitization, pgid clearing on failure, dirty worktree ------
 # --- refusal, and the per-slice reviewer-tool override -----------------------
 
 
