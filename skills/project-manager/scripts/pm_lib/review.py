@@ -188,6 +188,22 @@ def _fresh_drift_audit_report(
     return None
 
 
+def _lifecycle_event(run_dir: Path, *, slice_id: str, note: str, evidence: str | None = None) -> None:
+    """Append a reviewer lifecycle event, best-effort.
+
+    Every call site sits AFTER the reviewer process has been launched, and in
+    two cases after it has already produced its report. An exception escaping
+    here would be telemetry failing the operation it merely describes: skipping
+    `process.wait()` and orphaning a live reviewer, or turning a successful
+    review into a reported failure. A five-second state-lock timeout raises
+    `PmError` rather than `OSError`, so the catch is deliberately broad.
+    """
+    try:
+        state_mod.append_event(run_dir, "review", slice_id=slice_id, note=note, evidence=evidence)
+    except Exception:  # noqa: BLE001 - telemetry must never fail the review
+        pass
+
+
 def _tail(path: Path, max_chars: int = _STDERR_TAIL_CHARS) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -438,6 +454,25 @@ def run_review(
             f"reviewer launched: pgid={pgid} report={report_original} stderr={stderr_path}",
             flush=True,
         )
+        # Paired with the terminal `review` event below by (slice, seq), so a
+        # reviewer's wait has a derivable duration. Without a start event the
+        # only trace of a stalled reviewer is an unexplained gap in the log —
+        # one measured run spent 344 minutes inside exactly such a gap, versus
+        # 1-19 minutes for every other review in the same run. `seq` is unique
+        # per slice, not per run, so both fields are needed to pair.
+        # Best-effort, and deliberately catching everything: the reviewer is
+        # ALREADY RUNNING at this point. Anything escaping here skips
+        # `process.wait()` below, so the commissioning command returns while its
+        # reviewer keeps going, with a stale pgid recorded for a later `stop` to
+        # signal. A five-second lock timeout raises PmError, not OSError, so a
+        # narrow catch would have left exactly that hole.
+        try:
+            state_mod.append_event(
+                run_dir, "review-start", slice_id=slice_id,
+                note=f"seq={seq} {skill} via {resolved_tool} pgid={pgid}",
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never orphan a reviewer
+            pass
         timed_out = False
         try:
             returncode = process.wait(timeout=timeout)
@@ -475,11 +510,13 @@ def run_review(
             current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
 
     if timed_out:
-        state_mod.append_event(
+        _lifecycle_event(
             run_dir,
-            "review",
             slice_id=slice_id,
-            note=f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed",
+            note=(
+                f"seq={seq} {skill} via {resolved_tool} status=timeout; "
+                f"timed out after {timeout:g}s, reviewer process group killed"
+            ),
         )
         raise PmError(
             f"reviewer timed out after {timeout:g}s and was killed (process group {pgid}); "
@@ -488,6 +525,14 @@ def run_review(
         )
 
     if returncode != 0:
+        # Closes the `review-start` above. Without this the only non-terminating
+        # commission was the failing one, so an unmatched start could mean either
+        # "still running" or "died", and neither the PM nor the report could tell.
+        _lifecycle_event(
+            run_dir,
+            slice_id=slice_id,
+            note=f"seq={seq} {skill} via {resolved_tool} status=nonzero exit={returncode}",
+        )
         stderr_tail = _tail(stderr_path)
         raise PmError(f"reviewer command failed (exit {returncode}): {stderr_tail}")
 
@@ -511,8 +556,11 @@ def run_review(
                     "at": _utc_now_iso(),
                 },
             ]
-    state_mod.append_event(
-        run_dir, "review", slice_id=slice_id, note=f"{skill} via {resolved_tool}", evidence=str(report_original)
+    _lifecycle_event(
+        run_dir,
+        slice_id=slice_id,
+        note=f"seq={seq} {skill} via {resolved_tool} status=success",
+        evidence=str(report_original),
     )
 
     return ReviewOutcome(

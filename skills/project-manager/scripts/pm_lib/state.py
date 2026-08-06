@@ -14,7 +14,9 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -376,8 +378,15 @@ def read_events(run_dir: Path) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
-        if line:
-            events.append(json.loads(line))
+        if not line:
+            continue
+        event = json.loads(line)
+        # Every writer appends an object, but a corrupted or hand-edited log can
+        # hold a bare array or scalar. Callers all treat entries as mappings, so
+        # skipping a non-mapping here keeps `.get()` from raising AttributeError
+        # several frames away in report rendering or the observe hint.
+        if isinstance(event, dict):
+            events.append(event)
     return events
 
 
@@ -449,6 +458,240 @@ def run_elapsed(events: list[dict[str, Any]]) -> tuple[str, str, str] | None:
         last.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         duration,
     )
+
+
+# Events that open a Developer wait episode: each hands the session something
+# new to do, so what follows is a fresh period of waiting on it. `send` counts —
+# a nudge creates another wait just as a steer does.
+EPISODE_START_KINDS = ("launch", "relaunch", "steer", "send")
+
+# Events that close an episode without opening another: the slice is decided, or
+# the run is over. Together with EPISODE_START_KINDS these are every episode
+# boundary, defined once here and consumed by `slice_ops.episode_timeouts` so
+# the hint and the report can never disagree about where an episode ends.
+EPISODE_END_KINDS = ("accept", "slice-stop", "stop", "init")
+
+
+def _note_field(note: Any, key: str) -> str | None:
+    """Read one `key=value` token out of an event note.
+
+    The value stops at whitespace OR punctuation, because notes are part prose:
+    the timeout note reads `status=timeout; timed out after 3600s`, and a
+    greedy `\\S+` captured `timeout;` — which then matched no known status.
+
+    A non-string note yields None rather than raising: `read_events` guarantees
+    each entry is a mapping, not that every field has its expected type, and a
+    corrupted log must not take out `status --report`.
+    """
+    if not isinstance(note, str):
+        return None
+    match = re.search(rf"\b{key}=([^\s;,]+)", note)
+    return match.group(1) if match else None
+
+
+def _seconds(raw: str | None) -> float | None:
+    """Parse a `123.4s` / `900s` note value. `none` and junk yield None.
+
+    Finite and non-negative only. `float()` happily returns nan/inf for
+    `requested=nans` or `requested=infs`, which then raise when the renderer
+    converts them to an int — and the CLI's own validation cannot help here,
+    since a hand-recovered or corrupted log is exactly when this is read.
+    """
+    if not raw or not raw.endswith("s"):
+        return None
+    try:
+        value = float(raw[:-1])
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def wait_discipline(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-episode wait statistics, derived from the event log alone.
+
+    An *episode* opens at each launch/relaunch/steer/send and collects the
+    observes that follow it. The interesting figure is not how many observes an
+    episode took but the sequence of wait LENGTHS: measured across two real
+    runs the waste was uniformly `20/20/20/20` against a Developer needing 85
+    minutes, i.e. a pacing choice, not a redundant question. Showing the
+    sequence puts that in front of whoever reads the report.
+
+    Reviewer waits are reported separately and never mixed into the observe
+    counts — `observe` follows the Developer session only and returns the
+    instant `result.json` exists, so it is not what watches a reviewer.
+    """
+    episodes: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for event in events:
+        kind = event.get("kind")
+        if kind in EPISODE_START_KINDS:
+            current = {"kind": kind, "slice": event.get("slice"), "waits": [], "wakes": []}
+            episodes.append(current)
+        elif kind in EPISODE_END_KINDS:
+            # Closed, not replaced: the slice is decided or the run is over, so
+            # anything after this belongs to no episode. Matches where
+            # `slice_ops.episode_timeouts` stops its backwards scan.
+            current = None
+        elif kind == "observe" and current is not None:
+            note = event.get("note") or ""
+            current["waits"].append(_seconds(_note_field(note, "requested")))
+            current["wakes"].append(_note_field(note, "wake"))
+
+    observes = sum(len(e["waits"]) for e in episodes)
+    # "Repeat" means a no-signal wait that was followed by ANOTHER TIMED WAIT in
+    # the same episode. Two exclusions matter:
+    #   * a wait ending on result/death/hard-stop is never a repeat; and
+    #   * an untimed peek (`wake=immediate`) is not a wait, so a timeout
+    #     followed only by a glance was never repeated and must not be counted.
+    # An unclassified legacy observe counts neither way.
+    repeats = 0
+    for episode in episodes:
+        # Walk backwards so "was there a later timed wait?" is a running flag.
+        # "Timed" is `requested` being present, NOT the later wake being another
+        # timeout: a wait that finally returned a result is still a wait, and
+        # the timeout before it was still repeated.
+        later_timed_wait = False
+        for requested, wake in zip(
+            reversed(episode["waits"]), reversed(episode["wakes"]), strict=True
+        ):
+            if wake == "timeout" and later_timed_wait:
+                repeats += 1
+            if requested is not None:
+                later_timed_wait = True
+
+    # Reviewer commissions, paired (slice, seq). `seq` is unique per slice only.
+    open_starts: dict[tuple[Any, str | None], str] = {}
+    intervals: list[tuple[datetime, datetime]] = []
+    completed = 0
+    failed = 0
+    for event in events:
+        kind = event.get("kind")
+        if kind not in ("review-start", "review"):
+            continue
+        note = event.get("note") or ""
+        key = (event.get("slice"), _note_field(note, "seq"))
+        stamp = event.get("ts")
+        if kind == "review-start":
+            open_starts[key] = stamp
+        else:
+            completed += 1
+            # A timeout or a non-zero exit terminates a commission but produces
+            # no report, so folding it into a bare "completed" count would read
+            # as review coverage the run does not actually have.
+            if _note_field(note, "status") in ("timeout", "nonzero"):
+                failed += 1
+            started = open_starts.pop(key, None)
+            if not started or not isinstance(stamp, str):
+                continue
+            try:
+                begin = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                end = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            if begin.tzinfo and end.tzinfo and end >= begin:
+                intervals.append((begin, end))
+
+    # Union, not sum: reviews run concurrently, so adding their durations would
+    # overstate the wall-clock time the run actually spent waiting on reviewers.
+    union = 0.0
+    merged_start: datetime | None = None
+    merged_end: datetime | None = None
+    for begin, end in sorted(intervals):
+        if merged_end is None or begin > merged_end:
+            if merged_start is not None and merged_end is not None:
+                union += (merged_end - merged_start).total_seconds()
+            merged_start, merged_end = begin, end
+        elif end > merged_end:
+            merged_end = end
+    if merged_start is not None and merged_end is not None:
+        union += (merged_end - merged_start).total_seconds()
+
+    return {
+        "episodes": episodes,
+        "episode_count": len(episodes),
+        "observes": observes,
+        "repeat_waits": repeats,
+        "reviews_completed": completed,
+        "reviews_failed": failed,
+        "reviews_open": len(open_starts),
+        "review_wall_clock_seconds": union,
+        # True when ANY counted observe lacks a `wake=` token. `all` was wrong:
+        # a run started before this change and continued after it has a mix, and
+        # its earliest repeats are still unclassifiable — reporting that as a
+        # clean log would understate the very cost this section exists to show.
+        "legacy_log": any(wake is None for episode in episodes for wake in episode["wakes"]),
+    }
+
+
+def _format_minutes(seconds: float) -> str:
+    """A duration, never rounded down to a bare `0m`.
+
+    `observe --wait 30` is a legal input, and rendering it as `0m` erased the
+    only thing the wait column exists to show.
+    """
+    if seconds < 60:
+        # `:g` rather than `:.0f`: a 0.1s wait is legal and must not print as 0s.
+        return f"{seconds:g}s"
+    total = int(round(seconds / 60))
+    hours, minutes = divmod(total, 60)
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def render_wait_discipline(metrics: dict[str, Any]) -> list[str]:
+    """The `## Wait Discipline` report section, as lines."""
+    lines = ["## Wait Discipline", ""]
+    reviews = metrics["reviews_completed"]
+    has_reviews = bool(reviews or metrics["reviews_open"])
+    # Developer episodes and reviewer commissions are independent: a run can
+    # record commissions with no observes at all (a slice accepted on the first
+    # look), so neither absence may suppress the other.
+    if not metrics["episode_count"] and not has_reviews:
+        lines.append("(no wait episodes recorded)")
+        lines.append("")
+        return lines
+
+    if metrics["episode_count"]:
+        per_episode = metrics["observes"] / metrics["episode_count"]
+        lines.append(f"- Wait episodes (launch/relaunch/steer/send): {metrics['episode_count']}")
+        lines.append(f"- Observes: {metrics['observes']} ({per_episode:.2f} per episode)")
+        lines.append(
+            f"- Repeat waits (a wait returned no signal and was followed by another): "
+            f"{metrics['repeat_waits']}"
+        )
+    if has_reviews:
+        wall = _format_minutes(metrics["review_wall_clock_seconds"])
+        parts = [f"{reviews} terminated"]
+        if metrics["reviews_failed"]:
+            parts.append(f"{metrics['reviews_failed']} without a report (timeout/non-zero)")
+        if metrics["reviews_open"]:
+            parts.append(f"{metrics['reviews_open']} with no terminal event recorded")
+        lines.append(f"- Reviewer commissions: {', '.join(parts)}; {wall} wall-clock")
+    if metrics["legacy_log"]:
+        lines.append(
+            "- NOTE: this log predates unconditional observe logging, so observe counts "
+            "are lower bounds and repeat waits cannot be classified."
+        )
+    if metrics["episodes"]:
+        lines.append("")
+        lines.append("| episode | slice | requested waits |")
+        lines.append("|---|---|---|")
+        for episode in metrics["episodes"]:
+            waits = " / ".join(
+                _format_minutes(w) if w else "-" for w in episode["waits"]
+            ) or "(none)"
+            lines.append(f"| {episode['kind']} | {episode['slice']} | {waits} |")
+    lines.append("")
+    # Said plainly rather than implied: the expensive polling this metric exists
+    # to expose partly happens through harness calls the toolkit never sees.
+    lines.append(
+        "Counts actions, not turns: `events.jsonl` records no turn identifier, and "
+        "harness-level polling (a Read of a task output, a hand-rolled `sleep`-and-check) "
+        "never reaches this log at all. Treat these as a floor on wait cost."
+    )
+    lines.append("")
+    return lines
 
 
 def _reviewer_line(state: dict[str, Any]) -> str:
@@ -575,6 +818,8 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     else:
         lines.append("(not recorded)")
     lines.append("")
+
+    lines.extend(render_wait_discipline(wait_discipline(events)))
 
     lines.append("## Approvals")
     approvals = state.get("approvals") or {}
