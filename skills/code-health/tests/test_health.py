@@ -24,6 +24,10 @@ def sh(args, cwd):
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=True)
 
 
+def churn_facts_in(repo, maximum=10):
+    return health.churn_facts(Path(repo.path), maximum)
+
+
 class Repo:
     def __enter__(self):
         self.path = tempfile.mkdtemp(prefix="health-test-")
@@ -314,6 +318,43 @@ class TestDifferentialMechanics(InRepo):
             base = repo.commit()
             os.unlink(os.path.join(repo.path, "gone.py"))
             self.assertEqual(self.run_health(repo, "analyze", "--base", base, "--json"), 0)
+
+    def test_churn_counts_revisions_and_lines_under_literal_paths(self):
+        """One `git log --numstat`. Rename detection is off, so a renamed file
+        keeps two literal path keys rather than one `old => new` arrow that no
+        other fact in the bundle could be joined against."""
+        with Repo() as repo:
+            repo.write("src/alpha.py", "one = 1\n")
+            repo.commit()
+            repo.write("src/alpha.py", "one = 1\ntwo = 2\nthree = 3\n")
+            repo.commit("grow")
+            sh(["git", "mv", "src/alpha.py", "src/beta.py"], repo.path)
+            repo.commit("rename")
+            facts = churn_facts_in(repo)
+            rows = {row["path"]: row for row in facts["churn"]}
+            self.assertEqual(facts["commits_considered"], 3)
+            self.assertFalse(any("=>" in path for path in rows))
+            self.assertEqual(rows["src/alpha.py"],
+                             {"path": "src/alpha.py", "revisions": 3, "additions": 3, "deletions": 3})
+
+    def test_churn_is_refused_on_a_shallow_clone(self):
+        """Truncated history must read as unavailable, never as low churn, and
+        `--require-coverage` must be able to stop on it."""
+        with Repo() as repo:
+            repo.write("a.py", "x = 1\n")
+            repo.commit()
+            original = health.git
+            def fake(root, *args, **kwargs):
+                if args == ("rev-parse", "--is-shallow-repository"):
+                    return "true\n"
+                return original(root, *args, **kwargs)
+            health.git = fake
+            try:
+                self.assertEqual(churn_facts_in(repo)["reason"], "shallow_repository")
+                self.assertEqual(self.run_health(repo, "analyze", "--all", "--history",
+                                                 "--require-coverage", "--json"), 3)
+            finally:
+                health.git = original
 
     def test_candidates_require_changed_values_and_honor_renames(self):
         current = [

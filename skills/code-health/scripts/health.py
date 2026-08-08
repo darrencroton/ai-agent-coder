@@ -38,6 +38,7 @@ EXIT_OK = 0
 EXIT_ERROR = 2
 EXIT_COVERAGE = 3
 TOP_PER_FAMILY = 5
+DEFAULT_MAX_COMMITS = 200
 LIZARD_SUPPORTED = {"JavaScript", "TypeScript", "Java", "Kotlin", "C", "C/C++", "C++", "C#", "Go", "Ruby", "PHP", "Swift", "Rust", "Scala"}
 LIZARD_INSTALL = "uv tool install lizard  (or pipx install lizard)"
 
@@ -1220,6 +1221,36 @@ def new_cycles(current_graph: dict[str, Any], base_graph: dict[str, Any], invers
     return rows
 
 
+def churn_facts(root: Path, maximum: int) -> dict[str, Any]:
+    """Per-path revision and line counts from one ``git log --numstat``.
+
+    Context for ranking what is already measured; it never enters a changed,
+    worsened or resolved bucket, and it is refused outright on a shallow clone
+    rather than computed from a truncated history.  Rename detection is off so
+    churn keys stay literal repository paths.
+    """
+    if git(root, "rev-parse", "--is-shallow-repository").strip() == "true":
+        return {"status": "unavailable", "reason": "shallow_repository"}
+    churn: dict[str, dict[str, int]] = defaultdict(lambda: {"revisions": 0, "additions": 0, "deletions": 0})
+    commits = 0
+    for line in git(root, "log", f"--max-count={maximum}", "--format=%H",
+                    "--numstat", "--no-renames").splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) != 3:
+            # `--format=%H` emits nothing else, so any non-numstat line is a
+            # commit id, whatever its hash length.
+            commits += bool(line.strip())
+            continue
+        added, deleted, path = fields
+        entry = churn[path]
+        entry["revisions"] += 1
+        # Binary numstat uses '-', which is not a line count; keep the revision.
+        entry["additions"] += int(added) if added.isdigit() else 0
+        entry["deletions"] += int(deleted) if deleted.isdigit() else 0
+    return {"status": "covered", "max_commits": maximum, "commits_considered": commits,
+            "churn": [{"path": path, **churn[path]} for path in sorted(churn)]}
+
+
 def output_text(bundle: dict[str, Any]) -> str:
     coverage = bundle["coverage"]
     covered = sum(row["status"] == "covered" for row in coverage)
@@ -1328,6 +1359,7 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         "coverage": coverage,
         "facts": {"unreadable_files": unreadable},
     }
+    history_gap = False
     if analyzing:
         duplication = duplication_facts(source, args.duplicate_lines, list(diff.source), diff.changed)
         composition_facts, composition_unreadable = composition(root, current_paths, source)
@@ -1346,6 +1378,9 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
             "verdict": "none",
         }
         bundle["candidates"] = candidates(source, structure, includes, lizard.functions, duplication, diff)
+        if args.history:
+            bundle["facts"]["history"] = churn_facts(root, args.max_commits)
+            history_gap = bundle["facts"]["history"]["status"] == "unavailable"
     # Unrecognised files are disclosed, not gated: whether an unclassified file
     # is source is a judgement, and blocking on it made ordinary repositories
     # fail over a `.babelrc`.  The gate stays on measurement that actually
@@ -1354,7 +1389,8 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     gap = any(row["language"] in required and row["status"] == "unavailable" for row in coverage)
     blocking_conflicts = set(conflicts) & diff.changed if diff.active else set(conflicts)
     empty_differential = analyzing and args.base is not None and not diff.changed
-    return bundle, bool(empty_differential or (args.require_coverage and (gap or blocking_conflicts)))
+    return bundle, bool(empty_differential
+                        or (args.require_coverage and (gap or history_gap or blocking_conflicts)))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1371,13 +1407,15 @@ def parser() -> argparse.ArgumentParser:
     modes.add_argument("--base", metavar="REF", help="compare current scope with a git revision")
     modes.add_argument("--all", action="store_true", help="analyse the current complete scope")
     analyze.add_argument("--duplicate-lines", type=int, default=6, help="minimum duplicate window length (default: %(default)s)")
+    analyze.add_argument("--history", action="store_true", help="add repository-context churn evidence")
+    analyze.add_argument("--max-commits", type=int, default=DEFAULT_MAX_COMMITS, help="churn commit cap (default: %(default)s)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if getattr(args, "duplicate_lines", 6) < 1:
-        parser().error("--duplicate-lines must be positive")
+    if getattr(args, "duplicate_lines", 6) < 1 or getattr(args, "max_commits", 1) < 1:
+        parser().error("--duplicate-lines and --max-commits must be positive")
     try:
         bundle, coverage_exit = build_bundle(args)
     except HealthError as exc:

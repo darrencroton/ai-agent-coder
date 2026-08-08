@@ -16,7 +16,7 @@ The v1 analyzer has a dependency-free portable floor and one optional collector:
 - SonarQube is valuable when a project already operates it, but server/scanner setup is too heavy for the default skill.
 - Sentrux is close in intent and offers graph-oriented analysis, but its aggregate quality signal conflicts with this skill's no-score, evidence-first contract. Dimension-level evidence may be reconsidered after its machine-readable interface matures.
 - jCodeMunch is primarily symbol retrieval and impact exploration for agents, not a deterministic code-health measurement engine.
-- Code Maat validates churn and temporal-coupling techniques, but this analyzer retains no history facts at all: churn is one `git log --numstat` away, so correlating change frequency with structure stays an agent-side step rather than a JVM/Clojure dependency.
+- Code Maat validates churn and temporal-coupling techniques, but direct Git analysis avoids its JVM/Clojure runtime for the limited churn context `--history` retains.
 
 ## Dependency contract
 

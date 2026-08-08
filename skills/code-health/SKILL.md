@@ -27,16 +27,17 @@ Run from anywhere inside the target repository:
 ```bash
 python3 <skill-dir>/scripts/health.py detect
 python3 <skill-dir>/scripts/health.py analyze --base <ref>
+python3 <skill-dir>/scripts/health.py analyze --base <ref> --history
 python3 <skill-dir>/scripts/health.py analyze --all
 ```
 
-Add `--json` for the versioned evidence bundle and `--require-coverage` when incomplete structural coverage must stop automation. Neither subcommand installs anything. There is no history subcommand or flag: churn is one `git log --numstat` away and the analyzer did nothing with it but echo it, so correlating change frequency with structure is the agent's own step when it helps prioritize.
+Add `--json` for the versioned evidence bundle and `--require-coverage` when incomplete structural coverage must stop automation. Neither subcommand installs anything. `--history` adds per-path revision and line churn from one `git log --numstat`; it refuses to fabricate history from a shallow clone and never classifies change frequency as a structural regression.
 
 ## Workflow
 
 1. **Resolve scope.** For a plan slice use its `before_head`; for a branch use the merge base with the default branch; before a commit use `HEAD`. Use `--all` only when the user asked for a whole-codebase audit.
 2. **Run `detect`.** Read every language × metric-family cell and `repository.coverage_limits`. State unavailable or excluded coverage before drawing conclusions.
-3. **Run `analyze`.** Use whatever Lizard coverage exists; never install it. If change frequency would help rank what you found, get it yourself from `git log --numstat` and keep it as context — it never enters a changed, worsened, or resolved structural bucket.
+3. **Run `analyze`.** Use whatever Lizard coverage exists; never install it. Start without `--history`; add it when change frequency would materially help rank what you found and the clone is complete.
 4. **Read the distributions and deltas.** Prefer tails, new cycles, changed duplicate relationships, and per-node fan-in/fan-out/blast-radius changes over averages. Keep raw values attached to every claim. On a dependency graph, check `resolution_counts` before trusting an edge: a repository built with `-I` search paths can have most of its edges resolved by unique basename, which is a disclosed guess rather than a proven relationship.
 5. **Inspect candidates in code.** Determine each component's apparent role from callers, tests, interfaces, and surrounding modules. A dispatcher, parser table, generated protocol adapter, or boundary module may reasonably look structurally exceptional.
 6. **Explain proportionality.** For each material candidate, state the measured fact, contextual interpretation, consequence if unjustified, confidence, and either a concrete next step or `no change justified`.
@@ -51,7 +52,7 @@ Use these semantic sections; omit empty optional sections rather than inventing 
 - Mode/base, files and languages measured, metric families unavailable.
 
 ## Measured Facts
-- Raw distributions, deltas, and relationships.
+- Raw distributions, deltas, relationships, and optional churn context.
 
 ## Investigated Structural Risks
 1. `path:line` — measured evidence; role/context; interpretation and confidence.
@@ -60,7 +61,7 @@ Use these semantic sections; omit empty optional sections rather than inventing 
 - Action, verification, or `no change justified`, tied to the evidence above.
 
 ## Limits
-- Parser failures, unresolved index paths, symbolic links, unsupported languages, basename-guessed edges, configuration, or unmeasured semantics.
+- Parser failures, unresolved index paths, symbolic links, shallow history, unsupported languages, basename-guessed edges, configuration, or unmeasured semantics.
 ```
 
 Do not repeat the script's entire top-N list. Investigate the few candidates with the strongest combination of change relevance, structural reach, and maintenance consequence.
