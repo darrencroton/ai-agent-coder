@@ -28,12 +28,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from pathlib import Path
+import posixpath
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-BUNDLE_VERSION = "1.0"
+BUNDLE_VERSION = "1.1"
 EXIT_OK = 0
 EXIT_ERROR = 2
 EXIT_COVERAGE = 3
@@ -54,16 +55,64 @@ EXTENSIONS = {
     ".cjs": "JavaScript", ".jsx": "JavaScript", ".ts": "TypeScript", ".tsx": "TypeScript",
     ".java": "Java", ".kt": "Kotlin", ".kts": "Kotlin", ".c": "C", ".h": "C/C++",
     ".cc": "C++", ".cpp": "C++", ".cxx": "C++", ".hpp": "C++", ".cs": "C#",
+    ".hh": "C++", ".hxx": "C++", ".h++": "C++", ".c++": "C++",
+    ".inl": "C++", ".ipp": "C++", ".tcc": "C++",
+    ".cu": "CUDA", ".cuh": "CUDA",
     ".go": "Go", ".rs": "Rust", ".rb": "Ruby", ".php": "PHP", ".swift": "Swift",
     ".scala": "Scala", ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
     ".fish": "Shell", ".ps1": "PowerShell", ".r": "R", ".R": "R", ".lua": "Lua",
     ".pl": "Perl", ".pm": "Perl", ".ex": "Elixir", ".exs": "Elixir",
     ".fs": "F#", ".fsx": "F#", ".dart": "Dart", ".sql": "SQL",
+    ".f90": "Fortran", ".f95": "Fortran", ".f03": "Fortran", ".f08": "Fortran",
+    ".f": "Fortran", ".for": "Fortran", ".ftn": "Fortran",
+    ".F90": "Fortran", ".F95": "Fortran", ".F03": "Fortran", ".F08": "Fortran",
+    ".F": "Fortran", ".FOR": "Fortran", ".FTN": "Fortran",
+    ".mk": "Make", ".make": "Make", ".cmake": "CMake", ".m4": "Autoconf",
+}
+# Build files are matched by name because they carry no extension, or (CMake)
+# an extension already owned by documentation.  Recognising them keeps a build
+# system visible as source rather than silently 'other'.
+FILENAMES = {
+    "makefile": "Make", "gnumakefile": "Make", "bsdmakefile": "Make",
+    "makefile.am": "Automake", "makefile.in": "Automake",
+    "cmakelists.txt": "CMake", "meson.build": "Meson", "configure.ac": "Autoconf",
+    ".bashrc": "Shell", ".bash_profile": "Shell", ".zshrc": "Shell", ".zprofile": "Shell",
+    ".profile": "Shell", ".bash_aliases": "Shell", ".zshenv": "Shell",
 }
 DOC_EXTENSIONS = {".md", ".mdx", ".rst", ".txt", ".adoc"}
-CONFIG_EXTENSIONS = {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml"}
-HASH_COMMENT_LANGUAGES = {"Python", "Shell", "Ruby", "Perl", "R", "Lua", "Elixir", "PowerShell"}
-SLASH_COMMENT_LANGUAGES = {"JavaScript", "TypeScript", "Java", "Kotlin", "C", "C++", "C#", "Go", "Rust", "Swift", "Scala", "Dart", "PHP"}
+CONFIG_EXTENSIONS = {".json", ".jsonc", ".json5", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml"}
+# Extensionless repository metadata; recognised so it is not reported as an
+# unmeasured source language.
+DOC_FILENAMES = {"license", "licence", "copying", "notice", "authors", "contributors",
+                 "codeowners", "readme", "changelog", "version"}
+# Data and build products are not unmeasured *source*; classifying them keeps
+# `unrecognised_extensions` a usable signal rather than an inventory dump.
+DATA_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp", ".pdf", ".eps",
+    ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".tar", ".jar", ".whl",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp3", ".mp4", ".wav", ".avi", ".mov", ".webm",
+    ".csv", ".tsv", ".parquet", ".npy", ".npz", ".h5", ".hdf5", ".fits", ".nc",
+    ".dat", ".bin", ".so", ".dylib", ".dll", ".o", ".a", ".exe", ".pyc", ".class",
+    ".db", ".sqlite", ".sqlite3", ".pkl", ".pickle", ".lock",
+}
+# Named rather than "anything starting with a dot": a dotfile holding shell
+# code is unmeasured source, and calling it configuration hides that.
+CONFIG_FILENAMES = {
+    ".gitignore", ".gitattributes", ".gitmodules", ".gitkeep", ".dockerignore",
+    ".editorconfig", ".env", ".npmrc", ".nvmrc", ".prettierrc", ".eslintrc",
+    ".flake8", ".pylintrc", ".coveragerc", ".clang-format", ".clang-tidy",
+    ".markdownlintignore", ".ds_store",
+}
+HASH_COMMENT_LANGUAGES = {"Python", "Shell", "Ruby", "Perl", "R", "Lua", "Elixir", "PowerShell",
+                          "CMake", "Meson", "Automake", "Autoconf"}
+# GNU make treats '#' as a comment only outside a recipe; a tab-indented '#' is
+# a shell line.  Counted separately so an indented '#' stays code.
+COLUMN_ONE_HASH_LANGUAGES = {"Make"}
+# Free-form Fortran only.  Fixed-form 'C'/'*' in column 1 is deliberately not
+# claimed here; see references/methodology.md for the resulting undercount.
+BANG_COMMENT_LANGUAGES = {"Fortran"}
+SLASH_COMMENT_LANGUAGES = {"JavaScript", "TypeScript", "Java", "Kotlin", "C", "C++", "C/C++", "C#", "Go", "Rust", "Swift", "Scala", "Dart", "PHP", "CUDA"}
 METRIC_FAMILIES = ("composition", "duplication", "cyclomatic", "dependencies")
 
 
@@ -174,7 +223,8 @@ def archive_revision(root: Path, ref: str) -> tempfile.TemporaryDirectory[str]:
 
 
 def language_for(path: str) -> str | None:
-    return EXTENSIONS.get(Path(path).suffix)
+    name = Path(path).name
+    return EXTENSIONS.get(Path(path).suffix) or FILENAMES.get(name.lower())
 
 
 def category_for(path: str, language: str | None) -> tuple[str, str]:
@@ -191,10 +241,15 @@ def category_for(path: str, language: str | None) -> tuple[str, str]:
         )
         return ("test" if test else "production", "explicit_path_or_filename_rule")
     suffix = Path(path).suffix.lower()
-    if suffix in DOC_EXTENSIONS or lower.startswith("docs/"):
-        return "documentation", "extension_or_docs_directory_rule"
-    if suffix in CONFIG_EXTENSIONS or name.startswith("."):
+    if suffix in CONFIG_EXTENSIONS or (name.startswith(".") and (
+            name in CONFIG_FILENAMES or name.endswith(("rc", "ignore", "config", "cfg")))):
         return "configuration", "extension_or_dotfile_rule"
+    # Metadata names only when extensionless or already a doc extension, so a
+    # `version.awk` stays an unrecognised source file rather than a document.
+    if suffix in DOC_EXTENSIONS or lower.startswith("docs/") or (not suffix and name in DOC_FILENAMES):
+        return "documentation", "extension_or_docs_directory_rule"
+    if suffix in DATA_EXTENSIONS:
+        return "data", "data_or_build_product_rule"
     return "other", "unrecognised_extension_rule"
 
 
@@ -210,6 +265,10 @@ def line_counts(text: str, language: str | None) -> dict[str, int | str]:
             blank += 1
             continue
         if language in HASH_COMMENT_LANGUAGES and stripped.startswith("#"):
+            comment += 1
+        elif language in COLUMN_ONE_HASH_LANGUAGES and line.startswith("#"):
+            comment += 1
+        elif language in BANG_COMMENT_LANGUAGES and stripped.startswith("!"):
             comment += 1
         elif language in SLASH_COMMENT_LANGUAGES:
             if in_block or stripped.startswith("/*"):
@@ -432,35 +491,289 @@ def python_structure(source: list[SourceFile]) -> dict[str, Any]:
                     target = modules[max(matches, key=len)]
                     if target != path:
                         edges.add((path, target))
-    inbound: Counter[str] = Counter(dst for _, dst in edges)
-    outbound: Counter[str] = Counter(src for src, _ in edges)
-    graph = {path: sorted(dst for src, dst in edges if src == path) for path in sorted(trees)}
-    sccs = strongly_connected_components(graph)
-    cycles = [component for component in sccs if len(component) > 1]
-    reverse = {path: [] for path in graph}
-    for src, destinations in graph.items():
-        for dst in destinations:
-            reverse[dst].append(src)
-    blast = []
-    for path in sorted(graph):
-        seen = {path}
-        queue: deque[str] = deque(reverse[path])
-        while queue:
-            item = queue.popleft()
-            if item not in seen:
-                seen.add(item)
-                queue.extend(reverse[item])
-        blast.append({"path": path, "reverse_reachability": len(seen) - 1})
-    blast.sort(key=lambda row: (-row["reverse_reachability"], row["path"]))
     return {
         "parse_errors": errors,
         "functions": functions,
         "function_cyclomatic_distribution": size_distribution([r["cyclomatic"] for r in functions]),
-        "imports": {"edges": [{"from": src, "to": dst} for src, dst in sorted(edges)],
-                    "fan_in": [{"path": p, "value": inbound[p]} for p in sorted(graph)],
-                    "fan_out": [{"path": p, "value": outbound[p]} for p in sorted(graph)],
-                    "cycles": cycles, "reverse_reachability": blast},
+        "imports": graph_facts(sorted(trees), edges),
     }
+
+
+def reverse_reachability(graph: dict[str, list[str]], cycles: list[list[str]]) -> dict[str, int]:
+    """How many distinct files reach each node, via the SCC condensation.
+
+    A BFS per node is quadratic, which a dense C include graph makes real; the
+    condensation is a DAG, so one memoized pass in reverse topological order
+    answers every node.
+    """
+    component_of: dict[str, int] = {}
+    components: list[list[str]] = []
+    for cycle in cycles:
+        for path in cycle:
+            component_of[path] = len(components)
+        components.append(list(cycle))
+    for path in graph:
+        if path not in component_of:
+            component_of[path] = len(components)
+            components.append([path])
+    condensed: dict[int, set[int]] = {index: set() for index in range(len(components))}
+    for src, destinations in graph.items():
+        for dst in destinations:
+            if component_of[src] != component_of[dst]:
+                condensed[component_of[dst]].add(component_of[src])
+    order: list[int] = []
+    state = [0] * len(components)
+    for start in range(len(components)):
+        if state[start]:
+            continue
+        stack = [(start, iter(sorted(condensed[start])))]
+        state[start] = 1
+        while stack:
+            node, children = stack[-1]
+            child = next(children, None)
+            if child is None:
+                stack.pop()
+                order.append(node)
+                continue
+            if not state[child]:
+                state[child] = 1
+                stack.append((child, iter(sorted(condensed[child]))))
+    # Bitmask per component rather than a set of ancestors: a set costs O(V^2)
+    # *objects* on a wide DAG (measured 624 MB at 4,000 nodes), an int costs
+    # O(V^2) bits.
+    ancestors = [0] * len(components)
+    for node in order:
+        reached = 0
+        for parent in condensed[node]:
+            reached |= (1 << parent) | ancestors[parent]
+        ancestors[node] = reached
+    sizes = [len(members) for members in components]
+    uniform = all(size == 1 for size in sizes)
+    result: dict[str, int] = {}
+    for index, members in enumerate(components):
+        mask = ancestors[index]
+        if uniform:
+            total = mask.bit_count()
+        else:
+            total = 0
+            while mask:
+                lowest = mask & -mask
+                total += sizes[lowest.bit_length() - 1]
+                mask ^= lowest
+        for path in members:
+            result[path] = total + len(members) - 1
+    return result
+
+
+def graph_facts(nodes: Iterable[str], edges: set[tuple[str, str]]) -> dict[str, Any]:
+    """Fan-in/out, cycles and reverse reachability for a directed file graph.
+
+    Shared by every dependency collector so Python imports and C includes are
+    described in exactly the same units.
+    """
+    inbound: Counter[str] = Counter(dst for _, dst in edges)
+    outbound: Counter[str] = Counter(src for src, _ in edges)
+    # One pass; per-node edge scans are quadratic on dense C graphs.
+    adjacency: dict[str, list[str]] = defaultdict(list)
+    for src, dst in edges:
+        adjacency[src].append(dst)
+    graph = {path: sorted(adjacency.get(path, ())) for path in sorted(nodes)}
+    cycles = [component for component in strongly_connected_components(graph) if len(component) > 1]
+    blast = [{"path": path, "reverse_reachability": value}
+             for path, value in reverse_reachability(graph, cycles).items()]
+    blast.sort(key=lambda row: (-row["reverse_reachability"], row["path"]))
+    return {"edges": [{"from": src, "to": dst} for src, dst in sorted(edges)],
+            "fan_in": [{"path": p, "value": inbound[p]} for p in sorted(graph)],
+            "fan_out": [{"path": p, "value": outbound[p]} for p in sorted(graph)],
+            "cycles": cycles, "reverse_reachability": blast}
+
+
+C_FAMILY = {"C", "C++", "C/C++", "CUDA"}
+# Quoted includes only.  ``#include <...>`` names a system or external header
+# by contract, so excluding it keeps the graph internal without a header search
+# path.  Continuation lines and macro-computed includes are not handled.
+# A leading BOM is tolerated so an MSVC-authored first line is not skipped.
+INCLUDE_PATTERN = re.compile(r'^﻿?[ \t]*#[ \t]*include[ \t]*"([^"\n]+)"', re.MULTILINE)
+# C++ d-char: anything but whitespace, parentheses and backslash.  A quote is
+# legal, so `R""(...)""` is a raw string.
+RAW_STRING_OPEN = re.compile(r'R"([^()\s\\]{0,16})\(')
+RAW_STRING_PREFIXES = ("", "L", "u", "U", "u8")
+IDENTIFIER_CHAR = re.compile(r"[A-Za-z0-9_]")
+NEXT_INTERESTING = re.compile(r"""[/"']|R"|\n""")
+
+
+def blank_span(text: str) -> str:
+    return "".join(" " if char != "\n" else "\n" for char in text)
+
+
+def mask_non_code(text: str, language: str | None = None) -> str:
+    """Blank comments and raw strings, preserving offsets and line structure.
+
+    Ordinary string and character literals are consumed but kept verbatim: an
+    include's own quoted target is a string, so blanking strings would erase
+    the very thing being measured, while skipping them stops a literal such as
+    ``"/*"`` or ``"dir//b.h"`` from being mistaken for a comment.
+    """
+    # `.h` is C/C++ ambiguous, so raw strings stay enabled there; only a
+    # definitely-C translation unit disables them.
+    raw_strings_possible = language in {"C++", "C/C++", "CUDA", None}
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        match = NEXT_INTERESTING.search(text, i)
+        if not match:
+            out.append(text[i:])
+            break
+        if match.start() > i:
+            out.append(text[i:match.start()])
+            i = match.start()
+        char = text[i]
+        pair = text[i:i + 2]
+        if pair == "/*":
+            end = text.find("*/", i + 2)
+            end = n if end == -1 else end + 2
+            out.append(blank_span(text[i:end]))
+            i = end
+        elif pair == "//":
+            end = text.find("\n", i)
+            while end != -1 and text[end - 1:end] == "\\":
+                end = text.find("\n", end + 1)
+            end = n if end == -1 else end
+            # blank_span, not spaces: a spliced comment spans newlines, and
+            # eating them would shift every line number below it.
+            out.append(blank_span(text[i:end]))
+            i = end
+        elif char == "R" and raw_strings_possible and self_delimited_raw(text, i):
+            raw = RAW_STRING_OPEN.match(text, i)
+            terminator = ")" + raw.group(1) + '"'
+            end = text.find(terminator, raw.end())
+            if end == -1:
+                # Never blank to end of file on an unterminated opener: the
+                # loss would be silent and unbounded.
+                out.append(char)
+                i += 1
+            else:
+                out.append(blank_span(text[i:end + len(terminator)]))
+                i = end + len(terminator)
+        elif char in "\"'":
+            j = i + 1
+            while j < n and text[j] != char and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            if j < n and text[j] == char:
+                out.append(text[i:j + 1])
+                i = j + 1
+            else:
+                # Unterminated: emit the quote alone so the rest of the line is
+                # still lexed and a following comment is still masked.
+                out.append(char)
+                i += 1
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def self_delimited_raw(text: str, index: int) -> bool:
+    """True when ``R"`` at `index` opens a raw string rather than ending a token.
+
+    ``TAG_ERROR"("`` is string concatenation after an identifier, not a raw
+    string; only a standard encoding prefix may precede the ``R``.
+    """
+    if not RAW_STRING_OPEN.match(text, index):
+        return False
+    start = index
+    while start > 0 and IDENTIFIER_CHAR.match(text[start - 1]):
+        start -= 1
+    return text[start:index] in RAW_STRING_PREFIXES
+
+
+def c_include_structure(source: list[SourceFile], inventory: Iterable[str] | None = None) -> dict[str, Any]:
+    """Direct internal ``#include "..."`` edges between C-family files.
+
+    Raw syntactic evidence, deliberately not a preprocessor: an include guarded
+    by ``#ifdef`` still counts, and a header reached only through a macro is
+    invisible.  Resolution tries the including file's own directory first, then
+    a repository-relative path, then a unique basename; ambiguity yields no edge
+    rather than a guess, matching the Python collector's rule.
+    """
+    files = [item for item in source if item.language in C_FAMILY]
+    paths = {item.path for item in files}
+    # Every in-scope path, so a present-but-unmeasured header (.inc, generated
+    # body) is not reported as absent from the repository.
+    known = set(inventory) if inventory is not None else {item.path for item in source}
+    by_basename: dict[str, list[str]] = defaultdict(list)
+    for path in sorted(paths):
+        by_basename[posix_name(path)].append(path)
+    by_inventory_name: dict[str, list[str]] = defaultdict(list)
+    for path in sorted(known - paths):
+        by_inventory_name[posix_name(path)].append(path)
+    edges: set[tuple[str, str]] = set()
+    provenance: dict[tuple[str, str], str] = {}
+    unresolved: dict[tuple[str, str], dict[str, Any]] = {}
+    def record(path: str, target: str, line: int, reason: str) -> None:
+        unresolved.setdefault((path, target), {"path": path, "include": target, "line": line, "reason": reason})
+    for item in sorted(files, key=lambda row: row.path):
+        directory = PurePosixPath(item.path).parent
+        masked = mask_non_code(item.text, item.language)
+        for match in INCLUDE_PATTERN.finditer(masked):
+            target = match.group(1)
+            line = masked.count("\n", 0, match.start()) + 1
+            # Canonicalise separators before normpath: POSIX normpath does not
+            # treat '\' as a separator, so the order decides the result.
+            canonical = posixpath.normpath(target.replace("\\", "/"))
+            if posixpath.isabs(canonical) or re.match(r"^[A-Za-z]:", canonical):
+                record(item.path, target, line, "outside_repository")
+                continue
+            # Resolve against the including directory before judging escape:
+            # `../include/b.h` from `src/` is ordinary and stays inside.
+            local = posixpath.normpath(str(directory / canonical))
+            if local in {".", ".."} or local.startswith("../") or canonical in {".", ".."}:
+                record(item.path, target, line, "outside_repository")
+                continue
+            if local in paths:
+                resolved, via = local, "exact_relative"
+            elif canonical in paths:
+                resolved, via = canonical, "repository_relative"
+            elif local in known or canonical in known:
+                # The exact target exists but is not a measured C-family file
+                # (unreadable, symlink, or another language).  Naming it beats
+                # guessing a same-named file elsewhere.
+                record(item.path, target, line, "in_repository_unmeasured_language")
+                continue
+            else:
+                # Uniqueness is decided across the whole repository, not just
+                # measured files: an unmeasured same-named file makes the
+                # basename ambiguous, so guessing past it would be wrong.
+                basename = posix_name(canonical)
+                measured = by_basename.get(basename, [])
+                unmeasured = by_inventory_name.get(basename, [])
+                if len(measured) + len(unmeasured) != 1:
+                    reason = "ambiguous_basename" if measured or unmeasured else "not_in_repository"
+                    record(item.path, target, line, reason)
+                    continue
+                if unmeasured:
+                    record(item.path, target, line, "unique_unmeasured_basename")
+                    continue
+                resolved, via = measured[0], "unique_basename"
+            if resolved != item.path:
+                edges.add((item.path, resolved))
+                provenance[(item.path, resolved)] = via
+            else:
+                record(item.path, target, line, "self_include")
+    ordered = [unresolved[key] for key in sorted(unresolved)]
+    facts = graph_facts(sorted(paths), edges)
+    for edge in facts["edges"]:
+        edge["via"] = provenance[(edge["from"], edge["to"])]
+    guessed = sorted(edge for edge, via in provenance.items() if via == "unique_basename")
+    return {"unresolved_includes": ordered,
+            # A guessed edge can wire an unrelated copy of a file into the
+            # graph; naming them lets a reader discount those relationships.
+            "basename_resolved_edges": [{"from": src, "to": dst} for src, dst in guessed],
+            **facts}
+
+
+def posix_name(path: str) -> str:
+    return PurePosixPath(path.replace("\\", "/")).name
 
 
 @dataclass(frozen=True)
@@ -544,37 +857,50 @@ def lizard_complexity(root: Path, source: list[SourceFile], status: LizardResult
 
 
 def strongly_connected_components(graph: dict[str, list[str]]) -> list[list[str]]:
-    """Tarjan's SCC algorithm, sorted so JSON is stable across Python runs."""
+    """Tarjan's SCC algorithm, sorted so JSON is stable across Python runs.
+
+    Iterative: a deep C header chain would overflow a recursive walk, and that
+    surfaces as an execution error rather than as evidence.
+    """
     index = 0
     indices: dict[str, int] = {}
     low: dict[str, int] = {}
     stack: list[str] = []
     on_stack: set[str] = set()
     result: list[list[str]] = []
-    def visit(node: str) -> None:
-        nonlocal index
-        indices[node] = low[node] = index
-        index += 1
-        stack.append(node)
-        on_stack.add(node)
-        for target in graph[node]:
-            if target not in indices:
-                visit(target)
-                low[node] = min(low[node], low[target])
-            elif target in on_stack:
-                low[node] = min(low[node], indices[target])
-        if low[node] == indices[node]:
-            component = []
-            while True:
-                target = stack.pop()
-                on_stack.remove(target)
-                component.append(target)
-                if target == node:
-                    break
-            result.append(sorted(component))
-    for node in sorted(graph):
-        if node not in indices:
-            visit(node)
+    for root in sorted(graph):
+        if root in indices:
+            continue
+        work: list[tuple[str, int]] = [(root, 0)]
+        while work:
+            node, position = work[-1]
+            if position == 0:
+                indices[node] = low[node] = index
+                index += 1
+                stack.append(node)
+                on_stack.add(node)
+            targets = graph[node]
+            if position < len(targets):
+                work[-1] = (node, position + 1)
+                target = targets[position]
+                if target not in indices:
+                    work.append((target, 0))
+                elif target in on_stack:
+                    low[node] = min(low[node], indices[target])
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == indices[node]:
+                component = []
+                while True:
+                    target = stack.pop()
+                    on_stack.remove(target)
+                    component.append(target)
+                    if target == node:
+                        break
+                result.append(sorted(component))
     return sorted(result)
 
 
@@ -584,6 +910,7 @@ def coverage_matrix(source: list[SourceFile], unreadable: list[dict[str, str]], 
     })
     python_errors = structure["parse_errors"]
     unreadable_languages = {language_for(row["path"]) for row in unreadable}
+    c_family_unreadable = bool(unreadable_languages & C_FAMILY)
     matrix = []
     for language in languages:
         for family in METRIC_FAMILIES:
@@ -595,6 +922,13 @@ def coverage_matrix(source: list[SourceFile], unreadable: list[dict[str, str]], 
                 status, reason = "covered", "Python stdlib AST"
             elif language == "Python":
                 status, reason = "unavailable", "Python AST parse/read gap"
+            elif family == "dependencies" and language in C_FAMILY and not c_family_unreadable:
+                status, reason = "covered", "stdlib quoted-#include scan (no preprocessor evaluation)"
+            elif family == "dependencies" and language in C_FAMILY:
+                # One graph spans the family, so any unreadable member voids it.
+                status, reason = "unavailable", "unreadable source in the C-family include graph"
+            elif family == "cyclomatic" and language in unreadable_languages:
+                status, reason = "unavailable", "unreadable source in this language"
             elif family == "cyclomatic" and language in LIZARD_SUPPORTED and lizard.installed and not lizard.error:
                 status, reason = "covered", f"Lizard {lizard.version or 'unknown'}"
             elif family == "cyclomatic" and language in LIZARD_SUPPORTED:
@@ -647,12 +981,20 @@ def candidates(
     base_lizard_functions: list[dict[str, Any]],
     rename_map: dict[str, str],
     differential: bool,
+    includes: dict[str, Any] | None = None,
+    base_includes: dict[str, Any] | None = None,
+    base_unreadable_paths: set[str] | None = None,
+    unreliable_graphs: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build a bounded per-family reading list from raw facts.
 
     Families are ranked independently so unrelated units are never collapsed
     into a disguised repository score.
     """
+    includes = includes or {}
+    # A path whose base counterpart was unreadable has no honest delta.
+    unmeasured_base = base_unreadable_paths or set()
+    unreliable = unreliable_graphs or set()
     # Lines shift under unrelated edits.  Python qualified names (and Lizard's
     # long names) are more stable identities for a differential raw delta.
     old_complexity = {(row["path"], row["name"]): row["cyclomatic"] for row in (base_structure or {}).get("functions", [])}
@@ -662,6 +1004,8 @@ def candidates(
         if differential and row["path"] not in changed:
             continue
         old_path = rename_map.get(row["path"], row["path"])
+        if differential and old_path in unmeasured_base:
+            continue
         old_values = old_lizard if row.get("collector") == "lizard" else old_complexity
         old = old_values.get((old_path, row["name"]), 0)
         delta = row["cyclomatic"] - old
@@ -681,6 +1025,8 @@ def candidates(
         if differential and item.path not in changed:
             continue
         value = int(item.counts.get("code", 0))
+        if differential and rename_map.get(item.path, item.path) in unmeasured_base:
+            continue
         old = old_files.get(rename_map.get(item.path, item.path), 0)
         delta = value - old
         if differential and delta == 0:
@@ -690,20 +1036,19 @@ def candidates(
                "note": "Raw code-line count; inspect the file's role before considering decomposition."}
         by_family["file_size"].append(((value, delta), row))
 
-    current_cycles = {tuple(component) for component in structure["imports"]["cycles"]}
     inverse_renames = {old: new for new, old in rename_map.items()}
-    old_cycles = {
-        tuple(sorted(inverse_renames.get(path, path) for path in component))
-        for component in (base_structure or {}).get("imports", {}).get("cycles", [])
-    }
-    for component in sorted(current_cycles):
-        if differential and (component in old_cycles or not changed.intersection(component)):
+    graphs = [
+        ("python", structure["imports"], (base_structure or {}).get("imports", {}),
+         "Static Python import cycle; inspect runtime boundaries and intentionality."),
+        ("c_includes", includes, base_includes or {},
+         "Static C-family include cycle from quoted includes; inspect header guards and intentionality."),
+    ]
+    for name, current_graph, base_graph, note in graphs:
+        # An incomplete baseline cannot establish that a cycle is new.
+        if differential and name in unreliable:
             continue
-        row = {"kind": "dependency_cycle", "path": component[0], "line": 1,
-               "raw_value": len(component), "delta_from_base": 1 if differential else None,
-               "members": list(component),
-               "note": "Static Python import cycle; inspect runtime boundaries and intentionality."}
-        by_family["dependency_cycle"].append(((len(component),), row))
+        for row in new_cycles(current_graph, base_graph, inverse_renames, note, differential):
+            by_family["dependency_cycle"].append(((row["raw_value"],), row))
 
     result: list[dict[str, Any]] = []
     for family in ("dependency_cycle", "cyclomatic", "file_size", "duplication"):
@@ -713,6 +1058,42 @@ def candidates(
         )
         result.extend(row for _, row in ranked[:TOP_PER_FAMILY])
     return result
+
+
+def new_cycles(current_graph: dict[str, Any], base_graph: dict[str, Any], inverse_renames: dict[str, str],
+               note: str, differential: bool) -> list[dict[str, Any]]:
+    """Cycles worth reading, with pre-existing ones filtered out.
+
+    A cycle is pre-existing only when its members were already mutually
+    connected in one base cycle *and* every edge between them already existed:
+    shrinking a cycle creates nothing, rewiring one into a smaller cycle does.
+    """
+    old_components = [
+        {inverse_renames.get(path, path) for path in component}
+        for component in base_graph.get("cycles", [])
+    ]
+    old_edges = {
+        (inverse_renames.get(edge["from"], edge["from"]), inverse_renames.get(edge["to"], edge["to"]))
+        for edge in base_graph.get("edges", [])
+    }
+    rows = []
+    for component in sorted(tuple(component) for component in current_graph.get("cycles", [])):
+        members = set(component)
+        inner_edges = {(edge["from"], edge["to"]) for edge in current_graph.get("edges", [])
+                       if edge["from"] in members and edge["to"] in members}
+        pre_existing_members = any(members <= old for old in old_components)
+        if differential and pre_existing_members and inner_edges <= old_edges:
+            continue
+        row = {"kind": "dependency_cycle", "path": component[0], "line": 1,
+               "raw_value": len(component), "delta_from_base": 1 if differential else None,
+               "members": list(component), "note": note}
+        if differential and pre_existing_members:
+            # These files were already mutually connected; what changed is the
+            # edge, so say so rather than implying the whole cycle is new.
+            row["new_edges"] = [{"from": src, "to": dst} for src, dst in sorted(inner_edges - old_edges)]
+            row["note"] = f"{note} These members were already mutually connected; the listed edges are new."
+        rows.append(row)
+    return rows
 
 
 def history_facts(root: Path, maximum: int) -> dict[str, Any]:
@@ -795,6 +1176,11 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     symlinks = symlink_paths(root, scope_names)
     source, unreadable = scan(root, current_paths)
     structure = python_structure(source)
+    # Only `analyze` consumes the include graph; `detect` is the cheap coverage
+    # probe and must not pay for a full scan it discards.
+    # Full scope names, not the followable subset: a symlinked or unreadable
+    # header must be named as the exact target, never guessed past.
+    includes = c_include_structure(source, scope_names) if args.command == "analyze" else {}
     initial_lizard = lizard_status()
     lizard = lizard_complexity(root, source, initial_lizard) if args.command == "analyze" else initial_lizard
     mode = "detect" if args.command == "detect" else ("differential" if args.base else "absolute")
@@ -802,6 +1188,9 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     changed: set[str] = set()
     base_source: list[SourceFile] | None = None
     base_structure: dict[str, Any] | None = None
+    base_includes: dict[str, Any] | None = None
+    base_unreadable: list[dict[str, str]] = []
+    base_scope_names: list[str] = []
     base_lizard_functions: list[dict[str, Any]] = []
     rename_map: dict[str, str] = {}
     if args.command == "analyze" and args.base:
@@ -810,17 +1199,37 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         invocation["base_revision"] = git(root, "rev-parse", "--verify", f"{args.base}^{{commit}}").strip()
         invocation["changed_paths"] = sorted(changed)
         invocation["rename_map"] = {key: rename_map[key] for key in sorted(rename_map)}
+        # Names from the tree itself: archiving drops blobs analysis cannot
+        # read, so a base-only unmeasured file would otherwise vanish.
+        base_scope_names = [name for name in git(root, "ls-tree", "-r", "--name-only", "-z",
+                                                 args.base).split("\0") if name]
         with archive_revision(root, args.base) as archive:
-            base_source, _ = scan(Path(archive))
+            base_source, base_unreadable = scan(Path(archive))
             base_structure = python_structure(base_source)
+            base_includes = c_include_structure(base_source, base_scope_names)
             base_lizard_functions = lizard_complexity(Path(archive), base_source, initial_lizard).functions
-    coverage = coverage_matrix(source, unreadable, structure, lizard)
+    # An unreadable file at the base makes the baseline incomplete, so the
+    # differential comparison is not clean either.
+    # A base parse failure is as incomplete a baseline as an unreadable file.
+    base_failures = base_unreadable + [{"path": row["path"], "reason": "base_parse_error"}
+                                       for row in (base_structure or {}).get("parse_errors", [])]
+    coverage = coverage_matrix(source, unreadable + base_failures, structure, lizard)
+    # No language means no coverage row at all, which reads as covered.
+    unrecognised = sorted({path for path in list(current_paths) + base_scope_names
+                           if not language_for(path) and category_for(path, None)[0] == "other"})
     bundle: dict[str, Any] = {
         "bundle_version": BUNDLE_VERSION,
         "invocation": invocation,
         "repository": {"scope": "tracked_plus_untracked_nonignored", "vendor_excludes": [],
                        "coverage_limits": ([{"kind": "unmerged_index", "paths": conflicts}] if conflicts else [])
-                       + ([{"kind": "symbolic_links_not_followed", "paths": symlinks}] if symlinks else []),
+                       + ([{"kind": "symbolic_links_not_followed", "paths": symlinks}] if symlinks else [])
+                       + ([{"kind": "unrecognised_extensions", "paths": unrecognised}] if unrecognised else [])
+                       + ([{"kind": "unreadable_base_files", "paths": [r["path"] for r in base_unreadable]}]
+                          if base_unreadable else [])
+                       + ([{"kind": "base_parse_errors",
+                            "paths": sorted(r["path"] for r in (base_structure or {}).get("parse_errors", []))}]
+                          if (base_structure or {}).get("parse_errors") else []),
+                       "unrecognised_extensions": unrecognised,
                        "current_revision": git(root, "rev-parse", "HEAD").strip()},
         "collectors": {"lizard": {"installed": lizard.installed, "version": lizard.version, "error": lizard.error,
                                     "supported_languages": sorted(LIZARD_SUPPORTED)}},
@@ -835,6 +1244,7 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         all_unreadable = {row["path"]: row for row in [*unreadable, *composition_unreadable]}
         bundle["facts"]["unreadable_files"] = [all_unreadable[path] for path in sorted(all_unreadable)]
         bundle["facts"].update({"composition": composition_facts, "duplication": dup, "python": structure,
+                                "c_includes": includes, "base_unreadable_files": base_unreadable,
                                 "lizard": {"functions": lizard.functions, "error": lizard.error}})
         if args.history:
             bundle["facts"]["history"] = history_facts(root, args.max_commits)
@@ -845,8 +1255,30 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
             "cross_family_score": False,
             "verdict": "none",
         }
-        bundle["candidates"] = candidates(source, base_source, structure, lizard.functions, dup, changed, base_structure, base_lizard_functions, rename_map, bool(args.base))
-    required_languages = {f.language for f in source if (not args.base or f.path in changed)} if args.command == "analyze" else {f.language for f in source}
+        # A base-side parse failure leaves the baseline as incomplete as an
+        # unreadable file does, so it must disable the same comparisons.
+        base_parse_errors = (base_structure or {}).get("parse_errors", [])
+        base_unreadable_paths = ({row["path"] for row in base_unreadable}
+                                 | {row["path"] for row in base_parse_errors})
+        base_unreadable_languages = {language_for(path) for path in base_unreadable_paths}
+        unreliable_graphs = ({"python"} if "Python" in base_unreadable_languages else set()) | (
+            {"c_includes"} if base_unreadable_languages & C_FAMILY else set())
+        bundle["candidates"] = candidates(source, base_source, structure, lizard.functions, dup, changed,
+                                          base_structure, base_lizard_functions, rename_map, bool(args.base),
+                                          includes, base_includes, base_unreadable_paths, unreliable_graphs)
+    # An unreadable recognised file still makes its language required.
+    measurable = [(f.path, f.language) for f in source] + [
+        (row["path"], language_for(row["path"]))
+        for row in unreadable + base_failures if language_for(row["path"])
+    ]
+    required_languages = {
+        language for path, language in measurable
+        if args.command != "analyze" or not args.base or path in changed
+    }
+    # Unrecognised files are disclosed, not gated: whether an unclassified file
+    # is source is a judgement, and blocking on it made ordinary repositories
+    # fail over a `.babelrc`.  The gate stays on measurement that actually
+    # failed for a language in scope.
     gap = any(row["language"] in required_languages and row["status"] == "unavailable" for row in coverage)
     blocking_conflicts = set(conflicts) & changed if args.command == "analyze" and args.base else set(conflicts)
     return bundle, bool(empty_differential or (args.require_coverage and (gap or history_gap or blocking_conflicts)))

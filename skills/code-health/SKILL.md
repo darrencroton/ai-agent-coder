@@ -13,7 +13,7 @@ This skill complements `lint`: lint owns mechanically decidable local defects, w
 
 1. **Differential by default.** Compare with the change's starting ref. Attribute only raw-value changes and new structural relationships to the change; retain whole-repository values as context. Use `--all` only for an explicit baseline audit.
 2. **Facts and judgment stay separate.** The script emits facts, coverage, and bounded investigation candidates. The agent supplies interpretation and recommendations after inspecting the code.
-3. **Missing measurement is unavailable, never clean.** Read the language-by-metric coverage matrix before interpreting results. Never compare measured Python functions with unmeasured functions in another language.
+3. **Missing measurement is unavailable, never clean.** Read the language-by-metric coverage matrix before interpreting results. Never compare measured Python functions with unmeasured functions in another language. Read `repository.unrecognised_extensions` too: a language absent from the extension table produces no coverage row, so that field is the only evidence those files exist.
 4. **No score or universal target.** Do not convert comments-to-code, tests-to-code, duplication, complexity, or any composite into a repository grade. Ratios and ranks identify anomalies; they do not define quality.
 5. **Raw change, not percentile movement.** A candidate must be supported by a changed raw value or new relationship. Population rank may order a bounded reading list but never establishes regression.
 6. **Git defines the default scope.** Analyze tracked and untracked non-ignored files. Apply no hidden vendor/generated exclusions. Record every explicit configuration exclusion.

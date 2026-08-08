@@ -397,5 +397,474 @@ class TestLizardBoundaries(unittest.TestCase):
         self.assertIn("pip install --user lizard", out.getvalue())
 
 
+def c_file(path, text):
+    return health.SourceFile(path, health.language_for(path), "production", "rule", text, {})
+
+
+class TestCIncludeDependencies(unittest.TestCase):
+    def test_quoted_includes_build_edges_and_angle_includes_do_not(self):
+        source = [
+            c_file("src/a.c", '#include "b.h"\n#include <stdio.h>\n'),
+            c_file("src/b.h", "int b(void);\n"),
+        ]
+        facts = health.c_include_structure(source)
+        self.assertEqual([(e["from"], e["to"]) for e in facts["edges"]], [("src/a.c", "src/b.h")])
+
+    def test_include_cycle_is_measured(self):
+        source = [
+            c_file("src/b.h", '#include "c.h"\n'),
+            c_file("src/c.h", '#include "b.h"\n'),
+        ]
+        self.assertEqual(health.c_include_structure(source)["cycles"], [["src/b.h", "src/c.h"]])
+
+    def test_guarded_include_still_counts_as_an_edge(self):
+        """No preprocessor evaluation: a conditional include is raw evidence."""
+        source = [c_file("a.c", '#ifdef WANT\n#  include "b.h"\n#endif\n'), c_file("b.h", "\n")]
+        self.assertEqual([(e["from"], e["to"]) for e in health.c_include_structure(source)["edges"]],
+                         [("a.c", "b.h")])
+
+    def test_unmeasured_same_named_file_makes_the_basename_ambiguous(self):
+        """An unmeasured twin must block the guess, not be invisible to it."""
+        source = [c_file("src/a.c", '#include "missing/foo.h"\n'), c_file("other/foo.h", "\n")]
+        facts = health.c_include_structure(source, ["src/a.c", "other/foo.h", "alias/foo.h"])
+        self.assertEqual(facts["edges"], [])
+        self.assertEqual(facts["unresolved_includes"][0]["reason"], "ambiguous_basename")
+
+    def test_ambiguous_basename_yields_no_edge(self):
+        source = [
+            c_file("a.c", '#include "util.h"\n'),
+            c_file("one/util.h", "\n"),
+            c_file("two/util.h", "\n"),
+        ]
+        facts = health.c_include_structure(source)
+        self.assertEqual(facts["edges"], [])
+        self.assertEqual(facts["unresolved_includes"][0]["reason"], "ambiguous_basename")
+
+    def test_external_header_is_recorded_as_unresolved_not_an_edge(self):
+        source = [c_file("a.c", '#include "third_party/zlib.h"\n')]
+        facts = health.c_include_structure(source)
+        self.assertEqual(facts["edges"], [])
+        self.assertEqual(facts["unresolved_includes"][0]["reason"], "not_in_repository")
+
+    def test_c_dependencies_are_covered(self):
+        source = [c_file("a.c", '#include "b.h"\n'), c_file("b.h", "\n")]
+        coverage = health.coverage_matrix(
+            source, [], health.python_structure(source), health.LizardResult(False, None, [], "missing"),
+        )
+        rows = {(r["language"], r["metric_family"]): r["status"] for r in coverage}
+        self.assertEqual(rows[("C", "dependencies")], "covered")
+        self.assertEqual(rows[("C", "cyclomatic")], "unavailable")
+
+    def test_unreadable_c_family_file_voids_every_c_dependency_row(self):
+        """One include graph spans the family, so one unreadable member voids it."""
+        source = [c_file("src/a.c", '#include "b.h"\n')]
+        coverage = health.coverage_matrix(
+            source, [{"path": "src/b.h", "reason": "unreadable_utf8"}],
+            health.python_structure(source), health.LizardResult(False, None, [], "missing"),
+        )
+        rows = {(r["language"], r["metric_family"]): r["status"]
+                for r in coverage if r["metric_family"] == "dependencies"}
+        self.assertTrue(all(status == "unavailable" for status in rows.values()), rows)
+
+    def test_commented_out_include_is_not_an_edge(self):
+        for text in ('/*\n#include "b.h"\n*/\n', '// #include "b.h"\n'):
+            source = [c_file("a.c", text), c_file("b.h", "\n")]
+            self.assertEqual(health.c_include_structure(source)["edges"], [], text)
+
+    def test_raw_strings_are_masked_in_cxx_but_absent_from_c(self):
+        for text in ('const char *s = R"(\n#include "b.h"\n)";\n',
+                     'const char *s = R""(\n#include "b.h"\n)"";\n',
+                     'const char *s = u8R"x(\n#include "b.h"\n)x";\n'):
+            source = [c_file("a.cpp", text), c_file("b.h", "\n")]
+            self.assertEqual(health.c_include_structure(source)["edges"], [], text)
+        # C has no raw strings, so the same bytes are ordinary code there.
+        source = [c_file("a.c", 'R"(\n#include "b.h"\n)"\n'), c_file("b.h", "\n")]
+        self.assertEqual(len(health.c_include_structure(source)["edges"]), 1)
+
+    def test_identifier_ending_in_R_is_not_a_raw_string_opener(self):
+        """`TAG_ERROR"(` is string concatenation; treating it as a raw string
+        silently deleted every include below it."""
+        text = ('#include "log.h"\n'
+                'void g(void){ fprintf(stderr, TAG_ERROR"(%d", rc); }\n'
+                '#include "extra.h"\n'
+                'static const char *p = "a)";\n')
+        source = [c_file("src/log.c", text), c_file("src/log.h", "\n"), c_file("src/extra.h", "\n")]
+        self.assertEqual(sorted(e["to"] for e in health.c_include_structure(source)["edges"]),
+                         ["src/extra.h", "src/log.h"])
+
+    def test_unterminated_raw_opener_does_not_blank_the_rest_of_the_file(self):
+        source = [c_file("a.cpp", 'auto s = R"zz(never closed\n#include "b.h"\n'), c_file("b.h", "\n")]
+        self.assertEqual(len(health.c_include_structure(source)["edges"]), 1)
+
+    def test_odd_apostrophe_does_not_hide_a_following_comment(self):
+        text = ('#include "tuning.hpp"\n'
+                "constexpr int k = 1'000;   /* retired\n"
+                '#include "legacy.hpp"\n*/\n')
+        source = [c_file("src/t.cpp", text), c_file("src/tuning.hpp", "\n"), c_file("src/legacy.hpp", "\n")]
+        self.assertEqual([e["to"] for e in health.c_include_structure(source)["edges"]], ["src/tuning.hpp"])
+
+    def test_line_comment_continued_by_a_backslash_still_masks(self):
+        source = [c_file("a.c", '// disabled \\\n#include "b.h"\n'), c_file("b.h", "\n")]
+        self.assertEqual(health.c_include_structure(source)["edges"], [])
+
+    def test_exact_target_present_but_unmeasured_beats_a_basename_guess(self):
+        source = [c_file("src/a.c", '#include "include/foo.h"\n'), c_file("other/foo.h", "\n")]
+        facts = health.c_include_structure(source, ["src/a.c", "include/foo.h", "other/foo.h"])
+        self.assertEqual(facts["edges"], [])
+        self.assertEqual(facts["unresolved_includes"][0]["reason"], "in_repository_unmeasured_language")
+
+    def test_byte_order_mark_does_not_hide_the_first_include(self):
+        source = [c_file("a.c", '﻿#include "b.h"\n'), c_file("b.h", "\n")]
+        self.assertEqual([(e["from"], e["to"]) for e in health.c_include_structure(source)["edges"]],
+                         [("a.c", "b.h")])
+
+    def test_paths_escaping_the_repository_never_reach_the_basename_fallback(self):
+        for target in ("/opt/ext/util.h", "C:/ext/util.h", "../../util.h", "..\\..\\util.h"):
+            source = [c_file("src/a.c", f'#include "{target}"\n'), c_file("src/util.h", "\n")]
+            facts = health.c_include_structure(source)
+            self.assertEqual(facts["edges"], [], target)
+            self.assertEqual(facts["unresolved_includes"][0]["reason"], "outside_repository", target)
+
+    def test_parent_relative_include_inside_the_repository_resolves(self):
+        """`../include/b.h` from src/ is ordinary C layout, not an escape."""
+        for target in ("../include/b.h", "..\\include\\b.h"):
+            source = [c_file("src/a.c", f'#include "{target}"\n'), c_file("include/b.h", "\n")]
+            self.assertEqual([(e["from"], e["to"]) for e in health.c_include_structure(source)["edges"]],
+                             [("src/a.c", "include/b.h")], target)
+
+    def test_unresolved_includes_carry_a_line_and_are_deduplicated(self):
+        source = [c_file("a.c", '#include "missing.h"\n\n#include "missing.h"\n')]
+        rows = health.c_include_structure(source)["unresolved_includes"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["line"], 1)
+
+    def test_string_literals_are_not_mistaken_for_comments(self):
+        """Masking must not erase code: a literal is skipped, not blanked."""
+        source = [c_file("a.c", '#include "dir//b.h"\n'), c_file("dir/b.h", "\n")]
+        self.assertEqual([(e["from"], e["to"]) for e in health.c_include_structure(source)["edges"]],
+                         [("a.c", "dir/b.h")])
+        source = [c_file("a.c", 'char *s = "/*";\n#include "b.h"\nchar *t = "*/";\n'), c_file("b.h", "\n")]
+        self.assertEqual([(e["from"], e["to"]) for e in health.c_include_structure(source)["edges"]],
+                         [("a.c", "b.h")])
+
+    def test_unterminated_quote_does_not_swallow_later_includes(self):
+        source = [c_file("a.c", "char *bad = 'x;\n#include \"b.h\"\n"), c_file("b.h", "\n")]
+        self.assertEqual(len(health.c_include_structure(source)["edges"]), 1)
+
+    def test_present_but_unmeasured_header_is_not_reported_absent(self):
+        source = [c_file("a.c", '#include "body.inc"\n')]
+        rows = health.c_include_structure(source, ["a.c", "body.inc"])["unresolved_includes"]
+        self.assertEqual(rows[0]["reason"], "in_repository_unmeasured_language")
+
+    def test_edges_record_how_they_were_resolved(self):
+        source = [c_file("src/a.c", '#include "b.h"\n#include "far.h"\n'),
+                  c_file("src/b.h", "\n"), c_file("elsewhere/far.h", "\n")]
+        facts = health.c_include_structure(source)
+        self.assertEqual({(e["from"], e["to"]): e["via"] for e in facts["edges"]},
+                         {("src/a.c", "src/b.h"): "exact_relative",
+                          ("src/a.c", "elsewhere/far.h"): "unique_basename"})
+        self.assertEqual(facts["basename_resolved_edges"],
+                         [{"from": "src/a.c", "to": "elsewhere/far.h"}])
+
+    def test_common_cxx_header_extensions_are_measured(self):
+        source = [c_file("src/foo.cc", '#include "foo.hh"\n'), c_file("src/foo.hh", "\n")]
+        self.assertEqual([(e["from"], e["to"]) for e in health.c_include_structure(source)["edges"]],
+                         [("src/foo.cc", "src/foo.hh")])
+
+
+class TestGraphFactsExtraction(unittest.TestCase):
+    """The extraction is a silent-regression risk, so pin the actual output."""
+
+    def python_graph(self, files):
+        source = [health.SourceFile(p, "Python", "production", "rule", t, {}) for p, t in files]
+        return health.python_structure(source)["imports"]
+
+    def test_python_import_graph_output_is_exact(self):
+        graph = self.python_graph([
+            ("pkg/a.py", "import pkg.b\n"),
+            ("pkg/b.py", "import pkg.c\n"),
+            ("pkg/c.py", "import pkg.a\n"),
+            ("pkg/lonely.py", "x = 1\n"),
+        ])
+        self.assertEqual([(e["from"], e["to"]) for e in graph["edges"]],
+                         [("pkg/a.py", "pkg/b.py"), ("pkg/b.py", "pkg/c.py"), ("pkg/c.py", "pkg/a.py")])
+        self.assertEqual(graph["cycles"], [["pkg/a.py", "pkg/b.py", "pkg/c.py"]])
+        self.assertEqual({r["path"]: r["value"] for r in graph["fan_in"]},
+                         {"pkg/a.py": 1, "pkg/b.py": 1, "pkg/c.py": 1, "pkg/lonely.py": 0})
+        self.assertEqual({r["path"]: r["value"] for r in graph["fan_out"]},
+                         {"pkg/a.py": 1, "pkg/b.py": 1, "pkg/c.py": 1, "pkg/lonely.py": 0})
+        self.assertEqual({r["path"]: r["reverse_reachability"] for r in graph["reverse_reachability"]},
+                         {"pkg/a.py": 2, "pkg/b.py": 2, "pkg/c.py": 2, "pkg/lonely.py": 0})
+
+    def test_isolated_node_keeps_a_row_in_every_series(self):
+        graph = self.python_graph([("solo.py", "x = 1\n")])
+        self.assertEqual(graph["edges"], [])
+        for series in ("fan_in", "fan_out", "reverse_reachability"):
+            self.assertEqual([r["path"] for r in graph[series]], ["solo.py"], series)
+
+    def test_reverse_reachability_matches_a_per_node_traversal(self):
+        """The condensation replaced a BFS per node; results must be identical."""
+        graph = {"a": ["b"], "b": ["c", "a"], "c": ["d"], "d": [], "e": ["d"]}
+        cycles = [c for c in health.strongly_connected_components(graph) if len(c) > 1]
+        expected = {}
+        for node in graph:
+            seen, queue = {node}, [n for n, ds in graph.items() if node in ds]
+            while queue:
+                item = queue.pop()
+                if item not in seen:
+                    seen.add(item)
+                    queue.extend(n for n, ds in graph.items() if item in ds)
+            expected[node] = len(seen) - 1
+        self.assertEqual(health.reverse_reachability(graph, cycles), expected)
+
+    def test_scc_is_iterative_and_survives_a_deep_chain(self):
+        depth = 2000
+        graph = {f"h{i}": [f"h{i + 1}"] for i in range(depth)}
+        graph[f"h{depth}"] = []
+        self.assertEqual(len(health.strongly_connected_components(graph)), depth + 1)
+
+
+class TestCDifferentialWiring(unittest.TestCase):
+    def candidates_for(self, current, base, changed):
+        return [row for row in health.candidates(
+            current, base, health.python_structure(current), [], {"signatures": []}, changed,
+            health.python_structure(base), [], {}, True,
+            health.c_include_structure(current), health.c_include_structure(base),
+        ) if row["kind"] == "dependency_cycle"]
+
+    def test_new_include_cycle_surfaces_and_pre_existing_one_does_not(self):
+        cyclic = [c_file("b.h", '#include "c.h"\n'), c_file("c.h", '#include "b.h"\n')]
+        acyclic = [c_file("b.h", "\n"), c_file("c.h", '#include "b.h"\n')]
+        self.assertEqual([r["members"] for r in self.candidates_for(cyclic, acyclic, {"b.h"})],
+                         [["b.h", "c.h"]])
+        self.assertEqual(self.candidates_for(cyclic, cyclic, {"b.h"}), [])
+
+    def test_shrinking_a_cycle_is_not_a_new_relationship(self):
+        """Deleting c.h leaves the untouched a.h<->b.h cycle; nothing is new."""
+        base = [c_file("a.h", '#include "b.h"\n'),
+                c_file("b.h", '#include "a.h"\n#include "c.h"\n'),
+                c_file("c.h", '#include "b.h"\n')]
+        current = [c_file("a.h", '#include "b.h"\n'), c_file("b.h", '#include "a.h"\n')]
+        self.assertEqual(self.candidates_for(current, base, {"c.h", "b.h"}), [])
+
+    def test_cycle_rewired_inside_a_former_cycle_is_new(self):
+        """Subset of a base cycle, but b.h->a.h is a brand-new edge."""
+        base = [c_file("a.h", '#include "b.h"\n'), c_file("b.h", '#include "c.h"\n'),
+                c_file("c.h", '#include "a.h"\n')]
+        current = [c_file("a.h", '#include "b.h"\n'), c_file("b.h", '#include "a.h"\n'), c_file("c.h", "\n")]
+        self.assertEqual([r["members"] for r in self.candidates_for(current, base, {"b.h"})], [["a.h", "b.h"]])
+
+    def test_cycle_created_by_a_resolution_change_is_new(self):
+        """Deleting the file that made a basename ambiguous completes a cycle."""
+        base = [c_file("src/a.h", '#include "b.h"\n'), c_file("x/b.h", '#include "a.h"\n'), c_file("y/b.h", "\n")]
+        current = base[:2]
+        self.assertEqual([r["members"] for r in self.candidates_for(current, base, {"y/b.h"})],
+                         [["src/a.h", "x/b.h"]])
+
+
+class TestLanguageRecognition(unittest.TestCase):
+    def test_fortran_and_make_are_recognised_rather_than_other(self):
+        for path, language in (("sim.f90", "Fortran"), ("SIM.F90", "Fortran"), ("old.f", "Fortran"),
+                               ("Makefile", "Make"), ("makefile", "Make"), ("rules.mk", "Make")):
+            self.assertEqual(health.language_for(path), language, path)
+            self.assertEqual(health.category_for(path, language)[0], "production", path)
+
+    def test_unrecognised_language_would_be_invisible_in_coverage(self):
+        """Guards the reason Fortran was added: no row means no 'unavailable'."""
+        source = [c_file("sim.f90", "program p\nend program\n")]
+        coverage = health.coverage_matrix(
+            source, [], health.python_structure(source), health.LizardResult(False, None, [], "missing"),
+        )
+        families = {r["metric_family"] for r in coverage if r["language"] == "Fortran"}
+        self.assertEqual(families, set(health.METRIC_FAMILIES))
+
+    def test_comment_styles_are_language_specific(self):
+        fortran = health.line_counts("! note\nprogram p\nend program\n", "Fortran")
+        make = health.line_counts("# note\nall:\n\tcc a.c\n", "Make")
+        self.assertEqual((fortran["comment"], fortran["code"]), (1, 2))
+        self.assertEqual((make["comment"], make["code"]), (1, 2))
+
+    def test_fortran_fixed_form_comment_is_not_claimed(self):
+        """Documented undercount: fixed-form 'C' in column 1 reads as code."""
+        self.assertEqual(health.line_counts("C legacy comment\n", "Fortran")["comment"], 0)
+
+    def test_make_recipe_hash_is_code_not_comment(self):
+        counts = health.line_counts("# real\nall:\n\t# shell\n", "Make")
+        self.assertEqual((counts["comment"], counts["code"]), (1, 2))
+
+
+class TestCoverageHonesty(InRepo):
+    def test_unrecognised_extension_is_disclosed_in_detect(self):
+        with Repo() as repo:
+            repo.write("model.zzz", "data\n")
+            repo.commit()
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                bundle, _ = health.build_bundle(health.parser().parse_args(["detect"]))
+            finally:
+                os.chdir(old)
+            self.assertIn("model.zzz", bundle["repository"]["unrecognised_extensions"])
+            self.assertIn("unrecognised_extensions",
+                          {limit["kind"] for limit in bundle["repository"]["coverage_limits"]})
+
+    def test_unreadable_recognised_language_fails_require_coverage(self):
+        with Repo() as repo:
+            Path(repo.path, "sim.f90").write_bytes(b"\xff\xfe program\n")
+            repo.commit()
+            self.assertEqual(self.run_health(repo, "analyze", "--all", "--require-coverage", "--json"), 3)
+
+    def test_unreadable_base_file_is_not_a_clean_baseline(self):
+        with Repo() as repo:
+            repo.write("a.c", '#include "b.h"\n')
+            Path(repo.path, "b.h").write_bytes(b"\xff\xfe bad\n")
+            base = repo.commit()
+            repo.write("b.h", "int ok(void);\n")
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--base", base]))
+            finally:
+                os.chdir(old)
+            rows = {(r["language"], r["metric_family"]): r["status"]
+                    for r in bundle["coverage"] if r["metric_family"] == "dependencies"}
+            self.assertTrue(all(status == "unavailable" for status in rows.values()), rows)
+
+    def test_repository_metadata_is_not_an_unmeasured_language(self):
+        self.assertEqual(health.category_for("LICENSE", None)[0], "documentation")
+        self.assertEqual(health.category_for("skills/x/config.jsonc", None)[0], "configuration")
+
+    def test_metadata_stem_does_not_hide_an_unmeasured_source_file(self):
+        """`version.awk` is source we cannot measure, not a document."""
+        self.assertEqual(health.category_for("version.awk", None)[0], "other")
+        self.assertEqual(health.category_for("readme.json", None)[0], "configuration")
+
+    def test_base_unreadable_file_is_disclosed_and_suppresses_fake_deltas(self):
+        with Repo() as repo:
+            repo.write("a.c", "int a(int x){ if(x){return 1;} return 0; }\n")
+            Path(repo.path, "b.h").write_bytes(b"\xff\xfe bad\n")
+            base = repo.commit()
+            repo.write("b.h", "int ok(void);\n")
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--base", base]))
+            finally:
+                os.chdir(old)
+            self.assertEqual([row["path"] for row in bundle["facts"]["base_unreadable_files"]], ["b.h"])
+            self.assertIn("unreadable_base_files",
+                          {limit["kind"] for limit in bundle["repository"]["coverage_limits"]})
+            self.assertEqual([c for c in bundle["candidates"] if c["path"] == "b.h"], [])
+
+    def test_symlinked_target_is_named_not_guessed(self):
+        with Repo() as repo:
+            repo.write("src/a.c", '#include "include/foo.h"\n')
+            repo.write("other/foo.h", "int real(void);\n")
+            os.makedirs(os.path.join(repo.path, "include"), exist_ok=True)
+            os.symlink("../other/foo.h", os.path.join(repo.path, "include", "foo.h"))
+            repo.commit()
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
+            finally:
+                os.chdir(old)
+            facts = bundle["facts"]["c_includes"]
+            self.assertEqual(facts["edges"], [])
+            self.assertEqual(facts["unresolved_includes"][0]["reason"], "in_repository_unmeasured_language")
+
+    def test_unrecognised_file_is_disclosed_but_does_not_fail_coverage(self):
+        """Whether an unclassified file is source is a judgement, so it is
+        disclosed rather than gated; blocking made ordinary repositories fail
+        over a `.babelrc`."""
+        with Repo() as repo:
+            repo.write("model.zzz", "blob\n")
+            repo.write("a.py", "x = 1\n")
+            repo.commit()
+            self.assertEqual(self.run_health(repo, "detect", "--require-coverage", "--json"), 0)
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                bundle, _ = health.build_bundle(health.parser().parse_args(["detect"]))
+            finally:
+                os.chdir(old)
+            self.assertIn("model.zzz", bundle["repository"]["unrecognised_extensions"])
+
+    def test_ordinary_config_dotfiles_do_not_fail_coverage(self):
+        for name in (".babelrc", ".stylelintrc", ".browserslistrc", ".prettierignore",
+                     ".eslintignore", ".watchmanconfig", ".gitignore"):
+            self.assertEqual(health.category_for(name, None)[0], "configuration", name)
+        # Still unmeasured source, not silently reclassified.
+        self.assertEqual(health.category_for(".mystery", None)[0], "other")
+        self.assertEqual(health.language_for(".bashrc"), "Shell")
+
+    def test_data_assets_are_not_unmeasured_source(self):
+        self.assertEqual(health.category_for("img/logo.png", None)[0], "data")
+        self.assertEqual(health.category_for("model.zzz", None)[0], "other")
+
+    def test_base_parse_error_suppresses_phantom_cycles(self):
+        with Repo() as repo:
+            repo.write("a.py", "import b\n\ndef f(:\n    pass\n")
+            repo.write("b.py", "import a\n\ndef g():\n    pass\n")
+            base = repo.commit()
+            repo.write("a.py", "import b\n\ndef f():\n    pass\n")
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--base", base]))
+            finally:
+                os.chdir(old)
+            self.assertEqual([c for c in bundle["candidates"] if c["kind"] == "dependency_cycle"], [])
+            self.assertIn("base_parse_errors",
+                          {limit["kind"] for limit in bundle["repository"]["coverage_limits"]})
+
+    def test_base_parse_error_fails_require_coverage(self):
+        with Repo() as repo:
+            repo.write("a.py", "import b\n\ndef f(:\n    pass\n")
+            repo.write("b.py", "import a\n")
+            base = repo.commit()
+            repo.write("a.py", "import b\n\ndef f():\n    pass\n")
+            self.assertEqual(self.run_health(repo, "analyze", "--base", base, "--require-coverage", "--json"), 3)
+
+    def test_source_dotfile_is_measured_rather_than_called_configuration(self):
+        self.assertEqual(health.language_for(".bashrc"), "Shell")
+        self.assertEqual(health.category_for(".gitignore", None)[0], "configuration")
+        # An unknown dotfile stays unmeasured source rather than silently
+        # becoming configuration with no coverage row.
+        self.assertEqual(health.category_for(".mystery", None)[0], "other")
+
+    def test_base_side_resolution_uses_the_same_inventory_as_the_current_tree(self):
+        with Repo() as repo:
+            repo.write("src/a.h", '#include "include/foo.h"\n')
+            repo.write("other/foo.h", '#include "../src/a.h"\n')
+            os.makedirs(os.path.join(repo.path, "include"), exist_ok=True)
+            os.symlink("../other/foo.h", os.path.join(repo.path, "include", "foo.h"))
+            base = repo.commit()
+            repo.write("src/a.h", '#include "../other/foo.h"\n')
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--base", base]))
+            finally:
+                os.chdir(old)
+            cycles = [c["members"] for c in bundle["candidates"] if c["kind"] == "dependency_cycle"]
+            self.assertEqual(cycles, [["other/foo.h", "src/a.h"]])
+
+    def test_detect_does_not_build_the_include_graph(self):
+        with Repo() as repo:
+            repo.write("a.c", '#include "b.h"\n')
+            repo.write("b.h", "\n")
+            repo.commit()
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                detected, _ = health.build_bundle(health.parser().parse_args(["detect"]))
+                analyzed, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
+            finally:
+                os.chdir(old)
+            self.assertNotIn("c_includes", detected["facts"])
+            self.assertEqual(len(analyzed["facts"]["c_includes"]["edges"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

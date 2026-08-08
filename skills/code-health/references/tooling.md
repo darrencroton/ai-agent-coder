@@ -7,6 +7,7 @@ The v1 analyzer has a dependency-free portable floor and one optional collector:
 - [`scc`](https://github.com/boyter/scc) or [`cloc`](https://github.com/AlDanial/cloc) for broader lexical composition. `scc` is a portable single binary with JSON output; its file-level keyword complexity is an approximation and must not be presented as AST cyclomatic complexity.
 - [`Lizard`](https://github.com/terryyin/lizard) is the selected v1 adapter for multi-language per-function NLOC and cyclomatic complexity. The analyzer normalizes function records, calculates distributions locally, and never adopts Lizard's default threshold as policy.
 - [`jscpd`](https://jscpd.dev/reporters/json) for token-based multi-language duplication with JSON output.
+- C/C++ dependency resolution beyond the built-in quoted-`#include` scan needs real build knowledge — a `compile_commands.json` consumer, `gcc -MM`, or `include-what-you-use` — because header search paths and conditional compilation are build inputs, not source facts. Deferred: the portable floor covers internal coupling without asking the repository to be configured or compiled.
 - Language-native dependency tools where resolution semantics matter: [Import Linter](https://import-linter.readthedocs.io/en/latest/) for Python contracts and [dependency-cruiser](https://github.com/sverweij/dependency-cruiser) for JavaScript/TypeScript graphs and rules.
 
 ## Evaluated but not core
