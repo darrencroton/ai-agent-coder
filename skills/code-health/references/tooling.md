@@ -16,12 +16,12 @@ The v1 analyzer has a dependency-free portable floor and one optional collector:
 - SonarQube is valuable when a project already operates it, but server/scanner setup is too heavy for the default skill.
 - Sentrux is close in intent and offers graph-oriented analysis, but its aggregate quality signal conflicts with this skill's no-score, evidence-first contract. Dimension-level evidence may be reconsidered after its machine-readable interface matures.
 - jCodeMunch is primarily symbol retrieval and impact exploration for agents, not a deterministic code-health measurement engine.
-- Code Maat validates churn and temporal-coupling techniques, but direct Git analysis avoids its JVM/Clojure runtime for the limited history context retained here.
+- Code Maat validates churn and temporal-coupling techniques, but this analyzer retains no history facts at all: churn is one `git log --numstat` away, so correlating change frequency with structure stays an agent-side step rather than a JVM/Clojure dependency.
 
 ## Dependency contract
 
 1. `detect` names installed, missing, unsupported, and failed coverage.
-2. `analyze` never installs or repairs a tool.
-3. `install` prints an exact plan and mutates only with human-invoked `--yes`.
-4. Tool name, version, arguments, configuration, parser failures, and covered languages appear in the evidence bundle.
-5. A missing or failed tool never produces a zero metric or clean verdict.
+2. Nothing here installs or repairs a tool. The analyzer names the command that would install its one optional collector and never runs it, so there is no code path that can change the machine — a stronger guarantee than a dry-run flag, and the reason the earlier `install` subcommand was removed.
+3. Tool name, version, arguments, configuration, parser failures, and covered languages appear in the evidence bundle.
+4. A missing or failed tool never produces a zero metric or clean verdict.
+5. The Lizard CSV parser is pinned to the single 11-column headerless shape Lizard emits. A format change raises, surfacing as a recorded collector error and unavailable coverage; speculative support for formats Lizard has never produced was removed rather than maintained untested.

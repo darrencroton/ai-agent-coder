@@ -6,12 +6,12 @@ auditable set of structural properties, and leaves any judgement about whether
 an outlier is appropriate to the caller. The portable floor uses only Python's
 standard library and ``git``.
 
-``detect`` records available coverage. ``analyze`` records measured facts; in differential mode
-it limits investigation candidates to changed raw values and deltas from a git
-base revision.  Python analysis is stdlib-only; Lizard is an optional external
-collector for selected non-Python cyclomatic complexity, managed explicitly by
-the ``install`` subcommand.  Exit status 0 means analysis completed, not that a
-repository is "healthy".
+``detect`` records available coverage. ``analyze`` records measured facts; in
+differential mode it limits investigation candidates to changed raw values and
+deltas from a git base revision.  Python analysis is stdlib-only; Lizard is an
+optional external collector for selected non-Python cyclomatic complexity, and
+nothing here ever installs it.  Exit status 0 means analysis completed, not
+that a repository is "healthy".
 """
 
 from __future__ import annotations
@@ -23,30 +23,23 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import posixpath
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
-BUNDLE_VERSION = "1.1"
+BUNDLE_VERSION = "1.2"
 EXIT_OK = 0
 EXIT_ERROR = 2
 EXIT_COVERAGE = 3
 TOP_PER_FAMILY = 5
-DEFAULT_MAX_COMMITS = 200
 LIZARD_SUPPORTED = {"JavaScript", "TypeScript", "Java", "Kotlin", "C", "C/C++", "C++", "C#", "Go", "Ruby", "PHP", "Swift", "Rust", "Scala"}
-INSTALL_RECIPES = {
-    "uv": ["uv", "tool", "install", "lizard"],
-    "pipx": ["pipx", "install", "lizard"],
-    "brew": ["brew", "install", "lizard"],
-    "pip": [sys.executable, "-m", "pip", "install", "--user", "lizard"],
-}
+LIZARD_INSTALL = "uv tool install lizard  (or pipx install lizard)"
 
 # This is intentionally pragmatic rather than a claim to parse every language.
 # The map is used for scope and line counting, not as a language standard.
@@ -86,7 +79,7 @@ CONFIG_EXTENSIONS = {".json", ".jsonc", ".json5", ".yaml", ".yml", ".toml", ".in
 DOC_FILENAMES = {"license", "licence", "copying", "notice", "authors", "contributors",
                  "codeowners", "readme", "changelog", "version"}
 # Data and build products are not unmeasured *source*; classifying them keeps
-# `unrecognised_extensions` a usable signal rather than an inventory dump.
+# `composition.totals_by_category` honest about what the tree actually holds.
 DATA_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp", ".pdf", ".eps",
     ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".tar", ".jar", ".whl",
@@ -96,13 +89,12 @@ DATA_EXTENSIONS = {
     ".dat", ".bin", ".so", ".dylib", ".dll", ".o", ".a", ".exe", ".pyc", ".class",
     ".db", ".sqlite", ".sqlite3", ".pkl", ".pickle", ".lock",
 }
+# Only the dotfiles the `rc`/`ignore`/`config`/`cfg` suffix rule below misses.
 # Named rather than "anything starting with a dot": a dotfile holding shell
 # code is unmeasured source, and calling it configuration hides that.
 CONFIG_FILENAMES = {
-    ".gitignore", ".gitattributes", ".gitmodules", ".gitkeep", ".dockerignore",
-    ".editorconfig", ".env", ".npmrc", ".nvmrc", ".prettierrc", ".eslintrc",
-    ".flake8", ".pylintrc", ".coveragerc", ".clang-format", ".clang-tidy",
-    ".markdownlintignore", ".ds_store",
+    ".gitattributes", ".gitmodules", ".gitkeep", ".env",
+    ".flake8", ".clang-format", ".clang-tidy", ".ds_store",
 }
 HASH_COMMENT_LANGUAGES = {"Python", "Shell", "Ruby", "Perl", "R", "Lua", "Elixir", "PowerShell",
                           "CMake", "Meson", "Automake", "Autoconf"}
@@ -113,20 +105,29 @@ COLUMN_ONE_HASH_LANGUAGES = {"Make"}
 # claimed here; see references/methodology.md for the resulting undercount.
 BANG_COMMENT_LANGUAGES = {"Fortran"}
 SLASH_COMMENT_LANGUAGES = {"JavaScript", "TypeScript", "Java", "Kotlin", "C", "C++", "C/C++", "C#", "Go", "Rust", "Swift", "Scala", "Dart", "PHP", "CUDA"}
+C_FAMILY = {"C", "C++", "C/C++", "CUDA"}
 METRIC_FAMILIES = ("composition", "duplication", "cyclomatic", "dependencies")
+# Composition and duplication need only the file's text; the other two need a
+# parse, so a parse failure invalidates strictly less than an unreadable file.
+LEXICAL_FAMILIES = frozenset({"composition", "duplication"})
+AST_FAMILIES = tuple(family for family in METRIC_FAMILIES if family not in LEXICAL_FAMILIES)
 
 
 class HealthError(RuntimeError):
     """A user/actionable error, mapped to exit status 2."""
 
 
-def git(root: Path, *args: str, input_bytes: bytes | None = None) -> str:
+def git_bytes(root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
     """Run git at *root*, converting useful failures into a stable exception."""
     proc = subprocess.run(["git", *args], cwd=root, input=input_bytes, capture_output=True)
     if proc.returncode:
         detail = proc.stderr.decode(errors="replace").strip() or proc.stdout.decode(errors="replace").strip()
         raise HealthError(f"git {' '.join(args)} failed: {detail}")
-    return proc.stdout.decode(errors="replace")
+    return proc.stdout
+
+
+def git(root: Path, *args: str, input_bytes: bytes | None = None) -> str:
+    return git_bytes(root, *args, input_bytes=input_bytes).decode(errors="replace")
 
 
 def repository_root() -> Path:
@@ -144,9 +145,9 @@ def git_scope_names(root: Path) -> list[str]:
 def tracked_and_untracked(root: Path, names: Iterable[str] | None = None) -> list[str]:
     """Return existing tracked and non-ignored untracked files, sorted.
 
-    ``git ls-files -co --exclude-standard`` is important: a directory walk
-    would accidentally inspect ignored build output and dependencies, while
-    tracked-only scope would miss a newly-added source file in a change.
+    ``ls-files -co --exclude-standard`` rather than a walk: a walk would
+    inspect ignored build output, and tracked-only scope would miss a
+    newly-added source file.
     """
     return [name for name in (names or git_scope_names(root))
             if (root / name).is_file() and not (root / name).is_symlink()]
@@ -168,54 +169,36 @@ def archive_revision(root: Path, ref: str) -> tempfile.TemporaryDirectory[str]:
     revision = git(root, "rev-parse", "--verify", f"{ref}^{{commit}}").strip()
     tmp = tempfile.TemporaryDirectory(prefix="code-health-base-")
     try:
-        tree = subprocess.run(
-            ["git", "ls-tree", "-r", "-z", revision], cwd=root, capture_output=True, check=False,
-        )
-        if tree.returncode:
-            raise HealthError(tree.stderr.decode(errors="replace").strip() or "git ls-tree failed")
-        entries = []
-        for entry in tree.stdout.split(b"\0"):
+        entries: list[tuple[str, Path]] = []
+        for entry in git_bytes(root, "ls-tree", "-r", "-z", revision).split(b"\0"):
             if not entry:
                 continue
             metadata, raw_path = entry.split(b"\t", 1)
             mode, kind, object_id = metadata.decode("ascii").split()
-            if kind != "blob" or mode == "120000":
-                continue
             path = raw_path.decode("utf-8", errors="surrogateescape")
-            if not language_for(path):
+            if kind != "blob" or mode == "120000" or not language_for(path):
                 continue
             target = Path(tmp.name, path)
             if target.parent == target or not target.is_relative_to(tmp.name):
                 raise HealthError("unsafe path in git tree")
             entries.append((object_id, target))
-        process = subprocess.Popen(
-            ["git", "cat-file", "--batch"], cwd=root, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        assert process.stdin and process.stdout
-        try:
-            for object_id, target in entries:
-                process.stdin.write(f"{object_id}\n".encode())
-                process.stdin.flush()
-                header = process.stdout.readline().decode("ascii", errors="replace").split()
-                if len(header) != 3 or header[1] != "blob" or not header[2].isdigit():
-                    raise HealthError("git cat-file returned an invalid blob header")
-                blob = process.stdout.read(int(header[2]))
-                if len(blob) != int(header[2]) or process.stdout.read(1) != b"\n":
-                    raise HealthError("git cat-file returned a truncated blob")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(blob)
-            process.stdin.close()
-            if process.wait() != 0:
-                raise HealthError(process.stderr.read().decode(errors="replace").strip() or "git cat-file failed")
-        except Exception:
-            process.kill()
-            process.wait()
-            raise
-        finally:
-            for pipe in (process.stdin, process.stdout, process.stderr):
-                if pipe and not pipe.closed:
-                    pipe.close()
+        # One exchange rather than an interleaved write/read protocol.  `scan`
+        # holds the same text afterwards, so only the peak roughly doubles, and
+        # that buys the removal of a hand-rolled pipe dance.
+        blobs = git_bytes(root, "cat-file", "--batch",
+                          input_bytes="".join(f"{oid}\n" for oid, _ in entries).encode())
+        offset = 0
+        for _, target in entries:
+            newline = blobs.find(b"\n", offset)
+            header = blobs[offset:newline].decode("ascii", errors="replace").split() if newline != -1 else []
+            if len(header) != 3 or header[1] != "blob" or not header[2].isdigit():
+                raise HealthError("git cat-file returned an invalid blob header")
+            start, size = newline + 1, int(header[2])
+            offset = start + size + 1
+            if offset > len(blobs):
+                raise HealthError("git cat-file returned a truncated blob")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blobs[start:start + size])
     except Exception:
         tmp.cleanup()
         raise
@@ -251,6 +234,18 @@ def category_for(path: str, language: str | None) -> tuple[str, str]:
     if suffix in DATA_EXTENSIONS:
         return "data", "data_or_build_product_rule"
     return "other", "unrecognised_extension_rule"
+
+
+def unrecognised_extensions(paths: Iterable[str]) -> dict[str, int]:
+    """Unrecognised suffixes (or bare names) and how many files carry each.
+
+    A language absent from the extension table produces no coverage row, so
+    this is the only evidence those files exist.  Grouped rather than listed:
+    on real repositories the list was hundreds of data tables.
+    """
+    counts = Counter(Path(path).suffix.lower() or Path(path).name.lower() for path in paths
+                     if not language_for(path) and category_for(path, None)[0] == "other")
+    return {key: counts[key] for key in sorted(counts)}
 
 
 def line_counts(text: str, language: str | None) -> dict[str, int | str]:
@@ -317,22 +312,26 @@ def _files_under(root: Path) -> list[str]:
     return sorted(str(path.relative_to(root)).replace(os.sep, "/") for path in root.rglob("*") if path.is_file())
 
 
-def composition(root: Path, paths: Iterable[str] | None = None) -> tuple[dict[str, Any], list[dict[str, str]]]:
-    """Composition includes source plus separately-classified docs/config files."""
-    all_rows: list[dict[str, Any]] = []
+def composition(root: Path, paths: Iterable[str], source: list[SourceFile]) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Source plus separately-classified documentation, configuration and data.
+
+    Source rows reuse the single ``scan`` read, so nothing is opened twice.
+    """
+    rows = {file.path: {"path": file.path, "language": file.language, "category": file.category,
+                        "category_rule": file.category_rule, **file.counts} for file in source}
     unreadable: list[dict[str, str]] = []
-    # Current working-tree composition must have the same git-defined scope as
-    # analysis.  The archive has no .git directory, but test repositories do.
-    for path in sorted(paths if paths is not None else _files_under(root)):
-        language = language_for(path)
-        category, rule = category_for(path, language)
+    for path in paths:
+        if language_for(path):
+            continue  # `scan` already read it, or already recorded why it could not.
         try:
             text = (root / path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             unreadable.append({"path": path, "reason": f"unreadable_utf8: {exc.__class__.__name__}"})
             continue
-        row = {"path": path, "language": language, "category": category, "category_rule": rule, **line_counts(text, language)}
-        all_rows.append(row)
+        category, rule = category_for(path, None)
+        rows[path] = {"path": path, "language": None, "category": category, "category_rule": rule,
+                      **line_counts(text, None)}
+    all_rows = [rows[path] for path in sorted(rows)]
     totals: dict[str, dict[str, int]] = defaultdict(lambda: {"files": 0, "physical": 0, "code": 0, "comment": 0, "blank": 0})
     distributions: dict[str, list[int]] = defaultdict(list)
     for row in all_rows:
@@ -360,47 +359,108 @@ def size_distribution(values: list[int]) -> dict[str, int]:
     return {"count": len(values), "min": values[0], "p50": pct(50), "p90": pct(90), "max": values[-1]}
 
 
-def normalized_windows(source: list[SourceFile], width: int) -> dict[str, dict[str, Any]]:
-    """Return exact whitespace-normalised windows and their occurrence counts."""
-    found: dict[str, dict[str, Any]] = {}
+def code_windows(source: list[SourceFile], width: int) -> dict[str, list[tuple[int, str]]]:
+    """Per file, the signature of every window of *width* nonblank lines.
+
+    Blank lines are separators, not part of an exact window; physical start
+    lines are kept for investigation.
+    """
+    windows: dict[str, list[tuple[int, str]]] = {}
     for file in source:
-        # Blank lines are formatting separators, not a meaningful part of an
-        # exact code window.  Keep physical start lines for investigation.
-        lines = [(number, line) for number, line in enumerate(file.text.splitlines(), 1) if line.strip()]
-        for start in range(0, max(0, len(lines) - width + 1)):
-            normalized = "\n".join("".join(line.split()) for _, line in lines[start:start + width])
-            if not normalized.strip():
-                continue
-            signature = hashlib.sha256(normalized.encode()).hexdigest()
-            item = found.setdefault(signature, {"signature": signature, "line_count": width, "occurrences": []})
-            item["occurrences"].append({"path": file.path, "start_line": lines[start][0]})
-    for item in found.values():
-        item["occurrences"].sort(key=lambda x: (x["path"], x["start_line"]))
-        item["count"] = len(item["occurrences"])
-    return found
+        lines = [(number, "".join(line.split()))
+                 for number, line in enumerate(file.text.splitlines(), 1) if line.strip()]
+        windows[file.path] = [
+            (lines[start][0],
+             hashlib.sha256("\n".join(text for _, text in lines[start:start + width]).encode()).hexdigest())
+            for start in range(len(lines) - width + 1)
+        ]
+    return windows
 
 
-def duplication_facts(source: list[SourceFile], width: int, base_source: list[SourceFile] | None, changed: set[str]) -> dict[str, Any]:
-    current = normalized_windows(source, width)
-    base = normalized_windows(base_source or [], width)
+def duplicate_blocks(windows: dict[str, list[tuple[int, str]]],
+                     width: int) -> tuple[dict[str, int], dict[str, dict[str, Any]]]:
+    """Occurrence counts per signature, plus one record per duplicated run.
+
+    A repeated 30-line block is one finding, not the 25 overlapping windows a
+    sliding scan sees.  A window continues a run only when its whole occurrence
+    set follows one shared predecessor of the same count, so a more-repeated
+    tail keeps its own record.  The fixed-width signature stays the comparison
+    identity, and counts cover every signature because the other side of a
+    comparison needs them even where it holds no duplicate.
+    """
+    positions: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for path, rows in windows.items():
+        for index, (_, signature) in enumerate(rows):
+            positions[signature].append((path, index))
+    counts = {signature: len(group) for signature, group in positions.items()}
+    repeated = {signature for signature, count in counts.items() if count > 1}
+
+    def predecessor(signature: str) -> str | None:
+        group = positions[signature]
+        if any(index == 0 for _, index in group):
+            return None
+        earlier = {windows[path][index - 1][1] for path, index in group}
+        found = earlier.pop() if len(earlier) == 1 else None
+        return found if found != signature and counts.get(found) == len(group) else None
+
+    continuation: dict[str, str] = {}
+    for signature in repeated:
+        found = predecessor(signature)
+        if found is not None:
+            continuation[found] = signature
+    blocks: dict[str, dict[str, Any]] = {}
+    for start in repeated - set(continuation.values()):
+        run, tail = [start], start
+        while tail in continuation:
+            tail = continuation[tail]
+            run.append(tail)
+        # Every member of the run is recorded, not just its start: the same
+        # signature can start a run on one side of a comparison and continue a
+        # longer one on the other, and dropping the continuation's occurrences
+        # would leave that side's delta with nowhere to point.  Each member's
+        # length is measured from its OWN occurrences, so the row's line count
+        # and its cited lines describe the same block.
+        for offset, signature in enumerate(run):
+            blocks[signature] = {
+                "signature": signature, "line_count": width + len(run) - 1 - offset,
+                "count": counts[signature], "starts_run": offset == 0,
+                "occurrences": sorted(({"path": path, "start_line": windows[path][index][0]}
+                                       for path, index in positions[signature]),
+                                      key=lambda row: (row["path"], row["start_line"])),
+            }
+    return counts, blocks
+
+
+def duplication_facts(source: list[SourceFile], width: int, base_source: list[SourceFile] | None,
+                      changed: Iterable[str]) -> dict[str, Any]:
+    """One row per duplicated block on either side, with both raw counts.
+
+    A block the change resolved keeps its row so the delta stays honest; it has
+    no current block, so its occurrence lists are empty and the counts say why.
+    """
+    current_counts, current = duplicate_blocks(code_windows(source, width), width)
+    base_counts, base = duplicate_blocks(code_windows(base_source or [], width), width)
+    changed = set(changed)
     rows = []
     for signature in sorted(set(current) | set(base)):
-        head = current.get(signature, {"count": 0, "occurrences": []})
-        old = base.get(signature, {"count": 0, "occurrences": []})
-        # A signature that occurs only once on both sides is not duplication,
-        # even when it is new. Keep resolved duplicates (base >= 2) as well as
-        # current duplicates so differential counts remain honest.
-        if max(head["count"], old["count"]) < 2:
+        block, was = current.get(signature), base.get(signature)
+        # One row per run, anchored on whichever side actually holds the run.
+        if not (block or {}).get("starts_run") and not (was or {}).get("starts_run"):
             continue
-        delta = head["count"] - old["count"]
-        changed_occurrences = [o for o in head["occurrences"] if o["path"] in changed]
+        occurrences = block["occurrences"] if block else []
+        head, old = current_counts.get(signature, 0), base_counts.get(signature, 0)
         rows.append({
-            "signature": signature, "line_count": width, "current_count": head["count"],
-            "base_count": old["count"], "count_delta": delta,
-            "changed_side_occurrences": changed_occurrences,
-            "current_occurrences": head["occurrences"],
+            "signature": signature,
+            # Each side's own run length. Borrowing the other's would claim a
+            # block that side does not have; carrying both is what makes a
+            # clone that grew without repeating more times comparable at all.
+            "line_count": (block or was)["line_count"],
+            "base_line_count": was["line_count"] if was else 0,
+            "current_count": head, "base_count": old, "count_delta": head - old,
+            "changed_side_occurrences": [o for o in occurrences if o["path"] in changed],
+            "current_occurrences": occurrences,
         })
-    return {"normalization": "whitespace_only", "window_lines": width, "signatures": rows}
+    return {"normalization": "whitespace_only", "minimum_window_lines": width, "signatures": rows}
 
 
 def cyclomatic_for(node: ast.AST) -> int:
@@ -499,77 +559,38 @@ def python_structure(source: list[SourceFile]) -> dict[str, Any]:
     }
 
 
-def reverse_reachability(graph: dict[str, list[str]], cycles: list[list[str]]) -> dict[str, int]:
-    """How many distinct files reach each node, via the SCC condensation.
+def reverse_reachability(components: list[list[str]], edges: set[tuple[str, str]]) -> dict[str, int]:
+    """How many other files transitively reach each node.
 
-    A BFS per node is quadratic, which a dense C include graph makes real; the
-    condensation is a DAG, so one memoized pass in reverse topological order
-    answers every node.
+    The SCC condensation is a DAG and Tarjan emits it in reverse topological
+    order, so one backwards pass answers every node.  The accumulator is a
+    bitmask over files, not a set of paths: a set costs O(V^2) *objects* on a
+    wide graph (measured 624 MB at 4,000 nodes).
     """
     component_of: dict[str, int] = {}
-    components: list[list[str]] = []
-    for cycle in cycles:
-        for path in cycle:
-            component_of[path] = len(components)
-        components.append(list(cycle))
-    for path in graph:
-        if path not in component_of:
-            component_of[path] = len(components)
-            components.append([path])
-    condensed: dict[int, set[int]] = {index: set() for index in range(len(components))}
-    for src, destinations in graph.items():
-        for dst in destinations:
-            if component_of[src] != component_of[dst]:
-                condensed[component_of[dst]].add(component_of[src])
-    order: list[int] = []
-    state = [0] * len(components)
-    for start in range(len(components)):
-        if state[start]:
-            continue
-        stack = [(start, iter(sorted(condensed[start])))]
-        state[start] = 1
-        while stack:
-            node, children = stack[-1]
-            child = next(children, None)
-            if child is None:
-                stack.pop()
-                order.append(node)
-                continue
-            if not state[child]:
-                state[child] = 1
-                stack.append((child, iter(sorted(condensed[child]))))
-    # Bitmask per component rather than a set of ancestors: a set costs O(V^2)
-    # *objects* on a wide DAG (measured 624 MB at 4,000 nodes), an int costs
-    # O(V^2) bits.
-    ancestors = [0] * len(components)
-    for node in order:
-        reached = 0
-        for parent in condensed[node]:
-            reached |= (1 << parent) | ancestors[parent]
-        ancestors[node] = reached
-    sizes = [len(members) for members in components]
-    uniform = all(size == 1 for size in sizes)
-    result: dict[str, int] = {}
+    own: list[int] = []
     for index, members in enumerate(components):
-        mask = ancestors[index]
-        if uniform:
-            total = mask.bit_count()
-        else:
-            total = 0
-            while mask:
-                lowest = mask & -mask
-                total += sizes[lowest.bit_length() - 1]
-                mask ^= lowest
+        mask = 0
         for path in members:
-            result[path] = total + len(members) - 1
-    return result
+            mask |= 1 << len(component_of)
+            component_of[path] = index
+        own.append(mask)
+    parents: dict[int, set[int]] = defaultdict(set)
+    for src, dst in edges:
+        if component_of[src] != component_of[dst]:
+            parents[component_of[dst]].add(component_of[src])
+    reaching = [0] * len(components)
+    for index in reversed(range(len(components))):
+        for parent in parents[index]:
+            reaching[index] |= own[parent] | reaching[parent]
+    return {path: (reaching[index] | own[index]).bit_count() - 1 for path, index in component_of.items()}
 
 
 def graph_facts(nodes: Iterable[str], edges: set[tuple[str, str]]) -> dict[str, Any]:
-    """Fan-in/out, cycles and reverse reachability for a directed file graph.
+    """Edges, cycles, and per-node fan-in/fan-out/blast radius.
 
-    Shared by every dependency collector so Python imports and C includes are
-    described in exactly the same units.
+    Shared by every dependency collector, so Python imports and C includes are
+    described in identical units.
     """
     inbound: Counter[str] = Counter(dst for _, dst in edges)
     outbound: Counter[str] = Counter(src for src, _ in edges)
@@ -578,17 +599,14 @@ def graph_facts(nodes: Iterable[str], edges: set[tuple[str, str]]) -> dict[str, 
     for src, dst in edges:
         adjacency[src].append(dst)
     graph = {path: sorted(adjacency.get(path, ())) for path in sorted(nodes)}
-    cycles = [component for component in strongly_connected_components(graph) if len(component) > 1]
-    blast = [{"path": path, "reverse_reachability": value}
-             for path, value in reverse_reachability(graph, cycles).items()]
-    blast.sort(key=lambda row: (-row["reverse_reachability"], row["path"]))
+    components = strongly_connected_components(graph)
+    reaching = reverse_reachability(components, edges)
     return {"edges": [{"from": src, "to": dst} for src, dst in sorted(edges)],
-            "fan_in": [{"path": p, "value": inbound[p]} for p in sorted(graph)],
-            "fan_out": [{"path": p, "value": outbound[p]} for p in sorted(graph)],
-            "cycles": cycles, "reverse_reachability": blast}
+            "nodes": [{"path": path, "fan_in": inbound[path], "fan_out": outbound[path],
+                       "reverse_reachability": reaching[path]} for path in graph],
+            "cycles": sorted(component for component in components if len(component) > 1)}
 
 
-C_FAMILY = {"C", "C++", "C/C++", "CUDA"}
 # Quoted includes only.  ``#include <...>`` names a system or external header
 # by contract, so excluding it keeps the graph internal without a header search
 # path.  Continuation lines and macro-computed includes are not handled.
@@ -700,13 +718,10 @@ def c_include_structure(source: list[SourceFile], inventory: Iterable[str] | Non
     paths = {item.path for item in files}
     # Every in-scope path, so a present-but-unmeasured header (.inc, generated
     # body) is not reported as absent from the repository.
-    known = set(inventory) if inventory is not None else {item.path for item in source}
+    known = (set(inventory) if inventory is not None else {item.path for item in source}) | paths
     by_basename: dict[str, list[str]] = defaultdict(list)
-    for path in sorted(paths):
+    for path in sorted(known):
         by_basename[posix_name(path)].append(path)
-    by_inventory_name: dict[str, list[str]] = defaultdict(list)
-    for path in sorted(known - paths):
-        by_inventory_name[posix_name(path)].append(path)
     edges: set[tuple[str, str]] = set()
     provenance: dict[tuple[str, str], str] = {}
     unresolved: dict[tuple[str, str], dict[str, Any]] = {}
@@ -744,31 +759,29 @@ def c_include_structure(source: list[SourceFile], inventory: Iterable[str] | Non
                 # Uniqueness is decided across the whole repository, not just
                 # measured files: an unmeasured same-named file makes the
                 # basename ambiguous, so guessing past it would be wrong.
-                basename = posix_name(canonical)
-                measured = by_basename.get(basename, [])
-                unmeasured = by_inventory_name.get(basename, [])
-                if len(measured) + len(unmeasured) != 1:
-                    reason = "ambiguous_basename" if measured or unmeasured else "not_in_repository"
-                    record(item.path, target, line, reason)
+                matches = by_basename.get(posix_name(canonical), [])
+                if len(matches) != 1:
+                    record(item.path, target, line,
+                           "ambiguous_basename" if matches else "not_in_repository")
                     continue
-                if unmeasured:
+                if matches[0] not in paths:
                     record(item.path, target, line, "unique_unmeasured_basename")
                     continue
-                resolved, via = measured[0], "unique_basename"
+                resolved, via = matches[0], "unique_basename"
             if resolved != item.path:
                 edges.add((item.path, resolved))
                 provenance[(item.path, resolved)] = via
             else:
                 record(item.path, target, line, "self_include")
-    ordered = [unresolved[key] for key in sorted(unresolved)]
     facts = graph_facts(sorted(paths), edges)
     for edge in facts["edges"]:
         edge["via"] = provenance[(edge["from"], edge["to"])]
-    guessed = sorted(edge for edge, via in provenance.items() if via == "unique_basename")
-    return {"unresolved_includes": ordered,
-            # A guessed edge can wire an unrelated copy of a file into the
-            # graph; naming them lets a reader discount those relationships.
-            "basename_resolved_edges": [{"from": src, "to": dst} for src, dst in guessed],
+    return {"unresolved_includes": [unresolved[key] for key in sorted(unresolved)],
+            # A `unique_basename` edge can wire an unrelated copy of a file into
+            # the graph.  Counted rather than listed: a repository built with
+            # `-I` paths resolves almost every edge that way, and the list then
+            # buried the one number a reader needs.
+            "resolution_counts": dict(sorted(Counter(provenance.values()).items())),
             **facts}
 
 
@@ -796,56 +809,42 @@ def lizard_status() -> LizardResult:
     return LizardResult(True, version[0] if version else "unknown", [])
 
 
+LIZARD_CSV_COLUMNS = ("nloc", "ccn", "token", "param", "length", "location",
+                      "file", "function", "long_name", "start", "end")
+
+
 def parse_lizard_csv(output: str) -> list[dict[str, Any]]:
-    """Parse Lizard's headerless 11-column CSV and headered variants."""
-    raw_rows = list(csv.reader(output.splitlines()))
+    """Parse Lizard's headerless 11-column ``--csv`` rows.
+
+    Pinned to the one shape Lizard emits.  Anything else raises, which becomes
+    a recorded collector error and unavailable coverage — never a silent zero.
+    """
     parsed: list[dict[str, Any]] = []
-    if not raw_rows:
-        return parsed
-    headered = any(value.strip().lower() == "ccn" for value in raw_rows[0])
-    if headered:
-        header = [value.strip().lower() for value in raw_rows.pop(0)]
-        rows = [dict(zip(header, values, strict=False)) for values in raw_rows]
-    else:
-        columns = ("nloc", "ccn", "token", "param", "length", "location",
-                   "file", "function", "long_name", "start", "end")
-        rows = [dict(zip(columns, values, strict=False)) for values in raw_rows]
-    for row in rows:
+    for values in csv.reader(output.splitlines()):
         try:
-            complexity = int(row.get("ccn") or row.get("cyclomatic_complexity") or "")
-            name = row.get("function") or row.get("long_name") or row.get("name") or ""
-            path = row.get("filename") or row.get("file") or ""
-            line = int(row.get("start") or row.get("start_line") or "0")
-            location = row.get("location", "")
-            # Traditional lizard CSV has location: ``function@3-8@src/a.js``.
-            if location and (not name or not path):
-                pieces = location.rsplit("@", 2)
-                if len(pieces) == 3:
-                    name = name or pieces[0]
-                    path = path or pieces[2]
-                    if not line:
-                        line = int(pieces[1].split("-", 1)[0])
-            if not name or not path or line < 1:
-                raise ValueError("missing function, filename, or start")
-        except (TypeError, ValueError) as exc:
-            raise HealthError(f"unparsable lizard CSV row: {row}") from exc
-        parsed.append({"path": path.replace("\\", "/"), "name": name, "line": line,
-                       "cyclomatic": complexity, "collector": "lizard"})
+            row = dict(zip(LIZARD_CSV_COLUMNS, values, strict=True))
+            function = {"path": row["file"].replace("\\", "/"), "name": row["function"],
+                        "line": int(row["start"]), "cyclomatic": int(row["ccn"]),
+                        "collector": "lizard"}
+            if not function["path"] or not function["name"] or function["line"] < 1:
+                raise ValueError("empty filename or function, or non-positive start line")
+        except ValueError as exc:
+            raise HealthError(f"unparsable lizard CSV row: {values}") from exc
+        parsed.append(function)
     return sorted(parsed, key=lambda r: (-r["cyclomatic"], r["path"], r["line"], r["name"]))
 
 
 def lizard_complexity(root: Path, source: list[SourceFile], status: LizardResult | None = None) -> LizardResult:
     status = status or lizard_status()
     eligible = [item.path for item in source if item.language in LIZARD_SUPPORTED]
-    if not eligible:
-        return status
-    if not status.installed:
+    if not eligible or not status.installed:
         return status
     binary = shutil.which("lizard")
     assert binary  # status's installed state was derived from this probe.
     functions: list[dict[str, Any]] = []
     for start in range(0, len(eligible), 200):
-        proc = subprocess.run([binary, "--csv", *eligible[start:start + 200]], cwd=root, capture_output=True, text=True)
+        # `--` so a path that looks like an option cannot turn into one.
+        proc = subprocess.run([binary, "--csv", "--", *eligible[start:start + 200]], cwd=root, capture_output=True, text=True)
         if proc.returncode:
             return LizardResult(True, status.version, [], f"lizard failed: {(proc.stderr or proc.stdout).strip()}")
         try:
@@ -857,205 +856,330 @@ def lizard_complexity(root: Path, source: list[SourceFile], status: LizardResult
 
 
 def strongly_connected_components(graph: dict[str, list[str]]) -> list[list[str]]:
-    """Tarjan's SCC algorithm, sorted so JSON is stable across Python runs.
+    """Tarjan's SCC algorithm, in reverse topological order of the condensation.
 
     Iterative: a deep C header chain would overflow a recursive walk, and that
-    surfaces as an execution error rather than as evidence.
+    surfaces as an execution error rather than as evidence.  Members are sorted
+    and the walk is driven from sorted keys, so the order is stable.
     """
-    index = 0
-    indices: dict[str, int] = {}
+    index: dict[str, int] = {}
     low: dict[str, int] = {}
     stack: list[str] = []
     on_stack: set[str] = set()
     result: list[list[str]] = []
-    for root in sorted(graph):
-        if root in indices:
+
+    def enter(node: str) -> tuple[str, Any]:
+        index[node] = low[node] = len(index)
+        stack.append(node)
+        on_stack.add(node)
+        return node, iter(graph[node])
+
+    for start in sorted(graph):
+        if start in index:
             continue
-        work: list[tuple[str, int]] = [(root, 0)]
+        work = [enter(start)]
         while work:
-            node, position = work[-1]
-            if position == 0:
-                indices[node] = low[node] = index
-                index += 1
-                stack.append(node)
-                on_stack.add(node)
-            targets = graph[node]
-            if position < len(targets):
-                work[-1] = (node, position + 1)
-                target = targets[position]
-                if target not in indices:
-                    work.append((target, 0))
-                elif target in on_stack:
-                    low[node] = min(low[node], indices[target])
-                continue
-            work.pop()
-            if work:
-                parent = work[-1][0]
-                low[parent] = min(low[parent], low[node])
-            if low[node] == indices[node]:
-                component = []
-                while True:
-                    target = stack.pop()
-                    on_stack.remove(target)
-                    component.append(target)
-                    if target == node:
-                        break
-                result.append(sorted(component))
-    return sorted(result)
+            node, children = work[-1]
+            target = next(children, None)
+            if target is None:
+                work.pop()
+                if work:
+                    low[work[-1][0]] = min(low[work[-1][0]], low[node])
+                if low[node] == index[node]:
+                    component: list[str] = []
+                    while not component or component[-1] != node:
+                        component.append(stack.pop())
+                        on_stack.remove(component[-1])
+                    result.append(sorted(component))
+            elif target not in index:
+                work.append(enter(target))
+            elif target in on_stack:
+                low[node] = min(low[node], index[target])
+    return result
 
 
-def coverage_matrix(source: list[SourceFile], unreadable: list[dict[str, str]], structure: dict[str, Any], lizard: LizardResult) -> list[dict[str, str]]:
-    languages = sorted({item.language for item in source} | {
-        language_for(row["path"]) for row in unreadable if language_for(row["path"])
-    })
-    python_errors = structure["parse_errors"]
+@dataclass(frozen=True)
+class Baseline:
+    """What the base revision could not supply, and what that invalidates.
+
+    Derived once so the coverage matrix, the disclosed limits and candidate
+    suppression cannot drift.  ``scope`` is the current tree's languages, which
+    stops a base-only failure inventing rows for a language now absent.
+    """
+    unreadable: tuple[dict[str, str], ...] = ()
+    unparsable: tuple[dict[str, Any], ...] = ()
+    scope: frozenset[str] = frozenset()
+    changed_base_paths: frozenset[str] = frozenset()
+
+    @property
+    def unreadable_paths(self) -> set[str]:
+        """Base paths with no text at all, so no lexical measure is comparable."""
+        return {row["path"] for row in self.unreadable}
+
+    @property
+    def paths(self) -> set[str]:
+        """Base paths with no comparable AST; a parse failure still has text."""
+        return self.unreadable_paths | {row["path"] for row in self.unparsable}
+
+    @property
+    def voided(self) -> dict[tuple[str, str], str]:
+        """(language, metric family) -> reason the baseline cannot support it.
+
+        Unreadable voids every family for that language; a parse failure voids
+        only the AST families, since the text itself read fine.
+        """
+        result: dict[tuple[str, str], str] = {}
+        for rows, families, reason in (
+            (self.unparsable, AST_FAMILIES, "base source in this language failed to parse"),
+            (self.unreadable, METRIC_FAMILIES, "unreadable base source in this language"),
+        ):
+            for row in rows:
+                language = language_for(row["path"])
+                if language in self.scope:
+                    result.update({(language, family): reason for family in families})
+        # One include graph spans the C family, so an unreadable base member
+        # voids the dependency row for every C-family language in scope — even
+        # when the failing file's own extension is no longer present.
+        if {language_for(row["path"]) for row in self.unreadable} & C_FAMILY:
+            result.update({(language, "dependencies"): "incomplete base C-family include graph"
+                           for language in self.scope & C_FAMILY})
+        # Duplication signatures span every language at once, so missing base
+        # text understates a base count anywhere and could fabricate a rise in
+        # a language the failing file has nothing to do with.
+        if self.unreliable_duplication:
+            result.update({(language, "duplication"): "unreadable base source; duplication spans all languages"
+                           for language in self.scope})
+        return result
+
+    @property
+    def unreliable_graphs(self) -> set[str]:
+        """Dependency graphs whose baseline is too incomplete to compare."""
+        languages = {language_for(path) for path in self.paths}
+        return ({"python"} if "Python" in languages else set()) | (
+            {"c_includes"} if languages & C_FAMILY else set())
+
+    @property
+    def unreliable_duplication(self) -> bool:
+        """True when the base pool is missing text the current pool still has.
+
+        A parse failure does not count: that file's text was read and still
+        contributed its windows.  Nor does a file that never changed — it is
+        unreadable on both sides, so neither count can be understated alone.
+        Both sides of this comparison are base-path identities, so a renamed
+        file is matched under the name the base knew it by.
+        """
+        return bool(self.unreadable_paths & self.changed_base_paths)
+
+
+@dataclass(frozen=True)
+class Differential:
+    """Base-side context for differential attribution; inert in absolute mode."""
+    active: bool = False
+    changed: frozenset[str] = frozenset()
+    renames: dict[str, str] = field(default_factory=dict)
+    source: tuple[SourceFile, ...] = ()
+    structure: dict[str, Any] = field(default_factory=dict)
+    includes: dict[str, Any] = field(default_factory=dict)
+    lizard: LizardResult = field(default_factory=lambda: LizardResult(False, None, []))
+    baseline: Baseline = Baseline()
+
+    def unchanged(self, path: str, unusable: set[str]) -> bool:
+        """True when a differential run must skip *path* for this metric family.
+
+        *unusable* is the base paths that family cannot compare against, which
+        is narrower for a lexical measure than for one needing a parse.
+        """
+        return self.active and (path not in self.changed
+                                or self.renames.get(path, path) in unusable)
+
+    def base_path(self, path: str) -> str:
+        return self.renames.get(path, path)
+
+
+def coverage_cell(language: str, family: str, unreadable_languages: set[str | None],
+                  python_parse_gap: bool, c_family_gap: bool, lizard: LizardResult) -> tuple[str, str]:
+    """Measurement status for one language x metric-family cell."""
+    if family in LEXICAL_FAMILIES and language not in unreadable_languages:
+        return "covered", "stdlib lexical analysis"
+    if family in LEXICAL_FAMILIES:
+        return "unavailable", "unreadable source in this language"
+    if language == "Python":
+        if python_parse_gap or language in unreadable_languages:
+            return "unavailable", "Python AST parse/read gap"
+        return "covered", "Python stdlib AST"
+    if family == "dependencies" and language in C_FAMILY:
+        # One graph spans the family, so any unreadable member voids it.
+        if c_family_gap:
+            return "unavailable", "unreadable source in the C-family include graph"
+        return "covered", "stdlib quoted-#include scan (no preprocessor evaluation)"
+    if family == "cyclomatic":
+        if language in unreadable_languages:
+            return "unavailable", "unreadable source in this language"
+        if language in LIZARD_SUPPORTED:
+            if lizard.installed and not lizard.error:
+                return "covered", f"Lizard {lizard.version or 'unknown'}"
+            return "unavailable", lizard.error or "lizard not installed"
+    return "unavailable", "no portable parser for this language"
+
+
+def scope_languages(source: list[SourceFile], unreadable: list[dict[str, str]]) -> frozenset[str]:
+    """Current-tree languages, including ones whose files failed to read.
+
+    A language with no coverage row would read as covered.
+    """
+    return frozenset({item.language for item in source}
+                     | {language_for(row["path"]) for row in unreadable if language_for(row["path"])})
+
+
+def coverage_matrix(source: list[SourceFile], unreadable: list[dict[str, str]], structure: dict[str, Any],
+                    lizard: LizardResult, baseline: Baseline | None = None) -> list[dict[str, str]]:
+    """Per-language, per-family status.  Never 'covered' by omission."""
+    baseline = baseline or Baseline()
     unreadable_languages = {language_for(row["path"]) for row in unreadable}
-    c_family_unreadable = bool(unreadable_languages & C_FAMILY)
+    voided = baseline.voided
+    python_parse_gap = bool(structure["parse_errors"])
+    c_family_gap = bool(unreadable_languages & C_FAMILY)
     matrix = []
-    for language in languages:
+    for language in sorted(scope_languages(source, unreadable)):
         for family in METRIC_FAMILIES:
-            if family in {"composition", "duplication"} and language not in unreadable_languages:
-                status, reason = "covered", "stdlib lexical analysis"
-            elif family in {"composition", "duplication"}:
-                status, reason = "unavailable", "unreadable source in this language"
-            elif language == "Python" and not python_errors and language not in unreadable_languages:
-                status, reason = "covered", "Python stdlib AST"
-            elif language == "Python":
-                status, reason = "unavailable", "Python AST parse/read gap"
-            elif family == "dependencies" and language in C_FAMILY and not c_family_unreadable:
-                status, reason = "covered", "stdlib quoted-#include scan (no preprocessor evaluation)"
-            elif family == "dependencies" and language in C_FAMILY:
-                # One graph spans the family, so any unreadable member voids it.
-                status, reason = "unavailable", "unreadable source in the C-family include graph"
-            elif family == "cyclomatic" and language in unreadable_languages:
-                status, reason = "unavailable", "unreadable source in this language"
-            elif family == "cyclomatic" and language in LIZARD_SUPPORTED and lizard.installed and not lizard.error:
-                status, reason = "covered", f"Lizard {lizard.version or 'unknown'}"
-            elif family == "cyclomatic" and language in LIZARD_SUPPORTED:
-                status, reason = "unavailable", lizard.error or "lizard not installed"
-            else:
-                status, reason = "unavailable", "no portable parser for this language"
+            status, reason = coverage_cell(language, family, unreadable_languages,
+                                           python_parse_gap, c_family_gap, lizard)
+            # A clean current measurement is still not a clean comparison when
+            # the base could not supply the same language.
+            if status == "covered" and (language, family) in voided:
+                status, reason = "unavailable", voided[(language, family)]
             matrix.append({"language": language, "metric_family": family, "status": status, "reason": reason})
     return matrix
 
 
+def coverage_limits(conflicts: list[str], symlinks: list[str], baseline: Baseline) -> list[dict[str, Any]]:
+    """Disclosed reasons a measurement is incomplete, in reading order."""
+    kinds = (
+        ("unmerged_index", conflicts),
+        ("symbolic_links_not_followed", symlinks),
+        ("unreadable_base_files", sorted(row["path"] for row in baseline.unreadable)),
+        ("base_parse_errors", sorted(row["path"] for row in baseline.unparsable)),
+    )
+    return [{"kind": kind, "paths": paths} for kind, paths in kinds if paths]
+
+
 def changed_paths(root: Path, base: str, current_paths: Iterable[str] | None = None) -> tuple[set[str], dict[str, str]]:
     """Changed current paths plus current->base mapping for Git-detected renames."""
-    output = git(root, "diff", "--name-status", "-M", "-z", base, "--")
-    tokens = output.split("\0")
+    tokens = git(root, "diff", "--name-status", "-M", "-z", base, "--").split("\0")
     changed: set[str] = set()
     renames: dict[str, str] = {}
     i = 0
     while i < len(tokens) and tokens[i]:
-        status = tokens[i]
-        i += 1
-        code = status[:1]
-        if code in {"R", "C"}:
-            if i + 1 >= len(tokens):
-                break
-            old, new = tokens[i], tokens[i + 1]
-            i += 2
-            changed.add(new)
-            if code == "R":
-                renames[new] = old
-        else:
-            if i >= len(tokens):
-                break
-            path = tokens[i]
-            i += 1
-            changed.add(path)
+        code, i = tokens[i][:1], i + 1
+        # R and C carry two paths; the second is the current one.
+        span = 2 if code in {"R", "C"} else 1
+        if i + span > len(tokens):
+            break
+        paths, i = tokens[i:i + span], i + span
+        changed.add(paths[-1])
+        if code == "R":
+            renames[paths[-1]] = paths[0]
     # Non-ignored untracked paths are additions, absent from git diff.
     tracked = set(git(root, "ls-files", "-z").split("\0"))
     changed.update(path for path in (current_paths or tracked_and_untracked(root)) if path not in tracked)
     return changed, renames
 
 
-def candidates(
-    source: list[SourceFile],
-    base_source: list[SourceFile] | None,
-    structure: dict[str, Any],
-    lizard_functions: list[dict[str, Any]],
-    duplication: dict[str, Any],
-    changed: set[str],
-    base_structure: dict[str, Any] | None,
-    base_lizard_functions: list[dict[str, Any]],
-    rename_map: dict[str, str],
-    differential: bool,
-    includes: dict[str, Any] | None = None,
-    base_includes: dict[str, Any] | None = None,
-    base_unreadable_paths: set[str] | None = None,
-    unreliable_graphs: set[str] | None = None,
-) -> list[dict[str, Any]]:
+def cyclomatic_candidates(structure: dict[str, Any], lizard_functions: list[dict[str, Any]],
+                          diff: Differential) -> list[tuple[tuple[int, ...], dict[str, Any]]]:
+    # Lines shift under unrelated edits.  Python qualified names (and Lizard's
+    # long names) are more stable identities for a differential raw delta.
+    old_python = {(row["path"], row["name"]): row["cyclomatic"] for row in diff.structure.get("functions", [])}
+    old_lizard = {(row["path"], row["name"]): row["cyclomatic"] for row in diff.lizard.functions}
+    rows = []
+    for row in [*structure["functions"], *lizard_functions]:
+        if diff.unchanged(row["path"], diff.baseline.paths):
+            continue
+        previous = old_lizard if row.get("collector") == "lizard" else old_python
+        delta = row["cyclomatic"] - previous.get((diff.base_path(row["path"]), row["name"]), 0)
+        if diff.active and delta == 0:
+            continue
+        rows.append(((row["cyclomatic"], delta), {
+            "kind": "cyclomatic", "path": row["path"], "line": row["line"],
+            "raw_value": row["cyclomatic"], "delta_from_base": delta if diff.active else None,
+            "collector": row.get("collector", "python_ast"),
+            "note": "Measured complexity; investigate context before recommending change."}))
+    return rows
+
+
+def file_size_candidates(source: list[SourceFile], diff: Differential) -> list[tuple[tuple[int, ...], dict[str, Any]]]:
+    old_files = {item.path: int(item.counts.get("code", 0)) for item in diff.source}
+    rows = []
+    for item in source:
+        if diff.unchanged(item.path, diff.baseline.unreadable_paths):
+            continue
+        value = int(item.counts.get("code", 0))
+        delta = value - old_files.get(diff.base_path(item.path), 0)
+        if diff.active and delta == 0:
+            continue
+        rows.append(((value, delta), {
+            "kind": "file_size", "path": item.path, "line": 1, "raw_value": value,
+            "delta_from_base": delta if diff.active else None,
+            "note": "Raw code-line count; inspect the file's role before considering decomposition."}))
+    return rows
+
+
+def duplication_candidates(duplication: dict[str, Any], diff: Differential) -> list[tuple[tuple[int, ...], dict[str, Any]]]:
+    # An incomplete base pool cannot establish that duplication rose, exactly as
+    # an incomplete baseline cannot establish that a cycle is new.
+    if diff.active and diff.baseline.unreliable_duplication:
+        return []
+    rows = []
+    for row in duplication["signatures"]:
+        occurrences = row["changed_side_occurrences"] if diff.active else row["current_occurrences"]
+        grew = row["count_delta"] > 0 or row["line_count"] > row["base_line_count"]
+        if occurrences and (grew or not diff.active):
+            first = occurrences[0]
+            # Extent first: a block repeated twice over 326 lines duplicates far
+            # more code than a 6-line window repeated 33 times, and the second
+            # kind crowded the first out entirely on both reference repositories.
+            rows.append(((row["line_count"], row["current_count"], row["count_delta"]), {
+                "kind": "duplication", "path": first["path"], "line": first["start_line"],
+                "raw_value": row["current_count"], "delta_from_base": row["count_delta"] if diff.active else None,
+                "line_count": row["line_count"], "base_line_count": row["base_line_count"],
+                "note": "Exact whitespace-normalised repeated block; investigate whether shared structure is intentional."}))
+    return rows
+
+
+def cycle_candidates(structure: dict[str, Any], includes: dict[str, Any],
+                     diff: Differential) -> list[tuple[tuple[int, ...], dict[str, Any]]]:
+    inverse_renames = {old: new for new, old in diff.renames.items()}
+    graphs = [
+        ("python", structure["imports"], diff.structure.get("imports", {}),
+         "Static Python import cycle; inspect runtime boundaries and intentionality."),
+        ("c_includes", includes, diff.includes,
+         "Static C-family include cycle from quoted includes; inspect header guards and intentionality."),
+    ]
+    rows = []
+    for name, current_graph, base_graph, note in graphs:
+        # An incomplete baseline cannot establish that a cycle is new.
+        if diff.active and name in diff.baseline.unreliable_graphs:
+            continue
+        rows.extend(((row["raw_value"],), row)
+                    for row in new_cycles(current_graph, base_graph, inverse_renames, note, diff.active))
+    return rows
+
+
+def candidates(source: list[SourceFile], structure: dict[str, Any], includes: dict[str, Any],
+               lizard_functions: list[dict[str, Any]], duplication: dict[str, Any],
+               diff: Differential) -> list[dict[str, Any]]:
     """Build a bounded per-family reading list from raw facts.
 
     Families are ranked independently so unrelated units are never collapsed
     into a disguised repository score.
     """
-    includes = includes or {}
-    # A path whose base counterpart was unreadable has no honest delta.
-    unmeasured_base = base_unreadable_paths or set()
-    unreliable = unreliable_graphs or set()
-    # Lines shift under unrelated edits.  Python qualified names (and Lizard's
-    # long names) are more stable identities for a differential raw delta.
-    old_complexity = {(row["path"], row["name"]): row["cyclomatic"] for row in (base_structure or {}).get("functions", [])}
-    old_lizard = {(row["path"], row["name"]): row["cyclomatic"] for row in base_lizard_functions}
-    by_family: dict[str, list[tuple[tuple[int, ...], dict[str, Any]]]] = defaultdict(list)
-    for row in [*structure["functions"], *lizard_functions]:
-        if differential and row["path"] not in changed:
-            continue
-        old_path = rename_map.get(row["path"], row["path"])
-        if differential and old_path in unmeasured_base:
-            continue
-        old_values = old_lizard if row.get("collector") == "lizard" else old_complexity
-        old = old_values.get((old_path, row["name"]), 0)
-        delta = row["cyclomatic"] - old
-        if differential and delta == 0:
-            continue
-        item = {"kind": "cyclomatic", "path": row["path"], "line": row["line"], "raw_value": row["cyclomatic"], "delta_from_base": delta if differential else None, "collector": row.get("collector", "python_ast"), "note": "Measured complexity; investigate context before recommending change."}
-        by_family["cyclomatic"].append(((row["cyclomatic"], delta), item))
-    for row in duplication["signatures"]:
-        occurrences = row["changed_side_occurrences"] if differential else row["current_occurrences"]
-        if (row["count_delta"] > 0 or not differential) and occurrences:
-            first = occurrences[0]
-            item = {"kind": "duplication", "path": first["path"], "line": first["start_line"], "raw_value": row["current_count"], "delta_from_base": row["count_delta"] if differential else None, "window_lines": row["line_count"], "note": "Exact whitespace-normalised repeated window; investigate whether shared structure is intentional."}
-            by_family["duplication"].append(((row["current_count"], row["line_count"], row["count_delta"]), item))
-
-    old_files = {item.path: int(item.counts.get("code", 0)) for item in base_source or []}
-    for item in source:
-        if differential and item.path not in changed:
-            continue
-        value = int(item.counts.get("code", 0))
-        if differential and rename_map.get(item.path, item.path) in unmeasured_base:
-            continue
-        old = old_files.get(rename_map.get(item.path, item.path), 0)
-        delta = value - old
-        if differential and delta == 0:
-            continue
-        row = {"kind": "file_size", "path": item.path, "line": 1, "raw_value": value,
-               "delta_from_base": delta if differential else None,
-               "note": "Raw code-line count; inspect the file's role before considering decomposition."}
-        by_family["file_size"].append(((value, delta), row))
-
-    inverse_renames = {old: new for new, old in rename_map.items()}
-    graphs = [
-        ("python", structure["imports"], (base_structure or {}).get("imports", {}),
-         "Static Python import cycle; inspect runtime boundaries and intentionality."),
-        ("c_includes", includes, base_includes or {},
-         "Static C-family include cycle from quoted includes; inspect header guards and intentionality."),
-    ]
-    for name, current_graph, base_graph, note in graphs:
-        # An incomplete baseline cannot establish that a cycle is new.
-        if differential and name in unreliable:
-            continue
-        for row in new_cycles(current_graph, base_graph, inverse_renames, note, differential):
-            by_family["dependency_cycle"].append(((row["raw_value"],), row))
-
     result: list[dict[str, Any]] = []
-    for family in ("dependency_cycle", "cyclomatic", "file_size", "duplication"):
-        ranked = sorted(
-            by_family[family],
-            key=lambda pair: (tuple(-value for value in pair[0]), pair[1]["path"], pair[1]["line"]),
-        )
+    for family in (cycle_candidates(structure, includes, diff),
+                   cyclomatic_candidates(structure, lizard_functions, diff),
+                   file_size_candidates(source, diff),
+                   duplication_candidates(duplication, diff)):
+        ranked = sorted(family, key=lambda pair: (tuple(-value for value in pair[0]),
+                                                  pair[1]["path"], pair[1]["line"]))
         result.extend(row for _, row in ranked[:TOP_PER_FAMILY])
     return result
 
@@ -1096,43 +1220,21 @@ def new_cycles(current_graph: dict[str, Any], base_graph: dict[str, Any], invers
     return rows
 
 
-def history_facts(root: Path, maximum: int) -> dict[str, Any]:
-    if git(root, "rev-parse", "--is-shallow-repository").strip() == "true":
-        return {"status": "unavailable", "reason": "shallow_repository"}
-    invocation = ["git", "log", f"--max-count={maximum}", "--format=%H", "--numstat", "--no-renames"]
-    records = git(root, *invocation[1:]).splitlines()
-    churn: dict[str, dict[str, int]] = defaultdict(lambda: {"revisions": 0, "additions": 0, "deletions": 0})
-    commits = 0
-    for line in records:
-        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", line):
-            commits += 1
-            continue
-        fields = line.split("\t", 2)
-        if len(fields) == 3:
-            added, deleted, path = fields
-            # Binary numstat uses '-', which cannot honestly be represented as
-            # a line count; omit its line deltas while retaining its revision.
-            entry = churn[path]
-            entry["revisions"] += 1
-            if added.isdigit():
-                entry["additions"] += int(added)
-            if deleted.isdigit():
-                entry["deletions"] += int(deleted)
-    return {"status": "covered", "revision": git(root, "rev-parse", "HEAD").strip(), "max_commits": maximum,
-            "git_invocation": invocation,
-            "commits_considered": commits, "churn": [{"path": p, **churn[p]} for p in sorted(churn)]}
-
-
 def output_text(bundle: dict[str, Any]) -> str:
     coverage = bundle["coverage"]
     covered = sum(row["status"] == "covered" for row in coverage)
-    unavailable = len(coverage) - covered
-    lines = [f"Code health evidence bundle {bundle['bundle_version']}", f"Coverage: {covered} covered, {unavailable} unavailable"]
     lizard = bundle["collectors"]["lizard"]
-    collector_state = lizard["version"] if lizard["installed"] else "MISSING (optional)"
-    lines.append(f"Collector: Lizard {collector_state}")
+    lines = [f"Code health evidence bundle {bundle['bundle_version']}",
+             f"Coverage: {covered} covered, {len(coverage) - covered} unavailable",
+             f"Collector: Lizard {lizard['version'] if lizard['installed'] else 'MISSING (optional)'}"]
     if not lizard["installed"]:
-        lines.append(f"Install plan: {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} install")
+        # Named, never executed: installing changes the machine, so it stays a
+        # human decision and this tool has no code path that performs one.
+        lines.append(f"Optional collector, install by hand to widen coverage: {LIZARD_INSTALL}")
+    unrecognised = bundle["repository"]["unrecognised_extensions"]
+    if unrecognised:
+        lines.append("Unrecognised extensions (no coverage row): "
+                     + ", ".join(f"{key} x{count}" for key, count in unrecognised.items()))
     for limit in bundle["repository"]["coverage_limits"]:
         lines.append(f"Coverage limit: {limit['kind']} ({', '.join(limit['paths'])})")
     for row in coverage:
@@ -1142,30 +1244,45 @@ def output_text(bundle: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def package_managers() -> list[str]:
-    """Installation preference matches the lint skill's portable policy."""
-    return [manager for manager in ("uv", "pipx", "brew") if shutil.which(manager)] + ["pip"]
+def base_facts(root: Path, base: str, current_paths: list[str], lizard: LizardResult,
+               scope: frozenset[str]) -> Differential:
+    """Measure the base revision and record what it could not supply."""
+    changed, renames = changed_paths(root, base, current_paths)
+    # Names from the tree itself: archiving drops blobs analysis cannot read,
+    # so a base-only unmeasured file would otherwise vanish from resolution.
+    names = [name for name in git(root, "ls-tree", "-r", "--name-only", "-z", base).split("\0") if name]
+    with archive_revision(root, base) as archive:
+        snapshot = Path(archive)
+        source, unreadable = scan(snapshot)
+        structure = python_structure(source)
+        includes = c_include_structure(source, names)
+        collected = lizard_complexity(snapshot, source, lizard)
+    return Differential(
+        active=True, changed=frozenset(changed), renames=renames, source=tuple(source),
+        structure=structure, includes=includes, lizard=collected,
+        baseline=Baseline(unreadable=tuple(unreadable), unparsable=tuple(structure["parse_errors"]),
+                          scope=scope,
+                          changed_base_paths=frozenset(renames.get(path, path) for path in changed)))
 
 
-def install_lizard(args: argparse.Namespace) -> int:
-    """Print the one optional collector install plan; mutate only with --yes."""
-    status = lizard_status()
-    if status.installed:
-        print(f"nothing to install: lizard is already available ({status.version or 'version unknown'})")
-        return EXIT_OK
-    manager = package_managers()[0]
-    command = INSTALL_RECIPES[manager]
-    print("code-health install plan:")
-    print(f"  lizard  {' '.join(command)}")
-    if not args.yes:
-        print("\ndry run -- nothing executed. Installation changes the machine; a human may re-run with --yes.")
-        return EXIT_OK
-    proc = subprocess.run(command)
-    if proc.returncode:
-        print("code-health: lizard installation failed", file=sys.stderr)
-        return EXIT_ERROR
-    print("install complete")
-    return EXIT_OK
+def required_languages(source: list[SourceFile], unreadable: list[dict[str, str]],
+                       diff: Differential) -> set[str]:
+    """Languages whose coverage the caller actually asked about.
+
+    An unreadable recognised file still makes its language required, and so
+    does a base file the comparison needed but could not read or parse.  The
+    scope filter stops a base-only failure demanding absent coverage.
+    """
+    current = [(item.path, item.language) for item in source]
+    current += [(row["path"], language_for(row["path"])) for row in unreadable]
+    base = [(path, language_for(path)) for path in sorted(diff.baseline.paths)]
+    # Each list is filtered by its own identity: a renamed file appears under
+    # its current name in one and the name the base knew it by in the other.
+    return ({language for path, language in current
+             if language in diff.baseline.scope and not (diff.active and path not in diff.changed)}
+            | {language for path, language in base
+               if language in diff.baseline.scope
+               and not (diff.active and path not in diff.baseline.changed_base_paths)})
 
 
 def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
@@ -1173,115 +1290,71 @@ def build_bundle(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     scope_names = git_scope_names(root)
     current_paths = tracked_and_untracked(root, scope_names)
     conflicts = unmerged_paths(root)
-    symlinks = symlink_paths(root, scope_names)
     source, unreadable = scan(root, current_paths)
     structure = python_structure(source)
+    languages = scope_languages(source, unreadable)
+    analyzing = args.command == "analyze"
     # Only `analyze` consumes the include graph; `detect` is the cheap coverage
-    # probe and must not pay for a full scan it discards.
-    # Full scope names, not the followable subset: a symlinked or unreadable
-    # header must be named as the exact target, never guessed past.
-    includes = c_include_structure(source, scope_names) if args.command == "analyze" else {}
-    initial_lizard = lizard_status()
-    lizard = lizard_complexity(root, source, initial_lizard) if args.command == "analyze" else initial_lizard
-    mode = "detect" if args.command == "detect" else ("differential" if args.base else "absolute")
-    invocation = {"command": args.command, "mode": mode, "duplicate_lines": getattr(args, "duplicate_lines", None)}
-    changed: set[str] = set()
-    base_source: list[SourceFile] | None = None
-    base_structure: dict[str, Any] | None = None
-    base_includes: dict[str, Any] | None = None
-    base_unreadable: list[dict[str, str]] = []
-    base_scope_names: list[str] = []
-    base_lizard_functions: list[dict[str, Any]] = []
-    rename_map: dict[str, str] = {}
-    if args.command == "analyze" and args.base:
-        changed, rename_map = changed_paths(root, args.base, current_paths)
-        invocation["base"] = args.base
-        invocation["base_revision"] = git(root, "rev-parse", "--verify", f"{args.base}^{{commit}}").strip()
-        invocation["changed_paths"] = sorted(changed)
-        invocation["rename_map"] = {key: rename_map[key] for key in sorted(rename_map)}
-        # Names from the tree itself: archiving drops blobs analysis cannot
-        # read, so a base-only unmeasured file would otherwise vanish.
-        base_scope_names = [name for name in git(root, "ls-tree", "-r", "--name-only", "-z",
-                                                 args.base).split("\0") if name]
-        with archive_revision(root, args.base) as archive:
-            base_source, base_unreadable = scan(Path(archive))
-            base_structure = python_structure(base_source)
-            base_includes = c_include_structure(base_source, base_scope_names)
-            base_lizard_functions = lizard_complexity(Path(archive), base_source, initial_lizard).functions
-    # An unreadable file at the base makes the baseline incomplete, so the
-    # differential comparison is not clean either.
-    # A base parse failure is as incomplete a baseline as an unreadable file.
-    base_failures = base_unreadable + [{"path": row["path"], "reason": "base_parse_error"}
-                                       for row in (base_structure or {}).get("parse_errors", [])]
-    coverage = coverage_matrix(source, unreadable + base_failures, structure, lizard)
-    # No language means no coverage row at all, which reads as covered.
-    unrecognised = sorted({path for path in list(current_paths) + base_scope_names
-                           if not language_for(path) and category_for(path, None)[0] == "other"})
+    # probe and must not pay for a full scan it discards.  Full scope names, not
+    # the followable subset: a symlinked or unreadable header must be named as
+    # the exact target, never guessed past.
+    includes = c_include_structure(source, scope_names) if analyzing else {}
+    probe = lizard_status()
+    lizard = lizard_complexity(root, source, probe) if analyzing else probe
+    diff = (base_facts(root, args.base, current_paths, probe, languages)
+            if analyzing and args.base else Differential(baseline=Baseline(scope=languages)))
+    coverage = coverage_matrix(source, unreadable, structure, lizard, diff.baseline)
+    invocation: dict[str, Any] = {
+        "command": args.command,
+        "mode": "detect" if not analyzing else ("differential" if args.base else "absolute"),
+        "duplicate_lines": getattr(args, "duplicate_lines", None),
+    }
+    if diff.active:
+        invocation.update({
+            "base": args.base,
+            "base_revision": git(root, "rev-parse", "--verify", f"{args.base}^{{commit}}").strip(),
+            "changed_paths": sorted(diff.changed),
+            "rename_map": {key: diff.renames[key] for key in sorted(diff.renames)},
+        })
     bundle: dict[str, Any] = {
         "bundle_version": BUNDLE_VERSION,
         "invocation": invocation,
         "repository": {"scope": "tracked_plus_untracked_nonignored", "vendor_excludes": [],
-                       "coverage_limits": ([{"kind": "unmerged_index", "paths": conflicts}] if conflicts else [])
-                       + ([{"kind": "symbolic_links_not_followed", "paths": symlinks}] if symlinks else [])
-                       + ([{"kind": "unrecognised_extensions", "paths": unrecognised}] if unrecognised else [])
-                       + ([{"kind": "unreadable_base_files", "paths": [r["path"] for r in base_unreadable]}]
-                          if base_unreadable else [])
-                       + ([{"kind": "base_parse_errors",
-                            "paths": sorted(r["path"] for r in (base_structure or {}).get("parse_errors", []))}]
-                          if (base_structure or {}).get("parse_errors") else []),
-                       "unrecognised_extensions": unrecognised,
+                       "coverage_limits": coverage_limits(conflicts, symlink_paths(root, scope_names), diff.baseline),
+                       "unrecognised_extensions": unrecognised_extensions(current_paths),
                        "current_revision": git(root, "rev-parse", "HEAD").strip()},
         "collectors": {"lizard": {"installed": lizard.installed, "version": lizard.version, "error": lizard.error,
-                                    "supported_languages": sorted(LIZARD_SUPPORTED)}},
+                                  "supported_languages": sorted(LIZARD_SUPPORTED)}},
         "coverage": coverage,
         "facts": {"unreadable_files": unreadable},
     }
-    empty_differential = args.command == "analyze" and args.base is not None and not changed
-    history_gap = False
-    if args.command == "analyze":
-        dup = duplication_facts(source, args.duplicate_lines, base_source, changed)
-        composition_facts, composition_unreadable = composition(root, current_paths)
-        all_unreadable = {row["path"]: row for row in [*unreadable, *composition_unreadable]}
-        bundle["facts"]["unreadable_files"] = [all_unreadable[path] for path in sorted(all_unreadable)]
-        bundle["facts"].update({"composition": composition_facts, "duplication": dup, "python": structure,
-                                "c_includes": includes, "base_unreadable_files": base_unreadable,
+    if analyzing:
+        duplication = duplication_facts(source, args.duplicate_lines, list(diff.source), diff.changed)
+        composition_facts, composition_unreadable = composition(root, current_paths, source)
+        merged = {row["path"]: row for row in [*unreadable, *composition_unreadable]}
+        bundle["facts"]["unreadable_files"] = [merged[path] for path in sorted(merged)]
+        bundle["facts"].update({"composition": composition_facts, "duplication": duplication, "python": structure,
+                                "c_includes": includes,
+                                "base_unreadable_files": list(diff.baseline.unreadable),
                                 "lizard": {"functions": lizard.functions, "error": lizard.error}})
-        if args.history:
-            bundle["facts"]["history"] = history_facts(root, args.max_commits)
-            history_gap = bundle["facts"]["history"]["status"] == "unavailable"
         bundle["candidate_selection"] = {
             "limit_per_family": TOP_PER_FAMILY,
-            "ordering": "raw values and raw deltas descending within each metric family",
+            "ordering": "raw values and raw deltas descending within each metric family; "
+                        "duplication orders by block extent before occurrence count, so a bounded "
+                        "list can omit a large count rise behind longer blocks",
             "cross_family_score": False,
             "verdict": "none",
         }
-        # A base-side parse failure leaves the baseline as incomplete as an
-        # unreadable file does, so it must disable the same comparisons.
-        base_parse_errors = (base_structure or {}).get("parse_errors", [])
-        base_unreadable_paths = ({row["path"] for row in base_unreadable}
-                                 | {row["path"] for row in base_parse_errors})
-        base_unreadable_languages = {language_for(path) for path in base_unreadable_paths}
-        unreliable_graphs = ({"python"} if "Python" in base_unreadable_languages else set()) | (
-            {"c_includes"} if base_unreadable_languages & C_FAMILY else set())
-        bundle["candidates"] = candidates(source, base_source, structure, lizard.functions, dup, changed,
-                                          base_structure, base_lizard_functions, rename_map, bool(args.base),
-                                          includes, base_includes, base_unreadable_paths, unreliable_graphs)
-    # An unreadable recognised file still makes its language required.
-    measurable = [(f.path, f.language) for f in source] + [
-        (row["path"], language_for(row["path"]))
-        for row in unreadable + base_failures if language_for(row["path"])
-    ]
-    required_languages = {
-        language for path, language in measurable
-        if args.command != "analyze" or not args.base or path in changed
-    }
+        bundle["candidates"] = candidates(source, structure, includes, lizard.functions, duplication, diff)
     # Unrecognised files are disclosed, not gated: whether an unclassified file
     # is source is a judgement, and blocking on it made ordinary repositories
     # fail over a `.babelrc`.  The gate stays on measurement that actually
     # failed for a language in scope.
-    gap = any(row["language"] in required_languages and row["status"] == "unavailable" for row in coverage)
-    blocking_conflicts = set(conflicts) & changed if args.command == "analyze" and args.base else set(conflicts)
-    return bundle, bool(empty_differential or (args.require_coverage and (gap or history_gap or blocking_conflicts)))
+    required = required_languages(source, unreadable, diff)
+    gap = any(row["language"] in required and row["status"] == "unavailable" for row in coverage)
+    blocking_conflicts = set(conflicts) & diff.changed if diff.active else set(conflicts)
+    empty_differential = analyzing and args.base is not None and not diff.changed
+    return bundle, bool(empty_differential or (args.require_coverage and (gap or blocking_conflicts)))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1297,20 +1370,14 @@ def parser() -> argparse.ArgumentParser:
     modes = analyze.add_mutually_exclusive_group(required=True)
     modes.add_argument("--base", metavar="REF", help="compare current scope with a git revision")
     modes.add_argument("--all", action="store_true", help="analyse the current complete scope")
-    analyze.add_argument("--history", action="store_true", help="add repository-context churn evidence")
-    analyze.add_argument("--max-commits", type=int, default=DEFAULT_MAX_COMMITS, help="history commit cap (default: %(default)s)")
-    analyze.add_argument("--duplicate-lines", type=int, default=6, help="exact duplicate window length (default: %(default)s)")
-    install = sub.add_parser("install", help="print (or with --yes, execute) the Lizard install command")
-    install.add_argument("--yes", action="store_true", help="actually execute the install command")
+    analyze.add_argument("--duplicate-lines", type=int, default=6, help="minimum duplicate window length (default: %(default)s)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    if args.command == "install":
-        return install_lizard(args)
-    if getattr(args, "duplicate_lines", 6) < 1 or getattr(args, "max_commits", 1) < 1:
-        parser().error("--duplicate-lines and --max-commits must be positive")
+    if getattr(args, "duplicate_lines", 6) < 1:
+        parser().error("--duplicate-lines must be positive")
     try:
         bundle, coverage_exit = build_bundle(args)
     except HealthError as exc:

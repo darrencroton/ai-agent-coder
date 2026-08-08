@@ -36,7 +36,7 @@ Each skill's `SKILL.md` is the source of truth for trigger conditions, workflow,
 | [`implementation-plan`](skills/implementation-plan/) | Breaks a request into auditable slices with frozen contracts: acceptance criteria, authorized surface, validation, risk flags, and a copyable launcher for the next chat. |
 | [`scoped-implementation`](skills/scoped-implementation/) | Implements one frozen slice without expanding scope; prepares the receipt for drift audit. |
 | [`lint`](skills/lint/) | Runs the project's linters and reports only findings this change introduced. A missing linter is reported as uncovered, never as a pass. |
-| [`code-health`](skills/code-health/) | Measures codebase composition, duplication, complexity, dependencies, and optional Git context; the agent investigates the evidence rather than grading the repository. |
+| [`code-health`](skills/code-health/) | Measures codebase composition, duplication, complexity, and dependencies; the agent investigates the evidence rather than grading the repository. |
 | [`drift-audit`](skills/drift-audit/) | Answers one question: was the implementation authorized? Runs before any quality review. |
 | [`code-review`](skills/code-review/) | Quality review after drift audit passes: correctness, edge cases, tests, error handling, domain-specific risks. |
 | [`commit`](skills/commit/) | Stages by name, never skips hooks, writes a message listing every file with reasons. |

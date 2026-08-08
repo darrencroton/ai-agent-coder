@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,15 @@ class InRepo(unittest.TestCase):
         finally:
             os.chdir(old)
 
+    def bundle(self, repo, *args):
+        """Build a bundle with *repo* as the working directory."""
+        old = os.getcwd()
+        os.chdir(repo.path)
+        try:
+            return health.build_bundle(health.parser().parse_args(list(args)))
+        finally:
+            os.chdir(old)
+
 
 class TestScopeAndCoverage(InRepo):
     def test_untracked_nonignored_source_is_in_scope(self):
@@ -102,12 +112,7 @@ class TestScopeAndCoverage(InRepo):
             repo.write("real/impl.py", "x = 1\n")
             os.symlink("real/impl.py", Path(repo.path, "link.py"))
             repo.commit()
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
-            finally:
-                os.chdir(old)
+            bundle, _ = self.bundle(repo, "analyze", "--all")
             self.assertEqual([row["path"] for row in bundle["facts"]["composition"]["files"]
                               if row["language"] == "Python"], ["real/impl.py"])
             self.assertEqual(bundle["repository"]["coverage_limits"][0]["paths"], ["link.py"])
@@ -119,12 +124,7 @@ class TestScopeAndCoverage(InRepo):
             repo.write("a.py", "x = 1\n")
             repo.commit()
             repo.write("ignored.py", "hidden = True\n")
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
-            finally:
-                os.chdir(old)
+            bundle, _ = self.bundle(repo, "analyze", "--all")
             paths = {row["path"] for row in bundle["facts"]["composition"]["files"]}
             self.assertNotIn("ignored.py", paths)
 
@@ -150,12 +150,7 @@ class TestScopeAndCoverage(InRepo):
             path = Path(repo.path, "data.json")
             path.write_bytes(b"\xff\xfe")
             repo.commit()
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
-            finally:
-                os.chdir(old)
+            bundle, _ = self.bundle(repo, "analyze", "--all")
             self.assertEqual(bundle["facts"]["unreadable_files"][0]["path"], "data.json")
 
 
@@ -168,7 +163,7 @@ class TestPythonFacts(unittest.TestCase):
         facts = health.python_structure(source)
         self.assertEqual(facts["functions"][0]["cyclomatic"], 3)
         self.assertEqual(facts["imports"]["cycles"], [["a.py", "b.py"]])
-        self.assertEqual(facts["imports"]["reverse_reachability"][0]["reverse_reachability"], 1)
+        self.assertEqual(facts["imports"]["nodes"][0]["reverse_reachability"], 1)
 
     def test_syntax_error_is_coverage_gap_not_zero_complexity(self):
         source = [health.SourceFile("broken.py", "Python", "production", "rule", "def x(:\n", {})]
@@ -220,6 +215,77 @@ class TestDifferentialMechanics(InRepo):
         self.assertEqual(row["count_delta"], 1)
         self.assertEqual(row["changed_side_occurrences"][0]["path"], "new.py")
 
+    def test_overlapping_duplicate_windows_collapse_to_one_block(self):
+        """A repeated 10-line block is one finding, not the eight overlapping
+        windows a sliding scan sees; the row reports the whole block's length."""
+        block = "".join(f"line{i} = {i}\n" for i in range(10))
+        source = [health.SourceFile("a.py", "Python", "production", "rule",
+                                    block + "separator = 0\n" + block, {})]
+        rows = health.duplication_facts(source, 3, [], {"a.py"})["signatures"]
+        self.assertEqual([(r["current_count"], r["line_count"]) for r in rows], [(2, 10)])
+        self.assertEqual([o["start_line"] for o in rows[0]["current_occurrences"]], [1, 12])
+
+    def test_a_more_repeated_tail_is_not_absorbed_into_a_longer_block(self):
+        """`p q r` twice and `q r` a third time. Merging keys on the whole
+        occurrence set, so the count-3 run keeps its own row instead of being
+        swallowed by the count-2 run and losing an occurrence."""
+        source = [health.SourceFile("a.py", "Python", "production", "rule",
+                                    "p = 1\nq = 2\nr = 3\nz = 9\np = 1\nq = 2\nr = 3\ny = 8\nq = 2\nr = 3\n", {})]
+        rows = health.duplication_facts(source, 2, [], set())["signatures"]
+        self.assertEqual(sorted((r["current_count"], r["line_count"]) for r in rows), [(2, 2), (3, 2)])
+
+    def test_a_run_member_reports_the_extent_that_repeats_at_its_own_lines(self):
+        """`ab` occurs three times in both; `bc` rises 2 -> 3 and so becomes a
+        continuation of `ab`. It must keep its occurrences or the new
+        relationship yields no candidate, and its line count must describe what
+        repeats at ITS lines -- the whole run's length is anchored a line
+        earlier, so claiming it here would cite a block that is not duplicated."""
+        a, b, c = "aa = 1\n", "bb = 2\n", "cc = 3\n"
+        base = [health.SourceFile("f.py", "Python", "production", "rule",
+                                  a + b + c + "x=0\n" + a + b + c + "y=0\n" + a + b + "z=0\n", {})]
+        current = [health.SourceFile("f.py", "Python", "production", "rule",
+                                     a + b + c + "x=0\n" + a + b + c + "y=0\n" + a + b + c + "z=0\n", {})]
+        facts = health.duplication_facts(current, 2, base, {"f.py"})
+        risen = next(r for r in facts["signatures"] if r["count_delta"] > 0)
+        self.assertEqual((risen["current_count"], risen["base_count"], risen["line_count"]), (3, 2, 2))
+        self.assertEqual([o["start_line"] for o in risen["current_occurrences"]], [2, 6, 10])
+        diff = health.Differential(active=True, changed=frozenset({"f.py"}), source=tuple(base),
+                                   structure={"functions": [], "imports": {"cycles": []}})
+        rows = health.candidates([], {"functions": [], "imports": {"cycles": []}}, {}, [], facts, diff)
+        # Both are true: the 3-line run grew from repeating twice to three
+        # times (reported at its head), and its 2-line tail rose 2 -> 3.
+        self.assertEqual([(r["line"], r["line_count"]) for r in rows if r["kind"] == "duplication"],
+                         [(1, 3), (2, 2)])
+        # The other direction: the base holds the longer run, so a current row
+        # must not borrow a length the current tree does not have.
+        base = [health.SourceFile("g.py", "Python", "production", "rule",
+                                  a + b + c + "x=0\n" + a + b + c + "\n", {})]
+        current = [health.SourceFile("g.py", "Python", "production", "rule",
+                                     a + b + "p=0\n" + a + b + "q=0\n" + a + b + "r=0\n", {})]
+        rows = health.duplication_facts(current, 2, base, {"g.py"})["signatures"]
+        self.assertEqual([(r["current_count"], r["line_count"]) for r in rows], [(3, 2)])
+
+    def test_a_clone_that_grows_without_repeating_more_is_still_a_candidate(self):
+        """Merging runs made extent a real measured value, so extent has to
+        enter the differential too. A block that doubles from 6 to 12 lines
+        while still occurring twice has a changed raw value; keying only on
+        occurrence count would report nothing and read as clean."""
+        head = "".join(f"h{i} = {i}\n" for i in range(6))
+        tail = "".join(f"t{i} = {i}\n" for i in range(6))
+        base = [health.SourceFile("a.py", "Python", "production", "rule",
+                                  head + "sep = 0\n" + head, {})]
+        current = [health.SourceFile("a.py", "Python", "production", "rule",
+                                     head + tail + "sep = 0\n" + head + tail, {})]
+        facts = health.duplication_facts(current, 6, base, {"a.py"})
+        row = facts["signatures"][0]
+        self.assertEqual((row["current_count"], row["base_count"], row["count_delta"]), (2, 2, 0))
+        self.assertEqual((row["line_count"], row["base_line_count"]), (12, 6))
+        diff = health.Differential(active=True, changed=frozenset({"a.py"}), source=tuple(base),
+                                   structure={"functions": [], "imports": {"cycles": []}})
+        rows = health.candidates([], {"functions": [], "imports": {"cycles": []}}, {}, [], facts, diff)
+        self.assertEqual([(r["line_count"], r["base_line_count"])
+                          for r in rows if r["kind"] == "duplication"], [(12, 6)])
+
     def test_a_new_unique_window_is_not_reported_as_duplication(self):
         current = [health.SourceFile("new.py", "Python", "production", "rule", "a = 1\nb = 2\n", {})]
         facts = health.duplication_facts(current, 2, [], {"new.py"})
@@ -249,58 +315,6 @@ class TestDifferentialMechanics(InRepo):
             os.unlink(os.path.join(repo.path, "gone.py"))
             self.assertEqual(self.run_health(repo, "analyze", "--base", base, "--json"), 0)
 
-    def test_history_shallow_guard(self):
-        with Repo() as repo:
-            repo.write("a.py", "x = 1\n")
-            repo.commit()
-            # Git config cannot reliably simulate a shallow clone; the guard is
-            # isolated by replacing the git query with a tiny deterministic fake.
-            original = health.git
-            def fake(root, *args, **kwargs):
-                if args == ("rev-parse", "--is-shallow-repository"):
-                    return "true\n"
-                return original(root, *args, **kwargs)
-            health.git = fake
-            try:
-                self.assertEqual(health.history_facts(Path(repo.path), 4)["reason"], "shallow_repository")
-            finally:
-                health.git = original
-
-    def test_history_reports_revision_and_line_churn(self):
-        with Repo() as repo:
-            repo.write("a.py", "one = 1\n")
-            repo.commit()
-            repo.write("a.py", "one = 1\ntwo = 2\nthree = 3\n")
-            repo.commit("grow")
-            row = health.history_facts(Path(repo.path), 10)["churn"][0]
-            self.assertEqual(row, {"path": "a.py", "revisions": 2, "additions": 3, "deletions": 0})
-
-    def test_history_accepts_sha256_commit_ids(self):
-        digest = "a" * 64
-        original = health.git
-        def fake(root, *args, **kwargs):
-            if args == ("rev-parse", "--is-shallow-repository"):
-                return "false\n"
-            if args and args[0] == "log":
-                return f"{digest}\n1\t0\ta.py\n"
-            if args == ("rev-parse", "HEAD"):
-                return digest + "\n"
-            raise AssertionError(args)
-        health.git = fake
-        try:
-            self.assertEqual(health.history_facts(Path("."), 1)["commits_considered"], 1)
-        finally:
-            health.git = original
-
-    def test_history_rename_keys_are_repository_paths(self):
-        with Repo() as repo:
-            repo.write("src/alpha.py", "x = 1\n")
-            repo.commit()
-            sh(["git", "mv", "src/alpha.py", "src/beta.py"], repo.path)
-            repo.commit("rename")
-            paths = {row["path"] for row in health.history_facts(Path(repo.path), 10)["churn"]}
-            self.assertFalse(any("=>" in path for path in paths))
-
     def test_candidates_require_changed_values_and_honor_renames(self):
         current = [
             health.SourceFile("renamed.py", "Python", "production", "rule", "", {"code": 20}),
@@ -318,9 +332,10 @@ class TestDifferentialMechanics(InRepo):
             {"path": "old.py", "name": "f", "line": 1, "cyclomatic": 9},
             {"path": "changed.py", "name": "g", "line": 1, "cyclomatic": 1},
         ], "imports": {"cycles": []}}
-        rows = health.candidates(current, base, structure, [], {"signatures": []},
-                                 {"renamed.py", "changed.py"}, old_structure, [],
-                                 {"renamed.py": "old.py"}, True)
+        diff = health.Differential(active=True, changed=frozenset({"renamed.py", "changed.py"}),
+                                   renames={"renamed.py": "old.py"}, source=tuple(base),
+                                   structure=old_structure)
+        rows = health.candidates(current, structure, {}, [], {"signatures": []}, diff)
         self.assertEqual({(row["kind"], row["path"]) for row in rows},
                          {("cyclomatic", "changed.py"), ("file_size", "changed.py")})
 
@@ -328,22 +343,17 @@ class TestDifferentialMechanics(InRepo):
         functions = [{"path": f"f{i}.py", "name": "f", "line": 1, "cyclomatic": i + 2}
                      for i in range(7)]
         structure = {"functions": functions, "imports": {"cycles": []}}
-        rows = health.candidates([], [], structure, [], {"signatures": []},
-                                 {row["path"] for row in functions}, {"functions": [], "imports": {"cycles": []}},
-                                 [], {}, True)
+        diff = health.Differential(active=True, changed=frozenset(row["path"] for row in functions),
+                                   structure={"functions": [], "imports": {"cycles": []}})
+        rows = health.candidates([], structure, {}, [], {"signatures": []}, diff)
         self.assertEqual(sum(row["kind"] == "cyclomatic" for row in rows), health.TOP_PER_FAMILY)
 
     def test_json_is_deterministic_and_has_bundle_version_not_schema_version(self):
         with Repo() as repo:
             repo.write("a.py", "x = 1\n")
             repo.commit()
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle_a, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
-                bundle_b, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
-            finally:
-                os.chdir(old)
+            bundle_a, _ = self.bundle(repo, "analyze", "--all")
+            bundle_b, _ = self.bundle(repo, "analyze", "--all")
             encoded_a = json.dumps(bundle_a, sort_keys=True, separators=(",", ":"))
             self.assertEqual(encoded_a, json.dumps(bundle_b, sort_keys=True, separators=(",", ":")))
             self.assertIn("bundle_version", bundle_a)
@@ -357,10 +367,6 @@ class TestLizardBoundaries(unittest.TestCase):
         rows = health.parse_lizard_csv(captured)
         self.assertEqual(rows, [{"path": "src/check.js", "name": "check", "line": 7,
                                  "cyclomatic": 3, "collector": "lizard"}])
-
-    def test_parser_handles_headered_csv_variant(self):
-        captured = "nloc,ccn,token,param,length,location\n4,3,18,1,4,check@7-10@src/check.js\n"
-        self.assertEqual(health.parse_lizard_csv(captured)[0]["cyclomatic"], 3)
 
     def test_bad_csv_becomes_visible_collector_error(self):
         source = [health.SourceFile("a.js", "JavaScript", "production", "rule", "x\n", {})]
@@ -379,22 +385,6 @@ class TestLizardBoundaries(unittest.TestCase):
             result = health.lizard_complexity(Path("."), source, health.LizardResult(True, "1", []))
         self.assertIsNone(result.error)
         self.assertEqual(run.call_count, 2)
-
-    def test_install_is_dry_run_without_yes(self):
-        old_status = health.lizard_status
-        old_managers = health.package_managers
-        health.lizard_status = lambda: health.LizardResult(False, None, [], "missing")
-        health.package_managers = lambda: ["pip"]
-        out = StringIO()
-        try:
-            with redirect_stdout(out):
-                result = health.install_lizard(health.parser().parse_args(["install"]))
-        finally:
-            health.lizard_status = old_status
-            health.package_managers = old_managers
-        self.assertEqual(result, 0)
-        self.assertIn("dry run", out.getvalue())
-        self.assertIn("pip install --user lizard", out.getvalue())
 
 
 def c_file(path, text):
@@ -563,8 +553,9 @@ class TestCIncludeDependencies(unittest.TestCase):
         self.assertEqual({(e["from"], e["to"]): e["via"] for e in facts["edges"]},
                          {("src/a.c", "src/b.h"): "exact_relative",
                           ("src/a.c", "elsewhere/far.h"): "unique_basename"})
-        self.assertEqual(facts["basename_resolved_edges"],
-                         [{"from": "src/a.c", "to": "elsewhere/far.h"}])
+        # Guessed edges are counted, not listed: on a repository built with -I
+        # paths almost every edge is a guess and the list buried the ratio.
+        self.assertEqual(facts["resolution_counts"], {"exact_relative": 1, "unique_basename": 1})
 
     def test_common_cxx_header_extensions_are_measured(self):
         source = [c_file("src/foo.cc", '#include "foo.hh"\n'), c_file("src/foo.hh", "\n")]
@@ -589,23 +580,22 @@ class TestGraphFactsExtraction(unittest.TestCase):
         self.assertEqual([(e["from"], e["to"]) for e in graph["edges"]],
                          [("pkg/a.py", "pkg/b.py"), ("pkg/b.py", "pkg/c.py"), ("pkg/c.py", "pkg/a.py")])
         self.assertEqual(graph["cycles"], [["pkg/a.py", "pkg/b.py", "pkg/c.py"]])
-        self.assertEqual({r["path"]: r["value"] for r in graph["fan_in"]},
-                         {"pkg/a.py": 1, "pkg/b.py": 1, "pkg/c.py": 1, "pkg/lonely.py": 0})
-        self.assertEqual({r["path"]: r["value"] for r in graph["fan_out"]},
-                         {"pkg/a.py": 1, "pkg/b.py": 1, "pkg/c.py": 1, "pkg/lonely.py": 0})
-        self.assertEqual({r["path"]: r["reverse_reachability"] for r in graph["reverse_reachability"]},
-                         {"pkg/a.py": 2, "pkg/b.py": 2, "pkg/c.py": 2, "pkg/lonely.py": 0})
+        self.assertEqual(graph["nodes"], [
+            {"path": "pkg/a.py", "fan_in": 1, "fan_out": 1, "reverse_reachability": 2},
+            {"path": "pkg/b.py", "fan_in": 1, "fan_out": 1, "reverse_reachability": 2},
+            {"path": "pkg/c.py", "fan_in": 1, "fan_out": 1, "reverse_reachability": 2},
+            {"path": "pkg/lonely.py", "fan_in": 0, "fan_out": 0, "reverse_reachability": 0},
+        ])
 
-    def test_isolated_node_keeps_a_row_in_every_series(self):
+    def test_isolated_node_keeps_a_node_row(self):
         graph = self.python_graph([("solo.py", "x = 1\n")])
         self.assertEqual(graph["edges"], [])
-        for series in ("fan_in", "fan_out", "reverse_reachability"):
-            self.assertEqual([r["path"] for r in graph[series]], ["solo.py"], series)
+        self.assertEqual(graph["nodes"],
+                         [{"path": "solo.py", "fan_in": 0, "fan_out": 0, "reverse_reachability": 0}])
 
-    def test_reverse_reachability_matches_a_per_node_traversal(self):
-        """The condensation replaced a BFS per node; results must be identical."""
-        graph = {"a": ["b"], "b": ["c", "a"], "c": ["d"], "d": [], "e": ["d"]}
-        cycles = [c for c in health.strongly_connected_components(graph) if len(c) > 1]
+    @staticmethod
+    def naive_reverse_reachability(graph):
+        """Distinct other nodes that reach each node, by explicit traversal."""
         expected = {}
         for node in graph:
             seen, queue = {node}, [n for n, ds in graph.items() if node in ds]
@@ -615,7 +605,38 @@ class TestGraphFactsExtraction(unittest.TestCase):
                     seen.add(item)
                     queue.extend(n for n, ds in graph.items() if item in ds)
             expected[node] = len(seen) - 1
-        self.assertEqual(health.reverse_reachability(graph, cycles), expected)
+        return expected
+
+    def measured_reverse_reachability(self, graph):
+        edges = {(src, dst) for src, targets in graph.items() for dst in targets}
+        return health.reverse_reachability(health.strongly_connected_components(graph), edges)
+
+    def test_reverse_reachability_matches_a_per_node_traversal(self):
+        """The condensation replaced a BFS per node; results must be identical."""
+        graph = {"a": ["b"], "b": ["c", "a"], "c": ["d"], "d": [], "e": ["d"]}
+        self.assertEqual(self.measured_reverse_reachability(graph),
+                         self.naive_reverse_reachability(graph))
+
+    def test_reverse_reachability_matches_traversal_on_random_graphs(self):
+        """Cycles, shared ancestors and isolated nodes at once; a seeded sweep
+        is the only practical check on the condensation's bookkeeping."""
+        rng = random.Random(20260808)
+        for _ in range(200):
+            nodes = [f"n{i}" for i in range(rng.randint(1, 12))]
+            graph = {node: sorted({other for other in nodes
+                                   if other != node and rng.random() < 0.25}) for node in nodes}
+            self.assertEqual(self.measured_reverse_reachability(graph),
+                             self.naive_reverse_reachability(graph), graph)
+
+    def test_scc_order_lets_ancestors_be_visited_first(self):
+        """reverse_reachability walks the condensation backwards, so Tarjan must
+        emit every component before the components that reach it."""
+        graph = {"a": ["b"], "b": ["c"], "c": [], "d": ["b"]}
+        order = {component[0]: index
+                 for index, component in enumerate(health.strongly_connected_components(graph))}
+        self.assertLess(order["c"], order["b"])
+        self.assertLess(order["b"], order["a"])
+        self.assertLess(order["b"], order["d"])
 
     def test_scc_is_iterative_and_survives_a_deep_chain(self):
         depth = 2000
@@ -626,10 +647,12 @@ class TestGraphFactsExtraction(unittest.TestCase):
 
 class TestCDifferentialWiring(unittest.TestCase):
     def candidates_for(self, current, base, changed):
+        diff = health.Differential(active=True, changed=frozenset(changed), source=tuple(base),
+                                   structure=health.python_structure(base),
+                                   includes=health.c_include_structure(base))
         return [row for row in health.candidates(
-            current, base, health.python_structure(current), [], {"signatures": []}, changed,
-            health.python_structure(base), [], {}, True,
-            health.c_include_structure(current), health.c_include_structure(base),
+            current, health.python_structure(current), health.c_include_structure(current),
+            [], {"signatures": []}, diff,
         ) if row["kind"] == "dependency_cycle"]
 
     def test_new_include_cycle_surfaces_and_pre_existing_one_does_not(self):
@@ -698,15 +721,10 @@ class TestCoverageHonesty(InRepo):
         with Repo() as repo:
             repo.write("model.zzz", "data\n")
             repo.commit()
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["detect"]))
-            finally:
-                os.chdir(old)
-            self.assertIn("model.zzz", bundle["repository"]["unrecognised_extensions"])
-            self.assertIn("unrecognised_extensions",
-                          {limit["kind"] for limit in bundle["repository"]["coverage_limits"]})
+            bundle, _ = self.bundle(repo, "detect")
+            # Grouped by extension with a count: the one field is the whole
+            # disclosure, so a reader has a single place to look.
+            self.assertEqual(bundle["repository"]["unrecognised_extensions"], {".zzz": 1})
 
     def test_unreadable_recognised_language_fails_require_coverage(self):
         with Repo() as repo:
@@ -720,12 +738,7 @@ class TestCoverageHonesty(InRepo):
             Path(repo.path, "b.h").write_bytes(b"\xff\xfe bad\n")
             base = repo.commit()
             repo.write("b.h", "int ok(void);\n")
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--base", base]))
-            finally:
-                os.chdir(old)
+            bundle, _ = self.bundle(repo, "analyze", "--base", base)
             rows = {(r["language"], r["metric_family"]): r["status"]
                     for r in bundle["coverage"] if r["metric_family"] == "dependencies"}
             self.assertTrue(all(status == "unavailable" for status in rows.values()), rows)
@@ -745,12 +758,7 @@ class TestCoverageHonesty(InRepo):
             Path(repo.path, "b.h").write_bytes(b"\xff\xfe bad\n")
             base = repo.commit()
             repo.write("b.h", "int ok(void);\n")
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--base", base]))
-            finally:
-                os.chdir(old)
+            bundle, _ = self.bundle(repo, "analyze", "--base", base)
             self.assertEqual([row["path"] for row in bundle["facts"]["base_unreadable_files"]], ["b.h"])
             self.assertIn("unreadable_base_files",
                           {limit["kind"] for limit in bundle["repository"]["coverage_limits"]})
@@ -763,12 +771,7 @@ class TestCoverageHonesty(InRepo):
             os.makedirs(os.path.join(repo.path, "include"), exist_ok=True)
             os.symlink("../other/foo.h", os.path.join(repo.path, "include", "foo.h"))
             repo.commit()
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
-            finally:
-                os.chdir(old)
+            bundle, _ = self.bundle(repo, "analyze", "--all")
             facts = bundle["facts"]["c_includes"]
             self.assertEqual(facts["edges"], [])
             self.assertEqual(facts["unresolved_includes"][0]["reason"], "in_repository_unmeasured_language")
@@ -782,13 +785,8 @@ class TestCoverageHonesty(InRepo):
             repo.write("a.py", "x = 1\n")
             repo.commit()
             self.assertEqual(self.run_health(repo, "detect", "--require-coverage", "--json"), 0)
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["detect"]))
-            finally:
-                os.chdir(old)
-            self.assertIn("model.zzz", bundle["repository"]["unrecognised_extensions"])
+            bundle, _ = self.bundle(repo, "detect")
+            self.assertIn(".zzz", bundle["repository"]["unrecognised_extensions"])
 
     def test_ordinary_config_dotfiles_do_not_fail_coverage(self):
         for name in (".babelrc", ".stylelintrc", ".browserslistrc", ".prettierignore",
@@ -808,15 +806,125 @@ class TestCoverageHonesty(InRepo):
             repo.write("b.py", "import a\n\ndef g():\n    pass\n")
             base = repo.commit()
             repo.write("a.py", "import b\n\ndef f():\n    pass\n")
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--base", base]))
-            finally:
-                os.chdir(old)
+            bundle, _ = self.bundle(repo, "analyze", "--base", base)
             self.assertEqual([c for c in bundle["candidates"] if c["kind"] == "dependency_cycle"], [])
             self.assertIn("base_parse_errors",
                           {limit["kind"] for limit in bundle["repository"]["coverage_limits"]})
+
+    def test_base_parse_error_voids_only_the_families_that_need_a_parse(self):
+        """The base text read fine, so composition and duplication are honest;
+        only the AST families lose their baseline, and they say why."""
+        with Repo() as repo:
+            repo.write("a.py", "def f(:\n    pass\n")
+            base = repo.commit()
+            repo.write("a.py", "def f():\n    pass\n")
+            bundle, _ = self.bundle(repo, "analyze", "--base", base)
+            rows = {r["metric_family"]: (r["status"], r["reason"]) for r in bundle["coverage"]}
+            self.assertEqual(rows["composition"][0], "covered")
+            self.assertEqual(rows["duplication"][0], "covered")
+            self.assertEqual(rows["cyclomatic"], ("unavailable", "base source in this language failed to parse"))
+            self.assertEqual(rows["dependencies"][0], "unavailable")
+
+    def test_base_only_failure_invents_no_row_for_an_absent_language(self):
+        """A base-only unreadable .rb must not produce Ruby coverage rows, nor
+        demand Ruby coverage, in a repository that no longer contains Ruby."""
+        with Repo() as repo:
+            repo.write("a.py", "x = 1\n")
+            Path(repo.path, "legacy.rb").write_bytes(b"\xff\xfe bad\n")
+            base = repo.commit()
+            os.unlink(os.path.join(repo.path, "legacy.rb"))
+            old = os.getcwd()
+            os.chdir(repo.path)
+            try:
+                bundle, exit_three = health.build_bundle(
+                    health.parser().parse_args(["analyze", "--base", base, "--require-coverage"]))
+            finally:
+                os.chdir(old)
+            self.assertEqual({row["language"] for row in bundle["coverage"]}, {"Python"})
+            self.assertFalse(exit_three)
+            # Still disclosed as an incomplete baseline, just not as a gate.
+            self.assertEqual([row["path"] for row in bundle["facts"]["base_unreadable_files"]], ["legacy.rb"])
+
+    def test_unreadable_base_file_voids_duplication_in_every_language(self):
+        """Duplication signatures span all languages at once, so a base file
+        nobody can read understates a base count anywhere. Here the same six
+        lines sat in an unreadable `legacy.rb`, so Python's count reads 1 -> 2
+        when the truth is 2 -> 2: the comparison must report unavailable and
+        fail --require-coverage rather than emit a phantom rise."""
+        with Repo() as repo:
+            block = "".join(f"shared{i} = {i}\n" for i in range(6))
+            repo.write("a.py", block)
+            Path(repo.path, "legacy.rb").write_bytes(block.encode() + b"\xff\xfe\n")
+            base = repo.commit()
+            os.unlink(os.path.join(repo.path, "legacy.rb"))
+            repo.write("a.py", block + "spacer = 1\n" + block)
+            bundle, exit_three = self.bundle(
+                repo, "analyze", "--base", base, "--require-coverage", "--duplicate-lines", "6")
+            rows = {(r["language"], r["metric_family"]): r["status"] for r in bundle["coverage"]}
+            self.assertEqual(rows[("Python", "duplication")], "unavailable")
+            self.assertTrue(exit_three)
+            self.assertEqual([c for c in bundle["candidates"] if c["kind"] == "duplication"], [])
+            # Still no invented row for a language the current tree lacks.
+            self.assertEqual({language for language, _ in rows}, {"Python"})
+
+    def test_an_unchanged_unreadable_file_does_not_void_duplication(self):
+        """The rule above must fire only when the two pools can differ. A file
+        that is unreadable and never changes is missing from both sides, so
+        blocking on it would permanently fail --require-coverage on the routine
+        shape of an encoding fixture or a legacy Latin-1 source file."""
+        with Repo() as repo:
+            repo.write("a.py", "x = 1\n")
+            Path(repo.path, "fixtures/bad.rb").parent.mkdir(parents=True, exist_ok=True)
+            Path(repo.path, "fixtures/bad.rb").write_bytes(b"\xff\xfe bad\n")
+            base = repo.commit()
+            repo.write("a.py", "x = 2\n")
+            bundle, exit_three = self.bundle(repo, "analyze", "--base", base, "--require-coverage")
+            rows = {(r["language"], r["metric_family"]): r["status"] for r in bundle["coverage"]}
+            self.assertEqual(rows[("Python", "duplication")], "covered")
+            self.assertFalse(exit_three)
+
+    def test_a_renamed_unreadable_base_file_is_matched_by_its_base_name(self):
+        """The unreadable list is base-side and the changed set is current-side,
+        so a rename must be resolved to base identity before they are compared.
+        Here `legacy.rb` becomes a readable `renamed.py` holding the same block:
+        the base pool is short of that text while the current pool has it, which
+        is exactly the asymmetry that fabricates a rise."""
+        with Repo() as repo:
+            block = "".join(f"row{i} = {i}\n" for i in range(20))
+            repo.write("common.py", block)
+            Path(repo.path, "legacy.rb").write_bytes(block.encode() + b"\xff")
+            base = repo.commit()
+            sh(["git", "mv", "legacy.rb", "renamed.py"], repo.path)
+            repo.write("renamed.py", block)
+            bundle, exit_three = self.bundle(
+                repo, "analyze", "--base", base, "--require-coverage", "--duplicate-lines", "6")
+            self.assertEqual(bundle["invocation"]["rename_map"], {"renamed.py": "legacy.rb"})
+            rows = {(r["language"], r["metric_family"]): r["status"] for r in bundle["coverage"]}
+            self.assertEqual(rows[("Python", "duplication")], "unavailable")
+            self.assertTrue(exit_three)
+            self.assertEqual([c for c in bundle["candidates"] if c["kind"] == "duplication"], [])
+
+    def test_a_base_parse_error_still_allows_a_file_size_delta(self):
+        """A parse failure voids only the families that need an AST. The base
+        text was read, so its line count is comparable and the growth must
+        still reach the reading list."""
+        with Repo() as repo:
+            repo.write("a.py", "def f(:\n    pass\n")
+            base = repo.commit()
+            repo.write("a.py", "def f():\n" + "".join(f"    x{i} = {i}\n" for i in range(20)))
+            bundle, _ = self.bundle(repo, "analyze", "--base", base)
+            sizes = [c for c in bundle["candidates"] if c["kind"] == "file_size"]
+            self.assertEqual([(c["path"], c["delta_from_base"]) for c in sizes], [("a.py", 19)])
+
+    def test_unrecognised_extensions_describe_the_current_tree(self):
+        """A base-only unrecognised path is not evidence about the tree now."""
+        with Repo() as repo:
+            repo.write("a.py", "x = 1\n")
+            repo.write("gone.zzz", "blob\n")
+            base = repo.commit()
+            os.unlink(os.path.join(repo.path, "gone.zzz"))
+            bundle, _ = self.bundle(repo, "analyze", "--base", base)
+            self.assertEqual(bundle["repository"]["unrecognised_extensions"], {})
 
     def test_base_parse_error_fails_require_coverage(self):
         with Repo() as repo:
@@ -841,12 +949,7 @@ class TestCoverageHonesty(InRepo):
             os.symlink("../other/foo.h", os.path.join(repo.path, "include", "foo.h"))
             base = repo.commit()
             repo.write("src/a.h", '#include "../other/foo.h"\n')
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                bundle, _ = health.build_bundle(health.parser().parse_args(["analyze", "--base", base]))
-            finally:
-                os.chdir(old)
+            bundle, _ = self.bundle(repo, "analyze", "--base", base)
             cycles = [c["members"] for c in bundle["candidates"] if c["kind"] == "dependency_cycle"]
             self.assertEqual(cycles, [["other/foo.h", "src/a.h"]])
 
@@ -855,13 +958,8 @@ class TestCoverageHonesty(InRepo):
             repo.write("a.c", '#include "b.h"\n')
             repo.write("b.h", "\n")
             repo.commit()
-            old = os.getcwd()
-            os.chdir(repo.path)
-            try:
-                detected, _ = health.build_bundle(health.parser().parse_args(["detect"]))
-                analyzed, _ = health.build_bundle(health.parser().parse_args(["analyze", "--all"]))
-            finally:
-                os.chdir(old)
+            detected, _ = self.bundle(repo, "detect")
+            analyzed, _ = self.bundle(repo, "analyze", "--all")
             self.assertNotIn("c_includes", detected["facts"])
             self.assertEqual(len(analyzed["facts"]["c_includes"]["edges"]), 1)
 
