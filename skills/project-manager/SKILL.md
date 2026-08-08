@@ -83,7 +83,7 @@ Start the run for this plan and repo on the harness above. Keep the run token th
 Then, slice by slice, in plan order:
 1. Launch a fresh Developer session scoped to that slice's frozen contract.
 2. Wait on it with a single long `observe --wait` rather than repeated checks; nudge it only if it genuinely stalls, and otherwise let the session's own signal — result, death, or hard-stop — end the wait.
-3. Assess what it produced against the plan, the diff, and the validation evidence; run lint, investigate differential code-health when structure materially changed without treating candidates as defects, and commission an independent review when risk warrants it. A review blocks until it returns or its timeout kills it; leave it to run rather than watching it.
+3. Assess what it produced against the plan, the diff, and the validation evidence; run lint, investigate differential code-health when structure materially changed, and commission an independent review when risk warrants it. A review blocks until it returns or its timeout kills it; leave it to run rather than watching it.
 4. Record your decision: accept, send it back for correction, or stop for a human — whichever the evidence and the plan's gates call for.
 
 Stop the run and tell me whenever the plan or the mechanical floor requires a human decision, rather than making that call yourself.

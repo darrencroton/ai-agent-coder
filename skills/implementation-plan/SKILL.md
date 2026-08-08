@@ -178,7 +178,7 @@ For each selected slice or batch, in plan order:
 2. If any included slice's Risk Flags mark approval-needed, stop and get my approval before coding.
 3. apply the scoped-implementation skill against the selected contract.
 4. apply the drift-audit skill using a read-only Reviewer when available; otherwise perform Developer self-audit. Report the authorization gate result and who performed it before any quality review.
-5. If the gate passes, apply the code-review skill using a read-only Reviewer when available; otherwise perform Developer self-audit through the code-review skill. Record who performed it. If the drift gate fails, fix the drift and re-audit.
+5. If the gate passes: for a broad or structural change, first run the code-health skill differentially against the slice's starting commit and supply its report as review evidence. Then apply the code-review skill using a read-only Reviewer when available; otherwise perform Developer self-audit through the code-review skill. Record who performed it. If the drift gate fails, fix the drift and re-audit.
 6. Surface drift and review findings to me, fix them, then re-run the relevant gate. If consecutive reviews return only minor findings and have clearly converged record residuals in the slice summary and proceed.
 7. Ask me before committing. On my approval, commit the selected slice or batch with the commit skill.
 
@@ -205,7 +205,7 @@ For each slice or approved batch, in plan order:
 3. apply the scoped-implementation skill against the selected contract.
 4. apply the drift-audit skill using a read-only Reviewer when available; otherwise perform Developer self-audit. Record the authorization gate result and who performed it.
 5. If the gate fails, fix the drift inside the contract and re-audit. If it can't be fixed inside the contract, STOP and report.
-6. On a passing gate, apply the code-review skill using a read-only Reviewer when available; otherwise perform Developer self-audit through the code-review skill. Record who performed it. Fix findings, then re-run the relevant gate. If consecutive reviews return only minor findings and have clearly converged record residuals in the slice summary and proceed.
+6. On a passing gate: for a broad or structural change, first run the code-health skill differentially against the slice's starting commit and supply its report as review evidence. Then apply the code-review skill using a read-only Reviewer when available; otherwise perform Developer self-audit through the code-review skill. Record who performed it. Fix findings, then re-run the relevant gate. If consecutive reviews return only minor findings and have clearly converged record residuals in the slice summary and proceed.
 7. When the slice passes validation, the drift-audit gate, and the code-review gate, use the commit skill. This prompt is explicit approval to commit each slice that has cleared all three gates — and only those.
 
 Stop the run early on: an approval-gated slice, a blocker, an unapproved scope change, a gate/validation failure unfixable inside the contract, or context pressure. On any stop, use the handoff skill to record current state and the next slice or batch to resume from.

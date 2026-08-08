@@ -68,6 +68,10 @@ Use these semantic sections; omit empty optional sections rather than inventing 
 
 Do not repeat the script's entire top-N list. Investigate the few candidates with the strongest combination of change relevance, structural reach, and maintenance consequence.
 
+## Where It Runs
+
+Structural evidence feeds review, never a mechanical gate, so it has one touchpoint per mode. In Mode A the Developer runs it differentially before `code-review` on a broad or structural change and supplies the report as review evidence. In Mode B the PM runs it during assessment when a slice materially changes structure; a candidate alone never justifies a steer.
+
 ## Metric Semantics
 
 Read [references/methodology.md](references/methodology.md) before interpreting a report. It defines the built-in measures, differential attribution, coverage tiers, and known limits. Read [references/tooling.md](references/tooling.md) only when evaluating or adding an external collector.
