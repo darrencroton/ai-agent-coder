@@ -128,9 +128,10 @@ passes. An inherited `SHELLCHECK_OPTS=--format=quiet` prints nothing and exits 1
 exit 1 is accepted only when findings were actually parsed, and non-JSON output
 raises instead of parsing to zero findings.
 
-**Why no complexity metric:** cyclomatic complexity is a judgement signal, not a
-defect. Including it would violate the skill's "defects, not taste" invariant and
-put the linter in conflict with plans that legitimately mandate a long function.
+**Why no complexity metric:** complexity is measured and interpreted by the
+[`code-health`](../code-health/) skill. It is a judgement signal rather than a
+mechanically decidable defect, so it does not belong in lint's gate-shaped
+finding model.
 
 ## Configuration
 

@@ -36,6 +36,7 @@ Each skill's `SKILL.md` is the source of truth for trigger conditions, workflow,
 | [`implementation-plan`](skills/implementation-plan/) | Breaks a request into auditable slices with frozen contracts: acceptance criteria, authorized surface, validation, risk flags, and a copyable launcher for the next chat. |
 | [`scoped-implementation`](skills/scoped-implementation/) | Implements one frozen slice without expanding scope; prepares the receipt for drift audit. |
 | [`lint`](skills/lint/) | Runs the project's linters and reports only findings this change introduced. A missing linter is reported as uncovered, never as a pass. |
+| [`code-health`](skills/code-health/) | Measures codebase composition, duplication, complexity, dependencies, and optional Git context; the agent investigates the evidence rather than grading the repository. |
 | [`drift-audit`](skills/drift-audit/) | Answers one question: was the implementation authorized? Runs before any quality review. |
 | [`code-review`](skills/code-review/) | Quality review after drift audit passes: correctness, edge cases, tests, error handling, domain-specific risks. |
 | [`commit`](skills/commit/) | Stages by name, never skips hooks, writes a message listing every file with reasons. |
@@ -55,10 +56,11 @@ The default flow for feature or bug work, at every level:
 2. **Implement** — `scoped-implementation` against one frozen slice, in a fresh session.
 3. **Lint** — `lint`, differential against the starting commit so pre-existing debt cannot block. Runs before the reviews because its findings are unarguable and free.
 4. **Audit scope** — `drift-audit`: was what happened authorized? Always before quality review.
-5. **Review quality** — `code-review`, after the authorization gate passes.
-6. **Simplify** (optional) — `code-simplifier`, as a separate pass over working code.
-7. **Hand off** (if needed) — `handoff` before ending an unfinished session.
-8. **Commit** — `commit`, only with explicit approval.
+5. **Measure structure** (optional) — `code-health`, for broad, architectural, or maintainability-sensitive changes; supplies evidence, never a gate verdict.
+6. **Review quality** — `code-review`, after the authorization gate passes.
+7. **Simplify** (optional) — `code-simplifier`, as a separate pass over working code.
+8. **Hand off** (if needed) — `handoff` before ending an unfinished session.
+9. **Commit** — `commit`, only with explicit approval.
 
 Mode B reverses one step: the slice is committed *before* the reviews. The Developer commits, then PM runs the mechanical floor and commissions `drift-audit` and `code-review` against the committed diff before deciding acceptance. Committing per slice makes the reviewed state exact and any mistake one revert away.
 

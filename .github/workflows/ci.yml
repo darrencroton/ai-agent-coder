@@ -37,6 +37,7 @@ jobs:
           python3 -m py_compile skills/project-manager/scripts/pm.py skills/project-manager/scripts/pm_lib/*.py
           python3 -m py_compile skills/orchestrator/scripts/delegate_contract.py skills/orchestrator/scripts/delegate_sessions.py skills/orchestrator/scripts/delegate_jobs.py
           python3 -m py_compile skills/lint/scripts/lint.py
+          python3 -m py_compile skills/code-health/scripts/health.py
 
       # Run the PM modules concurrently. They are independent, and each test
       # process pins its own tmux server (PM_TMUX_SOCKET) and mints run ids
@@ -79,6 +80,9 @@ jobs:
       # No linter binary required: every parser is tested against captured output.
       - name: Lint skill tests
         run: python3 -m unittest discover -s skills/lint/tests -p 'test_*.py'
+
+      - name: Code Health skill tests
+        run: python3 -m unittest discover -s skills/code-health/tests -p 'test_*.py'
 
       # Blueprint §6 no-baggage checks: retired Mode B vocabulary (ledger §8),
       # the retired failure-signature taxonomy, and retired path/env tokens

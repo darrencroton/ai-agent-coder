@@ -24,6 +24,7 @@ Each contract lives in exactly one place; everything else points at it. Before e
 | Developer and Reviewer prompt contracts | `skills/project-manager/references/developer-prompt.md`, `…/reviewer-prompt.md` |
 | Harness profile table | `skills/project-manager/scripts/pm_lib/profiles.py` |
 | Delegate request contract and access-mode semantics | `skills/orchestrator/references/delegate-contract.md` |
+| Code-health evidence bundle, metric semantics, and interpretation boundary | `skills/code-health/SKILL.md`; `skills/code-health/references/methodology.md` |
 | Per-harness CLI capabilities | `skills/orchestrator/references/<harness>.md` |
 | Privacy and artifact sensitivity | `skills/project-manager/README.md` → "Privacy & sensitive artifacts" |
 | Maintainer guides | `skills/orchestrator/README.md`; `skills/project-manager/README.md` → "Maintainer map" |
@@ -38,6 +39,7 @@ Each skill's `SKILL.md` is the source of truth for its own triggers, workflow, a
   Each test process pins its own tmux server (`PM_TMUX_SOCKET=pm-tests-<pid>`), so parallel runs cannot collide with each other — or with the tmux sessions you are working in. Never point the suite at the default tmux server, and never run a bare `tmux kill-server`: both reach the operator's own sessions.
 - Prefer trigger-gated fake harnesses over fixed delays. A launch takes several seconds (readiness settle plus two 1 s injection settles), so a delay timed from launch both races that and has to be padded until it is slow as well. `pm_test_helpers` provides the shared builders; put a fixture used by more than one module there rather than copying it.
 - Orchestrator: `python3 -m unittest discover -s skills/orchestrator/tests -p 'test_*.py'`.
+- Code Health: `python3 -m unittest discover -s skills/code-health/tests -p 'test_*.py'`.
 - CI runs both suites plus compile checks on every push and pull request using the minimum supported PM runtime, Python 3.13. Keep them green; never weaken a failing test to make it pass — a failing test is evidence of a real problem.
 - New behavior lands with a regression test pinned beside it. Keep tests boundary-focused rather than permutation-heavy.
 
