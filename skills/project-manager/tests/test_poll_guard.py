@@ -81,12 +81,12 @@ class PollGuardTestCase(unittest.TestCase):
 
     # --- payload builders ----------------------------------------------------
 
-    def read_payload(self, file_path: str, *, cwd: Path | None = None) -> dict:
+    def read_payload(self, file_path: str, *, cwd: Path | None = None, **extra) -> dict:
         return {
             "session_id": "session-a",
             "cwd": str(self.cwd if cwd is None else cwd),
             "tool_name": "Read",
-            "tool_input": {"file_path": file_path},
+            "tool_input": {"file_path": file_path, **extra},
         }
 
     def bash_payload(self, command: str, *, background: bool = True, cwd: Path | None = None) -> dict:
@@ -160,6 +160,23 @@ class TestReadBranchUnchanged(PollGuardTestCase):
             self.read_payload(str(ordinary)),
             "a repository's own tasks/ directory must never match the scratchpad layout",
         )
+
+    def test_a_paginated_read_of_unchanged_bytes_is_allowed(self) -> None:
+        """The stamp digests the WHOLE file, so it cannot speak for a windowed
+        read: asking for a different `offset`/`limit` of unchanged bytes
+        genuinely returns something the previous read did not show. Denying it
+        would be the one failure this guard must not have — a false deny that
+        blocks a legitimate look — so any paginated read passes."""
+        path = self.task_output("line one\nline two\nline three\n")
+        self.assertAllowed(self.read_payload(path))
+        self.assertAllowed(
+            self.read_payload(path, offset=2),
+            "a different window of the same bytes is new information",
+        )
+        self.assertAllowed(self.read_payload(path, limit=1))
+        self.assertAllowed(self.read_payload(path, offset=2, limit=1))
+        # The whole-file re-read is still denied: pagination widens nothing else.
+        self.assertDenied(self.read_payload(path))
 
     def test_a_different_session_does_not_inherit_a_stamp(self) -> None:
         path = self.task_output("same\n")

@@ -37,13 +37,13 @@ A run id is `<UTC timestamp>-<random nonce>`. The nonce is load-bearing, not dec
   "plan": {"path": "/abs/plan.md", "sha256": "…", "slice_count": 5},
   "harness": {"name": "codex", "model": null, "effort": null, "command_override": null},
   "reviewer": {"tools": ["copilot"], "model": null, "effort": null},
-  "policy": {"max_attempts": 10, "commit_required": true},
+  "policy": {"max_attempts": 10},
   "auth": {"token_sha256": "…"},
   "current_slice": {
     "id": "Slice 3", "artifact_dir": "…", "tmux_session": "pm-<run-id>-s03a0",
     "before_head": "…", "started_at": "…", "attempts": 0,
     "risk": "standard", "plan_risk": "standard",
-    "wake_at": null, "reviewer_pids": []
+    "reviewer_pids": []
   },
   "slices": [
     {"id": "Slice 1", "title": "…", "status": null,
@@ -65,6 +65,5 @@ Validation is tolerant: only the fields PM reads are checked; unknown extras pas
 - **Risk:** `plan_risk` is derived mechanically at parse time (approval `yes`, independent-audit `yes`, or risky-surfaces ≠ exact `none` ⇒ `elevated`) and never changes. `risk` starts equal and may only be **raised** (`--risk elevated` on `start-slice`/`finalize`); elevated slices cannot be accepted without both a fresh `drift-audit` and `code-review` review pinned to the exact final HEAD.
 - **Attempts:** 0 on the initial launch; +1 per relaunch (`start-slice` again) and per steer (`finalize --steer`); pure observation and `send` nudges are free. `attempts > policy.max_attempts` forces a genuine stop: the live session is killed, and `send`, `finalize --steer`, and `finalize --accept` are refused for the slice — only `finalize --stop` (record the story) and `stop` remain. Persisted in the slice entry, so budgets survive process restarts. Known semantics to be aware of: re-running a slice that was explicitly stopped (`finalize --stop`, then `start-slice` after human review) starts a fresh budget — the reset is the recorded stop/re-run pair, visible in events and the assessment.
 - **Review freshness:** each review records the HEAD it reviewed and the report's sha256. Any tree change after a mandatory review invalidates it for acceptance; re-commission against the new HEAD.
-- **`wake_at`:** a reserved slot for a persisted resume time for whoever continues the run (PM agent or human). The toolkit initializes it and carries it in state; it has no setter command and no scheduler — multi-hour autonomous recovery depends on the PM harness's own scheduling, a declared dependency.
 - **Recovery:** `run.json` + the artifact dir + git are sufficient. `status` reconstructs the situation and checks session liveness. With state deleted or unreadable, `stop --scavenge` still sweeps that run's sessions (or, with no run id, all `pm-*`).
 - **Superseded attempts** live in `attempt-<n>/` subdirectories of the slice's `.pm/` artifact dir and in the event log — never as state rows.

@@ -131,13 +131,11 @@ Reviewers surface such a conflict; only the deciding seat resolves it. Every one
 
 ## Execution Modes
 
-The same plan file serves two run modes — Mode A (one agent session, checkpointed by default or autonomous as an alternate usage) and Mode B (supervised autonomy under `project-manager`) — but not every plan feature binds in both:
+The same plan file serves two run modes — Mode A (one agent session, checkpointed by default or autonomous as an alternate usage) and Mode B (supervised autonomy under `project-manager`) — but not every plan feature binds in both. The mode-binding rules for batches, the approval flag, and independent audit are stated once, in "Machine-Consumed Fields" above; this section covers only what is genuinely comparative between the two modes:
 
 - **Atomic slices** are safe everywhere — they are the unit both modes gate on.
-- **Batches** bind in Mode A only (either usage); Mode B ignores them (each slice is gated alone).
-- **`Approval needed before implementation:`** must be an exact `no` for any slice expected to run unattended (Mode A autonomous usage, or Mode B). An explicit `yes` stops an autonomous Mode A run and stops Mode B until the operator records approval; anything else is a planning defect that blocks Mode B entirely.
+- **The approval flag's stop differs by mode**: an explicit `yes` stops an autonomous Mode A run for human review, and stops Mode B until the operator records approval. See "Machine-Consumed Fields" for the exact-`no` rule and what counts as a planning defect.
 - **Risky-surface control is plan-level in both modes**: gates verify file authorization mechanically, but dependency/license/side-effect stops are heuristic — the plan is where those surfaces are kept out of unattended slices.
-- **`Independent audit required:` binds in Mode B only**, where an exact `yes` makes the slice elevated risk: PM cannot accept it without fresh PM-commissioned `drift-audit` and `code-review` reviews of the exact final commit. In Mode A the preference for independent review is judged by the human or Developer. On standard Mode B slices, PM's own reading of the diff is the review unless PM chooses to commission more.
 
 ## Output Rules
 

@@ -54,7 +54,7 @@ Every review must do all of the following:
 - Extract acceptance criteria from the plan/spec/ticket when present.
 - If no formal spec exists, infer intended behaviour from tests, docs, code structure, and the user request.
 - State important assumptions when they materially affect confidence.
-- A frozen contract can be self-contradictory: prose a later revision superseded, a requirement the contract's own conventions forbid satisfying. Report that under `Contract Defects`, addressed to whoever decides acceptance — quote the conflicting clauses, say which reading appears coherent, and review against that reading. Do not prescribe a fix the contract prohibits elsewhere, and do not rate it as a finding against the implementer. Name the conflict; do not settle it.
+- A frozen contract can be self-contradictory (superseded prose, a requirement its own conventions forbid). Report it under `Contract Defects` — quote the conflicting clauses, state which reading is coherent, and review against that reading — without rating it as a finding against the implementer. Name the conflict; do not settle it.
 
 ### 4. Run the review matrix
 - Use [references/review-matrix.md](references/review-matrix.md).
@@ -75,13 +75,9 @@ Every review must do all of the following:
 - When a plan-based workflow asks for residual or post-plan considerations, keep them separate from findings and the verdict. This category is only for genuinely pre-existing observations that do not interact with the change, unrelated out-of-scope opportunities, or inconsequential/speculative notes worth later consideration. A material defect introduced by the change remains a finding even when fixing it would require files outside the frozen contract; do not launder it into a post-plan consideration.
 
 ### 7. Validate review depth
-Before finishing, ask:
+Before finishing, confirm the Minimum Investigation Standard was met, plus:
 
 - Did I check or request the `drift-audit` result when a frozen contract exists?
-- Did I inspect all changed files?
-- Did I inspect the relevant tests?
-- Did I follow risky interfaces beyond the diff?
-- Did I assess numerical or scientific implications if present?
 - Am I reporting the highest-impact issues first?
 
 ## Severity
@@ -160,10 +156,8 @@ Prioritize in this order unless the task clearly demands otherwise:
 ## Avoid Shallow Reviews
 
 - Do not rely on a single score threshold to suppress medium-risk issues.
-- Do not conclude "looks good" after scanning only the diff header or happy-path tests.
 - Do not treat passing tests as proof of correctness.
 - Do not over-index on style when deeper risks exist.
-- Do not skip scientific review dimensions just because the code compiles.
 
 ## Notes
 

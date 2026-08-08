@@ -168,6 +168,20 @@ class TestGitFacts(PmTestCase):
         self.assertIn("README.md", content)
         self.assertFalse((destination.parent / "git-diff-error.txt").exists())
 
+    def test_write_git_diff_covers_first_commit_on_unborn_branch_run(self) -> None:
+        # A run initialized before the first commit has before_head=None; the
+        # committed slice must still appear in the evidence patch, mirroring
+        # changed_files_between's `git show` handling of the same case.
+        (self.repo / "new-file.txt").write_text("first slice\n", encoding="utf-8")
+        self._git("add", "new-file.txt")
+        self._git("commit", "-q", "-m", "first slice commit")
+        after_head = git_ops.git_head(self.repo)
+        destination = self.repo / "diff.patch"
+        git_ops.write_git_diff(self.repo, None, after_head, destination)
+        content = destination.read_text(encoding="utf-8")
+        self.assertIn("new-file.txt", content)
+        self.assertFalse((destination.parent / "git-diff-error.txt").exists())
+
     def test_write_git_diff_writes_error_sidecar_on_bad_ref(self) -> None:
         destination = self.repo / "diff.patch"
         git_ops.write_git_diff(self.repo, "0" * 40, "1" * 40, destination)

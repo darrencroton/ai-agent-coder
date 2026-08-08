@@ -12,7 +12,8 @@ bound them.
 Denies two shapes:
 
 `Read` — a re-read byte-identical to the file's previous read. First read and
-any read returning new bytes still pass.
+any read returning new bytes still pass, as does any read carrying
+`offset`/`limit`, whose returned window the whole-file digest cannot speak for.
 
 `Bash` — a BACKGROUNDED command that waits then inspects a PM artifact
 (`until [ -s .../tasks/<id>.output ]; do sleep 30; done`, and similarly
@@ -158,10 +159,18 @@ def _check_bash(payload: dict) -> None:
 
 def _check_read(payload: dict) -> None:
     """Deny a re-read returning bytes identical to the previous one. Never returns a value."""
-    file_path = (payload.get("tool_input") or {}).get("file_path") or ""
+    tool_input = payload.get("tool_input") or {}
+    file_path = tool_input.get("file_path") or ""
 
     match = _TASK_OUTPUT_RE.search(file_path)
     if not match:
+        _allow()
+    # A paginated read asks for a different window of the file, so identical
+    # whole-file bytes do NOT mean it returns nothing new — the stamp compares
+    # the wrong thing. Allowed outright rather than keyed by offset/limit: the
+    # polling shape this guard was measured against re-reads the whole file,
+    # and a false deny is the one failure mode the guard must not have.
+    if "offset" in tool_input or "limit" in tool_input:
         _allow()
     # Checked only once the path already looks like a task output, so an
     # unrelated Read never triggers a filesystem call it did not before.

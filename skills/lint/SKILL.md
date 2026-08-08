@@ -7,7 +7,7 @@ description: Run deterministic linters over a change and report only the finding
 
 Deterministic hygiene, run before any model-based review. The linters answer
 questions that have exact answers — unused name, unreachable branch,
-uninitialised read, malformed table, misspelt identifier, unformatted file — so
+uninitialised read, malformed table, misspelt word, unformatted file — so
 no reviewer attention should be spent on them, and no reviewer's opinion is
 needed to settle them.
 

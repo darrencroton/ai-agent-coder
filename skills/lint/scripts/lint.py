@@ -303,7 +303,12 @@ def _parse_clang_tidy(out: str, err: str, cwd: str) -> list[Finding]:
 
 def _needs_clang_format_config(cwd: str) -> str | None:
     """Without a .clang-format, clang-format falls back to LLVM style and would
-    impose a convention the project never chose."""
+    impose a convention the project never chose. The walk checks the repo root
+    plus five ancestors, mirroring clang-format's own upward search -- so a
+    stray ~/.clang-format a few directories up will just as silently enable
+    format checks here as it would for a bare clang-format invocation. That is
+    a known trade-off, kept for parity with the tool's real behavior rather
+    than fixed here."""
     here = cwd
     for _ in range(6):
         for name in (".clang-format", "_clang-format"):
@@ -440,7 +445,14 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="markdownlint", language="markdown", extensions=MD, binary="markdownlint-cli2",
-        build=lambda b, f: [b] + f,
+        # markdownlint-cli2 appends a project config's "globs" to the CLI file
+        # list rather than replacing it, so a config with e.g. "**/*.md" makes
+        # both runs lint far beyond the changed files -- and every glob-matched
+        # file that exists at head but not in the base checkout (untracked
+        # work, runtime artifacts under .git/) reads as introduced by the
+        # change. --no-globs suppresses that expansion while still honoring
+        # the project's rule config and ignores.
+        build=lambda b, f: [b, "--no-globs"] + f,
         parse=_parse_markdownlint, extra_argv=_markdownlint_config,
         note="Catches malformed tables, bad headings, broken structure.",
     ),
@@ -448,7 +460,9 @@ TOOLS: list[Tool] = [
         name="codespell", language="any", extensions=(), binary="codespell",
         build=lambda b, f: [b, "--quiet-level=2", "--"] + f,
         parse=_parse_codespell, ok_codes=(0, 65),
-        note="Language-agnostic typo check over identifiers, comments, prose.",
+        note="Language-agnostic typo check over comments, strings, prose, and"
+             " whole-word identifiers (snake_case typos inside a longer"
+             " identifier are not tokenized out and can be missed).",
     ),
     Tool(
         name="shellcheck", language="shell", extensions=SHELL_EXT, binary="shellcheck",
@@ -813,10 +827,9 @@ def package_managers() -> list[str]:
     order = ["uv", "pipx", "brew", "npm", "apt-get", "pip"]
     found = []
     for m in order:
-        probe = "apt-get" if m == "apt-get" else m
         if m == "pip":
             found.append("pip")
-        elif have(probe):
+        elif have(m):
             found.append("apt" if m == "apt-get" else m)
     return found
 

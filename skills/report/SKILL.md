@@ -1,7 +1,6 @@
 ---
 name: report
 description: Create a concise evidence-backed written synthesis when the user explicitly asks for a report, assessment, investigation summary, comparison memo, status note, or final summary. Do not use for implementation planning, scoped implementation receipts, drift audits, code reviews, handoffs, PM run summaries, or commit messages.
-
 ---
 
 # Report

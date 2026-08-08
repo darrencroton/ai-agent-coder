@@ -74,101 +74,20 @@ def option_values(command: list[str], flags: set[str]) -> list[str]:
 
 
 def codex_prompt_from_command(command: list[str]) -> str | None:
-    if len(command) < 2 or command[1] != "exec":
+    """The prompt in a codex command composed by ``compose_delegate_command``.
+
+    Deliberately parses only the two shapes that composer emits —
+    ``["codex", "exec", <prompt>, ...]`` and its resume form — and returns None
+    for anything else. Correlation only ever sees composed commands, and a
+    resume launch short-circuits on the recorded parent session id long before
+    the prompt is consulted, so a general codex-argv parser would be
+    speculative machinery for callers that do not exist.
+    """
+    if len(command) < 3 or command[1] != "exec":
         return None
-    idx = 2
-
-    exec_skip_value_flags = {
-        "--enable",
-        "--disable",
-        "-c",
-        "--config",
-        "-i",
-        "--image",
-        "-m",
-        "--model",
-        "--local-provider",
-        "-s",
-        "--sandbox",
-        "-p",
-        "--profile",
-        "-C",
-        "--cd",
-        "--add-dir",
-        "--output-schema",
-        "--color",
-        "-o",
-        "--output-last-message",
-    }
-    exec_standalone_flags = {
-        "--oss",
-        "--full-auto",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--progress-cursor",
-        "--json",
-    }
-
-    while idx < len(command):
-        arg = command[idx]
-        if arg in exec_skip_value_flags:
-            idx += 2
-            continue
-        if any(arg.startswith(f"{flag}=") for flag in exec_skip_value_flags):
-            idx += 1
-            continue
-        if arg in exec_standalone_flags or any(arg.startswith(f"{flag}=") for flag in exec_standalone_flags):
-            idx += 1
-            continue
-        if arg.startswith("-"):
-            idx += 1
-            continue
-        if arg == "review":
-            idx += 1
-            break
-        if arg in {"resume", "help"}:
-            return None
-        return arg
-
-    review_skip_value_flags = {
-        "--enable",
-        "--disable",
-        "-c",
-        "--config",
-        "--base",
-        "--commit",
-        "-m",
-        "--model",
-        "--title",
-        "-o",
-        "--output-last-message",
-    }
-    review_standalone_flags = {
-        "--uncommitted",
-        "--full-auto",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--json",
-    }
-
-    while idx < len(command):
-        arg = command[idx]
-        if arg in review_skip_value_flags:
-            idx += 2
-            continue
-        if any(arg.startswith(f"{flag}=") for flag in review_skip_value_flags):
-            idx += 1
-            continue
-        if arg in review_standalone_flags or any(arg.startswith(f"{flag}=") for flag in review_standalone_flags):
-            idx += 1
-            continue
-        if arg.startswith("-"):
-            idx += 1
-            continue
-        return arg
-    return None
+    if command[2] == "resume":
+        return command[4] if len(command) >= 5 else None
+    return command[2]
 
 
 def prompt_from_command(command: list[str]) -> str | None:
@@ -179,21 +98,6 @@ def prompt_from_command(command: list[str]) -> str | None:
         return command[2]
     values = option_values(command, {"-p", "--print", "--prompt"})
     return values[-1] if values else None
-
-
-def prompt_marker(prompt: str | None) -> str | None:
-    if not prompt:
-        return None
-    for line in prompt.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("TASK:") or stripped.startswith("REVIEW THIS") or stripped.startswith("RESEARCH:"):
-            return stripped[:200]
-    for line in prompt.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("RETURN:") or stripped.startswith("FILES:"):
-            return stripped[:200]
-    collapsed = prompt.strip().replace("\n", " ")
-    return collapsed[:200] if collapsed else None
 
 
 def infer_project_dirs(command: list[str], tool: str) -> list[Path]:
@@ -276,16 +180,6 @@ def configured_session_id(command: list[str]) -> str | None:
     return values[-1] if values and values[-1] else None
 
 
-def file_head_contains(path: Path, marker: str | None, *, max_bytes: int = 131072) -> bool:
-    if not marker:
-        return True
-    try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            return marker in handle.read(max_bytes)
-    except OSError:
-        return False
-
-
 def jsonl_head_rows(path: Path, max_lines: int) -> Iterator[Any]:
     """The first `max_lines` decoded JSON values in a session transcript.
 
@@ -294,7 +188,7 @@ def jsonl_head_rows(path: Path, max_lines: int) -> Iterator[Any]:
     nothing, so every caller degrades to "no match" instead of raising.
 
     Rows are yielded as decoded, without a mapping check, because that is what
-    the four callers this replaced each did. A line that is valid JSON but not
+    the hand-written loops this replaced each did. A line that is valid JSON but not
     an object therefore still reaches `row.get(...)` and raises, exactly as
     before. `pm_lib.state.read_events` guards that case; adding the same guard
     here would be a behaviour change, so it is left as a separate decision.
@@ -312,19 +206,6 @@ def jsonl_head_rows(path: Path, max_lines: int) -> Iterator[Any]:
                 yield row
     except OSError:
         return
-
-
-def candidate_prompt_matches(path: Path, prompt: str | None, *, max_lines: int = 6) -> bool:
-    if not prompt:
-        return False
-    for row in jsonl_head_rows(path, max_lines):
-        if row.get("type") == "queue-operation" and row.get("content") == prompt:
-            return True
-        if row.get("type") == "user":
-            message_content = row.get("message", {}).get("content")
-            if isinstance(message_content, str) and message_content == prompt:
-                return True
-    return False
 
 
 def codex_candidate_prompt_matches(path: Path, prompt: str | None, *, max_lines: int = 40) -> bool:
@@ -402,55 +283,22 @@ def resolve_claude_session_path(entry: dict[str, Any], *, wait_seconds: float = 
     if not isinstance(command, list):
         return None
 
+    # A Claude transcript is always addressable by id: a first launch is
+    # composed with --session-id, and a continuation inherits the recorded
+    # parent id. Without one there is nothing launch-bound left to correlate
+    # against, so ownership fails closed to null rather than guessing.
     session_id = entry.get("session_id") or configured_session_id(command)
-    if isinstance(session_id, str) and session_id:
-        deadline = time.time() + max(wait_seconds, 0.0)
-        while True:
-            for project_dir in infer_project_dirs(command, "claude"):
-                exact_path = claude_project_root(project_dir) / f"{session_id}.jsonl"
-                if exact_path.exists():
-                    return exact_path
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.5)
+    if not isinstance(session_id, str) or not session_id:
+        return None
 
-    prompt = prompt_from_command(command)
-    marker = prompt_marker(prompt)
-    started_at = parse_iso(entry.get("started_at"))
     deadline = time.time() + max(wait_seconds, 0.0)
-    best_match: tuple[int, float, Path] | None = None
-
     while True:
         for project_dir in infer_project_dirs(command, "claude"):
-            session_root = claude_project_root(project_dir)
-            if not session_root.exists():
-                continue
-            candidates: list[tuple[float, Path]] = []
-            for candidate in session_root.glob("*.jsonl"):
-                try:
-                    candidates.append((candidate.stat().st_mtime, candidate))
-                except OSError:
-                    continue
-            for _, candidate in sorted(candidates, reverse=True):
-                stat = candidate.stat()
-                if started_at is not None and stat.st_mtime < (started_at - 300):
-                    continue
-                score = 0
-                if started_at is not None and stat.st_mtime >= (started_at - 1):
-                    score += 2
-                if candidate_prompt_matches(candidate, prompt):
-                    score += 10
-                if file_head_contains(candidate, marker):
-                    score += 4
-                if best_match is None or (score, stat.st_mtime) > (best_match[0], best_match[1]):
-                    best_match = (score, stat.st_mtime, candidate)
-
-        threshold = 10 if prompt else 4
-        if best_match and best_match[0] >= threshold:
-            return best_match[2]
+            exact_path = claude_project_root(project_dir) / f"{session_id}.jsonl"
+            if exact_path.exists():
+                return exact_path
         if time.time() >= deadline:
-            fallback_threshold = 6 if prompt else 2
-            return best_match[2] if best_match and best_match[0] >= fallback_threshold else None
+            return None
         time.sleep(0.5)
 
 

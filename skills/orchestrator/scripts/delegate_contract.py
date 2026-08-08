@@ -406,7 +406,9 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
                 "Use a required tool or stop and report that the configured tool cannot satisfy the task.",
             )
         )
-    elif tool not in DELEGATE_PROFILES:
+    # Guarded on `tool` so a missing tool reports only its own missing-field
+    # issue: naming the same absence twice buries the real correction.
+    elif tool and tool not in DELEGATE_PROFILES:
         issues.append(
             ContractIssue(
                 "unsupported-tool",
@@ -418,7 +420,10 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
 
     model = _required_string(request, "model", issues)
     effort = _required_string(request, "effort", issues)
-    if model != required_model:
+    # Both mismatch checks require the pair to be present: an absent model or
+    # effort is already reported as missing-field, and adding a mismatch issue
+    # against the empty string would name the same defect twice.
+    if model and required_model and model != required_model:
         issues.append(
             ContractIssue(
                 "model-mismatch",
@@ -427,7 +432,7 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
                 f"Set model to {required_model!r}; do not silently fall back.",
             )
         )
-    if effort != required_effort:
+    if effort and required_effort and effort != required_effort:
         issues.append(
             ContractIssue(
                 "effort-mismatch",
@@ -768,13 +773,15 @@ def compose_delegate_command(
             command.extend(["--resume", resume_session_id])
         if model != "default":
             command.extend(["--model", model])
-        # --yolo in both access modes: without it qwen gates every tool call on
-        # a confirmation a headless delegate cannot answer. It removes a
-        # mechanical approval barrier without widening authorization — this
-        # profile was never mechanically differentiated between modes. Qwen
+        # Yolo approval mode in both access modes: without it qwen gates every
+        # tool call on a confirmation a headless delegate cannot answer. It
+        # removes a mechanical approval barrier without widening authorization —
+        # this profile was never mechanically differentiated between modes. Qwen
         # reverts it to the gated mode in an untrusted folder; see
-        # references/qwen.md.
-        command.extend(["--yolo", "--sandbox", "--output-format", "text"])
+        # references/qwen.md. Spelled as the documented --approval-mode yolo
+        # rather than the hidden --yolo alias, whose removal qwen's non-strict
+        # argv parsing would swallow silently.
+        command.extend(["--approval-mode", "yolo", "--sandbox", "--output-format", "text"])
         return command
 
     if tool == "claude":

@@ -21,25 +21,10 @@ Choose the lightest mode that preserves continuity.
 
 ## What To Capture
 
-Always:
-- the user's actual goal
-- the full task list to achieve this goal
-- what is done, in progress, and remaining
-- the single best next action
-- blockers and dependencies
-- files changed or examined
-- validation run and validation still needed
+The template below names the structure — objective, task list, status, blockers, files, validation, next action, and so on. Capture facts under whichever heading fits. Beyond that structure, always capture:
+
 - frozen contract, authorized surface, and authorization gate status when the task used implementation-plan or scoped-implementation
 - residual findings and post-plan considerations that were intentionally not fixed in the current frozen slice, including why they did not block and what later follow-up should consider
-
-When relevant:
-- branch name
-- failing tests or known errors
-- environment quirks
-- commands that succeeded or failed
-- design constraints from the user
-- links to local docs or plans
-- Developer session and Reviewer-run details
 
 Never:
 - chatty narrative or repeated background
@@ -131,10 +116,7 @@ Weak:
 
 Before finishing, verify:
 - the todo list is clear
-- the next action is concrete and specific
 - blockers are explicit
-- failed attempts are recorded if any occurred
-- the handoff contains no secrets
 - the handoff can be scanned in under two minutes
 
 ## Writing Style
@@ -158,52 +140,32 @@ Add only when they provide real value:
 # HANDOFF
 
 ## Objective
-- Continue migrating the app from legacy auth middleware to token-based session validation without breaking admin routes.
+- Migrate the app from legacy auth middleware to token-based session validation without breaking admin routes.
 
 ## Task List
 - [x] Create new token validator and wire for standard user routes.
-- [x] Begin updating error handling across auth middleware.
-- [ ] Audit all admin routes in `src/routes/admin.ts` for legacy middleware dependencies.
-- [ ] Update admin routes to use the new token validator behind the existing fallback.
-- [ ] Remove or isolate the legacy middleware helper once no routes depend on it directly.
+- [ ] Audit admin routes in `src/routes/admin.ts` for legacy middleware dependencies.
 - [ ] Run full integration test suite to confirm no regressions.
-- [ ] Clean up partial error handling updates and verify coverage.
 
 ## Current Status
 - New token validator exists and is wired for standard user routes.
 - Admin routes still reference legacy middleware.
-- Error handling was partially updated but not fully tested.
 
 ## Decisions Made
 - Keep the existing session cookie format for backward compatibility.
-- Do not change route shapes in this pass.
-- Preserve current audit logging behavior.
 
 ## Failed or Rejected Approaches
 - Replacing all middleware in one pass caused admin authorization regressions.
-- Removing the legacy helper entirely was deferred — two internal routes still import it.
 
 ## Active Blockers
 - Need to inspect admin route coverage before removing fallback logic.
-- Full integration test run has not been completed.
 
 ## Files That Matter
 - `src/auth/token-validator.ts`: new validation path.
-- `src/middleware/auth.ts`: route wiring in progress.
 - `src/routes/admin.ts`: still using legacy path.
-- `tests/auth/integration.test.ts`: primary regression coverage.
-
-## Developer / Reviewer State
-- Run dir: `.orchestrator/current/`
-- Developer: `codex` — implementation and validation complete
-- Reviewers: `01-claude-drift-audit` (PASS), `02-opencode-code-review` (in progress)
-- Audit provenance: drift audit by Reviewer `01-claude-drift-audit`; code review pending Reviewer `02-opencode-code-review`
-- Next planned Reviewer work: complete code review; no Reviewer mutation work is permitted
 
 ## Validation
-- Targeted auth unit tests passed.
-- Admin integration tests not yet run.
-- Manual review suggests fallback code may still be required.
+- Targeted auth unit tests passed. Admin integration tests not yet run.
 
 ## Next Action
 - Update `src/routes/admin.ts` to use the new validator behind the existing fallback, then run `tests/auth/integration.test.ts`.

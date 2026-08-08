@@ -324,12 +324,18 @@ def composition(root: Path, paths: Iterable[str], source: list[SourceFile]) -> t
     for path in paths:
         if language_for(path):
             continue  # `scan` already read it, or already recorded why it could not.
+        category, rule = category_for(path, None)
         try:
             text = (root / path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            unreadable.append({"path": path, "reason": f"unreadable_utf8: {exc.__class__.__name__}"})
+            # A `data`-classified path (font, archive, image, tabular/scientific
+            # binary, ...) is expected to be binary; failing to decode it as text is
+            # not a defect, and recording it here would bury the unreadable *source*
+            # files this list exists to surface.  It still stays out of
+            # `totals_by_category`, exactly as an unreadable file always has.
+            if category != "data":
+                unreadable.append({"path": path, "reason": f"unreadable_utf8: {exc.__class__.__name__}"})
             continue
-        category, rule = category_for(path, None)
         rows[path] = {"path": path, "language": None, "category": category, "category_rule": rule,
                       **line_counts(text, None)}
     all_rows = [rows[path] for path in sorted(rows)]
@@ -1413,9 +1419,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    arg_parser = parser()
+    args = arg_parser.parse_args(argv)
     if getattr(args, "duplicate_lines", 6) < 1 or getattr(args, "max_commits", 1) < 1:
-        parser().error("--duplicate-lines and --max-commits must be positive")
+        arg_parser.error("--duplicate-lines and --max-commits must be positive")
     try:
         bundle, coverage_exit = build_bundle(args)
     except HealthError as exc:

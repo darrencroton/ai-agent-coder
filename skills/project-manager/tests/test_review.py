@@ -958,33 +958,6 @@ class TestReviewDefaultTimeout(ReviewCommandTestCase):
     model still runs to completion; one that genuinely needs longer takes a
     larger explicit `--timeout`."""
 
-    def test_default_timeout_lets_moderately_slow_reviewer_run_to_completion(self) -> None:
-        token, before_head, run_dir = self._init_and_advance()
-        state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
-        self._advance_head()
-
-        fake = _write_fake_reviewer(
-            self.repo.parent / "fake_reviewer_moderately_slow.sh",
-            'sleep 3\necho "FAKE REVIEW REPORT"\nexit 0',
-        )
-
-        code, _out, err = self.run_cli_in_repo(
-            [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake),
-                "--token", token,
-                # Deliberately no --timeout.
-            ]
-        )
-        self.assertEqual(code, 0, err)
-
-        reloaded = state_mod.load_state(run_dir, token)
-        entry = reloaded["slices"][0]
-        self.assertEqual(len(entry["reviews"]), 1)
-
     def test_omitted_timeout_passes_the_default_to_process_wait(self) -> None:
         """Direct proof, not just behavioural inference: with no `--timeout`,
         `run_review` calls the REVIEWER subprocess's `.wait(timeout=...)`

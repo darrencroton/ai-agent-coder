@@ -25,13 +25,13 @@ This skill complements `lint`: lint owns mechanically decidable local defects, w
 Run from anywhere inside the target repository:
 
 ```bash
-python3 <skill-dir>/scripts/health.py detect
-python3 <skill-dir>/scripts/health.py analyze --base <ref>
-python3 <skill-dir>/scripts/health.py analyze --base <ref> --history
-python3 <skill-dir>/scripts/health.py analyze --all
+python3 <skill-dir>/scripts/health.py detect --json
+python3 <skill-dir>/scripts/health.py analyze --base <ref> --json
+python3 <skill-dir>/scripts/health.py analyze --base <ref> --history --json
+python3 <skill-dir>/scripts/health.py analyze --all --json
 ```
 
-Add `--json` for the versioned evidence bundle and `--require-coverage` when incomplete structural coverage must stop automation. Neither subcommand installs anything. `--history` adds per-path revision and line churn from one `git log --numstat`; it refuses to fabricate history from a shallow clone and never classifies change frequency as a structural regression.
+`--json` is the operative form: it is the only output carrying the distributions, deltas, and candidates the workflow below reads. Without it, `analyze` prints only coverage rows and a candidate count — a status summary, not evidence to interpret. Add `--require-coverage` when incomplete structural coverage must stop automation. Neither subcommand installs anything. `--history` adds per-path revision and line churn from one `git log --numstat`; it refuses to fabricate history from a shallow clone and never classifies change frequency as a structural regression.
 
 ## Workflow
 

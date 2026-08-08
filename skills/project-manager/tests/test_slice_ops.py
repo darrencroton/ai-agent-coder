@@ -198,6 +198,9 @@ class TestTokenGating(SliceOpsTestCase):
             ["send", "--text", "hi", "--reason", "steer"],
             ["finalize"],
             ["stop", "--reason", "done"],
+            ["notes", "--set", "x"],
+            ["rate", "--text", "Process discipline: 5/5 — no incidents."],
+            ["review", "--slice", "Slice 1", "--skill", "code-review"],
         ]
         for argv in cases:
             with self.subTest(command=argv[0]):
@@ -374,6 +377,11 @@ class TestAttemptAccounting(SliceOpsTestCase):
         self.assertIsNotNone(session0)
         artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
+        # The fake harness writes no validation.md, so stand in for the
+        # Developer-authored evidence the real one leaves behind: it must
+        # rotate with the result, or attempt 1 inherits attempt 0's evidence
+        # looking freshly written.
+        (artifact_dir / "validation.md").write_text("attempt 0 validation\n", encoding="utf-8")
 
         # Simulate a dead harness: force-kill the still-running session.
         sessions.force_stop(session0)
@@ -396,6 +404,10 @@ class TestAttemptAccounting(SliceOpsTestCase):
         # written a fresh result.json of its own by now, which is correct
         # and expected — this only asserts the OLD one was moved aside.)
         self.assertTrue((artifact_dir / "attempt-0" / "result.json").is_file())
+        rotated_validation = artifact_dir / "attempt-0" / "validation.md"
+        self.assertTrue(rotated_validation.is_file())
+        self.assertEqual(rotated_validation.read_text(encoding="utf-8"), "attempt 0 validation\n")
+        self.assertFalse((artifact_dir / "validation.md").exists())
 
         sessions.force_stop(session1)
         self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session1), timeout=10.0))
@@ -406,6 +418,53 @@ class TestAttemptAccounting(SliceOpsTestCase):
         self.assertIn("attempt budget exhausted", err)
         final_state = state_mod.load_state(run_dir, token)
         self.assertEqual(final_state["status"], "needs-human")
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestLaunchPersistenceWindow(SliceOpsTestCase):
+    def test_a_persistence_failure_after_launch_kills_the_session_and_reraises(self) -> None:
+        """The window between `start_session` and a successful `save_state` is
+        the one where a live Developer session exists that no state names: it
+        is invisible to `observe`, `finalize`, and `stop`'s recorded-session
+        path, so it would burn tokens unattended until a human noticed the
+        stray tmux session. A failing `save_state` (full or read-only state
+        dir) is the realistic trigger, and is injected here directly."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        # The session name is recorded from the real `start_session` rather
+        # than reconstructed: state never names it on this path, and a test
+        # that guessed the name wrong would pass vacuously (an unknown
+        # session never "exists").
+        started: list[str] = []
+        real_start_session = sessions.start_session
+
+        def _recording_start_session(session_name, *args, **kwargs):
+            started.append(session_name)
+            return real_start_session(session_name, *args, **kwargs)
+
+        with mock.patch.object(sessions, "start_session", _recording_start_session), mock.patch.object(
+            state_mod, "save_state", side_effect=OSError("no space left on device")
+        ):
+            with self.assertRaises(OSError) as caught:
+                self.run_cli_in_repo(["start-slice", "--token", token])
+
+        # The original failure reaches the operator; cleanup never replaces it.
+        self.assertIn("no space left on device", str(caught.exception))
+        self.assertEqual(len(started), 1, "the launch must have actually happened")
+        session = started[0]
+        self._sessions_to_reap.append(session)
+        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
+
+        # Nothing was persisted, so the run is exactly where it was: no
+        # current slice, and a relaunch is still attempt 0.
+        reloaded = state_mod.load_state(run_dir, token)
+        self.assertIsNone(reloaded.get("current_slice"))
+        self.assertEqual(reloaded["slices"][0]["attempts"], 0)
 
 
 class TestMidRunPlanEdit(SliceOpsTestCase):

@@ -191,31 +191,22 @@ def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | Non
 
 
 def _fact_commit_ancestry(repo: Path, state: dict[str, Any]) -> FloorFact:
-    policy = state.get("policy") if isinstance(state.get("policy"), dict) else {}
-    commit_required = bool(policy.get("commit_required", True))
     current_slice = state.get("current_slice") if isinstance(state.get("current_slice"), dict) else {}
     before_head = current_slice.get("before_head")
-    evidence: dict[str, Any] = {"commit_required": commit_required, "before_head": before_head}
+    evidence: dict[str, Any] = {"before_head": before_head}
 
-    if not commit_required:
-        return FloorFact(6, "commit-ancestry", True, "no commit is required by run policy", evidence)
-
-    try:
-        head = git_ops.git_head(repo)
-    except PmError as exc:
-        evidence["error"] = str(exc)
-        return FloorFact(6, "commit-ancestry", False, f"HEAD could not be resolved: {exc}", evidence)
+    # `git_head` and `commit_is_descendant` are built on `git_result`, which
+    # reports a failing git by return code and never raises PmError — so
+    # neither call needs a catch here. The branch rev-parse below uses `git`,
+    # which does raise, and keeps its own.
+    head = git_ops.git_head(repo)
     evidence["head"] = head
     if head is None:
         return FloorFact(6, "commit-ancestry", False, "no HEAD commit exists", evidence)
     if head == before_head:
         return FloorFact(6, "commit-ancestry", False, "HEAD has not advanced since before_head", evidence)
 
-    try:
-        descends = git_ops.commit_is_descendant(repo, before_head, head)
-    except PmError as exc:
-        evidence["error"] = str(exc)
-        return FloorFact(6, "commit-ancestry", False, f"ancestry could not be computed: {exc}", evidence)
+    descends = git_ops.commit_is_descendant(repo, before_head, head)
     evidence["descends_from_before_head"] = descends
 
     branch = state.get("branch")

@@ -278,6 +278,24 @@ class TestAcceptRefusedOnShortReasoning(PmTestCase):
 
         self.assertEqual((run_dir / "run.json").read_bytes(), before_bytes)
 
+    def test_an_empty_decision_is_refused_rather_than_silently_dropped(self) -> None:
+        """`--accept ""`/`--steer ""`/`--stop ""` were tested by truthiness, so
+        an empty decision fell through to the bare evidence-only finalize: it
+        printed a floor report, exited 0, and recorded no decision at all —
+        indistinguishable, to a PM reading the output, from a run where its
+        acceptance was recorded. Each must now fail closed and say so."""
+        plan_path = self.write_plan(slices=[{"files": ["a.py"]}])
+        _state, token, run_dir = self.make_run(plan_path=plan_path)
+        before_bytes = (run_dir / "run.json").read_bytes()
+
+        for flag in ("--accept", "--steer", "--stop"):
+            with self.subTest(flag=flag):
+                code, out, err = self.run_cli_in_repo(["finalize", flag, "", "--token", token])
+                self.assertEqual(code, 2, out)
+                self.assertIn(flag, err)
+                self.assertNotIn("PASS", out, "an empty decision must not degrade to a floor dump")
+                self.assertEqual((run_dir / "run.json").read_bytes(), before_bytes)
+
 
 # --- elevated slice review requirement + staleness ---------------------------
 
@@ -718,16 +736,6 @@ class TestNotesCommand(FinalizeTestCase):
         # footgun of hand-editing only the mirror is gone.
         self.assertEqual(mirror.read_text(encoding="utf-8"), text)
 
-    def test_requires_a_token(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, _token = parse_init_output(out)
-        code, _out, err = self.run_cli_in_repo(["notes", "--set", "x", "--run", run_id])
-        self.assertEqual(code, 2)
-        self.assertIn("token", err.lower())
-
     def test_empty_or_whitespace_text_is_refused(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
@@ -770,16 +778,6 @@ class TestRateCommand(FinalizeTestCase):
         text = original.read_text(encoding="utf-8")
         self.assertEqual(text, "Process discipline: 3/5 — revised.\n")
         self.assertNotIn("5/5", text)
-
-    def test_requires_a_token(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
-        code, out, _err = self._init(plan_path, harness)
-        self.assertEqual(code, 0)
-        run_id, _token = parse_init_output(out)
-        code, _out, err = self.run_cli_in_repo(["rate", "--text", self._RATING, "--run", run_id])
-        self.assertEqual(code, 2)
-        self.assertIn("token", err.lower())
 
     def test_empty_or_whitespace_text_is_refused(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])

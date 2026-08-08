@@ -277,10 +277,12 @@ def run_review(
     already-current or unreviewable range refuses outright (PmError) rather
     than silently reviewing nothing.
 
-    `timeout`, when given, bounds the wait on the reviewer subprocess; on
-    expiry the process group is killed and the call fails closed (PmError).
-    There is deliberately no default — a legitimately slow cold local model
-    is the PM's judgement call, not a hard ceiling.
+    `timeout` bounds the wait on the reviewer subprocess; on expiry the
+    process group is killed and the call fails closed (PmError). This
+    function itself requires it to be passed (None means an unbounded wait);
+    the CLI never omits it, applying a one-hour default so an unattended run
+    always regains control from a stuck reviewer. A legitimately slow cold
+    local model is handled with a larger explicit `--timeout`.
 
     `pm_adjudications` is PM-authored free text naming rulings already settled
     in this run, so a reviewer stops re-raising them. It is the only

@@ -118,7 +118,7 @@ Run state, artifacts, transcripts, and review evidence stay on your machine. Wha
 - **Drift audit** — the authorization gate: compares actual changes against the frozen contract, before any quality judgment.
 - **Differential lint** — `lint`'s default question: not "is this code clean?" but "does this change introduce a finding that was not there before?"
 - **Gate** — a check that must pass before work advances. In Mode A these are the in-session chain steps (validation, drift audit, code review, commit evidence); in Mode B there are exactly three: the mechanical floor, PM assessment, and human approval.
-- **Floor** — the eight mechanical, non-waivable facts checked at finalize: plan digest, repo/branch identity, approvals, result identity, frozen surface, commit ancestry, clean worktree, hard-stop scan. Any failure blocks acceptance.
+- **Floor** — the eight mechanical, non-waivable facts checked at finalize, enumerated in `project-manager`'s `SKILL.md`. Any failure blocks acceptance.
 - **Harness** — a coding-agent CLI (Codex CLI, Claude Code, OpenCode, Copilot CLI, and others) that PM or you run a session in.
 - **Developer** — the context-rich agent that owns implementation, validation, session management, gates, commits, and delivery. Under PM it is the supervised per-slice session and has no authority above PM.
 - **Delegate** — orchestrator's term for a harness session the Developer launches: **read-only** (investigation, evidence gathering, drift audit, code review — a synonym for Reviewer) or **read-write** (a bounded implementer confined to an explicit authorized surface). Neither commits, mutates Git/GitHub state, or re-delegates; the Developer reviews and accepts its output either way.

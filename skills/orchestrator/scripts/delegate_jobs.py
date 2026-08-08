@@ -58,12 +58,9 @@ RUN_SCHEMA_VERSION = 3
 RUNS_DIR_NAME = "runs"
 MANIFEST_NAME = "manifest.json"
 MANIFEST_LOCK_NAME = ".manifest.lock"
-INDEX_NAME = "index.json"
-INDEX_LOCK_NAME = ".index.lock"
 # Match line-based SECTION headers even when a model prefixes them with Markdown.
 SECTION_RE = re.compile(r"^\s*(?:#+\s*)?SECTION:\s*([A-Za-z0-9_ -]+)\s*$", re.MULTILINE)
 CONTINUATION_SUFFIX_RE = re.compile(r"-r(\d+)$")
-_LIBRARY_WRAPPERS: dict[int, subprocess.Popen[bytes]] = {}
 
 
 class DelegateJobsError(RuntimeError):
@@ -300,14 +297,6 @@ def manifest_lock_path(run_dir: Path) -> Path:
     return run_dir / MANIFEST_LOCK_NAME
 
 
-def index_path(state_dir: Path) -> Path:
-    return state_dir / INDEX_NAME
-
-
-def index_lock_path(state_dir: Path) -> Path:
-    return state_dir / INDEX_LOCK_NAME
-
-
 @contextmanager
 def hold_lock(lock_path: Path, description: str):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,12 +314,6 @@ def hold_lock(lock_path: Path, description: str):
 @contextmanager
 def hold_manifest_lock(run_dir: Path):
     with hold_lock(manifest_lock_path(run_dir), f"manifest for run directory {run_dir}"):
-        yield
-
-
-@contextmanager
-def hold_index_lock(state_dir: Path):
-    with hold_lock(index_lock_path(state_dir), f"index for state directory {state_dir}"):
         yield
 
 
@@ -368,21 +351,6 @@ def ensure_manifest(run_dir: Path) -> dict[str, Any]:
 def derive_run_dir(root: Path, prefix: str) -> Path:
     stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     return root / f"{prefix}-{stamp}-{os.getpid()}"
-
-
-def load_index(state_dir: Path) -> list[dict[str, Any]]:
-    path = index_path(state_dir)
-    if not path.exists():
-        return []
-    try:
-        payload = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return []
-    return payload if isinstance(payload, list) else []
-
-
-def save_index(state_dir: Path, index: list[dict[str, Any]]) -> None:
-    write_json(index_path(state_dir), index)
 
 
 def delegate_status(entry: dict[str, Any]) -> dict[str, Any]:
@@ -433,37 +401,6 @@ def delegate_status(entry: dict[str, Any]) -> dict[str, Any]:
         "session_id": entry.get("session_id"),
         "session_path": entry.get("session_path"),
     }
-
-
-def run_status_from_manifest(manifest: dict[str, Any]) -> str:
-    states = {delegate_status(entry)["state"] for entry in manifest.get("delegates", {}).values()}
-    if not states or states & {"running", "stalled", "finished"}:
-        return "active"
-    if "failed" in states:
-        return "failed"
-    if "cancelled" in states:
-        return "cancelled"
-    return "completed"
-
-
-def sync_run_index(run_dir: Path, *, manifest: dict[str, Any] | None = None, status: str | None = None) -> None:
-    state_dir = state_dir_from_run_dir(run_dir)
-    if state_dir is None:
-        return
-    manifest = manifest if manifest is not None else load_manifest(run_dir)
-    run_status = status or run_status_from_manifest(manifest)
-    created_at = manifest.get("created_at") or iso_now()
-    with hold_index_lock(state_dir):
-        index = load_index(state_dir)
-        for entry in index:
-            if entry.get("run") != run_dir.name:
-                continue
-            entry["created_at"] = entry.get("created_at") or created_at
-            entry["status"] = run_status
-            break
-        else:
-            index.append({"created_at": created_at, "run": run_dir.name, "status": run_status})
-        save_index(state_dir, index)
 
 
 def find_section_blocks(text: str) -> list[tuple[str, int, int]]:
@@ -577,15 +514,13 @@ def command_init(args: argparse.Namespace) -> int:
             )
     run_dir = derive_run_dir(root, args.prefix)
     run_dir.mkdir(parents=True, exist_ok=False)
-    manifest = ensure_manifest(run_dir)
+    ensure_manifest(run_dir)
 
     state_dir = default_state_dir()
     current_link = state_dir / "current"
     if current_link.exists() or current_link.is_symlink():
         current_link.unlink()
     current_link.symlink_to(run_dir.relative_to(state_dir))
-
-    sync_run_index(run_dir, manifest=manifest, status="active")
 
     print(run_dir)
     return 0
@@ -597,23 +532,25 @@ def command_profiles(args: argparse.Namespace) -> int:
     return 0
 
 
-def normalize_dependencies(manifest: dict[str, Any], label: str, depends_on: list[str] | None) -> list[str]:
-    if not depends_on:
-        return []
-    delegates = manifest.get("delegates", {})
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for dep in depends_on:
-        validate_label(dep)
-        if dep == label:
-            raise DelegateJobsError(f"Delegate '{label}' cannot depend on itself.")
-        if dep not in delegates:
-            raise DelegateJobsError(f"Unknown dependency label: {dep}")
-        if dep in seen:
-            continue
-        seen.add(dep)
-        normalized.append(dep)
-    return normalized
+def terminate_unpersisted_wrapper(pid: int, status_file: Path) -> None:
+    """Best-effort teardown of a wrapper whose launch could not be persisted.
+
+    Between ``Popen`` and the first durable manifest entry the wrapper owns a
+    real process group that no manifest records, so ``cancel`` could never
+    reach it. Ownership is proven the same way ``command_cancel`` proves it,
+    and every failure here is swallowed: cleanup must never replace the launch
+    error the caller is about to see.
+    """
+    probe = {"pid": pid, "status_file": str(status_file)}
+    try:
+        signal_tracked_child(probe, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    try:
+        if tracked_wrapper_running(probe):
+            os.killpg(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
 
 
 def start_tracked_delegate(
@@ -622,7 +559,6 @@ def start_tracked_delegate(
     command: list[str],
     *,
     cwd: Path,
-    depends_on: list[str] | None = None,
     launch_contract: dict[str, Any] | None = None,
     continuation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -634,7 +570,6 @@ def start_tracked_delegate(
         manifest = ensure_manifest(run_dir)
         if label in manifest["delegates"]:
             raise DelegateJobsError(f"Delegate label already exists in manifest: {label}")
-        normalized_dependencies = normalize_dependencies(manifest, label, depends_on)
 
         started_at = iso_now()
         outfile = run_dir / f"{label}-out.txt"
@@ -665,44 +600,43 @@ def start_tracked_delegate(
             start_new_session=True,
             close_fds=True,
         )
-        if __name__ != "__main__":
-            # Library callers (principally tests and PM utilities) keep the
-            # Popen handle so they can reap it after an external cancel.
-            _LIBRARY_WRAPPERS[process.pid] = process
+        try:
+            initial_session_id = continuation.get("parent_session_id") if continuation else None
+            if initial_session_id is None and tool_name in {"claude", "copilot"}:
+                initial_session_id = configured_session_id(command)
 
-        initial_session_id = continuation.get("parent_session_id") if continuation else None
-        if initial_session_id is None and tool_name in {"claude", "copilot"}:
-            initial_session_id = configured_session_id(command)
-
-        manifest["delegates"][label] = {
-            "label": label,
-            "tool": tool_name,
-            "pid": process.pid,
-            "command": command,
-            "outfile": str(outfile),
-            "errfile": str(errfile),
-            "status_file": str(status_file),
-            "started_at": started_at,
-            "cwd": str(cwd),
-            "session_id": initial_session_id,
-        }
-        if normalized_dependencies:
-            manifest["delegates"][label]["depends_on"] = normalized_dependencies
-        if continuation is not None:
-            manifest["delegates"][label].update(
-                {
-                    "parent_label": continuation["parent_label"],
-                    "parent_session_id": continuation["parent_session_id"],
-                    "continuation_index": continuation["continuation_index"],
-                }
-            )
-            parent_session_path = continuation.get("parent_session_path")
-            if parent_session_path:
-                manifest["delegates"][label]["session_path"] = parent_session_path
-        if launch_contract is not None:
-            manifest["delegates"][label]["launch_contract"] = launch_contract
-        save_manifest(run_dir, manifest)
-        sync_run_index(run_dir, manifest=manifest, status="active")
+            manifest["delegates"][label] = {
+                "label": label,
+                "tool": tool_name,
+                "pid": process.pid,
+                "command": command,
+                "outfile": str(outfile),
+                "errfile": str(errfile),
+                "status_file": str(status_file),
+                "started_at": started_at,
+                "cwd": str(cwd),
+                "session_id": initial_session_id,
+            }
+            if continuation is not None:
+                manifest["delegates"][label].update(
+                    {
+                        "parent_label": continuation["parent_label"],
+                        "parent_session_id": continuation["parent_session_id"],
+                        "continuation_index": continuation["continuation_index"],
+                    }
+                )
+                parent_session_path = continuation.get("parent_session_path")
+                if parent_session_path:
+                    manifest["delegates"][label]["session_path"] = parent_session_path
+            if launch_contract is not None:
+                manifest["delegates"][label]["launch_contract"] = launch_contract
+            save_manifest(run_dir, manifest)
+        except BaseException:
+            # The wrapper is running but nothing durable records it yet, so no
+            # later command could find or stop it. Terminate it, then re-raise
+            # the original failure unchanged.
+            terminate_unpersisted_wrapper(process.pid, status_file)
+            raise
 
     wait_seconds = 5.0 if tool_name in {"claude", "codex", "copilot", "opencode", "qwen"} else 0.0
     try:
@@ -846,18 +780,12 @@ def resolve_continuation_parent(run_dir: Path, contract: dict[str, Any]) -> dict
     if parent_label is None:
         return None
 
+    # validate_contract already rejects a parented label without an -rN suffix
+    # (continuation-label-required) and always runs first, so the suffix is a
+    # precondition here rather than a second check. Only the lineage comparison
+    # below genuinely needs the manifest.
     child_match = CONTINUATION_SUFFIX_RE.search(contract["label"])
-    if child_match is None:
-        raise DelegateContractError(
-            [
-                ContractIssue(
-                    "continuation-label-required",
-                    "label",
-                    f"continuation label must end in -rN, got {contract['label']!r}",
-                    "Add an -rN suffix so the continuation is identifiable in run artifacts.",
-                )
-            ]
-        )
+    assert child_match is not None, "validate_contract must reject a continuation label without an -rN suffix"
     child_root = contract["label"][: child_match.start()]
 
     with hold_manifest_lock(run_dir):
@@ -1039,7 +967,6 @@ def command_launch(args: argparse.Namespace) -> int:
         label,
         command,
         cwd=Path(contract["repo_path"]),
-        depends_on=args.depends_on,
         launch_contract=launch_contract,
         continuation=continuation,
     )
@@ -1056,36 +983,11 @@ def iter_selected_delegates(manifest: dict[str, Any], label: str | None) -> list
     return [delegates[label]]
 
 
-def dependency_warnings(manifest: dict[str, Any], entry: dict[str, Any]) -> list[str]:
-    """Return warning strings for invalid or incomplete delegate dependencies."""
-    deps = entry.get("depends_on") or []
-    if not deps:
-        return []
-    ws = manifest.get("delegates", {})
-    warnings_list = []
-    for dep in deps:
-        dep_entry = ws.get(dep)
-        if dep_entry is None:
-            warnings_list.append(
-                f"delegate '{entry['label']}' depends on unknown delegate '{dep}'"
-            )
-            continue
-        dep_state = delegate_status(dep_entry)["state"]
-        if dep_state not in {"completed", "cancelled", "failed"}:
-            warnings_list.append(
-                f"delegate '{entry['label']}' depends on '{dep}' which is {dep_state}"
-            )
-    return warnings_list
-
-
 def command_status(args: argparse.Namespace) -> int:
     run_dir = resolve_run_dir(args.run_dir)
     manifest = load_manifest(run_dir)
     entries = iter_selected_delegates(manifest, args.label)
     statuses = [delegate_status(entry) for entry in entries]
-    for entry in entries:
-        for warn in dependency_warnings(manifest, entry):
-            print(f"WARNING: {warn}", file=sys.stderr)
     if args.json:
         print(json.dumps(statuses, indent=2, sort_keys=True))
         return 0
@@ -1105,9 +1007,6 @@ def command_activity(args: argparse.Namespace) -> int:
     run_dir = resolve_run_dir(args.run_dir)
     manifest = load_manifest(run_dir)
     entries = iter_selected_delegates(manifest, args.label)
-    for entry in entries:
-        for warn in dependency_warnings(manifest, entry):
-            print(f"WARNING: {warn}", file=sys.stderr)
     now = time.time()
     activity_rows: list[dict[str, Any]] = []
 
@@ -1376,7 +1275,6 @@ def command_runner(args: argparse.Namespace) -> int:
             "cwd": str(Path(args.cwd).resolve()),
         },
     )
-    sync_run_index(status_file.parent)
     return returncode
 
 
@@ -1414,12 +1312,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch_parser.add_argument("--policy", required=True, help="PM/Developer delegate-policy.json path.")
     launch_parser.add_argument("--request", required=True, help="Semantic delegate-request.json path.")
-    launch_parser.add_argument(
-        "--depends-on",
-        nargs="*",
-        metavar="LABEL",
-        help="Delegate labels that must complete before this one (stored in manifest; checked by status/activity).",
-    )
     launch_parser.set_defaults(func=command_launch)
 
     status_parser = subparsers.add_parser("status", help="Show delegate status.")

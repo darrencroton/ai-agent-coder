@@ -83,7 +83,7 @@ Default tier runs whenever a matching file is in scope. Opt-in tier needs
 | `ruff-check` | default | Python | `ruff` | Unused imports/variables, undefined names, unsorted imports, and the rest of the pyflakes/pycodestyle/isort/pyupgrade superset |
 | `ruff-format` | default | Python | `ruff` | Formatting drift (Black-compatible) |
 | `markdownlint` | default | Markdown | `markdownlint-cli2` | Malformed tables (**MD056** — wrong cell count, where the extra cell is silently dropped when rendered), heading structure, list and spacing errors |
-| `codespell` | default | any text | `codespell` | Misspellings in identifiers, comments, and prose |
+| `codespell` | default | any text | `codespell` | Misspellings in comments, strings, prose, and whole-word identifiers (snake_case parts inside a longer identifier can be missed) |
 | `shellcheck` | default | Shell (`.sh`, `.bash`) | `shellcheck` | Unquoted expansions that word-split (**SC2086**), misused `test` operators, unreachable code, `$?` read after the wrong command |
 | `clang-format` | default | C/C++ | `clang-format` | Formatting drift; needs a `.clang-format` in the project. One finding per file, not per hunk |
 | `cppcheck` | default | C/C++ | `cppcheck` | Static analysis — null dereference, uninitialised use, portability. No compile database needed |
@@ -156,7 +156,7 @@ lint is not a floor fact, so `--skip markdownlint` is always available.
 Findings are compared by **signature**, not by line:
 
 ```text
-(tool, rule, path, message with digit runs normalized to '#')
+(tool, rule, path, message)
 ```
 
 Counts of identical signatures are compared, so:
@@ -198,7 +198,7 @@ them.
 python3 -m unittest discover -s skills/lint/tests -p 'test_*.py'
 ```
 
-38 tests, no linter binary required — each parser is tested against output
+No linter binary required — each parser is tested against output
 captured from the real tool. The suite pins the bugs found during
 implementation: symlink resolution on both sides of `_rel` (the macOS
 `/var` → `/private/var` case that silently broke every signature match),

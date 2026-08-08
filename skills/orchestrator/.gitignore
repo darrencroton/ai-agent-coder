@@ -3,7 +3,7 @@ __pycache__/
 
 .claude/
 
-# Orchestration artefacts (runs/ and current symlink are transient; index.json may be committed deliberately)
+# Orchestration artefacts (runs/ and the current symlink are transient)
 .orchestrator/
 
 # Session handoff document (ephemeral per session; commit deliberately if needed)

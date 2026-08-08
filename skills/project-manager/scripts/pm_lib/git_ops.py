@@ -124,6 +124,12 @@ def write_git_diff(repo: Path, before_head: str | None, after_head: str | None, 
     """
     if before_head and after_head and before_head != after_head:
         returncode, stdout, stderr = git_result(repo, "diff", "--binary", before_head, after_head)
+    elif after_head and before_head is None:
+        # A run initialized on an unborn branch has no before_head to diff
+        # against; `git show` covers the committed slice exactly as
+        # `changed_files_between` does for the same case, so the evidence
+        # artifact is not silently empty.
+        returncode, stdout, stderr = git_result(repo, "show", "--binary", "--format=", after_head)
     else:
         returncode, stdout, stderr = git_result(repo, "diff", "--binary")
     if returncode == 0:

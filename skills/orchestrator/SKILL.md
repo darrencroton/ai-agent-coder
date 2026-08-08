@@ -12,6 +12,8 @@ A **delegate** is an external harness session the Developer launches to do bound
 - **`read-only`** — an evidence source. It inspects code and artifacts, gathers evidence, verifies plans, performs drift audits, and performs code reviews. It never edits files, runs mutation-prone commands, performs Git or GitHub mutations, commits, or re-delegates.
 - **`read-write`** — a bounded implementer. It may create, edit, and run commands to complete a task, but only inside the request's explicit `authorized_surface` and never past its `non_goals`. Like a read-only delegate, it never performs Git or GitHub mutations, never commits, and never re-delegates: the Developer reviews its diff and commits it, exactly as it would for its own edits.
 
+A read-only delegate is what the other skills in this repository call a **Reviewer**; the two names describe the same read-only, gate-free helper.
+
 The Developer must critically evaluate every delegate result — a read-only delegate's report before trusting it as evidence, and a read-write delegate's diff before accepting it as if it were the Developer's own work. Running `drift-audit` against a read-write delegate's diff is the expected next step, the same as after any other implementation.
 
 Use [scripts/delegate_jobs.py](scripts/delegate_jobs.py) for every delegate launch. Read [references/delegate-contract.md](references/delegate-contract.md) before writing a request. The helper validates schema-v3 semantic requests, embeds required skills, composes the selected harness command, records normalized access evidence, manages process lifecycle, and extracts results.
@@ -49,7 +51,7 @@ Equal eligibility does not imply identical enforcement. Read the selected tool r
 
 | Tool | Read-only boundary | Read-write boundary | Reference |
 |---|---|---|---|
-| Claude Code | Plan-mode restrictions; command execution still requires delegate discipline | `acceptEdits` auto-approves file edits; prompt-enforced beyond that | [references/claude.md](references/claude.md) |
+| Claude Code | Plan-mode restrictions; command execution still requires delegate discipline | `acceptEdits` auto-approves file edits; prompt-enforced beyond that | [references/claude-code.md](references/claude-code.md) |
 | Codex CLI | Read-only sandbox | `workspace-write` sandbox mechanically confines writes to the working directory, `/tmp`, and `$TMPDIR` | [references/codex.md](references/codex.md) |
 | GitHub Copilot CLI | Prompt-enforced read-only behavior | Prompt-enforced; same command as read-only | [references/copilot.md](references/copilot.md) |
 | OpenCode CLI | Plan agent denies edit tools; shell discipline remains prompt-enforced | Build agent grants unrestricted tool permissions; prompt-enforced | [references/opencode.md](references/opencode.md) |

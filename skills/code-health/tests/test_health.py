@@ -157,6 +157,32 @@ class TestScopeAndCoverage(InRepo):
             bundle, _ = self.bundle(repo, "analyze", "--all")
             self.assertEqual(bundle["facts"]["unreadable_files"][0]["path"], "data.json")
 
+    def test_binary_data_asset_is_not_recorded_unreadable(self):
+        # A font, image, or other `data`-classified path is expected to be binary;
+        # failing to decode it as UTF-8 is not a defect worth surfacing alongside
+        # genuinely unreadable source, and it stays absent from totals_by_category
+        # exactly as an unreadable file always has.
+        with Repo() as repo:
+            path = Path(repo.path, "glyph.woff2")
+            path.write_bytes(b"\x00\x01\x02\xff\xfe")
+            repo.write("app.py", "x = 1\n")
+            repo.commit()
+            bundle, _ = self.bundle(repo, "analyze", "--all")
+            self.assertNotIn("glyph.woff2", {row["path"] for row in bundle["facts"]["unreadable_files"]})
+            self.assertNotIn("glyph.woff2", {row["path"] for row in bundle["facts"]["composition"]["files"]})
+
+    def test_binary_data_asset_does_not_shadow_coverage_matrix(self):
+        # composition's unreadable list is disjoint from scan's; the coverage
+        # matrix is derived from scan's list only, so a binary data asset must not
+        # move any coverage cell regardless of how it is disclosed.
+        with Repo() as repo:
+            Path(repo.path, "glyph.woff2").write_bytes(b"\x00\x01\x02\xff\xfe")
+            repo.write("app.py", "x = 1\n")
+            repo.commit()
+            bundle, _ = self.bundle(repo, "analyze", "--all")
+            self.assertTrue(all(row["status"] != "unavailable" for row in bundle["coverage"]
+                                 if row["language"] == "Python"))
+
 
 class TestPythonFacts(unittest.TestCase):
     def test_ast_complexity_and_cycle_are_raw_measured_facts(self):
@@ -758,15 +784,6 @@ class TestLanguageRecognition(unittest.TestCase):
 
 
 class TestCoverageHonesty(InRepo):
-    def test_unrecognised_extension_is_disclosed_in_detect(self):
-        with Repo() as repo:
-            repo.write("model.zzz", "data\n")
-            repo.commit()
-            bundle, _ = self.bundle(repo, "detect")
-            # Grouped by extension with a count: the one field is the whole
-            # disclosure, so a reader has a single place to look.
-            self.assertEqual(bundle["repository"]["unrecognised_extensions"], {".zzz": 1})
-
     def test_unreadable_recognised_language_fails_require_coverage(self):
         with Repo() as repo:
             Path(repo.path, "sim.f90").write_bytes(b"\xff\xfe program\n")
@@ -792,6 +809,8 @@ class TestCoverageHonesty(InRepo):
         """`version.awk` is source we cannot measure, not a document."""
         self.assertEqual(health.category_for("version.awk", None)[0], "other")
         self.assertEqual(health.category_for("readme.json", None)[0], "configuration")
+        # Data and build products are not unmeasured source either.
+        self.assertEqual(health.category_for("img/logo.png", None)[0], "data")
 
     def test_base_unreadable_file_is_disclosed_and_suppresses_fake_deltas(self):
         with Repo() as repo:
@@ -827,7 +846,9 @@ class TestCoverageHonesty(InRepo):
             repo.commit()
             self.assertEqual(self.run_health(repo, "detect", "--require-coverage", "--json"), 0)
             bundle, _ = self.bundle(repo, "detect")
-            self.assertIn(".zzz", bundle["repository"]["unrecognised_extensions"])
+            # Grouped by extension with a count: the one field is the whole
+            # disclosure, so a reader has a single place to look.
+            self.assertEqual(bundle["repository"]["unrecognised_extensions"], {".zzz": 1})
 
     def test_ordinary_config_dotfiles_do_not_fail_coverage(self):
         for name in (".babelrc", ".stylelintrc", ".browserslistrc", ".prettierignore",
@@ -836,10 +857,6 @@ class TestCoverageHonesty(InRepo):
         # Still unmeasured source, not silently reclassified.
         self.assertEqual(health.category_for(".mystery", None)[0], "other")
         self.assertEqual(health.language_for(".bashrc"), "Shell")
-
-    def test_data_assets_are_not_unmeasured_source(self):
-        self.assertEqual(health.category_for("img/logo.png", None)[0], "data")
-        self.assertEqual(health.category_for("model.zzz", None)[0], "other")
 
     def test_base_parse_error_suppresses_phantom_cycles(self):
         with Repo() as repo:
@@ -859,12 +876,15 @@ class TestCoverageHonesty(InRepo):
             repo.write("a.py", "def f(:\n    pass\n")
             base = repo.commit()
             repo.write("a.py", "def f():\n    pass\n")
-            bundle, _ = self.bundle(repo, "analyze", "--base", base)
+            bundle, exit_three = self.bundle(repo, "analyze", "--base", base, "--require-coverage")
             rows = {r["metric_family"]: (r["status"], r["reason"]) for r in bundle["coverage"]}
             self.assertEqual(rows["composition"][0], "covered")
             self.assertEqual(rows["duplication"][0], "covered")
             self.assertEqual(rows["cyclomatic"], ("unavailable", "base source in this language failed to parse"))
             self.assertEqual(rows["dependencies"][0], "unavailable")
+            # The voided AST families are still required coverage for a
+            # language in scope, so the same run fails --require-coverage.
+            self.assertTrue(exit_three)
 
     def test_base_only_failure_invents_no_row_for_an_absent_language(self):
         """A base-only unreadable .rb must not produce Ruby coverage rows, nor
@@ -966,21 +986,6 @@ class TestCoverageHonesty(InRepo):
             os.unlink(os.path.join(repo.path, "gone.zzz"))
             bundle, _ = self.bundle(repo, "analyze", "--base", base)
             self.assertEqual(bundle["repository"]["unrecognised_extensions"], {})
-
-    def test_base_parse_error_fails_require_coverage(self):
-        with Repo() as repo:
-            repo.write("a.py", "import b\n\ndef f(:\n    pass\n")
-            repo.write("b.py", "import a\n")
-            base = repo.commit()
-            repo.write("a.py", "import b\n\ndef f():\n    pass\n")
-            self.assertEqual(self.run_health(repo, "analyze", "--base", base, "--require-coverage", "--json"), 3)
-
-    def test_source_dotfile_is_measured_rather_than_called_configuration(self):
-        self.assertEqual(health.language_for(".bashrc"), "Shell")
-        self.assertEqual(health.category_for(".gitignore", None)[0], "configuration")
-        # An unknown dotfile stays unmeasured source rather than silently
-        # becoming configuration with no coverage row.
-        self.assertEqual(health.category_for(".mystery", None)[0], "other")
 
     def test_base_side_resolution_uses_the_same_inventory_as_the_current_tree(self):
         with Repo() as repo:

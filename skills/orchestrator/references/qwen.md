@@ -7,7 +7,7 @@ Qwen Code is eligible as Developer or delegate, in either access mode. The user,
 Write schema-v3 policy/request JSON as documented in [delegate-contract.md](delegate-contract.md), then use `delegate_jobs.py launch`. The launcher owns Qwen's headless prompt, model flag, approval mode, sandbox, text output, repository working directory, and capture. The tested Qwen Code command has no effort/variant flag, so a non-default effort request fails closed before launch.
 
 ```bash
-qwen --prompt <prompt> [--model <model>] --yolo --sandbox --output-format text
+qwen --prompt <prompt> [--model <model>] --approval-mode yolo --sandbox --output-format text
 ```
 
 The tracked launcher fixes the child working directory to the policy repository; Qwen Code has no separate repository-directory flag. The composed command is identical for both access modes: Qwen Code's CLI exposes no separate write-enabled flag, so what changes between a read-only and a read-write launch is entirely the rendered prompt.
@@ -16,9 +16,11 @@ The tracked launcher fixes the child working directory to the policy repository;
 
 The launcher requests `--sandbox`, which isolates Qwen Code from the host when enabled. A caller-supplied `QWEN_SANDBOX` setting can override that flag, so the evidence profile records sandboxing as requested rather than guaranteed. On macOS, the default Seatbelt profile restricts writes outside the project directory; container providers mount the workspace. Neither mechanism makes the repository itself read-only, and neither confines a read-write delegate to its request's specific `authorized_surface`. The embedded delegate contract therefore remains the authority that forbids edits in read-only mode, and that forbids Git/GitHub mutations, commits, and re-delegation in both modes. This profile is prompt-enforced, not mechanically differentiated between access modes.
 
-Bare `qwen` starts in classifier-gated Auto mode and blocks on an interactive confirmation for any tool call whose classifier is unavailable — a live check against the installed CLI hung on every prompt requiring a file read or write, succeeding only for a no-tool-call prompt. The launcher therefore passes `--yolo` in both access modes. This widens no *authorization*: the delegate contract forbids exactly what it forbade before, and the profile was never mechanically differentiated between modes. It does remove a mechanical approval barrier, which is the point — a headless delegate has nobody to answer one.
+Bare `qwen` starts in classifier-gated Auto mode and blocks on an interactive confirmation for any tool call whose classifier is unavailable — a live check against the installed CLI hung on every prompt requiring a file read or write, succeeding only for a no-tool-call prompt. The launcher therefore passes yolo approval mode in both access modes. This widens no *authorization*: the delegate contract forbids exactly what it forbade before, and the profile was never mechanically differentiated between modes. It does remove a mechanical approval barrier, which is the point — a headless delegate has nobody to answer one.
 
-`--yolo` is conditional on folder trust, and silently so. In a folder Qwen Code does not trust it prints `Approval mode overridden to "default" because the current folder is not trusted.` to stderr and reverts to the gated mode, restoring the hang. Trust the repository in Qwen Code once, as a human, before relying on a Qwen delegate; the stderr line is the signal when a launch stalls anyway.
+The launcher composes it as `--approval-mode yolo`, the form Qwen Code's own documentation names, rather than the equivalent `--yolo`, which upstream now keeps as a hidden alias. Qwen Code does not reject unknown argv strictly, so if the alias were dropped the launch would keep running in the gated mode instead of failing — a silent regression the documented spelling avoids.
+
+Yolo approval mode is conditional on folder trust, and silently so. In a folder Qwen Code does not trust it prints `Approval mode overridden to "default" because the current folder is not trusted.` to stderr and reverts to the gated mode, restoring the hang. Trust the repository in Qwen Code once, as a human, before relying on a Qwen delegate; the stderr line is the signal when a launch stalls anyway.
 
 ## Lifecycle and configuration
 

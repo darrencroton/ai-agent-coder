@@ -303,7 +303,7 @@ class TestLinkedWorktreeIsolation(PmTestCase):
                 branch="linked-branch",
                 harness={"name": "fake", "model": None, "effort": None},
                 reviewer={"tools": [], "model": None, "effort": None},
-                policy={"max_attempts": 3, "commit_required": True},
+                policy={"max_attempts": 3},
                 slices=[
                     {"id": s.slice_id, "title": s.title, "status": None, "risk": s.plan_risk,
                      "plan_risk": s.plan_risk, "commit": None, "attempts": 0}
@@ -473,7 +473,7 @@ class TestRunReportHeader(PlanTestCase):
             "plan": {"path": "/plan.md", "sha256": "a" * 64, "slice_count": 1},
             "harness": {"name": "opencode", "model": "qwen3.6-27b-bf16", "effort": None},
             "reviewer": {"tools": ["codex"], "model": "gpt-5.6-sol", "effort": "high"},
-            "policy": {"max_attempts": 10, "commit_required": True},
+            "policy": {"max_attempts": 10},
             "slices": [], "approvals": {}, "stop_reason": None,
         }
         state.update(overrides)

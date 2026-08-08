@@ -374,21 +374,6 @@ class TestFactCommitAncestry(FloorTestCase):
         )
         self.assertFalse(_facts_by_name(report)["commit-ancestry"].passed)
 
-    def test_commit_required_false_passes_without_any_commit(self) -> None:
-        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        state, token, run_dir = self.make_run(plan_path=plan_path, policy={"max_attempts": 3, "commit_required": False})
-        before_head = self._git("rev-parse", "HEAD").stdout.strip()
-        slices = plan_mod.parse_plan(plan_path)
-        self._write_result()
-        state = self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
-        )
-
-        report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
-        )
-        self.assertTrue(_facts_by_name(report)["commit-ancestry"].passed)
-
 
 class TestFactCleanWorktree(FloorTestCase):
     def test_dirty_file_outside_pm_fails(self) -> None:

@@ -431,7 +431,7 @@ class PmTestCase(PlanTestCase):
             branch=branch,
             harness=harness if harness is not None else {"name": "fake", "model": None, "effort": None},
             reviewer=reviewer if reviewer is not None else {"tools": [], "model": None, "effort": None},
-            policy=policy if policy is not None else {"max_attempts": 3, "commit_required": True},
+            policy=policy if policy is not None else {"max_attempts": 3},
             slices=entries,
             run_id=run_id,
         )

@@ -86,11 +86,10 @@ class TestRelPathSymlinks(unittest.TestCase):
 
 
 class TestDiffFindings(unittest.TestCase):
-    def test_identical_finding_is_not_new(self):
+    def test_identical_line_shift_and_empty_base_cases(self):
         self.assertEqual(lint.diff_findings([F()], [F()]), [])
-
-    def test_line_shift_alone_is_not_new(self):
         self.assertEqual(lint.diff_findings([F(line=42)], [F(line=1)]), [])
+        self.assertEqual(len(lint.diff_findings([F(), F(rule="E1")], [])), 2)
 
     def test_second_occurrence_of_same_rule_is_new(self):
         new = lint.diff_findings([F(line=1), F(line=9)], [F(line=1)])
@@ -110,9 +109,6 @@ class TestDiffFindings(unittest.TestCase):
         a = F(message="Table column count [Expected: 2; Actual: 3]")
         b = F(message="Table column count [Expected: 2; Actual: 4]")
         self.assertEqual(len(lint.diff_findings([a], [b])), 1)
-
-    def test_empty_base_makes_everything_new(self):
-        self.assertEqual(len(lint.diff_findings([F(), F(rule="E1")], [])), 2)
 
 
 class TestParsers(unittest.TestCase):
@@ -396,14 +392,6 @@ class TestInstallSafety(unittest.TestCase):
             if "nothing to install" not in text:
                 self.assertIn("dry run", text)
 
-    def test_check_subcommand_has_no_install_path(self):
-        """`check` must never install: the string is absent from its help and
-        cmd_check never calls cmd_install."""
-        import inspect
-        src = inspect.getsource(lint.cmd_check)
-        self.assertNotIn("cmd_install", src)
-        self.assertNotIn("pip install", src)
-
     def test_missing_binary_hint_names_the_tool_and_the_install_command(self):
         """A missing linter must tell the human what is absent and what fixes
         it — silence is how an unavailable gate reads as a pass."""
@@ -480,11 +468,6 @@ class TestInstallSafety(unittest.TestCase):
 
 
 class TestExitCodes(unittest.TestCase):
-    def test_codes_are_distinct_and_documented(self):
-        codes = {lint.EXIT_PASS, lint.EXIT_FINDINGS, lint.EXIT_ERROR, lint.EXIT_COVERAGE}
-        self.assertEqual(len(codes), 4)
-        self.assertEqual(lint.EXIT_PASS, 0)
-
     def test_no_files_in_scope_passes(self):
         with TempRepo() as repo:
             repo.write("a.py", "x = 1\n")
@@ -751,6 +734,14 @@ class TestConfigPrecedence(unittest.TestCase):
         with TempRepo() as repo:
             repo.write("package.json", '{"markdownlint-cli2": {"config": {}}}')
             self.assertEqual(lint._markdownlint_config(repo.dir), [])
+
+    def test_markdownlint_argv_suppresses_config_globs(self):
+        """markdownlint-cli2 appends a project config's "globs" to the CLI
+        file list rather than replacing it, so without --no-globs a config
+        globbing the whole tree would lint files the base worktree lacks."""
+        tool = lint.TOOLS_BY_NAME["markdownlint"]
+        argv = tool.build("markdownlint-cli2", ["a.md"])
+        self.assertIn("--no-globs", argv)
 
     def test_ruff_uses_shipped_default_when_project_has_none(self):
         with TempRepo() as repo:

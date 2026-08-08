@@ -451,7 +451,14 @@ def _run_finalize(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
 
-    if args.accept:
+    # `is not None`, not truthiness: `--accept ""` is a decision that was
+    # made and typed badly, not an absent one. Under truthiness it fell
+    # through to the bare evidence-only finalize, which prints a floor report
+    # and records nothing — so a PM that believed it had accepted, steered, or
+    # stopped the slice would see a plausible success and no decision. Each
+    # decision path refuses blank text itself, so the empty string now fails
+    # closed with a message naming the flag.
+    if args.accept is not None:
         outcome = slice_ops.finalize_accept(repo, run_dir, token, reasoning=args.accept, risk=args.risk)
         print(f"slice: {outcome.slice_id}")
         if outcome.report:
@@ -463,7 +470,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         print(f"pm: refused: {outcome.message}", file=sys.stderr)
         return 1
 
-    if args.steer:
+    if args.steer is not None:
         outcome = slice_ops.finalize_steer(repo, run_dir, token, correction=args.steer, risk=args.risk)
         if outcome.kind == "steered":
             print(f"steered {outcome.slice_id} (attempt {outcome.attempts})")
@@ -472,7 +479,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         print(f"pm: error: {outcome.message}", file=sys.stderr)
         return 2
 
-    if args.stop:
+    if args.stop is not None:
         outcome = slice_ops.finalize_stop(repo, run_dir, token, reason=args.stop, risk=args.risk)
         print(f"STOPPED {outcome.slice_id}")
         _print_floor_facts(outcome.report)
@@ -540,11 +547,14 @@ def _run_stop(args: argparse.Namespace) -> int:
         try:
             token = _require_token(args)
             run_dir = state_mod.resolve_run_dir(repo, args.run)
-            state = slice_ops.load_writable_state(run_dir, token)
+            # `stop` authenticates and loads state itself and reports the run
+            # id back, so this path reads state once. Unreadable or tampered
+            # state still raises PmError from inside `stop` before anything
+            # is killed, landing in the same state-unavailable sweep below.
             outcome = slice_ops.stop(repo, run_dir, token, reason=args.reason, slice_status=args.slice_status)
-            extra_killed = slice_ops.stop_scavenge_sweep(run_id=state["run_id"])
+            extra_killed = slice_ops.stop_scavenge_sweep(run_id=outcome.run_id)
             all_killed = outcome.killed + [name for name in extra_killed if name not in outcome.killed]
-            print(f"stopped run {state['run_id']}; killed sessions: {all_killed}")
+            print(f"stopped run {outcome.run_id}; killed sessions: {all_killed}")
             return 0
         except PmError as exc:
             killed = slice_ops.stop_scavenge_sweep(run_id=args.run)

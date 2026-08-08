@@ -355,7 +355,7 @@ def init_run(
         "model": reviewer_model,
         "effort": reviewer_effort,
     }
-    policy_block = {"max_attempts": max_attempts if max_attempts is not None else 10, "commit_required": True}
+    policy_block = {"max_attempts": max_attempts if max_attempts is not None else 10}
 
     state, token, run_dir = state_mod.create_run(
         repo,
@@ -501,7 +501,11 @@ class StartSliceOutcome:
 
 
 def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> None:
-    names = ("result.json", "pane.txt", "pane-live.txt")
+    # `validation.md` rotates with the rest: it is Developer-authored evidence
+    # PM assesses the attempt against, so a steer or relaunch that left the
+    # prior attempt's copy in place would present stale evidence as this
+    # attempt's own.
+    names = ("result.json", "pane.txt", "pane-live.txt", "validation.md")
     present = [name for name in names if (artifact_dir / name).exists()]
     if not present:
         return
@@ -692,57 +696,58 @@ def start_slice(
     sessions.start_session(session_name, repo, command, env)
     launch_executable = shlex.split(command)[0] if command.strip() else ""
     # The session is live from here but is not recorded in `current_slice`
-    # until `save_state` below, so anything that raises in between would
-    # otherwise strand a running Developer session that no state names —
+    # until `save_state` succeeds, so anything that raises anywhere in between
+    # would otherwise strand a running Developer session that no state names —
     # invisible to `observe`, `finalize`, and `stop`'s recorded-session path.
     # Readiness and injection both fail closed on a trust prompt, a
-    # credential/approval prompt, or a session that exits early, so this is a
-    # reachable path, not a theoretical one.
+    # credential/approval prompt, or a session that exits early, and the
+    # persistence itself can fail on a full or read-only state dir, so this is
+    # a reachable path, not a theoretical one. The guard therefore spans the
+    # whole window rather than the launch handshake alone.
     try:
         sessions.wait_until_ready(session_name, launch_executable, expected_model_display=expected_model_display)
         sessions.send_prompt(session_name, prompts.render_launch_pointer(prompt_path))
+
+        # `new_current` below discards the outgoing slice's recorded pgids.
+        _reap_reviewers(current if relaunch else None)
+
+        now = state_mod.utc_now_iso()
+        new_current: dict[str, Any] = {
+            "id": plan_slice.slice_id,
+            "artifact_dir": str(artifact_dir),
+            "tmux_session": session_name,
+            "before_head": before_head,
+            "started_at": (current.get("started_at") if relaunch and current and current.get("started_at") else now),
+            "attempts": attempts,
+            "risk": entry.get("risk", plan_slice.plan_risk),
+            "plan_risk": plan_slice.plan_risk,
+            "reviewer_pids": [],
+        }
+        launch_overrides: dict[str, Any] = {key: value for key, value in (("model", model), ("effort", effort)) if value}
+        if reviewer_tools:
+            # review._resolve_tool prefers this per-slice record over the
+            # run-level reviewer configuration.
+            launch_overrides["reviewer_tools"] = list(profiles.parse_reviewer_tools(reviewer_tools))
+        if launch_overrides:
+            new_current["launch"] = launch_overrides
+
+        state["current_slice"] = new_current
+        entry["attempts"] = attempts
+        # A successful launch reactivates a run that a human resumed after a
+        # stop/needs-human pause; tampered state can never reach here (the MAC
+        # check above fails closed before any launch).
+        state["status"] = "active"
+        state_mod.save_state(run_dir, state, token)
     except BaseException:
-        # Best-effort cleanup that must never replace the launch failure it is
-        # cleaning up after: the operator needs the trust prompt or credential
-        # prompt that actually stopped the launch, not whatever tmux said on
-        # the way out.
+        # Best-effort cleanup that must never replace the failure it is
+        # cleaning up after: the operator needs the trust prompt, credential
+        # prompt, or write error that actually stopped the launch, not
+        # whatever tmux said on the way out.
         try:
             sessions.force_stop(session_name)
         except BaseException:
             pass
         raise
-
-    # `new_current` below discards the outgoing slice's recorded pgids.
-    _reap_reviewers(current if relaunch else None)
-
-    now = state_mod.utc_now_iso()
-    new_current: dict[str, Any] = {
-        "id": plan_slice.slice_id,
-        "artifact_dir": str(artifact_dir),
-        "tmux_session": session_name,
-        "before_head": before_head,
-        "started_at": (current.get("started_at") if relaunch and current and current.get("started_at") else now),
-        "attempts": attempts,
-        "risk": entry.get("risk", plan_slice.plan_risk),
-        "plan_risk": plan_slice.plan_risk,
-        "wake_at": None,
-        "reviewer_pids": [],
-    }
-    launch_overrides: dict[str, Any] = {key: value for key, value in (("model", model), ("effort", effort)) if value}
-    if reviewer_tools:
-        # review._resolve_tool prefers this per-slice record over the
-        # run-level reviewer configuration.
-        launch_overrides["reviewer_tools"] = list(profiles.parse_reviewer_tools(reviewer_tools))
-    if launch_overrides:
-        new_current["launch"] = launch_overrides
-
-    state["current_slice"] = new_current
-    entry["attempts"] = attempts
-    # A successful launch reactivates a run that a human resumed after a
-    # stop/needs-human pause; tampered state can never reach here (the MAC
-    # check above fails closed before any launch).
-    state["status"] = "active"
-    state_mod.save_state(run_dir, state, token)
     note = f"attempt {attempts}"
     if reaped:
         note += f"; reaped stale sessions: {', '.join(reaped)}"
@@ -1211,6 +1216,12 @@ class SteerOutcome:
 def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, risk: str | None = None) -> SteerOutcome:
     """`finalize --steer "correction"`: a corrective nudge into the LIVE
     session, counted against the same attempt budget as a relaunch."""
+    # Checked before any state is touched, exactly as `finalize_accept`
+    # checks its minimum: a blank correction spends an attempt to type
+    # nothing into the Developer's session, which is worse than refusing.
+    if not correction.strip():
+        raise PmError("--steer correction must be non-empty (there is nothing to deliver)")
+
     state = load_writable_state(run_dir, token)
     _refuse_if_budget_exhausted(state)
     current = state.get("current_slice")
@@ -1324,6 +1335,13 @@ class StopDecisionOutcome:
 def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: str | None = None) -> StopDecisionOutcome:
     """`finalize --stop "reason"`: records exactly what happened, floor
     passing or not — that is the point of a stop record."""
+    # A stop is an accountability record like an acceptance, so a blank
+    # reason is refused rather than written into the assessment as an empty
+    # decision line. No minimum length: the honest reason for some stops
+    # really is short ("floor fact 5 failed").
+    if not reason.strip():
+        raise PmError("--stop reason must be non-empty (the stop record is the accountability record)")
+
     state = load_writable_state(run_dir, token)
     current = state.get("current_slice")
     if not current:
