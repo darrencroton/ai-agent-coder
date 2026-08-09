@@ -10,6 +10,7 @@ Background, motivation, and design principles: [`docs/VISION.md`](docs/VISION.md
 
 - **Atomic skills** — nothing beyond the Markdown files.
 - **`lint`** — whichever linters your repository needs. `skills/lint/scripts/lint.py detect` reports what is missing and prints install commands; it never installs anything.
+- **`code-health`** — Python 3.13+ and `git` only; Lizard is an optional multi-language complexity collector that `skills/code-health/scripts/health.py detect` reports as present or missing and never installs.
 - **Mode B (Project Manager)** — Python 3.13+, `git`, `tmux`, and at least one supported coding CLI on the machine running PM.
 
 ## Installation
