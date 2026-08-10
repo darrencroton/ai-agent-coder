@@ -43,6 +43,7 @@ Every review must do all of the following:
 - Prefer `git diff`, `git show`, or a user-supplied patch.
 - If there is no usable git context, review the supplied files directly and say so.
 - Identify high-risk files first: core algorithms, public APIs, memory management, concurrency, I/O, configs, tests, and build files.
+- Never browse `.pm/`, `.orchestrator/`, `archive/` (bookkeeping/log/archive, not content) — reading a specific path already named there is fine.
 
 ### 2. Confirm authorization status
 - If a `drift-audit` result is supplied, summarize its verdict and proceed to quality review.

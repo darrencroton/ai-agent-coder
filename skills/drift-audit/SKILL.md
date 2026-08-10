@@ -22,6 +22,8 @@ Identify or reconstruct these inputs before auditing:
 
 If no frozen contract exists, stop after drafting a candidate contract from the user request and mark the audit `BLOCKED: no frozen contract`. Do not pretend an inferred contract has the same authority as an approved one.
 
+Never browse `.pm/`, `.orchestrator/`, `archive/` (bookkeeping/log/archive, not content) — reading a specific path already named there is fine.
+
 ## Workflow
 
 1. Read the frozen contract and list the authorized surface.

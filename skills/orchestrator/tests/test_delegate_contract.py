@@ -577,6 +577,7 @@ class DelegateContractTests(unittest.TestCase):
                 self.assertIn("Do not run tests or commands that may write", prompt)
                 self.assertIn("Do not perform Git, GitHub, commit, branch, staging, push", prompt)
                 self.assertIn("Do not invoke orchestrator, re-delegate", prompt)
+                self.assertIn(delegate_contract.SCOPE_SKIP_NOTE, prompt)
 
     def test_prompt_read_write_includes_authorized_surface_and_forbids_git_mutations(self):
         prompt = delegate_contract.render_delegate_prompt(self.validate_write())
@@ -588,6 +589,7 @@ class DelegateContractTests(unittest.TestCase):
         self.assertIn("Do not perform Git, GitHub, commit, branch, staging, push", prompt)
         self.assertIn("Do not invoke orchestrator", prompt)
         self.assertIn("only inside the authorized surface", prompt)
+        self.assertIn(delegate_contract.SCOPE_SKIP_NOTE, prompt)
 
     def test_contract_mismatch_returns_actionable_corrections(self):
         self.request["slice_id"] = "Slice 2"

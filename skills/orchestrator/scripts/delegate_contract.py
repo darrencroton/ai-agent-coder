@@ -43,6 +43,12 @@ SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 NEVER_DELEGATE_SKILLS = {"commit", "orchestrator", "scoped-implementation", "project-manager"}
 # Edit-oriented; fine for a read-write delegate, never for a read-only one.
 WRITE_ONLY_SKILLS = {"code-simplifier"}
+# Bookkeeping/log/archive directories, not review content.
+SCOPE_SKIP_DIRS = (".pm/", ".orchestrator/", "archive/")
+SCOPE_SKIP_NOTE = (
+    f"Never browse {', '.join(SCOPE_SKIP_DIRS)} (bookkeeping/log/archive, not content) "
+    "— reading a specific path already named there is fine."
+)
 
 # Factual command-mechanics and enforcement notes only; not a suitability or
 # capability ranking. `read_write_enforcement` describes whether the harness
@@ -646,6 +652,7 @@ def render_delegate_prompt(contract: dict[str, Any]) -> str:
             "surface below; no Git/GitHub mutations, no commits, no orchestrator invocation, no re-delegation."
         )
         constraints = [
+            SCOPE_SKIP_NOTE,
             "You may create, edit, and run commands needed to implement the task, but only inside the authorized surface below.",
             "Do not create, edit, delete, move, or format any file outside the authorized surface.",
             "Do not perform Git, GitHub, commit, branch, staging, push, or other repository-history operations. The calling session reviews your diff and commits it.",
@@ -687,6 +694,7 @@ RETURN:
         return prompt
 
     constraints = [
+        SCOPE_SKIP_NOTE,
         (
             "Read-only access is intrinsic to this mode: you may read files and run commands that do not modify "
             "the workspace; you must not create, edit, delete, move, or format files."
