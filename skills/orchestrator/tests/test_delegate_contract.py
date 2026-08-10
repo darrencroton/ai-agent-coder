@@ -1345,6 +1345,142 @@ class DelegateContractTests(unittest.TestCase):
             # helper's exit code instead of the gate.
             self.assertEqual(delegate_jobs.command_wait(args), 1)
 
+    def _contract_entry(self, label: str, *, expected_output: str, out_text: str, err_text: str = "") -> dict:
+        status_file = self.run_dir / f"{label}-status.json"
+        outfile = self.run_dir / f"{label}-out.txt"
+        errfile = self.run_dir / f"{label}-err.txt"
+        request_path = self.run_dir / f"{label}-request.json"
+        delegate_jobs.write_json(status_file, {"label": label, "state": "completed", "returncode": 0})
+        outfile.write_text(out_text)
+        errfile.write_text(err_text)
+        delegate_jobs.write_json(request_path, dict(self.request, label=label, expected_output=expected_output))
+        return {
+            "label": label,
+            "pid": 999999,
+            "tool": "opencode",
+            "status_file": str(status_file),
+            "outfile": str(outfile),
+            "errfile": str(errfile),
+            "started_at": "2026-08-10T00:00:00Z",
+            "command": ["opencode"],
+            "launch_contract": {"request_artifact": str(request_path)},
+        }
+
+    def test_delegate_status_downgrades_completed_to_incomplete_when_contract_unmet(self):
+        entry = self._contract_entry(
+            "01-opencode-review",
+            expected_output="SECTION: VERDICT\n<pass|fail>",
+            out_text="Investigating the repository...\n",
+        )
+        with mock.patch.object(delegate_jobs, "process_running", return_value=False):
+            status = delegate_jobs.delegate_status(entry)
+        self.assertEqual(status["state"], "incomplete")
+        self.assertFalse(status["contract_met"])
+
+    def test_delegate_status_stays_completed_when_contract_satisfied(self):
+        entry = self._contract_entry(
+            "02-opencode-review",
+            expected_output="SECTION: VERDICT\n<pass|fail>",
+            out_text="SECTION: VERDICT\npass\n",
+        )
+        with mock.patch.object(delegate_jobs, "process_running", return_value=False):
+            status = delegate_jobs.delegate_status(entry)
+        self.assertEqual(status["state"], "completed")
+        self.assertTrue(status["contract_met"])
+
+    def test_delegate_status_contract_met_is_none_without_declared_section_contract(self):
+        entry = self._contract_entry(
+            "03-opencode-review",
+            expected_output="RESULT: pass or RESULT: blocked.",
+            out_text="No SECTION markers here, just prose.\n",
+        )
+        with mock.patch.object(delegate_jobs, "process_running", return_value=False):
+            status = delegate_jobs.delegate_status(entry)
+        self.assertEqual(status["state"], "completed")
+        self.assertIsNone(status["contract_met"])
+
+    def test_delegate_status_survives_unreadable_and_malformed_request_artifacts(self):
+        cases = (
+            {"launch_contract": {"request_artifact": str(self.run_dir / "missing-request.json")}},
+            {"launch_contract": {"request_artifact": str(self.run_dir)}},  # a directory, not a file
+            {"launch_contract": "01-opencode-request.json"},  # wrongly-shaped launch_contract
+            {"launch_contract": {"request_artifact": {}}},  # request_artifact not path-like
+        )
+        malformed_json_path = self.run_dir / "malformed-request.json"
+        malformed_json_path.write_text("{not valid json")
+        cases = cases + ({"launch_contract": {"request_artifact": str(malformed_json_path)}},)
+        for launch_contract in cases:
+            with self.subTest(launch_contract=launch_contract):
+                label = "07-opencode-review"
+                status_file = self.run_dir / f"{label}-status.json"
+                outfile = self.run_dir / f"{label}-out.txt"
+                errfile = self.run_dir / f"{label}-err.txt"
+                delegate_jobs.write_json(status_file, {"label": label, "state": "completed", "returncode": 0})
+                outfile.write_text("Investigating the repository...\n")
+                errfile.write_text("")
+                entry = {
+                    "label": label,
+                    "pid": 999999,
+                    "tool": "opencode",
+                    "status_file": str(status_file),
+                    "outfile": str(outfile),
+                    "errfile": str(errfile),
+                    "started_at": "2026-08-10T00:00:00Z",
+                    "command": ["opencode"],
+                    **launch_contract,
+                }
+                with mock.patch.object(delegate_jobs, "process_running", return_value=False):
+                    status = delegate_jobs.delegate_status(entry)
+                self.assertEqual(status["state"], "completed")
+                self.assertIsNone(status["contract_met"])
+
+    def test_command_wait_fails_on_incomplete_state(self):
+        entry = self._contract_entry(
+            "04-opencode-review",
+            expected_output="SECTION: VERDICT\n<pass|fail>",
+            out_text="Investigating the repository...\n",
+        )
+        manifest = delegate_jobs.ensure_manifest(self.run_dir)
+        manifest["delegates"][entry["label"]] = entry
+        delegate_jobs.save_manifest(self.run_dir, manifest)
+        args = mock.Mock(run_dir=str(self.run_dir), label=None, timeout=None, interval=0, json=False)
+        with mock.patch.object(delegate_jobs, "process_running", return_value=False), contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            self.assertEqual(delegate_jobs.command_wait(args), 1)
+
+    def test_extract_best_result_falls_through_to_errfile_when_contract_unmet(self):
+        entry = self._contract_entry(
+            "05-opencode-review",
+            expected_output="SECTION: VERDICT\n<pass|fail>",
+            out_text="Investigating the repository...\n",
+            err_text="SECTION: VERDICT\nfail\n",
+        )
+        result = delegate_jobs.extract_best_result(entry)
+        self.assertEqual(result["source"], "errfile_sections")
+        self.assertIn("SECTION: VERDICT", result["text"])
+
+    def test_continuation_accepts_incomplete_terminal_parent(self):
+        entry = self._contract_entry(
+            "06-opencode-review",
+            expected_output="SECTION: VERDICT\n<pass|fail>",
+            out_text="Investigating the repository...\n",
+        )
+        entry["session_id"] = "12345678-1234-1234-1234-123456789abc"
+        manifest = delegate_jobs.ensure_manifest(self.run_dir)
+        manifest["delegates"][entry["label"]] = entry
+        delegate_jobs.save_manifest(self.run_dir, manifest)
+        request = dict(self.request, label=f"{entry['label']}-r1", parent_label=entry["label"])
+        with mock.patch.object(delegate_jobs, "process_running", return_value=False):
+            # Prove the parent actually derives to "incomplete" before relying on
+            # it: otherwise reverting the terminal-set change alongside the
+            # state-derivation change would leave the parent "completed" and
+            # this test would pass without exercising the terminal-set fix.
+            self.assertEqual(delegate_jobs.delegate_status(entry)["state"], "incomplete")
+            contract = delegate_contract.validate_contract(self.policy, request, self.run_dir)
+            continuation = delegate_jobs.resolve_continuation_parent(self.run_dir, contract)
+        self.assertEqual(continuation["parent_label"], entry["label"])
+
     def test_force_cancel_does_not_signal_reused_child_pid(self):
         status_file = self.run_dir / "01-opencode-check-status.json"
         status_file.write_text(

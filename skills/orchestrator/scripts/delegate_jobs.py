@@ -382,6 +382,12 @@ def delegate_status(entry: dict[str, Any]) -> dict[str, Any]:
         state = "failed"
     else:
         state = status_state or "finished"
+    contract_met = None
+    if state == "completed":
+        contract_met = output_contract_met(primary_output_text(entry), entry)
+        if contract_met is False:
+            # A clean exit doesn't mean the declared output contract was met.
+            state = "incomplete"
     return {
         "label": entry["label"],
         "pid": pid,
@@ -400,6 +406,7 @@ def delegate_status(entry: dict[str, Any]) -> dict[str, Any]:
         "command": entry.get("command", []),
         "session_id": entry.get("session_id"),
         "session_path": entry.get("session_path"),
+        "contract_met": contract_met,
     }
 
 
@@ -411,6 +418,37 @@ def find_section_blocks(text: str) -> list[tuple[str, int, int]]:
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
         blocks.append((normalize_section_name(match.group(1)), start, end))
     return blocks
+
+
+def primary_output_text(entry: dict[str, Any]) -> str:
+    """The cheap, non-session text a completed delegate's output would live in."""
+    outfile = Path(entry["outfile"])
+    if outfile.exists():
+        text = outfile.read_text()
+        if text.strip():
+            return text
+    errfile = Path(entry["errfile"])
+    if errfile.exists():
+        return errfile.read_text()
+    return ""
+
+
+def output_contract_met(text: str, entry: dict[str, Any]) -> bool | None:
+    """True/False when the request declares a SECTION-based output contract; None when it declares none or can't be read."""
+    launch_contract = entry.get("launch_contract")
+    request_path = launch_contract.get("request_artifact") if isinstance(launch_contract, dict) else None
+    if not request_path:
+        return None
+    try:
+        path = Path(request_path)
+        request = read_json(path) if path.exists() else None
+    except (OSError, ValueError, TypeError):
+        request = None
+    if not isinstance(request, dict):
+        return None
+    if "SECTION:" not in (request.get("expected_output") or ""):
+        return None
+    return bool(find_section_blocks(text))
 
 
 def extract_sections(text: str, names: list[str]) -> str:
@@ -449,7 +487,9 @@ def extract_best_result(entry: dict[str, Any]) -> dict[str, str]:
     outfile = Path(entry["outfile"])
     if outfile.exists() and outfile.stat().st_size > 0:
         out_text = outfile.read_text()
-        if out_text.strip():
+        # Non-empty stdout that violates a declared contract falls through
+        # to the session/errfile fallbacks below instead of short-circuiting here.
+        if out_text.strip() and output_contract_met(out_text, entry) is not False:
             if entry.get("tool") == "codex" and status_payload.get("returncode") == 0 and looks_like_codex_exec_transcript(out_text):
                 session_path = resolve_session_path(entry)
                 if session_path is not None:
@@ -829,7 +869,7 @@ def resolve_continuation_parent(run_dir: Path, contract: dict[str, Any]) -> dict
                     )
                 ]
             ) from exc
-        if parent_state not in {"completed", "cancelled", "failed"}:
+        if parent_state not in {"completed", "cancelled", "failed", "incomplete"}:
             raise DelegateContractError(
                 [
                     ContractIssue(
@@ -1086,10 +1126,12 @@ def command_wait(args: argparse.Namespace) -> int:
             # wrapper that died before writing any status file has
             # returncode=None too (see delegate_status) - catch that via the
             # "failed" state so wait doesn't exit 0 for a dead-on-arrival job.
+            # "incomplete" is a clean exit (returncode=0) whose output never
+            # satisfied its declared SECTION: contract - also not a success.
             failed = [
                 status
                 for status in statuses
-                if status["returncode"] not in (None, 0) or status["state"] == "failed"
+                if status["returncode"] not in (None, 0) or status["state"] in {"failed", "incomplete"}
             ]
             if args.json:
                 print(json.dumps(statuses, indent=2, sort_keys=True))
