@@ -67,8 +67,9 @@ _LITERAL_MARKERS: dict[str, tuple[str, ...]] = {
         "MFA",
         "two-factor",
     ),
+    # Prompt-shaped phrases only: an outcome like "Permission denied" is not a
+    # prompt and fires on a slice's own test evidence.
     "permission_prompt": (
-        "Permission denied",
         "Grant permission",
         "requires permission",
         "allow access",

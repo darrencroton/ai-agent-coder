@@ -80,7 +80,7 @@ class TestScanHardStopPositiveFixtures(unittest.TestCase):
         self.assertIn("credential_prompt", result["kinds"])
 
     def test_permission_prompt(self) -> None:
-        result = sessions.scan_hard_stop("Permission denied")
+        result = sessions.scan_hard_stop("Grant permission to read this file?")
         self.assertTrue(result["present"])
         self.assertIn("permission_prompt", result["kinds"])
 
@@ -133,6 +133,20 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
         result = sessions.scan_hard_stop("PM_TMPDIR=/tmp/tmpq8mfa2z1/fake.sh")
         self.assertFalse(result["present"])
         self.assertEqual(result["kinds"], [])
+
+    def test_permission_denied_outcome_is_not_a_prompt(self) -> None:
+        """An operation that already failed is not a prompt waiting on a human.
+        A slice whose own test asserts an unwritable directory puts this phrase
+        in the pane, and a false hard stop there fails floor fact 8 with no
+        route back: the pane is scrollback the PM must not clear."""
+        for text in (
+            "bash: /etc/shadow: Permission denied",
+            "'... is not writable: could not create a probe file there: Permission denied'",
+        ):
+            with self.subTest(text=text):
+                result = sessions.scan_hard_stop(text)
+                self.assertFalse(result["present"])
+                self.assertEqual(result["kinds"], [])
 
     def test_empty_text_is_not_stopping(self) -> None:
         result = sessions.scan_hard_stop("")
