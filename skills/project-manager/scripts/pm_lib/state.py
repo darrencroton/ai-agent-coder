@@ -25,6 +25,7 @@ from typing import Any, Iterable, Iterator
 
 from . import IntegrityError, PmError
 from .git_ops import worktree_git_dir
+from .plan import format_grant
 
 SCHEMA = "lite-1"
 RUN_STATUSES = {"active", "needs-human", "complete", "stopped"}
@@ -160,6 +161,19 @@ def _validate_shape(state: dict[str, Any]) -> None:
             value = entry.get(field)
             if value is not None and value not in RISK_LEVELS:
                 raise PmError(f"run state slice {entry.get('id')!r} has an invalid {field}: {value!r}")
+        # `"grants" in entry` (not `entry.get("grants") is not None`): a JSON
+        # `null` passes the latter unnoticed, and `grant`'s own
+        # `entry.setdefault("grants", [])` then finds the key already present
+        # (as None) and returns it unchanged — an authorization field must
+        # fail closed here, not surface as an AttributeError on `.append`.
+        if "grants" in entry and not isinstance(entry["grants"], list):
+            raise PmError(f"run state slice {entry.get('id')!r} has a non-list 'grants' field")
+        for grant in entry.get("grants") or []:
+            if not isinstance(grant, dict) or not str(grant.get("path") or "").strip():
+                raise PmError(
+                    f"run state slice {entry.get('id')!r} has a surface grant without a path; "
+                    "grants authorize writes, so a malformed one fails closed"
+                )
 
 
 def create_run(
@@ -589,6 +603,16 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
         for slice_id, record in approvals.items():
             lines.append(f"- {slice_id}: {record.get('reason')} (at {record.get('at')})")
     else:
+        lines.append("(none)")
+    lines.append("")
+
+    lines.append("## Surface Grants")
+    any_grant = False
+    for entry in slices:
+        for grant in entry.get("grants") or []:
+            any_grant = True
+            lines.append(f"- {entry.get('id')}: {format_grant(grant)}")
+    if not any_grant:
         lines.append("(none)")
     lines.append("")
 

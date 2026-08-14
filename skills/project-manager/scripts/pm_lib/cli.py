@@ -81,6 +81,28 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--run")
     approve.add_argument("--token")
 
+    grant = subparsers.add_parser(
+        "grant",
+        help="Extend the effective authorized surface for the in-flight slice by one exact file path, "
+        "on recorded evidence (ratchets the slice to elevated and stales its recorded reviews)",
+    )
+    grant.add_argument("--slice", required=True)
+    grant.add_argument(
+        "--path",
+        required=True,
+        help="one exact repository-relative file path. A directory, trailing-slash subtree, or glob is "
+        "refused: write envelopes belong in the plan, where check-plan lints them and a human approved "
+        "them. Dependency manifests, lockfiles and licenses are refused outright",
+    )
+    grant.add_argument(
+        "--evidence",
+        required=True,
+        help="the repository evidence that makes this path necessary to satisfy the slice's "
+        "existing contract; >= 40 characters",
+    )
+    grant.add_argument("--run")
+    grant.add_argument("--token")
+
     start_slice = subparsers.add_parser("start-slice", help="Run the next eligible slice")
     start_slice.add_argument("--model")
     start_slice.add_argument("--effort")
@@ -343,6 +365,28 @@ def _run_approve(args: argparse.Namespace) -> int:
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     slice_ops.approve(repo, run_dir, token, slice_id=args.slice, reason=args.reason)
     print(f"approved {args.slice}: {args.reason}")
+    return 0
+
+
+# --- grant --------------------------------------------------------------------
+
+
+def _run_grant(args: argparse.Namespace) -> int:
+    token = _require_token(args)
+    repo = _repo_from_cwd()
+    run_dir = state_mod.resolve_run_dir(repo, args.run)
+    outcome = slice_ops.grant(repo, run_dir, token, slice_id=args.slice, path=args.path, evidence=args.evidence)
+    print(f"granted {outcome.slice_id}: {outcome.path}")
+    print(f"evidence recorded; grants on this slice: {outcome.grant_count}")
+    if outcome.elevated:
+        print("risk: elevated (raised by this grant)")
+    # Said plainly because the staling is the part a PM can act on wrongly: any
+    # review it already commissioned for this slice no longer counts, and
+    # `finalize --accept` will refuse until both are re-run past the last grant.
+    print(
+        "acceptance now requires a fresh drift-audit and code-review; any review already recorded for "
+        "this slice is stale — re-commission both after your last grant for this slice"
+    )
     return 0
 
 
@@ -610,6 +654,7 @@ _HANDLERS = {
     "init": _run_init,
     "status": _run_status,
     "approve": _run_approve,
+    "grant": _run_grant,
     "start-slice": _run_start_slice,
     "observe": _run_observe,
     "send": _run_send,

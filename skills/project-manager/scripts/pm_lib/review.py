@@ -151,22 +151,23 @@ def _resolve_tool(state: dict[str, Any], tool_arg: str | None, *, has_override: 
 
 
 def _fresh_drift_audit_report(
-    repo: Path, run_dir: Path, run_id: str, entry: dict[str, Any] | None, head: str
+    repo: Path, run_dir: Path, run_id: str, entry: dict[str, Any] | None, head: str, grant_count: int
 ) -> str | None:
     """A reviewer-readable path to a drift-audit report already recorded fresh
     against `head`, or None.
 
     Freshness reuses `slice_ops.is_review_fresh` — the same rule that decides
     whether an elevated slice's mandatory reviews still hold — so a report
-    superseded by a later tree change is never presented as current. The
-    reviewer is pointed at the `.pm/` mirror, which sits inside the repository
-    it is scoped to read, but only after re-copying the hash-verified original
-    over it: freshness authenticates the controller original, so handing over a
-    mirror that was not just written from it would let anything with write
-    access to the gitignored mirror substitute a different report.
+    superseded by a later tree change, or by a grant recorded after it was
+    commissioned, is never presented as current. The reviewer is pointed at the `.pm/`
+    mirror, which sits inside the repository it is scoped to read, but only
+    after re-copying the hash-verified original over it: freshness
+    authenticates the controller original, so handing over a mirror that was
+    not just written from it would let anything with write access to the
+    gitignored mirror substitute a different report.
     """
     for review in reversed((entry or {}).get("reviews") or []):
-        if review.get("skill") != "drift-audit" or not slice_ops.is_review_fresh(review, head):
+        if review.get("skill") != "drift-audit" or not slice_ops.is_review_fresh(review, head, grant_count):
             continue
         original = Path(str(review.get("artifact")))
         try:
@@ -356,13 +357,23 @@ def run_review(
     resolved_model = model or reviewer_block.get("model")
     resolved_effort = effort or reviewer_block.get("effort")
 
+    # Read once, so the grants rendered into the prompt and the count recorded
+    # with the finished review are provably the same set. That count is what
+    # `slice_ops.is_review_fresh` compares against the slice's current grants:
+    # a review is only fresh while its own prompt showed every grant that
+    # exists, which is a property of COMMISSION time, not of when the reviewer
+    # happened to finish.
+    commissioned_grants = plan_mod.slice_grants(state, slice_id)
+
     prompt_text = prompts.render_reviewer_prompt(
         # Never handed to a drift audit itself: a second audit of the same
         # commit must stay independent of the first one's verdict.
         drift_audit_report=None if skill == "drift-audit" else _fresh_drift_audit_report(
-            repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head
+            repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head,
+            len(commissioned_grants),
         ),
         pm_adjudications=pm_adjudications,
+        pm_surface_grants=commissioned_grants,
         skill_name=skill,
         repo=str(repo),
         slice_id=slice_id,
@@ -500,6 +511,11 @@ def run_review(
                     "artifact": str(report_original),
                     "sha256": sha256,
                     "at": state_mod.utc_now_iso(),
+                    # How many surface grants this reviewer's prompt showed.
+                    # `is_review_fresh` stales the review as soon as the slice
+                    # carries a different number, so a grant landing mid-review
+                    # cannot be papered over by a later completion stamp.
+                    "grants_seen": len(commissioned_grants),
                 },
             ]
     state_mod.append_event(

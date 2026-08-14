@@ -2,6 +2,8 @@
 
 PM renders this template for each slice launch and delivers it to a fresh Developer session. It is the session's complete authorization: the Developer may not expand the slice, and PM assesses the result from repository evidence, not from the session's narration.
 
+`prompt.md` is rendered only at launch. A grant recorded mid-slice does not rewrite the file already on disk, so a session that received the grant only through a steer still has a `prompt.md` whose "PM-granted additions" reads `none` — a relaunch (`start-slice` again) is what re-renders the file with the grant included, which is why *Surface grants* in `SKILL.md` calls relaunch the preferred way to deliver new authority.
+
 > Editing note: PM renders the block below with Python `str.format`. The only
 > braces in it may be the `{placeholder}` fields consumed by
 > `prompts.render_developer_prompt`. Any other literal `{` or `}` (a JSON
@@ -24,8 +26,10 @@ Frozen contract (this is your complete authorization):
 {intended_change}
 - Acceptance criteria:
 {acceptance_criteria}
-- Authorized surface (only these files may change):
+- Authorized surface (only the files listed here and under "PM-granted additions" below may change):
 {authorized_surface}
+- PM-granted additions (paths PM authorized mid-run on recorded repository evidence; `none` if there are none):
+{granted_surface}
 - Explicit non-goals:
 {explicit_non_goals}
 - Risk flags:
@@ -50,7 +54,7 @@ Workflow:
    Use status "blocked" with the reason in "summary" when you must stop instead.
 
 Hard rules:
-- Change no file outside the authorized surface. If the work genuinely requires one, stop and report blocked — never touch it.
+- Change no file outside the authorized surface or the PM-granted additions above. If the work genuinely requires one, stop and report blocked — never touch it. Say which path you need and quote the repository evidence that makes it necessary to satisfy this slice's existing acceptance criteria; PM may then grant it, or stop the run for a human. That decision is PM's, never yours, and a grant is never something to assume in advance.
 - Do not push, open a PR, release, deploy, publish, install or change dependencies, change licenses, enter credentials, or perform destructive or external actions. Nothing in this run authorizes them.
 - Do not read or modify Project Manager's run state (`run.json`, the event log, status files) or any other slice's artifacts. The files this prompt points you to are the exception — read your slice contract and the run notes at the paths named above — and write only your code changes, `validation.md`, and `{result_path}`.
 - Do not weaken or delete failing tests to get a pass; a real failure you cannot fix inside the surface is a blocked report, not a workaround.
@@ -74,5 +78,5 @@ Read your complete frozen slice contract at {prompt_path} now, in full, before d
 PM renders this one-line pointer into your live session to deliver a corrective nudge; the correction itself is written verbatim to `steer-attempt-<n>.md` in the slice artifact directory and you read it from there — a correction can be long and multi-line, so it goes in a file for exactly the reason the launch contract does. The rendered block must stay a single line — `send_line` refuses a newline — and the only brace in it is the `{correction_path}` field.
 
 ```md
-PM correction — read it at {correction_path} now, in full, before doing anything else. It stays inside your frozen slice contract: it never expands your authorized surface, adds scope, or grants new authority.
+PM correction — read it at {correction_path} now, in full, before doing anything else. It stays inside your frozen slice contract: a steer never expands your authorized surface, adds scope, or grants new authority. Only a PM grant recorded in run state can add a path, and the correction names it when one applies.
 ```

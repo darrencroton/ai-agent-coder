@@ -200,6 +200,36 @@ class TestTamperDetection(PmTestCase):
         (run_dir / "run.json").write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+class TestGrantsShapeValidation(PmTestCase):
+    """`_validate_shape` fails closed on malformed surface grants: PM reads
+    grants to decide authorization, so a malformed one must refuse to load
+    rather than silently authorize (or silently deny) on bad data."""
+
+    def test_non_list_grants_field_rejected(self) -> None:
+        plan_path = self.write_plan()
+        _state, _token, run_dir = self.make_run(plan_path=plan_path)
+        raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        raw["slices"][0]["grants"] = "not-a-list"
+        (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaises(PmError) as ctx:
+            state_mod.load_state(run_dir)
+        self.assertIn("non-list", str(ctx.exception))
+
+    def test_grant_without_path_rejected_and_absent_grants_key_stays_valid(self) -> None:
+        plan_path = self.write_plan()
+        _state, token, run_dir = self.make_run(plan_path=plan_path)
+        # No slice carries a "grants" key yet — absence must stay valid.
+        loaded = state_mod.load_state(run_dir, token)
+        self.assertNotIn("grants", loaded["slices"][0])
+
+        raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        raw["slices"][0]["grants"] = [{"evidence": "no path recorded here"}]
+        (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaises(PmError) as ctx:
+            state_mod.load_state(run_dir)
+        self.assertIn("without a path", str(ctx.exception))
+
+
 class TestEventsAndReadback(PmTestCase):
     def test_append_event_does_not_rewrite_run_json(self) -> None:
         plan_path = self.write_plan()
@@ -549,6 +579,33 @@ class TestRunReportHeader(PlanTestCase):
         state a budget no command would apply."""
         text = self._header(policy={})
         self.assertIn("- Attempt budget: 10 per slice", text)
+
+
+class TestRunReportSurfaceGrants(PlanTestCase):
+    def _report(self, slices: list[dict]) -> str:
+        state = {
+            "run_id": "r", "repo": "/repo", "branch": "b", "status": "active",
+            "plan": {"path": "/plan.md", "sha256": "a" * 64}, "harness": {},
+            "reviewer": {}, "policy": {}, "slices": slices, "approvals": {},
+            "stop_reason": None,
+        }
+        return state_mod.render_run_report(state, [], Path(self.repo))
+
+    def test_surface_grants_section_lists_a_grant_and_reads_none_when_empty(self) -> None:
+        text = self._report(
+            [
+                {
+                    "id": "Slice 1", "title": "T",
+                    "grants": [{"path": "b.py", "evidence": "needed for the fix", "at": "2026-01-01T00:00:00Z"}],
+                },
+            ]
+        )
+        self.assertIn(
+            "## Surface Grants\n- Slice 1: b.py — granted 2026-01-01T00:00:00Z: needed for the fix", text
+        )
+
+        empty_text = self._report([{"id": "Slice 1", "title": "T"}])
+        self.assertIn("## Surface Grants\n(none)", empty_text)
 
 
 class TestRunElapsed(unittest.TestCase):

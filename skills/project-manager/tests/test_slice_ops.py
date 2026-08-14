@@ -43,6 +43,7 @@ from pm_test_helpers import (
 )
 
 from pm_lib import PmError
+from pm_lib import plan as plan_mod
 from pm_lib import sessions
 from pm_lib import slice_ops
 from pm_lib import state as state_mod
@@ -323,6 +324,158 @@ class TestApprove(SliceOpsTestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("not approval-gated", err)
+
+
+# --- grant ---------------------------------------------------------------
+
+
+_LONG_EVIDENCE = "Repository investigation confirms this path must change to satisfy the slice's contract."
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestGrant(SliceOpsTestCase):
+    """`pm grant`: widening a slice's *effective* authorized surface mid-run.
+
+    `grant` itself never touches tmux, but its "current in-flight slice"
+    check reads `current_slice`, which only a real `start-slice` launch
+    sets — so every scenario here launches a fake-harness session first.
+    """
+
+    def _launch_single_slice(self, *, plan_slices: list[dict] | None = None) -> tuple[str, str, Path, Path]:
+        plan_path = self.write_plan(self._plan_path(), slices=plan_slices or [{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        return run_id, token, run_dir, plan_path
+
+    def test_grant_records_path_evidence_and_ratchets_risk_elevated(self) -> None:
+        run_id, token, run_dir, _plan_path = self._launch_single_slice()
+
+        code, out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        [record] = entry["grants"]
+        self.assertEqual(record["path"], "b.py")
+        self.assertEqual(record["evidence"], _LONG_EVIDENCE)
+        self.assertIn("T", record["at"])
+        self.assertEqual(entry["risk"], "elevated")
+        self.assertEqual(entry["plan_risk"], "standard")
+
+        events = state_mod.read_events(run_dir)
+        self.assertTrue(any(e["kind"] == "grant" and e["note"].startswith("b.py:") for e in events))
+
+    def test_risk_raise_event_fires_once_not_on_a_second_grant(self) -> None:
+        _run_id, token, run_dir, _plan_path = self._launch_single_slice()
+
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, err)
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "c.py", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, err)
+
+        events = state_mod.read_events(run_dir)
+        risk_raise_events = [e for e in events if e["kind"] == "risk-raise"]
+        self.assertEqual(len(risk_raise_events), 1)
+
+    def test_grant_refused_when_evidence_is_too_short_after_stripping(self) -> None:
+        _run_id, token, _run_dir, _plan_path = self._launch_single_slice()
+
+        # Padded with whitespace so the RAW length clears 40 chars: the
+        # refusal must be on the STRIPPED length, not the raw one.
+        evidence = " " * 20 + "short reason" + " " * 20
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", evidence, "--token", token]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("40", err)
+
+    def test_grant_refused_on_a_slice_that_is_not_current(self) -> None:
+        _run_id, token, _run_dir, _plan_path = self._launch_single_slice(
+            plan_slices=[{"files": ["a.py"]}, {"files": ["b.py"]}]
+        )
+
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 2", "--path", "c.py", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("not the current in-flight slice", err)
+
+    def test_grant_refused_on_invalid_path_shape(self) -> None:
+        _run_id, token, _run_dir, _plan_path = self._launch_single_slice()
+
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "/abs/path.py", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("invalid grant path", err)
+
+    def test_grant_refused_on_dependency_shaped_path(self) -> None:
+        _run_id, token, _run_dir, _plan_path = self._launch_single_slice()
+
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "package.json", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("grant refused", err)
+        self.assertIn("dependency-shaped", err)
+
+    def test_grant_refused_for_a_directory_or_glob_path_only_exact_files_are_grantable(self) -> None:
+        """A grant authorizes one exact file path. A trailing-slash directory,
+        a glob, the whole-repo spelling, and a plain path naming an existing
+        directory must all be refused — none of them is the one discovered
+        file PM has evidence for, and a surviving pattern would alias a
+        surface the dangerous-surface refusal must catch (e.g. '*.toml'
+        reaching pyproject.toml)."""
+        _run_id, token, _run_dir, _plan_path = self._launch_single_slice()
+        (self.repo / "src" / "query").mkdir(parents=True)
+        (self.repo / "src" / "query" / "placeholder.py").write_text("x = 1\n", encoding="utf-8")
+        self._git("add", "src/query/placeholder.py")
+        self._git("commit", "-q", "-m", "add src/query directory")
+
+        for grant_path in ("src/query/", "*.toml", "**/**", "src/query"):
+            with self.subTest(path=grant_path):
+                code, _out, err = self.run_cli_in_repo(
+                    ["grant", "--slice", "Slice 1", "--path", grant_path, "--evidence", _LONG_EVIDENCE, "--token", token]
+                )
+                self.assertEqual(code, 2, err)
+                self.assertIn("grant refused", err)
+
+    def test_grant_refused_when_path_already_within_effective_surface(self) -> None:
+        _run_id, token, _run_dir, _plan_path = self._launch_single_slice()
+
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "a.py", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("already within the effective authorized surface", err)
+
+    def test_grant_survives_a_fresh_state_load_on_resume(self) -> None:
+        _run_id, token, run_dir, plan_path = self._launch_single_slice()
+
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, err)
+
+        # A fresh state load in a brand-new call — the resume invariant: a
+        # grant's authority must not depend on anything held in memory.
+        reloaded = state_mod.load_state(run_dir, token)
+        slices = plan_mod.parse_plan(plan_path)
+        plan_slice = plan_mod.plan_slice_by_id(slices, "Slice 1")
+        self.assertIn("b.py", plan_mod.effective_authorized_files(plan_slice, reloaded))
 
 
 # --- tmux-gated flows --------------------------------------------------------

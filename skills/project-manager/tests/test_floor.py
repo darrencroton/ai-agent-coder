@@ -22,6 +22,7 @@ from pm_test_helpers import PmTestCase
 
 from pm_lib import floor as floor_mod
 from pm_lib import plan as plan_mod
+from pm_lib import state as state_mod
 
 
 def _facts_by_name(report: floor_mod.FloorReport) -> dict[str, floor_mod.FloorFact]:
@@ -63,6 +64,24 @@ class FloorTestCase(PmTestCase):
         before_head = self._git("rev-parse", "HEAD").stdout.strip()
         slices = plan_mod.parse_plan(plan_path)
         return plan_path, state, token, run_dir, before_head, slices
+
+    def _record_grant(self, state: dict, token: str, run_dir: Path, *, slice_id: str, path: str) -> dict:
+        """Append one PM surface grant directly to slice-entry state, mirroring
+        `record_approval`'s save-then-reload shape. `slice_ops.grant`'s own
+        validation is exercised end-to-end in test_slice_ops.py; these tests
+        pin only the FLOOR's evidence-reads against whatever is recorded."""
+        updated = dict(state)
+        updated_slices = []
+        for entry in updated.get("slices", []):
+            entry = dict(entry)
+            if entry.get("id") == slice_id:
+                grants = list(entry.get("grants") or [])
+                grants.append({"path": path, "evidence": "recorded for a floor fact 5 test", "at": "2026-01-01T00:00:00Z"})
+                entry["grants"] = grants
+            updated_slices.append(entry)
+        updated["slices"] = updated_slices
+        state_mod.save_state(run_dir, updated, token)
+        return state_mod.load_state(run_dir, token)
 
 
 class TestFloorHappyPath(FloorTestCase):
@@ -322,6 +341,60 @@ class TestFactSurface(FloorTestCase):
             self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
         )
         self.assertFalse(_facts_by_name(report)["surface"].passed)
+
+
+class TestFactSurfaceGrants(FloorTestCase):
+    """Fact 5 checks the *effective* authorized surface: frozen plan surface
+    plus recorded PM grants."""
+
+    def test_grant_widens_surface_to_pass_a_file_outside_the_plan_surface(self) -> None:
+        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
+        (self.repo / "b.py").write_text("granted change\n", encoding="utf-8")
+        self._git("add", "b.py")
+        self._git("commit", "-q", "-m", "grant-covered change")
+        self._write_result()
+        state = self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        )
+        state = self._record_grant(state, token, run_dir, slice_id="Slice 1", path="b.py")
+
+        report = floor_mod.evaluate_floor(
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+        )
+        self.assertTrue(_facts_by_name(report)["surface"].passed)
+
+    def test_fact_surface_still_fails_outside_both_plan_and_granted_surface(self) -> None:
+        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
+        (self.repo / "c.py").write_text("ungranted change\n", encoding="utf-8")
+        self._git("add", "c.py")
+        self._git("commit", "-q", "-m", "change outside both surfaces")
+        self._write_result()
+        state = self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        )
+        # Grant covers a different path, not the one actually changed.
+        state = self._record_grant(state, token, run_dir, slice_id="Slice 1", path="b.py")
+
+        report = floor_mod.evaluate_floor(
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+        )
+        self.assertFalse(_facts_by_name(report)["surface"].passed)
+
+    def test_surface_evidence_separates_plan_surface_from_granted_surface(self) -> None:
+        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
+        self._commit_authorized_change()
+        self._write_result()
+        state = self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        )
+        state = self._record_grant(state, token, run_dir, slice_id="Slice 1", path="b.py")
+
+        report = floor_mod.evaluate_floor(
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+        )
+        evidence = _facts_by_name(report)["surface"].evidence
+        self.assertEqual(evidence["authorized_surface"], ["a.py"])
+        self.assertEqual(evidence["granted_surface"], ["b.py"])
 
 
 class TestFactCommitAncestry(FloorTestCase):

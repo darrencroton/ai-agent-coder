@@ -115,7 +115,8 @@ Run state, artifacts, transcripts, and review evidence stay on your machine. Wha
 
 - **Slice** — the unit of work: one narrow, independently reviewable change with its own frozen contract.
 - **Frozen contract** — a slice's authorization, fixed before coding: acceptance criteria, authorized surface, non-goals, validation plan, rollback path.
-- **Authorized surface** — the files (and functions/tests) a slice may touch; everything else is drift.
+- **Authorized surface** — the files (and functions/tests) a slice may touch; its *effective* surface is the frozen plan surface plus any PM-recorded grants (see Surface grant, below). Everything outside it is drift.
+- **Surface grant** — a PM-recorded widening of a slice's effective authorized surface to one exact additional file path (never a directory or glob), on recorded evidence; it ratchets the slice to elevated risk. Authority and refusal rules live in `project-manager`'s `SKILL.md`.
 - **Drift audit** — the authorization gate: compares actual changes against the frozen contract, before any quality judgment.
 - **Differential lint** — `lint`'s default question: not "is this code clean?" but "does this change introduce a finding that was not there before?"
 - **Gate** — a check that must pass before work advances. In Mode A these are the in-session chain steps (validation, drift audit, code review, commit evidence); in Mode B there are exactly three: the mechanical floor, PM assessment, and human approval.

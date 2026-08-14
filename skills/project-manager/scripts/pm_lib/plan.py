@@ -278,9 +278,10 @@ def directory_surface_lint(entry: str, repo: Path) -> str | None:
         return None
     if (repo / normalized).is_dir():
         return (
-            f"entry {normalized!r} names an existing directory; a plain path matches only an identical "
-            f"changed path, so it authorizes nothing beneath the directory — write {normalized + '/'!r} "
-            "to authorize the subtree"
+            f"entry {normalized!r} names an existing directory but is written as a plain path. Git "
+            "reports changed files, never directories, so this entry can match nothing at all — write "
+            f"{normalized + '/'!r} to authorize the subtree as a write envelope, or name the individual "
+            "files this slice changes"
         )
     return None
 
@@ -455,3 +456,41 @@ def plan_slice_by_id(slices: list[PlanSlice], slice_id: str) -> PlanSlice | None
         if plan_slice.slice_id == slice_id:
             return plan_slice
     return None
+
+
+def slice_grants(state: dict[str, Any], slice_id: str) -> list[dict[str, Any]]:
+    """Recorded PM surface grants for one slice, in grant order.
+
+    Malformed entries are skipped rather than raised on: `state._validate_shape`
+    already refuses to load state whose grants are not well-formed, so anything
+    reaching here is defensive.
+    """
+    for entry in state.get("slices", []):
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        if entry["id"] == slice_id:
+            return [g for g in entry.get("grants") or [] if isinstance(g, dict) and str(g.get("path") or "").strip()]
+    return []
+
+
+def effective_authorized_files(plan_slice: PlanSlice, state: dict[str, Any]) -> list[str]:
+    """The frozen plan surface plus every recorded PM grant path — the surface
+    floor fact 5 actually checks.
+
+    Grants only ever widen: the plan's own entries always come first and are
+    never removed, so an effective surface can never be narrower than the
+    frozen one. The plan FILE is untouched by a grant; fact 1's digest still
+    holds byte-exactly.
+    """
+    return [*plan_slice.authorized_files, *(str(g["path"]).strip() for g in slice_grants(state, plan_slice.slice_id))]
+
+
+def format_grant(grant: dict[str, Any]) -> str:
+    """One human-readable line for one recorded grant, shared by the Developer
+    prompt, the Reviewer prompt, the slice assessment, and the run report, so a
+    grant reads identically wherever a human meets it. Evidence whitespace is
+    collapsed because the prompt blocks sit above the frozen contract, where a
+    multi-line item could imitate a later prompt section.
+    """
+    evidence = " ".join(str(grant.get("evidence") or "").split())
+    return f"{grant.get('path')} — granted {grant.get('at')}: {evidence}"

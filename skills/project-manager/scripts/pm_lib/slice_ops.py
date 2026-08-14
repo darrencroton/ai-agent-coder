@@ -485,6 +485,141 @@ def approve(repo: Path, run_dir: Path, token: str, *, slice_id: str, reason: str
     return state
 
 
+# --- grant --------------------------------------------------------------------
+
+
+@dataclass
+class GrantOutcome:
+    slice_id: str
+    path: str
+    elevated: bool  # True iff this grant raised the slice's risk
+    grant_count: int  # grants now recorded on the slice
+
+
+def grant(repo: Path, run_dir: Path, token: str, *, slice_id: str, path: str, evidence: str) -> GrantOutcome:
+    """PM extends the slice's *effective* authorized surface by one path, on
+    recorded repository evidence. The plan file is never touched — a grant
+    lives only in run state, alongside the plan's own frozen entries.
+
+    The grant ratchets the slice's risk to elevated, and — separately, and the
+    load-bearing effect — stales every review already recorded for the slice
+    (`is_review_fresh`), so both mandatory reviews must be re-commissioned
+    after it. Without that, a slice already elevated would keep reviews whose
+    prompts could not have named the grant, and the ratchet alone would
+    require nothing new.
+
+    A grant is not retroactive absolution: fact 5 still evaluates the *final*
+    state against the effective surface at acceptance time. Nothing here proves
+    the grant preceded the edit it authorizes — a reviewer never receives the
+    event log, and the floor has no per-file timestamps. PM and the human can
+    read grant-vs-commit ordering from the event log and git history; a
+    reviewer can flag it only from repository evidence in front of it. That
+    guarantee sits with judgement over evidence, not with a mechanism.
+    """
+    stripped_evidence = evidence.strip()
+    if len(stripped_evidence) < _GRANT_EVIDENCE_MIN_CHARS:
+        raise PmError(
+            f"--evidence must be at least {_GRANT_EVIDENCE_MIN_CHARS} characters after stripping "
+            "whitespace; the grant record is the accountability record for an authorization change, "
+            "not a rubber stamp"
+        )
+
+    # A background reviewer records itself under `locked_update` between a
+    # separate load-and-save's two writes, and `grant` runs mid-slice, often
+    # right after a reviewer flagged something — the one command that
+    # genuinely races a concurrently-recorded review. `locked_update` holds
+    # the lock across the whole read-check-write, so no reviewer write can
+    # land in that window and be reverted by this whole-snapshot write.
+    with state_mod.locked_update(run_dir, token) as state:
+        _refuse_if_budget_exhausted(state)
+
+        current = state.get("current_slice")
+        if not current or current.get("id") != slice_id:
+            raise PmError(
+                f"{slice_id} is not the current in-flight slice; a grant can only widen the surface of "
+                f"the slice presently running (current: {current.get('id') if current else None})"
+            )
+
+        plan_path = Path(state["plan"]["path"])
+        # Read only if the plan is still the frozen one: the plan is about to be
+        # re-parsed for the redundancy check below, and a mid-run edit to it is
+        # `start_slice`'s stop to record, not this command's.
+        plan_mod.verify_plan_unchanged(state, plan_path)
+
+        slices = plan_mod.parse_plan(plan_path)
+        plan_slice = plan_mod.plan_slice_by_id(slices, slice_id)
+        if plan_slice is None:
+            raise PmError(f"{slice_id} was not found in the plan")
+
+        entry = slice_entry(state, slice_id)
+        if entry is None:
+            raise PmError(f"{slice_id} is not present in the run's slice entries")
+
+        entry_error = plan_mod.authorized_entry_error(path)
+        if entry_error:
+            raise PmError(f"invalid grant path: {entry_error}")
+
+        normalized = git_ops.normalize_authorized_entry(path)
+
+        # A grant authorizes one exact file path. PM's evidence is about one
+        # discovered path, and a pattern authorizes files it has no evidence
+        # for — it can also alias a surface the toolkit must refuse ('*.toml'
+        # reaches pyproject.toml, 'config/' reaches config/package.json),
+        # making the dangerous-surface refusal below evadable. Checked before
+        # that refusal, on `normalized`, so no glob or directory spelling can
+        # survive to be shape-inspected as if it were a single file.
+        if normalized.endswith("/") or any(marker in normalized for marker in ("*", "?", "[")):
+            raise PmError(
+                f"grant refused: {normalized!r} is a directory or glob, and a grant authorizes one exact "
+                "file path. PM's evidence is about one discovered path, and a pattern authorizes files it "
+                "has no evidence for — it can also alias a surface the toolkit must refuse ('*.toml' "
+                "reaches pyproject.toml, 'config/' reaches config/package.json). Write write envelopes in "
+                "the plan, where check-plan lints them and a human approved them; grant discovered files "
+                "one at a time."
+            )
+
+        lint = plan_mod.surface_lint(path)
+        if lint is not None:
+            raise PmError(
+                f"grant refused: {lint}; a grant cannot enter a surface PM cannot mechanically police — "
+                "isolate it into its own approval-gated slice instead"
+            )
+
+        # A plain path naming a real directory matches only an identical changed
+        # path, so it would authorize nothing beneath it while still ratcheting the
+        # slice to elevated — the grant PM meant to make silently does nothing, and
+        # fact 5 fails again on the same file. Refused rather than warned: a path
+        # that is a directory in the worktree cannot also be the file PM meant.
+        dir_lint = plan_mod.directory_surface_lint(path, repo)
+        if dir_lint is not None:
+            raise PmError(f"grant refused: {dir_lint}")
+
+        # A grant into a path already covered by the effective surface would still
+        # ratchet the slice to elevated and mandate two reviews for nothing, so a
+        # no-op is refused rather than silently recorded.
+        if git_ops.is_authorized_path(normalized, plan_mod.effective_authorized_files(plan_slice, state)):
+            raise PmError(f"{normalized!r} is already within the effective authorized surface; no grant is needed")
+
+        grants = entry.setdefault("grants", [])
+        grants.append({"path": normalized, "evidence": stripped_evidence, "at": state_mod.utc_now_iso()})
+
+        was_elevated = entry.get("risk") == "elevated"
+        apply_risk_ratchet(entry, current, risk_flag="elevated")
+        grant_count = len(grants)
+
+    # Outside the `with` block: `_advisory_lock` is not reentrant, and
+    # `append_event` takes it itself, so calling it while `locked_update`
+    # still held the lock would deadlock.
+    first_line = stripped_evidence.splitlines()[0][:120]
+    state_mod.append_event(run_dir, "grant", slice_id=slice_id, note=f"{normalized}: {first_line}")
+    if not was_elevated:
+        state_mod.append_event(
+            run_dir, "risk-raise", slice_id=slice_id, note="risk raised to elevated by surface grant"
+        )
+
+    return GrantOutcome(slice_id=slice_id, path=normalized, elevated=not was_elevated, grant_count=grant_count)
+
+
 # --- start-slice --------------------------------------------------------------
 
 
@@ -655,6 +790,7 @@ def start_slice(
         notes_path=slice_notes_path,
         result_path=result_path,
         before_head=before_head,
+        granted_surface=plan_mod.slice_grants(state, plan_slice.slice_id),
     )
     prompt_path = artifact_dir / "prompt.md"
     prompt_path.write_text(prompt_text, encoding="utf-8")
@@ -918,6 +1054,9 @@ class FinalizeOutcome:
 
 
 _ACCEPT_REASONING_MIN_CHARS = 40
+# Deliberately the same figure as the accept minimum: a grant is an
+# authorization decision, and its evidence is the accountability record for it.
+_GRANT_EVIDENCE_MIN_CHARS = 40
 _REQUIRED_ELEVATED_REVIEW_SKILLS = ("code-review", "drift-audit")
 
 
@@ -996,11 +1135,33 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
-    """A review is fresh for `head` iff it was recorded against exactly
-    this HEAD and its artifact still exists with a matching sha256 (design
-    §5: any tree change after a mandatory review invalidates it)."""
+def is_review_fresh(review: dict[str, Any], head: str | None, grant_count: int) -> bool:
+    """A review is fresh for `head` iff it was recorded against exactly this
+    HEAD, was commissioned against the slice's current set of surface grants,
+    and its artifact still exists with a matching sha256 (design §5: any tree
+    change after a mandatory review invalidates it — and so does any
+    authorization change).
+
+    `grant_count` is how many grants the slice carries now; a review records
+    how many its own prompt was rendered from (`grants_seen`), so the
+    comparison asks exactly the right question — did this reviewer see every
+    grant that exists? Grants are append-only, so that count is a monotonic
+    authorization revision and no clock is involved. Deliberately not a
+    timestamp: a review's stamp is written when it *completes*, which cannot
+    answer whether its prompt showed a given grant.
+
+    A record with no `grants_seen` counts as 0, so a review predating this
+    field stays valid on a slice with no grants and fails closed the moment one
+    is recorded.
+
+    `grant_count` is deliberately NOT defaulted: a caller that omitted it would
+    silently accept a review the grants should have staled, and this predicate
+    gates acceptance.
+    """
     if not isinstance(review, dict) or head is None or review.get("head") != head:
+        return False
+    seen = review.get("grants_seen")
+    if (seen if isinstance(seen, int) else 0) != grant_count:
         return False
     artifact = review.get("artifact")
     if not artifact or not Path(artifact).is_file():
@@ -1008,27 +1169,41 @@ def is_review_fresh(review: dict[str, Any], head: str | None) -> bool:
     return review.get("sha256") == sha256_file(Path(artifact))
 
 
-def _fresh_reviews_for_head(reviews: list[dict[str, Any]], head: str | None) -> dict[str, dict[str, Any]]:
+def _fresh_reviews_for_head(
+    reviews: list[dict[str, Any]], head: str | None, grant_count: int
+) -> dict[str, dict[str, Any]]:
     fresh: dict[str, dict[str, Any]] = {}
     for review in reviews:
-        if is_review_fresh(review, head):
+        if is_review_fresh(review, head, grant_count):
             skill = review.get("skill")
             if skill:
                 fresh[skill] = review
     return fresh
 
 
-def _reviews_consulted_text(reviews: list[dict[str, Any]], head: str | None, effective_risk: str) -> str:
+def _reviews_consulted_text(
+    reviews: list[dict[str, Any]], head: str | None, effective_risk: str, grant_count: int
+) -> str:
     if not reviews:
         return "PM assessment only (standard risk)" if effective_risk != "elevated" else "(no reviews recorded)"
     lines: list[str] = []
     for review in reviews:
-        stale = "" if is_review_fresh(review, head) else " [SUPERSEDED - stale for current HEAD]"
+        stale = (
+            ""
+            if is_review_fresh(review, head, grant_count)
+            else " [SUPERSEDED - stale for current HEAD or a later surface grant]"
+        )
         lines.append(
             f"- {review.get('skill')}/{review.get('tool')} @ {review.get('head')} -> "
             f"{review.get('artifact')}{stale}"
         )
     return "\n".join(lines)
+
+
+def _grants_text(grants: list[dict[str, Any]]) -> str:
+    if not grants:
+        return "(none)"
+    return "\n".join(f"- {plan_mod.format_grant(record)}" for record in grants)
 
 
 def _attempts_summary(run_dir: Path, slice_id: str, attempts: int) -> str:
@@ -1054,6 +1229,7 @@ def _render_assessment(
     head: str | None,
     reviews_text: str,
     attempts_summary: str,
+    grants_text: str,
 ) -> str:
     lines = [
         f"# Assessment: {entry.get('id')} - {entry.get('title')}",
@@ -1075,6 +1251,9 @@ def _render_assessment(
         "",
         "## Risk",
         f"Level: {risk} (source: {source}; plan_risk={plan_risk})",
+        "",
+        "## Surface grants",
+        grants_text,
         "",
         "## Reviews consulted",
         reviews_text,
@@ -1145,9 +1324,13 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     effective_risk = entry.get("risk") or "standard"
     reviews = list(entry.get("reviews") or [])
     head = git_ops.git_head(repo)
+    # A grant changes the authorization the reviews were judging, and neither
+    # reviewer's prompt could have named a grant recorded after it ran, so a
+    # grant stales a review exactly as a tree change does (is_review_fresh).
+    grant_count = len(plan_mod.slice_grants(state, slice_id))
 
     if effective_risk == "elevated":
-        fresh = _fresh_reviews_for_head(reviews, head)
+        fresh = _fresh_reviews_for_head(reviews, head, grant_count)
         missing = sorted(set(_REQUIRED_ELEVATED_REVIEW_SKILLS) - set(fresh.keys()))
         if missing:
             state_mod.save_state(run_dir, state, token)
@@ -1159,11 +1342,12 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
                 ),
             )
 
-    reviews_text = _reviews_consulted_text(reviews, head, effective_risk)
+    reviews_text = _reviews_consulted_text(reviews, head, effective_risk, grant_count)
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
+    grants_text = _grants_text(plan_mod.slice_grants(state, slice_id))
     assessment_text = _render_assessment(
         entry, report, reasoning=stripped_reasoning, decision="ACCEPTED", head=head,
-        reviews_text=reviews_text, attempts_summary=attempts_summary,
+        reviews_text=reviews_text, attempts_summary=attempts_summary, grants_text=grants_text,
     )
     assessment_relative = f"{slice_relative_dir(slice_id)}/assessment.md"
     assessment_original = write_controller_artifact(repo, run_dir, state["run_id"], assessment_relative, assessment_text)
@@ -1363,11 +1547,13 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
 
     head = git_ops.git_head(repo)
     reviews = list(entry.get("reviews") or [])
-    reviews_text = _reviews_consulted_text(reviews, head, entry.get("risk") or "standard")
+    grant_count = len(plan_mod.slice_grants(state, slice_id))
+    reviews_text = _reviews_consulted_text(reviews, head, entry.get("risk") or "standard", grant_count)
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
+    grants_text = _grants_text(plan_mod.slice_grants(state, slice_id))
     assessment_text = _render_assessment(
         entry, report, reasoning=stripped_reason, decision="STOPPED", head=head,
-        reviews_text=reviews_text, attempts_summary=attempts_summary,
+        reviews_text=reviews_text, attempts_summary=attempts_summary, grants_text=grants_text,
     )
     assessment_relative = f"{slice_relative_dir(slice_id)}/assessment.md"
     assessment_original = write_controller_artifact(repo, run_dir, state["run_id"], assessment_relative, assessment_text)

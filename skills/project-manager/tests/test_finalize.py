@@ -408,6 +408,201 @@ class TestRiskRatchet(FinalizeTestCase):
         self.assertIn("can only be raised", err)
 
 
+# --- surface grants ratchet acceptance requirements --------------------------
+
+
+_LONG_GRANT_EVIDENCE = "Repository investigation confirms this path must change to satisfy the slice's contract."
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestGrantRatchetsAcceptance(FinalizeTestCase):
+    def test_accept_refused_after_grant_for_missing_mandatory_reviews(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        code, out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", _LONG_GRANT_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("drift-audit", out + err)
+        self.assertIn("code-review", out + err)
+
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        self.assertEqual(entry["risk"], "elevated")
+        self.assertIsNone(entry.get("status"))
+
+    def test_accepted_assessment_contains_surface_grants_block(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        code, out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", _LONG_GRANT_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+
+        fake_drift = _fake_reviewer_ok(self.repo.parent / "fake_drift.sh", "drift-1")
+        fake_code = _fake_reviewer_ok(self.repo.parent / "fake_code.sh", "code-1")
+        code, _out, err = self.run_cli_in_repo(
+            ["review", "--slice", "Slice 1", "--skill", "drift-audit", "--tool", "t1",
+             "--reviewer-command", str(fake_drift), "--token", token]
+        )
+        self.assertEqual(code, 0, err)
+        code, _out, err = self.run_cli_in_repo(
+            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "t1",
+             "--reviewer-command", str(fake_code), "--token", token]
+        )
+        self.assertEqual(code, 0, err)
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 0, out + err)
+
+        state = state_mod.load_state(run_dir, token)
+        assessment_text = Path(state["slices"][0]["assessment"]).read_text(encoding="utf-8")
+        self.assertIn("## Surface grants", assessment_text)
+        grant_at = state["slices"][0]["grants"][0]["at"]
+        self.assertIn(f"b.py — granted {grant_at}: {_LONG_GRANT_EVIDENCE}", assessment_text)
+
+    def test_accept_refused_for_a_review_commissioned_before_a_grant_but_recorded_after_it(self) -> None:
+        """A reviewer already running when a grant lands finishes AFTER it, so
+        its completion stamp postdates the grant while its prompt never showed
+        it — the fail-open a completion-time comparison allowed. Freshness
+        therefore compares `grants_seen` (what the prompt was rendered from)
+        against the slice's current grant count, so the later stamp cannot
+        launder a review that saw nothing.
+
+        The review record is written directly, because reproducing the true
+        interleaving would mean racing a live subprocess against a grant: what
+        the gate must key on is the recorded `grants_seen`, not the timing that
+        produced it."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        code, out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", _LONG_GRANT_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+
+        # Both mandatory reviews recorded AFTER the grant (a strictly later
+        # `at`), but each commissioned before it, so each saw zero grants.
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+        report = self.repo.parent / "in-flight-review.md"
+        report.write_text("IN-FLIGHT REVIEW REPORT\n", encoding="utf-8")
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        entry["reviews"] = [
+            {
+                "skill": skill, "tool": "t1", "model": None, "head": head,
+                "before_head": state["current_slice"]["before_head"],
+                "artifact": str(report), "sha256": slice_ops.sha256_file(report),
+                "at": "2099-01-01T00:00:00Z", "grants_seen": 0,
+            }
+            for skill in ("drift-audit", "code-review")
+        ]
+        state_mod.save_state(run_dir, state, token)
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("drift-audit", out + err)
+        self.assertIn("code-review", out + err)
+        self.assertIsNone(state_mod.load_state(run_dir, token)["slices"][0].get("status"))
+
+    def test_accept_refused_when_a_grant_follows_both_fresh_reviews_at_the_same_head(self) -> None:
+        """The P1 regression two independent reviewers converged on: freshness
+        keyed only on head + artifact + sha256, none of which a grant touches.
+        So a developer could commit an authorized AND an unauthorized file at
+        HEAD X, PM could commission both mandatory reviews (recorded fresh at
+        HEAD X, each showing no grants), then grant the unauthorized path
+        after the fact — and the two reviews, never having seen the widened
+        authorization, stayed 'fresh' straight through to acceptance. A grant
+        must stale a review exactly as a tree change does, so this refuses
+        exactly as a missing-reviews acceptance would, and the slice must NOT
+        be accepted."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        # Both mandatory reviews recorded fresh at the current HEAD, BEFORE
+        # any grant — exactly the state the pre-fix code considered good
+        # enough to accept, with each review's prompt showing no PM grants.
+        fake_drift = _fake_reviewer_ok(self.repo.parent / "fake_drift.sh", "drift-1")
+        fake_code = _fake_reviewer_ok(self.repo.parent / "fake_code.sh", "code-1")
+        code, _out, err = self.run_cli_in_repo(
+            ["review", "--slice", "Slice 1", "--skill", "drift-audit", "--tool", "t1",
+             "--reviewer-command", str(fake_drift), "--token", token]
+        )
+        self.assertEqual(code, 0, err)
+        code, _out, err = self.run_cli_in_repo(
+            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "t1",
+             "--reviewer-command", str(fake_code), "--token", token]
+        )
+        self.assertEqual(code, 0, err)
+
+        # A grant recorded AFTER both reviews, at the SAME HEAD (no further
+        # commit): head, artifact, and sha256 are all untouched by it, so
+        # only grant-staling — not any tree-change check — can catch this.
+        code, out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", _LONG_GRANT_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("drift-audit", out + err)
+        self.assertIn("code-review", out + err)
+
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        self.assertIsNone(entry.get("status"))
+        self.assertIsNotNone(state["current_slice"])
+
+
 # --- steer -------------------------------------------------------------------
 
 

@@ -269,6 +269,15 @@ class TestRenderReviewerPrompt(unittest.TestCase):
         self.assertIn("normal severity, reachability, evidence, and fix direction", rendered)
         self.assertIn("label it as dissent", rendered)
 
+    def test_pm_surface_grants_render_path_or_the_literal_none(self) -> None:
+        with_grant = self._render(
+            pm_surface_grants=[{"path": "b.py", "evidence": "needed for the fix", "at": "2026-01-01T00:00:00Z"}]
+        )
+        self.assertIn("- b.py — granted 2026-01-01T00:00:00Z: needed for the fix", with_grant)
+
+        without_grant = self._render()
+        self.assertIn("the frozen plan file itself is unchanged:\nnone", without_grant)
+
     def test_adjudications_cannot_inject_a_stray_placeholder(self) -> None:
         """PM-authored text is substituted, never re-formatted, so a brace in
         an adjudication is inert rather than a template error."""
@@ -621,6 +630,44 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
             with self.assertRaises(PmError) as ctx:
                 review_mod._next_commission_seq(Path("/nonexistent-slice-dir"), 0)
         self.assertIn("overwrite", str(ctx.exception))
+
+
+class TestReviewThreadsSurfaceGrants(ReviewCommandTestCase):
+    def test_persisted_review_prompt_contains_recorded_grant_path(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+
+        # Record a grant directly on state, mirroring the floor tests' shape:
+        # `slice_ops.grant`'s own validation is exercised end-to-end in
+        # test_slice_ops.py, so this only needs one recorded grant to prove
+        # `run_review` threads it into the rendered prompt.
+        state = state_mod.load_state(run_dir, token)
+        updated = dict(state)
+        updated_slices = [dict(entry) for entry in updated["slices"]]
+        updated_slices[0]["grants"] = [
+            {"path": "b.py", "evidence": "Investigation shows b.py is needed too.", "at": "2026-01-01T00:00:00Z"}
+        ]
+        updated["slices"] = updated_slices
+        state_mod.save_state(run_dir, updated, token)
+
+        fake = _write_fake_reviewer(
+            self.repo.parent / "fake_reviewer_grant.sh", 'echo "FAKE REVIEW REPORT"\nexit 0'
+        )
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "review", "--slice", "Slice 1", "--skill", "code-review",
+                "--tool", "faketool", "--reviewer-command", str(fake), "--token", token,
+            ]
+        )
+        self.assertEqual(code, 0, err)
+
+        prompt_path = run_dir / "slices" / "slice-001" / "review-1-code-review-faketool-prompt.md"
+        self.assertIn(
+            "b.py — granted 2026-01-01T00:00:00Z: Investigation shows b.py is needed too.",
+            prompt_path.read_text(encoding="utf-8"),
+        )
 
 
 class TestReviewRefusals(ReviewCommandTestCase):

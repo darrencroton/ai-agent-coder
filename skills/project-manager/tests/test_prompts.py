@@ -217,6 +217,28 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
                 )
             self.assertIn(str(path), str(ctx.exception))
 
+    def test_granted_surface_renders_path_or_the_literal_none(self) -> None:
+        plan_slice = _make_plan_slice(3)
+        kwargs = dict(
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/.pm/runs/run-a/slices/slice-003"),
+            notes_path=Path("/repo/.pm/runs/run-a/notes.md"),
+            result_path=Path("/repo/.pm/runs/run-a/slices/slice-003/result.json"),
+        )
+        with_grant = prompts.render_developer_prompt(
+            plan_slice,
+            granted_surface=[{"path": "b.py", "evidence": "needed for the fix", "at": "2026-01-01T00:00:00Z"}],
+            **kwargs,
+        )
+        self.assertIn("- b.py — granted 2026-01-01T00:00:00Z: needed for the fix", with_grant)
+
+        without_grant = prompts.render_developer_prompt(plan_slice, **kwargs)
+        self.assertIn(
+            "additions (paths PM authorized mid-run on recorded repository evidence; `none` if there "
+            "are none):\nnone",
+            without_grant,
+        )
+
     def test_missing_placeholder_field_raises_pm_error(self) -> None:
         import tempfile
 

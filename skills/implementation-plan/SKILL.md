@@ -118,12 +118,20 @@ The contract reaches an implementer and a reviewer verbatim, and both read it li
 
 Reviewers surface such a conflict; only the deciding seat resolves it. Every one you leave behind costs execution and review attention to rediscover.
 
+## Choosing an Authorized Surface
+
+The authorized surface should describe the narrowest reasonable engineering boundary, not a prediction of the eventual diff. Authorize exact files when the topology is genuinely known. Authorize a directory or glob **write envelope** (`src/query/`, `tests/query/`) instead when the work is complex or the repository large enough that implementation will legitimately discover sibling files inside that boundary — matching semantics (trailing `/` for a subtree, segment-aware globs) are defined once below, in *Machine-Consumed Fields*.
+
+This is not licence to widen for convenience — an envelope must still be the narrowest boundary that honestly contains the work.
+
+Under Mode B, a single path discovered outside the surface is not a dead end: `project-manager` can grant it mid-run on recorded repository evidence, at the cost of mandatory elevated review (`project-manager`'s SKILL.md, *Surface grants*) — but a grant covers exactly one file, never a boundary, so it recovers one discovered path at a time rather than the envelope a slice might actually need. That recovery is real but not free, so a well-chosen envelope — the only thing that covers a *boundary* rather than a single file — is cheaper than either an over-broad surface or an over-narrow one that turns ordinary discovery into a stop.
+
 ## Machine-Consumed Fields
 
 `project-manager` parses these plan fields mechanically, so keep their labels and shapes exact:
 
 - Slice headings must be `## Slice <N>: <name>` with unique numbers, and each slice must include all seven `###` sections above verbatim. Heading text beginning with the standalone word `Slice` is reserved for these machine-consumed headings, except the optional `Slice Batches` heading. Never place slice-like headings inside fenced code blocks — the parser reads headings literally, so `check-plan` rejects fenced slice headings and unclosed fences as ambiguous.
-- `Files allowed to change:` must list each authorized repository-relative path as an indented sub-bullet. Empty, absolute, `.`/`..`, `./`-prefixed, empty-segment, and backslash-separated paths are invalid, as are paths with unwrapped whitespace — to annotate an entry, backtick-wrap the path itself (`` `src/app.py` `` (new file)) so only the path is matched. Entries are matched segment-aware: a plain path matches exactly and never matches beneath a directory (add a trailing `/` to authorize a subtree), and `*`/`?` match within one segment. A lone `*` covers top-level paths only; use `/` separators and `**` for a recursive glob (`docs/**/*.md`).
+- `Files allowed to change:` must list each authorized repository-relative path as an indented sub-bullet. Empty, absolute, `.`/`..`, `./`-prefixed, empty-segment, and backslash-separated paths are invalid, as are paths with unwrapped whitespace — to annotate an entry, backtick-wrap the path itself (`` `src/app.py` `` (new file)) so only the path is matched. Entries are matched segment-aware: a plain path matches exactly and never matches beneath a directory (add a trailing `/` to authorize a subtree), and `*`, `?`, and `[` match within one segment. A lone `*` covers top-level paths only; use `/` separators and `**` for a recursive glob (`docs/**/*.md`).
 - `Approval needed before implementation:` must be an exact `no` to run unattended. Anything else (`yes`, `not yet decided`, `none`, blank) stops the run for a human. An explicit `yes` is satisfied at runtime by a recorded human approval (`project-manager`'s `approve` command) without editing the plan; anything unclear cannot be.
 - `Independent audit required:` is optional and lives in the `Risk Flags` section, a sibling of `Approval needed before implementation:`. It defaults to off: absent, blank, or anything that is not an exact `yes` leaves it off. An exact `yes` makes the slice **elevated risk** under `project-manager` (Mode B): PM must commission independent `drift-audit` and `code-review` reviews of the final diff, both fresh at the exact final commit, before the slice can be accepted. In Mode A it is not mechanically enforced: the human or Developer judges independence directly, and the `orchestrator` skill's fallback rules apply (stop and report rather than self-audit such a slice).
 - Slice batches (`Batch A: Slices 1-2`) apply to Mode A runs only (either usage). `project-manager` (Mode B) executes atomic slices in plan order and ignores batch groupings, so a plan destined for PM should make each slice independently gateable rather than relying on a batch sharing one review.
@@ -141,7 +149,7 @@ The same plan file serves two run modes — Mode A (one agent session, checkpoin
 
 - Keep plans specific to files, symbols, and observable behaviour.
 - Prefer one slice that can be completed and reviewed independently over a broad multi-concern pass.
-- Do not list files as authorized just because they might be convenient; only authorize files the implementation is expected to touch.
+- Do not list files, directories, or globs as authorized just because they might be convenient. Authorize exactly what the work is expected to touch — as exact files when known, or as the narrowest write envelope that honestly bounds it otherwise (see *Choosing an Authorized Surface*).
 - Do not put dependency manifests, lockfiles, or license files in the authorized surface of a slice that runs unattended. Runtime dependency/license stops are heuristic, not diff inspection, so the plan is the real control: isolate such changes into their own slice and mark it `Approval needed before implementation: yes`.
 - If discovery shows the planned surface is too broad, recommend a smaller first slice.
 - If the repository state is unclear or dirty in relevant files, call that out before finalising the plan.

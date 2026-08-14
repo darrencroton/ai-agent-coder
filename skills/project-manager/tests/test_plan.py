@@ -402,6 +402,24 @@ class TestNextSliceAndEligibility(PlanTestCase):
         self.assertIsNone(plan_mod.plan_slice_by_id(slices, "Slice 99"))
 
 
+class TestSurfaceGrants(PlanTestCase):
+    """PM surface grants: `slice_grants` reads them out of state,
+    `effective_authorized_files` folds them onto the frozen plan surface."""
+
+    def test_slice_grants_returns_recorded_grants_and_empty_for_absent_slice(self) -> None:
+        grants = [{"path": "b.py", "evidence": "needed", "at": "2026-01-01T00:00:00Z"}]
+        state = {"slices": [{"id": "Slice 1", "grants": grants}]}
+        self.assertEqual(plan_mod.slice_grants(state, "Slice 1"), grants)
+        self.assertEqual(plan_mod.slice_grants(state, "Slice 2"), [])
+
+    def test_effective_authorized_files_orders_plan_surface_before_grants(self) -> None:
+        plan_slice = plan_mod.parse_plan(self.write_plan(slices=[{"files": ["a.py"]}]))[0]
+        state = {"slices": [{"id": "Slice 1", "grants": [{"path": "b.py", "evidence": "needed"}]}]}
+        # Plan entries must come first: grants only ever widen, never reorder
+        # the frozen surface ahead of what a mid-run grant adds.
+        self.assertEqual(plan_mod.effective_authorized_files(plan_slice, state), ["a.py", "b.py"])
+
+
 class TestImportHygiene(unittest.TestCase):
     """pm_lib may only import stdlib modules plus pm_lib internals."""
 

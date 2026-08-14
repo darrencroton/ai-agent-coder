@@ -20,7 +20,8 @@ the exact pass/fail wording in its `detail` strings:
 2. identity-branch — repo path and current branch match the run's record.
 3. approval — an approval-flagged slice has a recorded human approval.
 4. result — result.json exists, parses, and names this slice.
-5. surface — changed files are a subset of the frozen authorized surface.
+5. surface — changed files are a subset of the effective authorized surface
+   (frozen plan surface + PM grants).
 6. commit-ancestry — a commit exists, descends from before_head, and is the
    recorded branch's tip.
 7. clean-worktree — nothing dirty outside `.pm/`.
@@ -37,8 +38,10 @@ from typing import Any
 from . import PmError
 from . import git_ops
 from .plan import PlanSlice
+from .plan import effective_authorized_files
 from .plan import plan_digest as compute_plan_digest
 from .plan import plan_slice_by_id
+from .plan import slice_grants
 from .sessions import scan_hard_stop
 
 
@@ -176,16 +179,17 @@ def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | Non
         evidence["error"] = str(exc)
         return FloorFact(5, "surface", False, f"changed files could not be computed: {exc}", evidence)
 
-    authorized = plan_slice.authorized_files
+    authorized = effective_authorized_files(plan_slice, state)
     unauthorized = git_ops.unauthorized_files(changed, authorized)
     evidence["changed_files"] = sorted(changed)
     evidence["unauthorized_files"] = unauthorized
-    evidence["authorized_surface"] = list(authorized)
+    evidence["authorized_surface"] = list(plan_slice.authorized_files)
+    evidence["granted_surface"] = [g["path"] for g in slice_grants(state, plan_slice.slice_id)]
     passed = not unauthorized
     detail = (
-        "all changed files are within the authorized surface"
+        "all changed files are within the effective authorized surface"
         if passed
-        else "changed files include entries outside the authorized surface"
+        else "changed files include entries outside the effective authorized surface"
     )
     return FloorFact(5, "surface", passed, detail, evidence)
 

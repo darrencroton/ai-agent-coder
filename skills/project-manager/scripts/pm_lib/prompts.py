@@ -20,6 +20,7 @@ from typing import Any
 
 from . import PmError
 from .plan import PlanSlice
+from .plan import format_grant
 
 # skills/project-manager/scripts/pm_lib/prompts.py -> parents[2] is
 # skills/project-manager/, so references/ sits alongside scripts/.
@@ -84,6 +85,17 @@ def load_template(reference_path: Path | None = None, *, heading: str | None = N
     return matches[0]
 
 
+def _render_grant_lines(grants: list[dict[str, Any]] | None) -> str:
+    """One line per recorded PM surface grant, or the literal `none`.
+
+    `none` (not an empty string) so a template that always shows the field
+    reads honestly when nothing was granted.
+    """
+    if not grants:
+        return "none"
+    return "\n".join(f"- {format_grant(grant)}" for grant in grants)
+
+
 def _render(template: str, path: Path, what: str, **fields: Any) -> str:
     """`template.format(**fields)`, turning a template authoring error into a
     PmError that names the file and the fix."""
@@ -104,6 +116,7 @@ def render_developer_prompt(
     notes_path: Path,
     result_path: Path,
     before_head: str | None = None,
+    granted_surface: list[dict[str, Any]] | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
 ) -> str:
@@ -139,6 +152,7 @@ def render_developer_prompt(
         "intended_change": sections.get("Intended Change", "").rstrip(),
         "acceptance_criteria": sections.get("Acceptance Criteria", "").rstrip(),
         "authorized_surface": sections.get("Authorized Surface", "").rstrip(),
+        "granted_surface": _render_grant_lines(granted_surface),
         "explicit_non_goals": sections.get("Explicit Non-Goals", "").rstrip(),
         "risk_flags": sections.get("Risk Flags", "").rstrip(),
         "validation_plan": sections.get("Validation Plan", "").rstrip(),
@@ -253,6 +267,7 @@ def render_reviewer_prompt(
     risk_flags: str,
     drift_audit_report: str | None = None,
     pm_adjudications: str | None = None,
+    pm_surface_grants: list[dict[str, Any]] | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
 ) -> str:
@@ -269,6 +284,11 @@ def render_reviewer_prompt(
     in the run, or None for the template's literal `none`. It bounds reviewer
     attention only; the template — not this module — carries the wording that
     forbids treating it as widening scope or as licence to suppress dissent.
+
+    `pm_surface_grants` is the run's recorded PM surface grants for this
+    slice, or None for the template's literal `none`. Rendered through the
+    same `_render_grant_lines` helper `render_developer_prompt` uses, so the
+    Developer and the Reviewer read one identical list of what was granted.
     """
     template = load_template(reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH)
     skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root)
@@ -284,6 +304,7 @@ def render_reviewer_prompt(
         "changed_files": changed_files_text,
         "drift_audit_report": drift_audit_report or "none",
         "pm_adjudications": pm_adjudications or "none",
+        "pm_surface_grants": _render_grant_lines(pm_surface_grants),
         "intended_change": intended_change,
         "acceptance_criteria": acceptance_criteria,
         "authorized_surface": authorized_surface,
