@@ -915,7 +915,9 @@ class ObserveOutcome:
     pane_changed: bool = False
     result_present: bool = False
     result_status: str | None = None
-    hard_stop: dict[str, Any] = field(default_factory=lambda: {"present": False, "kinds": [], "markers": []})
+    dialog_markers: dict[str, Any] = field(
+        default_factory=lambda: {"present": False, "kinds": [], "markers": []}
+    )
     tail: str = ""
     slice_id: str | None = None
     elapsed_seconds: float = 0.0
@@ -942,46 +944,47 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
 
     deadline = time.monotonic() + wait if wait else None
     wait_start = time.monotonic()
-    activity = sessions.detect_activity(session, previous_capture)
+    activity = sessions.detect_activity(session)
+    # A dead session or failed capture provides no new screen. Keep the last
+    # good capture instead of turning absence into an empty pane and erasing
+    # the evidence finalize falls back to after session exit.
+    capture = activity["capture"] if activity["capture"] is not None else previous_capture
     # Wait exits early ONLY on a meaningful signal — session death, result.json
     # appearing, or a dialog marker on the visible pane — never on a mere
-    # pane byte-change, which `detect_activity`'s "active" flags on any TUI
-    # spinner/stream churn and would otherwise defeat the wait almost immediately.
-    break_hard_stop: dict[str, Any] | None = None
+    # pane byte-change; TUI spinner/stream churn would otherwise defeat the
+    # wait almost immediately.
+    marker_observation: sessions.PaneObservation | None = None
     while deadline is not None and time.monotonic() < deadline:
-        live = sessions.scan_live_hard_stop(session)
-        if live["present"]:
-            # Kept, because the post-loop scan below can miss it: a TUI redraw
-            # between the two reads would otherwise have `observe` report
-            # "clear" and a no-signal wait on the very marker that ended it.
-            # The accepted cost is the mirror case — a dialog dismissed in that
-            # same gap is still reported — which errs toward telling PM to look
-            # at a pane it was going to read anyway.
-            break_hard_stop = live
+        visible = sessions.scan_visible_pane(session)
+        if visible.dialog_markers["present"]:
+            # Retain the marker and the exact screen that produced it. A second
+            # capture could observe a redraw and recreate the old mismatch:
+            # marker reported, but marker absent from the tail and pane-live.
+            marker_observation = visible
             break
         if not activity["running"] or result_path.is_file():
             break
         time.sleep(_OBSERVE_POLL_SECONDS)
-        activity = sessions.detect_activity(session, previous_capture)
-    if break_hard_stop is not None:
-        # The marker was found on a pane read *after* the last `detect_activity`,
-        # so `activity["capture"]` predates it: reporting that would name a
-        # dialog in `hard_stop` while showing a tail that does not contain it,
-        # and leave the same stale screen in `pane-live.txt` for finalize to
-        # fall back to. Re-read, and keep the older capture only when the
-        # re-read is empty, which means the session died in the interval —
-        # discarding the screen that showed the marker is the one outcome worse
-        # than a slightly stale one.
-        refreshed = sessions.pane_text(session)
-        if refreshed:
-            activity = {**activity, "capture": refreshed}
-    # Liveness is re-read directly rather than through `detect_activity`, which
-    # would overwrite `capture` with the empty string a dead session returns
-    # and undo exactly the preservation above.
+        activity = sessions.detect_activity(session)
+        if activity["capture"] is not None:
+            capture = activity["capture"]
+
+    if marker_observation is None:
+        final_visible = sessions.scan_visible_pane(session)
+        if final_visible.dialog_markers["present"]:
+            marker_observation = final_visible
+    if marker_observation is not None:
+        # A present marker necessarily came from a successful, non-None
+        # capture. Use that same visible screen as both the reported tail and
+        # the durable fallback rather than trying to reconstruct it later.
+        assert marker_observation.capture is not None
+        capture = marker_observation.capture
+
+    # Re-read liveness after the last poll/marker observation without touching
+    # the capture retained above.
     running = sessions.session_exists(session)
     elapsed_seconds = time.monotonic() - wait_start
 
-    capture = activity["capture"]
     pane_changed = capture != previous_capture
     if pane_changed:
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1000,7 +1003,11 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     # Visible pane, not the scrollback `capture` above: an interactive dialog
     # is only actionable while it is on screen, and a dead session captures
     # nothing (so this reads clear, as it should).
-    hard_stop = break_hard_stop or sessions.scan_live_hard_stop(session)
+    dialog_markers = (
+        marker_observation.dialog_markers
+        if marker_observation is not None
+        else {"present": False, "kinds": [], "markers": []}
+    )
     tail_lines = capture.splitlines()[-_OBSERVE_TAIL_LINES:]
     tail = "\n".join(tail_lines)
 
@@ -1009,7 +1016,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     # A full requested wait that ended in none of the above is exactly the
     # pattern worth telling the caller about: re-asking at the same length
     # cannot return anything a longer wait would not have.
-    no_signal = bool(wait) and running and not result_present and not hard_stop["present"]
+    no_signal = bool(wait) and running and not result_present and not dialog_markers["present"]
     changed = pane_changed or liveness_changed or result_newly_appeared
     if changed or no_signal:
         note = (
@@ -1034,7 +1041,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         pane_changed=pane_changed,
         result_present=result_present,
         result_status=result_status,
-        hard_stop=hard_stop,
+        dialog_markers=dialog_markers,
         tail=tail,
         slice_id=current.get("id"),
         elapsed_seconds=elapsed_seconds,
@@ -1314,12 +1321,10 @@ def _render_assessment(
 class AcceptOutcome:
     kind: str  # accepted | floor_failed | reviews_stale
     slice_id: str
-    report: FloorReport | None = None
+    report: FloorReport
+    pane_path: Path
     assessment_path: Path | None = None
     message: str = ""
-    # Carried on every outcome, refusals included: the pane is PM's evidence
-    # on the accept path and its diagnosis on the refusal paths.
-    pane_path: Path | None = None
 
 
 def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, risk: str | None = None) -> AcceptOutcome:
@@ -1566,7 +1571,7 @@ class StopDecisionOutcome:
     report: FloorReport
     # A stop records an assessment, so it gets the same pane evidence an
     # acceptance does — often more relevant, since the pane is frequently why.
-    pane_path: Path | None = None
+    pane_path: Path
 
 
 def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: str | None = None) -> StopDecisionOutcome:

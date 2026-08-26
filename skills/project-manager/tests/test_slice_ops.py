@@ -795,7 +795,7 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertIn("session running: False", result["out"])
         self.assertNotIn("note:", result["out"], "a dead session is a signal, not a no-signal wait")
 
-    def test_hard_stop_marker_mid_wait_ends_wait_early(self) -> None:
+    def test_dialog_marker_mid_wait_ends_wait_early(self) -> None:
         trigger = self.repo.parent / "credential_trigger"
         self._launch(trigger_gated_credential_prompt_script(trigger))
         result = self._wait_then_trigger(trigger)
@@ -872,7 +872,7 @@ class TestObserveEventAppendFailure(PmTestCase):
             slice_id="Slice 1", before_head=None, artifact_dir=artifact_dir,
             tmux_session="pm-fake-session",
         )
-        activity = {"running": True, "active": capture != previous, "capture": capture}
+        activity = {"running": True, "capture": capture}
         with mock.patch.object(sessions, "session_exists", return_value=True), \
              mock.patch.object(sessions, "detect_activity", return_value=activity), \
              mock.patch.object(
@@ -954,13 +954,8 @@ class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
     """The race the two isolated `observe` tests cannot reach: a marker ends
     the wait and the session dies inside the same poll window.
 
-    Every mock here is ORDERED, and that is the point. An earlier version
-    returned constant values, which made the test pass with marker retention
-    and capture preservation both reverted — it happened to pin only the
-    liveness re-read. Constant mocks cannot distinguish "kept the marker we
-    saw" from "saw the same marker again on a later read", so the sequence has
-    to be alive-then-dead and marker-then-clear for each claimed invariant to
-    be independently necessary.
+    The marker result and capture come from one `PaneObservation`; a later
+    liveness read cannot replace that screen or report the session as alive.
     """
 
     def test_marker_wins_the_break_without_losing_liveness_or_the_capture(self) -> None:
@@ -975,28 +970,27 @@ class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
         )
 
         marker_screen = "working...\nEnter API key to continue\n"
-        dialog = sessions.scan_hard_stop(marker_screen)
-        clear = {"present": False, "kinds": [], "markers": []}
-
+        dialog = sessions.scan_dialog_markers(marker_screen)
         with mock.patch.object(
             slice_ops.sessions, "detect_activity",
             # The pre-marker screen: the loop reads this BEFORE the dialog draws,
             # so a tail taken from it would not contain the marker.
-            return_value={"running": True, "active": True, "capture": "working...\n"},
+            return_value={"running": True, "capture": "working...\n"},
         ), mock.patch.object(
-            # Marker on the first scan, clear afterwards: a post-loop re-scan
-            # instead of the retained one would report "clear".
-            slice_ops.sessions, "scan_live_hard_stop", side_effect=[dialog, clear, clear],
+            slice_ops.sessions, "scan_visible_pane",
+            return_value=sessions.PaneObservation(capture=marker_screen, dialog_markers=dialog),
         ), mock.patch.object(
             # Alive when the wait began, dead by the time liveness is re-read.
-            slice_ops.sessions, "session_exists", side_effect=[True, False, False],
+            slice_ops.sessions, "session_exists", side_effect=[True, False],
         ), mock.patch.object(
-            slice_ops.sessions, "pane_text", return_value=marker_screen,
+            slice_ops.sessions,
+            "pane_text",
+            side_effect=AssertionError("marker evidence must not be reconstructed by a second read"),
         ):
             outcome = slice_ops.observe(self.repo, run_dir, wait=30.0, token=token)
 
-        self.assertTrue(outcome.hard_stop["present"], "the marker that ended the wait must be retained")
-        self.assertIn("credential_prompt", outcome.hard_stop["kinds"])
+        self.assertTrue(outcome.dialog_markers["present"], "the marker that ended the wait must be retained")
+        self.assertIn("credential_prompt", outcome.dialog_markers["kinds"])
         self.assertFalse(outcome.running, "liveness must be re-read after a marker break")
         self.assertIn(
             "Enter API key", outcome.tail,
@@ -1008,6 +1002,35 @@ class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
         )
         self.assertFalse(outcome.no_signal, "a marker is a signal, not a no-signal wait")
         self.assertLess(outcome.elapsed_seconds, 30.0, "the wait must break early, not run to term")
+
+    def test_session_death_preserves_the_last_good_capture(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        pane_live = artifact_dir / "pane-live.txt"
+        pane_live.write_text("last good screen\n", encoding="utf-8")
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=None,
+            artifact_dir=artifact_dir, tmux_session="pm-not-a-real-session",
+        )
+        clear = sessions.PaneObservation(
+            capture=None,
+            dialog_markers={"present": False, "kinds": [], "markers": []},
+        )
+
+        with mock.patch.object(
+            slice_ops.sessions, "detect_activity", return_value={"running": False, "capture": None}
+        ), mock.patch.object(
+            slice_ops.sessions, "scan_visible_pane", return_value=clear
+        ), mock.patch.object(
+            slice_ops.sessions, "session_exists", side_effect=[True, False]
+        ):
+            outcome = slice_ops.observe(self.repo, run_dir, wait=30.0, token=token)
+
+        self.assertFalse(outcome.running)
+        self.assertEqual(outcome.tail, "last good screen")
+        self.assertEqual(pane_live.read_text(encoding="utf-8"), "last good screen\n")
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")

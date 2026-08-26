@@ -452,11 +452,11 @@ def _run_observe(args: argparse.Namespace) -> int:
     print(f"pane changed: {outcome.pane_changed}")
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
     print(f"result present: {outcome.result_present}{status_note}")
-    if outcome.hard_stop["present"]:
+    if outcome.dialog_markers["present"]:
         # Named as a signal, not a verdict: no fact reads this, PM decides what
         # a marker means. Carries the matched literal for the same reason the
         # send refusals do — a kind alone cannot be judged.
-        print(f"dialog marker: {sessions.marker_detail(outcome.hard_stop)}")
+        print(f"dialog marker: {sessions.dialog_marker_detail(outcome.dialog_markers)}")
     else:
         print("dialog marker: clear")
 
@@ -497,7 +497,7 @@ def _print_floor_facts(report) -> None:
 _PANE_TAIL_LINES = 40
 
 
-def _print_pane_tail(pane_path: Path | None) -> None:
+def _print_pane_tail(pane_path: Path) -> None:
     """Print the tail of the captured pane on every path that records an assessment.
 
     No floor fact reads the pane any more, so PM's own read is the only thing
@@ -511,7 +511,7 @@ def _print_pane_tail(pane_path: Path | None) -> None:
     and the session it is correcting is still running, so its pane is a moving
     target that the next `finalize` before acceptance shows properly.
     """
-    if pane_path is None or not Path(pane_path).is_file():
+    if not pane_path.is_file():
         print("pane: (not captured — no live session at finalize)")
         return
     lines = Path(pane_path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -541,8 +541,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
     if args.accept is not None:
         outcome = slice_ops.finalize_accept(repo, run_dir, token, reasoning=args.accept, risk=args.risk)
         print(f"slice: {outcome.slice_id}")
-        if outcome.report:
-            _print_floor_facts(outcome.report)
+        _print_floor_facts(outcome.report)
         _print_pane_tail(outcome.pane_path)
         if outcome.kind == "accepted":
             print(f"ACCEPTED {outcome.slice_id}")

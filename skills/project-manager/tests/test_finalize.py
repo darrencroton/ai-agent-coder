@@ -628,6 +628,38 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
 # --- steer -------------------------------------------------------------------
 
 
+class TestSteerTypedStateCleanup(PmTestCase):
+    def test_typed_not_submitted_preserves_the_correction_file(self) -> None:
+        plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        self.set_current_slice(
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=None,
+            artifact_dir=artifact_dir,
+            tmux_session="pm-mocked",
+            attempts=0,
+        )
+
+        with mock.patch.object(slice_ops.sessions, "session_exists", return_value=True), \
+             mock.patch.object(
+                 slice_ops.sessions,
+                 "send_line",
+                 side_effect=TypedNotSubmitted("typed, not sent"),
+             ):
+            with self.assertRaises(TypedNotSubmitted):
+                slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the thing")
+
+        self.assertTrue(
+            (artifact_dir / "steer-attempt-1.md").is_file(),
+            "a correction whose pointer is typed in the pane must not be deleted",
+        )
+
+
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestSteer(FinalizeTestCase):
     def test_steer_files_the_correction_sends_a_pointer_and_exhausts_budget(self) -> None:
@@ -743,7 +775,7 @@ class TestSteer(FinalizeTestCase):
         self.assertTrue((artifact_dir / "attempt-0" / "result.json").is_file())
         self.assertFalse((artifact_dir / "result.json").is_file())
 
-    def test_steer_refuses_into_visible_hard_stop_prompt(self) -> None:
+    def test_steer_refuses_into_visible_dialog_prompt(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         # Trigger-gated: the marker must appear strictly AFTER injection
         # (`send_prompt` refuses into a visible one, which would fail
@@ -780,17 +812,7 @@ class TestSteer(FinalizeTestCase):
         events = state_mod.read_events(run_dir)
         self.assertFalse([e for e in events if e["kind"] == "steer"])
 
-    def test_post_typing_refusal_preserves_the_correction_file(self) -> None:
-        """Cleanup depends on whether the text reached the pane.
-
-        An undelivered steer deletes its correction file so nothing reads as
-        delivered. But a refusal *after* typing leaves the pointer to that
-        file sitting in the Developer's input line, so deleting it would leave
-        the pane naming a path that no longer exists — a dangling pointer the
-        Developer would read if the dialog were dismissed and the line
-        submitted. Both branches are asserted here because the pre-typing test
-        above expressly requires deletion, so nothing else pins the difference.
-        """
+    def test_pretyping_send_failure_deletes_the_correction_file(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(self.repo.parent / "fake.sh", stdin_draining_idle_script())
         code, out, _err = self._init(plan_path, harness)
@@ -805,24 +827,6 @@ class TestSteer(FinalizeTestCase):
             state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
         )
 
-        with mock.patch.object(
-            slice_ops.sessions, "send_line", side_effect=TypedNotSubmitted("typed, not sent")
-        ) as typed:
-            with self.assertRaises(TypedNotSubmitted):
-                slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the thing")
-        self.assertTrue(typed.called, "the TypedNotSubmitted branch must reach the send")
-        self.assertTrue(
-            (artifact_dir / "steer-attempt-1.md").is_file(),
-            "a correction whose pointer is typed in the pane must not be deleted",
-        )
-
-        # Cleared first, and this matters: a failed steer does not persist its
-        # attempt, so a second call recomputes attempt 1 and would die on the
-        # exclusive-create guard against the file just preserved — never
-        # reaching the send at all. Asserting on a `steer-attempt-2.md` that
-        # was never going to exist is how this test passed while proving
-        # nothing about the branch below.
-        (artifact_dir / "steer-attempt-1.md").unlink()
         with mock.patch.object(
             slice_ops.sessions, "send_line", side_effect=PmError("never reached the pane")
         ) as never_delivered:

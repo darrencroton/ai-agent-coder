@@ -2,7 +2,7 @@
 
 This module owns *all* tmux and harness-process contact — no other module in
 this package shells out to tmux. It never judges anything beyond the
-interactive-dialog marker scan (`scan_hard_stop`), which is pure text parsing
+interactive-dialog marker scan (`scan_dialog_markers`), which is pure text parsing
 guarding PM's own keystrokes in `send_prompt`/`send_line` and reported as a
 signal by `observe`. It is not a floor fact: whether a visible message means
 the run must stop is the PM agent's reading, not this module's.
@@ -27,13 +27,14 @@ import shlex
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from . import PmError
 from . import TypedNotSubmitted
 
-# --- Hard-stop markers ------------------------------------------------------
+# --- Dialog markers ---------------------------------------------------------
 
 # Directory-trust / folder-trust dialogs from the interactive TUIs. If any of
 # these is on screen when PM is about to submit, a blind Enter would confirm
@@ -102,7 +103,7 @@ def _literal_marker_re(marker: str) -> re.Pattern[str]:
     return re.compile(rf"\b{body}\b")
 
 
-def scan_hard_stop(text: str) -> dict[str, Any]:
+def scan_dialog_markers(text: str) -> dict[str, Any]:
     """The interactive-dialog marker scan that guards PM's own keystrokes.
 
     Whitespace-normalizes and lowercases, then looks for the literal dialog
@@ -136,12 +137,12 @@ def scan_hard_stop(text: str) -> dict[str, Any]:
     return matches
 
 
-def marker_detail(hard_stop: dict[str, Any]) -> str:
+def dialog_marker_detail(dialog_markers: dict[str, Any]) -> str:
     """Kinds plus the matched strings — a refusal that names only its kinds
     leaves PM guessing which line of the pane it objected to, and so unable to
     tell a real dialog from a false match."""
-    kinds = ", ".join(hard_stop["kinds"])
-    markers = "; ".join(repr(marker) for marker in hard_stop["markers"])
+    kinds = ", ".join(dialog_markers["kinds"])
+    markers = "; ".join(repr(marker) for marker in dialog_markers["markers"])
     return f"{kinds} (matched {markers})" if markers else kinds
 
 
@@ -219,16 +220,29 @@ def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -
     _tmux_or_raise(["new-session", "-d", "-s", session, "-c", str(repo), shell_command], "tmux start failed")
 
 
+def _pane_capture(session: str, *, visible: bool, required: bool = False) -> str | None:
+    args = ["capture-pane", "-p", "-J"]
+    if not visible:
+        args += ["-S", "-32768"]
+    result = _run_tmux(*args, "-t", session)
+    if result.returncode == 0:
+        return result.stdout
+    if required:
+        detail = (result.stderr or result.stdout or "").strip()
+        message = "tmux visible-pane safety capture failed"
+        raise PmError(f"{message}: {detail}" if detail else message)
+    return None
+
+
 def pane_text(session: str) -> str:
     """`capture-pane -p -J -S -32768`; empty string on any failure.
 
     `-J` rejoins lines tmux hard-wrapped at the pane width. Without it a
     marker split mid-token ("Ente" / "r API key to continue") survives
-    `scan_hard_stop`'s whitespace normalization as "Ente r API key" and
+    `scan_dialog_markers`' whitespace normalization as "Ente r API key" and
     matches nothing, making marker detection depend on pane width.
     """
-    result = _run_tmux("capture-pane", "-p", "-J", "-S", "-32768", "-t", session)
-    return result.stdout if result.returncode == 0 else ""
+    return _pane_capture(session, visible=False) or ""
 
 
 def visible_pane_text(session: str) -> str:
@@ -240,13 +254,30 @@ def visible_pane_text(session: str) -> str:
     and scanning those refused every later send for the life of the session.
     Full scrollback stays the right capture for evidence (`capture_to`).
     """
-    result = _run_tmux("capture-pane", "-p", "-J", "-t", session)
-    return result.stdout if result.returncode == 0 else ""
+    return _pane_capture(session, visible=True) or ""
 
 
-def scan_live_hard_stop(session: str) -> dict[str, Any]:
-    """`scan_hard_stop` over the visible pane of a live session."""
-    return scan_hard_stop(visible_pane_text(session))
+@dataclass(frozen=True)
+class PaneObservation:
+    """One visible-pane read and the markers parsed from that exact screen.
+
+    ``capture=None`` means tmux could not provide a screen. Safety callers use
+    ``required=True`` and receive ``PmError`` instead; observation callers may
+    keep their last good capture without mistaking failure for an empty pane.
+    """
+
+    capture: str | None
+    dialog_markers: dict[str, Any]
+
+
+def scan_visible_pane(session: str, *, required: bool = False) -> PaneObservation:
+    """Capture and parse the visible pane once.
+
+    ``required=True`` is the keystroke-safety contract: failure to inspect the
+    pane raises instead of being interpreted as a clear screen.
+    """
+    capture = _pane_capture(session, visible=True, required=required)
+    return PaneObservation(capture=capture, dialog_markers=scan_dialog_markers(capture or ""))
 
 
 def capture_to(session: str, destination: Path) -> None:
@@ -283,11 +314,10 @@ def sessions_with_prefix(prefix: str) -> list[str]:
     return [name for name in _session_names() if name.startswith(prefix)]
 
 
-def detect_activity(session: str, previous_capture: str) -> dict[str, Any]:
+def detect_activity(session: str) -> dict[str, Any]:
     if not session_exists(session):
-        return {"running": False, "active": False, "capture": ""}
-    capture = pane_text(session)
-    return {"running": True, "active": capture != previous_capture, "capture": capture}
+        return {"running": False, "capture": None}
+    return {"running": True, "capture": _pane_capture(session, visible=False)}
 
 
 def request_stop(session: str) -> None:
@@ -304,7 +334,7 @@ def force_stop(session: str) -> None:
 
 
 def _raise_on_trust_prompt(executable: str, capture: str) -> None:
-    result = scan_hard_stop(capture)
+    result = scan_dialog_markers(capture)
     if "trust_prompt" in result["kinds"]:
         raise PmError(f"{executable} directory trust prompt blocked unattended launch; trust the repo before running PM")
 
@@ -425,28 +455,35 @@ def send_prompt(session: str, pointer: str) -> None:
     """
     if "\n" in pointer or "\r" in pointer:
         raise PmError("launch pointer must be a single line; the contract itself goes in the prompt.md file it names")
-    hard_stop = scan_live_hard_stop(session)
-    if hard_stop["present"]:
+    dialog_markers = scan_visible_pane(session, required=True).dialog_markers
+    if dialog_markers["present"]:
         raise PmError(
             "refusing to inject the slice launch pointer into a visible dialog: "
-            + marker_detail(hard_stop)
+            + dialog_marker_detail(dialog_markers)
             + "; trust/authenticate the harness before launching, then start the slice again"
         )
     _tmux_or_raise(["send-keys", "-t", session, "-l", "--", pointer], "tmux launch pointer send failed")
     time.sleep(1.0)
     # Same settle window as `send_line`'s: a trust or credential dialog can
     # draw itself during this second, and the Enter below would confirm it.
-    pre_submit = scan_live_hard_stop(session)
+    try:
+        pre_submit = scan_visible_pane(session, required=True).dialog_markers
+    except PmError as exc:
+        raise TypedNotSubmitted(
+            f"{exc}; the launch pointer is typed but unsubmitted — do not retry into this session; relaunch"
+        ) from exc
     if pre_submit["present"]:
         raise TypedNotSubmitted(
             "a dialog appeared while the launch pointer was being typed; refusing to submit into it: "
-            + marker_detail(pre_submit)
-            + " (the pointer is typed but unsubmitted; read the pane before retrying)"
+            + dialog_marker_detail(pre_submit)
+            + " (the pointer is typed but unsubmitted; do not retry into this session — relaunch after reading the pane)"
         )
     _run_tmux("send-keys", "-t", session, "C-m")
     time.sleep(1.0)
-    if session_exists(session) and not scan_live_hard_stop(session)["present"]:
-        _run_tmux("send-keys", "-t", session, "C-m")
+    if session_exists(session):
+        second_submit = scan_visible_pane(session)
+        if second_submit.capture is not None and not second_submit.dialog_markers["present"]:
+            _run_tmux("send-keys", "-t", session, "C-m")
 
 
 def send_line(session: str, text: str) -> None:
@@ -457,11 +494,10 @@ def send_line(session: str, text: str) -> None:
     The dialog scan is not overridable. A marker literal is not a dialog
     identity — `Enter API key` in a test log and a real credential dialog scan
     identically — so no comparison may authorize a keystroke this function is
-    about to send blind. Nothing is walled off by refusing: the scan reads the
-    *visible* pane, so a false match from ordinary output clears as the
-    Developer prints its next line and PM re-issues after the next `observe`,
-    while a marker persisting on a static screen is a session that is not
-    progressing — a relaunch or a stop.
+    about to send blind. A pre-typing false match clears with ordinary output
+    and may then be re-issued. A post-typing refusal raises
+    `TypedNotSubmitted`; that line must not be duplicated by a retry, so the
+    safe routes are relaunch or human input cleanup.
 
     The first C-m is checked, unlike `send_prompt`'s: callers treat a return
     as delivery, and a pane exiting before it leaves the text typed but never
@@ -474,11 +510,11 @@ def send_line(session: str, text: str) -> None:
         raise PmError("send text must be a single line; write multi-line content to a file and send a one-line pointer")
     if not session_exists(session):
         raise PmError(f"tmux session is not running: {session}")
-    hard_stop = scan_live_hard_stop(session)
-    if hard_stop["present"]:
+    dialog_markers = scan_visible_pane(session, required=True).dialog_markers
+    if dialog_markers["present"]:
         raise PmError(
             "refusing to send into a dialog on screen: "
-            + marker_detail(hard_stop)
+            + dialog_marker_detail(dialog_markers)
             + "; if this is ordinary output rather than a dialog it clears as the pane scrolls, so"
             " re-issue after the next observe — a marker that persists on a static screen is a"
             " relaunch or a stop"
@@ -489,14 +525,28 @@ def send_line(session: str, text: str) -> None:
     # settle above is a full second in which an asynchronous dialog can draw
     # itself over a pane that was clear when this call began, and it is the
     # Enter — never the typing — that would answer it.
-    pre_submit = scan_live_hard_stop(session)
+    try:
+        pre_submit = scan_visible_pane(session, required=True).dialog_markers
+    except PmError as exc:
+        raise TypedNotSubmitted(
+            f"{exc}; the text is typed but unsubmitted — do not retry into this session; "
+            "relaunch or have a human clear the input"
+        ) from exc
     if pre_submit["present"]:
         raise TypedNotSubmitted(
             "a dialog appeared while the line was being typed; refusing to submit into it: "
-            + marker_detail(pre_submit)
-            + " (the text is typed but unsubmitted; read the pane before retrying)"
+            + dialog_marker_detail(pre_submit)
+            + " (the text is typed but unsubmitted; do not retry into this session — relaunch or have a human clear the input)"
         )
-    _tmux_or_raise(["send-keys", "-t", session, "C-m"], "tmux submit failed; text typed but not sent")
+    try:
+        _tmux_or_raise(["send-keys", "-t", session, "C-m"], "tmux submit failed")
+    except PmError as exc:
+        raise TypedNotSubmitted(
+            f"{exc}; the text is typed but unsubmitted — do not retry into this session; "
+            "relaunch or have a human clear the input"
+        ) from exc
     time.sleep(1.0)
-    if session_exists(session) and not scan_live_hard_stop(session)["present"]:
-        _run_tmux("send-keys", "-t", session, "C-m")
+    if session_exists(session):
+        second_submit = scan_visible_pane(session)
+        if second_submit.capture is not None and not second_submit.dialog_markers["present"]:
+            _run_tmux("send-keys", "-t", session, "C-m")

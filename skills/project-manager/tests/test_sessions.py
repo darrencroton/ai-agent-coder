@@ -1,11 +1,11 @@
 """Protected behaviours: tmux session lifecycle and the dialog-marker guard.
 
-`scan_hard_stop`, `session_name`, and the env-token assertion run without
+`scan_dialog_markers`, `session_name`, and the env-token assertion run without
 tmux. Everything that drives a real pane is gated with
 `@unittest.skipUnless(shutil.which("tmux"), ...)` and drives a tiny fake
 harness shell script — no real coding CLI is ever launched.
 
-`scan_hard_stop` carries both positive fixtures (one per marker class) and
+`scan_dialog_markers` carries both positive fixtures (one per marker class) and
 the negative ones that stop it over-firing: an informational sub-100% usage
 warning, a conditional "if you hit your limit", and a marker embedded in an
 unrelated word.
@@ -39,14 +39,14 @@ from pm_lib import sessions
 _HAS_TMUX = shutil.which("tmux") is not None
 
 
-# --- scan_hard_stop: no tmux required ---------------------------------------
+# --- scan_dialog_markers: no tmux required ----------------------------------
 
 
-class TestScanHardStopPositiveFixtures(unittest.TestCase):
+class TestScanDialogMarkersPositiveFixtures(unittest.TestCase):
     def test_trust_prompt_markers(self) -> None:
         for marker in sessions.TRUST_PROMPT_MARKERS:
             with self.subTest(marker=marker):
-                result = sessions.scan_hard_stop(f"{marker}?")
+                result = sessions.scan_dialog_markers(f"{marker}?")
                 self.assertTrue(result["present"])
                 self.assertIn("trust_prompt", result["kinds"])
 
@@ -54,22 +54,22 @@ class TestScanHardStopPositiveFixtures(unittest.TestCase):
         """Pinned to the observed string, not to the marker tuple: qwen's dialog
         defaults to "Trust folder", so a phrasing the tuple stops covering would
         be confirmed by the launch injection's Enter rather than merely missed."""
-        result = sessions.scan_hard_stop("Do you trust this folder?\n> 1. Trust folder\n  2. Don't trust")
+        result = sessions.scan_dialog_markers("Do you trust this folder?\n> 1. Trust folder\n  2. Don't trust")
         self.assertTrue(result["present"])
         self.assertIn("trust_prompt", result["kinds"])
 
     def test_approval_prompt(self) -> None:
-        result = sessions.scan_hard_stop("Do you want to proceed?")
+        result = sessions.scan_dialog_markers("Do you want to proceed?")
         self.assertTrue(result["present"])
         self.assertIn("approval_prompt", result["kinds"])
 
     def test_qwen_manual_approval_prompt(self) -> None:
-        result = sessions.scan_hard_stop("This action requires manual approval before continuing")
+        result = sessions.scan_dialog_markers("This action requires manual approval before continuing")
         self.assertTrue(result["present"])
         self.assertIn("approval_prompt", result["kinds"])
 
     def test_credential_prompt(self) -> None:
-        result = sessions.scan_hard_stop("Enter API key to continue")
+        result = sessions.scan_dialog_markers("Enter API key to continue")
         self.assertTrue(result["present"])
         self.assertIn("credential_prompt", result["kinds"])
 
@@ -77,17 +77,17 @@ class TestScanHardStopPositiveFixtures(unittest.TestCase):
         """"two-factor" is a hyphenated phrase, not a bare word, so it keeps
         substring matching. Bounding it would lose a prompt a pane renders
         flush against padding — the same mid-token wrap case `-J` protects."""
-        result = sessions.scan_hard_stop("xxxTwo-factor authentication required")
+        result = sessions.scan_dialog_markers("xxxTwo-factor authentication required")
         self.assertTrue(result["present"])
         self.assertIn("credential_prompt", result["kinds"])
 
     def test_permission_prompt(self) -> None:
-        result = sessions.scan_hard_stop("Grant permission to read this file?")
+        result = sessions.scan_dialog_markers("Grant permission to read this file?")
         self.assertTrue(result["present"])
         self.assertIn("permission_prompt", result["kinds"])
 
 
-class TestScanHardStopNegativeFixtures(unittest.TestCase):
+class TestScanDialogMarkersNegativeFixtures(unittest.TestCase):
     def test_claude_code_weekly_limit_banner_is_not_a_dialog(self) -> None:
         """The verbatim banner that stopped a real run. A usage window is an
         operational recovery decision (docs/VISION.md), so PM reads it from the
@@ -99,7 +99,7 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
             "Subscription plan limit exhausted. Upgrade billing to continue.",
         ):
             with self.subTest(text=text):
-                result = sessions.scan_hard_stop(text)
+                result = sessions.scan_dialog_markers(text)
                 self.assertFalse(result["present"])
                 self.assertEqual(result["kinds"], [])
 
@@ -116,7 +116,7 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
             "Plan: add credits limit to billing module",
         ):
             with self.subTest(text=text):
-                result = sessions.scan_hard_stop(text)
+                result = sessions.scan_dialog_markers(text)
                 self.assertFalse(result["present"])
                 self.assertEqual(result["kinds"], [])
 
@@ -124,7 +124,7 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
         """A one-word marker matches on boundaries: "MFA" inside a temp path is
         not a credential prompt, and a false marker refuses every send and ends
         `observe --wait` early."""
-        result = sessions.scan_hard_stop("PM_TMPDIR=/tmp/tmpq8mfa2z1/fake.sh")
+        result = sessions.scan_dialog_markers("PM_TMPDIR=/tmp/tmpq8mfa2z1/fake.sh")
         self.assertFalse(result["present"])
         self.assertEqual(result["kinds"], [])
 
@@ -138,12 +138,12 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
             "'... is not writable: could not create a probe file there: Permission denied'",
         ):
             with self.subTest(text=text):
-                result = sessions.scan_hard_stop(text)
+                result = sessions.scan_dialog_markers(text)
                 self.assertFalse(result["present"])
                 self.assertEqual(result["kinds"], [])
 
     def test_empty_text_is_not_stopping(self) -> None:
-        result = sessions.scan_hard_stop("")
+        result = sessions.scan_dialog_markers("")
         self.assertFalse(result["present"])
         self.assertEqual(result["kinds"], [])
         self.assertEqual(result["markers"], [])
@@ -162,7 +162,7 @@ class TestPostTypingRefusalWithholdsTheEnter(unittest.TestCase):
 
     def _run(self, call):
         clear = {"present": False, "kinds": [], "markers": []}
-        dialog = sessions.scan_hard_stop("Enter API key to continue")
+        dialog = sessions.scan_dialog_markers("Enter API key to continue")
         sent: list[tuple[str, ...]] = []
 
         def record(*args, **kwargs):
@@ -170,7 +170,11 @@ class TestPostTypingRefusalWithholdsTheEnter(unittest.TestCase):
             sent.append(argv)
             return subprocess.CompletedProcess(args=list(argv), returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(sessions, "scan_live_hard_stop", side_effect=[clear, dialog]), \
+        observations = [
+            sessions.PaneObservation(capture="clear pane", dialog_markers=clear),
+            sessions.PaneObservation(capture="Enter API key to continue", dialog_markers=dialog),
+        ]
+        with mock.patch.object(sessions, "scan_visible_pane", side_effect=observations), \
              mock.patch.object(sessions, "session_exists", return_value=True), \
              mock.patch.object(sessions, "_tmux_or_raise", side_effect=record), \
              mock.patch.object(sessions, "_run_tmux", side_effect=record), \
@@ -187,6 +191,7 @@ class TestPostTypingRefusalWithholdsTheEnter(unittest.TestCase):
                          f"no Enter may be sent once a dialog is visible; got {sent!r}")
         self.assertIn("credential_prompt", message)
         self.assertIn("typed but unsubmitted", message)
+        self.assertIn("do not retry", message)
 
     def test_send_prompt_types_but_never_presses_enter(self) -> None:
         sent, message = self._run(lambda: sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md"))
@@ -195,10 +200,110 @@ class TestPostTypingRefusalWithholdsTheEnter(unittest.TestCase):
         self.assertIn("credential_prompt", message)
 
 
-class TestScanHardStopWrapping(unittest.TestCase):
+class TestGuardCaptureFailureWithholdsTheEnter(unittest.TestCase):
+    """A failed safety capture is unknown, never a clear pane."""
+
+    def _run(self, call, capture_codes: list[int]) -> list[tuple[str, ...]]:
+        codes = iter(capture_codes)
+        sent: list[tuple[str, ...]] = []
+
+        def fake_tmux(*args):
+            if args[0] == "capture-pane":
+                code = next(codes)
+                return subprocess.CompletedProcess(
+                    args=list(args), returncode=code, stdout="clear pane" if code == 0 else "", stderr="capture failed"
+                )
+            sent.append(tuple(args))
+            return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux), \
+             mock.patch.object(sessions, "session_exists", return_value=True), \
+             mock.patch.object(sessions.time, "sleep"):
+            with self.assertRaises(PmError) as ctx:
+                call()
+        self.assertIn("safety capture failed", str(ctx.exception))
+        self.assertFalse([argv for argv in sent if "C-m" in argv], sent)
+        if len(capture_codes) > 1:
+            self.assertIsInstance(ctx.exception, TypedNotSubmitted)
+            self.assertIn("do not retry", str(ctx.exception))
+        return sent
+
+    def test_pretyping_capture_failure_sends_nothing(self) -> None:
+        for call in (
+            lambda: sessions.send_line("pm-mocked", "please continue"),
+            lambda: sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md"),
+        ):
+            with self.subTest(call=call):
+                self.assertEqual(self._run(call, [1]), [])
+
+    def test_presubmit_capture_failure_leaves_only_typed_text(self) -> None:
+        for call in (
+            lambda: sessions.send_line("pm-mocked", "please continue"),
+            lambda: sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md"),
+        ):
+            with self.subTest(call=call):
+                sent = self._run(call, [0, 1])
+                self.assertTrue(any("-l" in argv for argv in sent), sent)
+
+    def test_second_submit_capture_failure_withholds_only_the_redundant_enter(self) -> None:
+        for call in (
+            lambda: sessions.send_line("pm-mocked", "please continue"),
+            lambda: sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md"),
+        ):
+            with self.subTest(call=call):
+                codes = iter([0, 0, 1])
+                sent: list[tuple[str, ...]] = []
+
+                def fake_tmux(*args, _codes=codes, _sent=sent):
+                    if args[0] == "capture-pane":
+                        code = next(_codes)
+                        return subprocess.CompletedProcess(
+                            args=list(args),
+                            returncode=code,
+                            stdout="clear pane" if code == 0 else "",
+                            stderr="capture failed",
+                        )
+                    _sent.append(tuple(args))
+                    return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+                with mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux), \
+                     mock.patch.object(sessions, "session_exists", return_value=True), \
+                     mock.patch.object(sessions.time, "sleep"):
+                    call()
+
+                self.assertEqual(sum("C-m" in argv for argv in sent), 1, sent)
+
+
+class TestSubmitFailurePreservesTypedState(unittest.TestCase):
+    def test_send_line_reports_typed_not_submitted_when_first_enter_fails(self) -> None:
+        clear = sessions.PaneObservation(
+            capture="clear pane",
+            dialog_markers={"present": False, "kinds": [], "markers": []},
+        )
+        sends: list[tuple[str, ...]] = []
+
+        def fake_send(args, message):
+            sends.append(tuple(args))
+            if "C-m" in args:
+                raise PmError(message)
+
+        with mock.patch.object(sessions, "scan_visible_pane", return_value=clear), \
+             mock.patch.object(sessions, "session_exists", return_value=True), \
+             mock.patch.object(sessions, "_tmux_or_raise", side_effect=fake_send), \
+             mock.patch.object(sessions.time, "sleep"):
+            with self.assertRaises(TypedNotSubmitted) as ctx:
+                sessions.send_line("pm-mocked", "please continue")
+
+        self.assertTrue(any("-l" in argv for argv in sends), sends)
+        self.assertEqual(sum("C-m" in argv for argv in sends), 1, sends)
+        self.assertIn("typed but unsubmitted", str(ctx.exception))
+        self.assertIn("do not retry", str(ctx.exception))
+
+
+class TestScanDialogMarkersWrapping(unittest.TestCase):
     def test_credential_prompt_wrapped_across_lines_still_matches(self) -> None:
         wrapped = "Enter API\nkey to continue"
-        result = sessions.scan_hard_stop(wrapped)
+        result = sessions.scan_dialog_markers(wrapped)
         self.assertTrue(result["present"])
         self.assertIn("credential_prompt", result["kinds"])
 
@@ -234,7 +339,7 @@ class TestVisiblePaneExcludesScrollback(unittest.TestCase):
         self.assertIn("Enter API key", sessions.pane_text(session))
         # The guard's view does not, so it does not refuse.
         self.assertNotIn("Enter API key", sessions.visible_pane_text(session))
-        self.assertFalse(sessions.scan_live_hard_stop(session)["present"])
+        self.assertFalse(sessions.scan_visible_pane(session).dialog_markers["present"])
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real pane")
@@ -282,7 +387,7 @@ class TestPaneTextRejoinsHardWraps(unittest.TestCase):
 
         joined = sessions.pane_text(session)
         self.assertIn("Enter API key", joined)
-        result = sessions.scan_hard_stop(joined)
+        result = sessions.scan_dialog_markers(joined)
         self.assertTrue(result["present"])
         self.assertIn("credential_prompt", result["kinds"])
 
@@ -403,13 +508,15 @@ class TestStartSessionAndBasicLifecycle(TmuxSessionTestCase):
         content = destination.read_text(encoding="utf-8")
         self.assertTrue(content.strip())
 
-    def test_detect_activity_flags_change(self) -> None:
+    def test_detect_activity_returns_the_latest_capture(self) -> None:
         name = "pm-test-activity-s01a0"
         self._start(name, "bash -c 'sleep 1; echo NEW_ACTIVITY_LINE; sleep 5'")
         self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
-        result = sessions.detect_activity(name, "")
+        result = sessions.detect_activity(name)
         self.assertTrue(result["running"])
-        self.assertTrue(self._wait_for(lambda: sessions.detect_activity(name, result["capture"])["active"]))
+        self.assertTrue(
+            self._wait_for(lambda: "NEW_ACTIVITY_LINE" in (sessions.detect_activity(name)["capture"] or ""))
+        )
 
 
 class TestSendPrompt(TmuxSessionTestCase):
@@ -429,7 +536,7 @@ class TestSendPrompt(TmuxSessionTestCase):
             )
         )
 
-    def test_send_prompt_withholds_second_enter_when_a_hard_stop_appears(self) -> None:
+    def test_send_prompt_withholds_second_enter_when_a_dialog_marker_appears(self) -> None:
         name = "pm-test-sendprompt-rescan-s01a0"
         # After reading the pointer (first Enter), the harness reveals a
         # credential prompt, then does a TIMED read for a second line: it
@@ -476,7 +583,7 @@ class TestSendLine(TmuxSessionTestCase):
         with self.assertRaises(PmError):
             sessions.send_line("pm-test-definitely-not-running-s01a0", "hello")
 
-    def test_send_line_withholds_second_enter_when_a_hard_stop_appears(self) -> None:
+    def test_send_line_withholds_second_enter_when_a_dialog_marker_appears(self) -> None:
         # The steer/nudge counterpart of the send_prompt case above: the first
         # Enter can itself surface a credential prompt, and a blind second
         # would answer it. NO_SECOND_ENTER is the expected positive outcome;
