@@ -151,7 +151,7 @@ attention on something a tool already knows.
 - PM's recorded decision: a new finding is a steer when the fix is pure cleanup
   inside the authorized surface, or a recorded tolerance with a reason.
 
-**Why lint is not a ninth floor fact.** The floor's eight facts are
+**Why lint is not an eighth floor fact.** The floor's seven facts are
 repository-integrity properties that are never legitimately violated and are
 always knowable — surface, ancestry, cleanliness, digest, approvals. Lint is a
 *quality* signal, and this system deliberately places quality in recorded

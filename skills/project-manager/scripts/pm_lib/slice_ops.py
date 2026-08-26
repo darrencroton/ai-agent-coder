@@ -1063,18 +1063,31 @@ _REQUIRED_ELEVATED_REVIEW_SKILLS = ("code-review", "drift-audit")
 def _floor_note(report: FloorReport) -> str:
     """The one-line floor summary recorded on every `floor` event."""
     if report.passed:
-        return "8/8 passed"
+        return f"{len(report.facts)}/{len(report.facts)} passed"
     return "failed: " + ", ".join(fact.name for fact in report.facts if not fact.passed)
 
 
 def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[str, Any]) -> tuple[FloorReport, Path]:
     """Shared by bare `finalize` and every decision path: capture pane +
     status-after + diff evidence under the slice's artifact dir, then
-    evaluate the eight-fact floor. Never mutates or saves state."""
+    evaluate the seven-fact floor. Never mutates or saves state.
+
+    The pane capture is evidence for the PM agent to read, not an input to
+    the floor: whether a visible prompt or usage banner means this run must
+    stop is its judgement, recorded in the assessment."""
     slice_id = current["id"]
     artifact_dir = Path(current["artifact_dir"])
     session = current.get("tmux_session")
-    pane_text = sessions.pane_text(session) if session and sessions.session_exists(session) else ""
+    if session and sessions.session_exists(session):
+        pane_text = sessions.pane_text(session)
+    else:
+        # Falls back to the last screen `observe` recorded. The Developer
+        # session has normally already exited by finalize — it writes
+        # result.json and stops — so capturing only a live pane left pane.txt
+        # empty in the common case, which is exactly when PM is required to
+        # say what the pane showed.
+        pane_live = artifact_dir / "pane-live.txt"
+        pane_text = pane_live.read_text(encoding="utf-8") if pane_live.is_file() else ""
 
     (artifact_dir / "pane.txt").write_text(pane_text, encoding="utf-8")
     (artifact_dir / "status-after.txt").write_text(git_ops.git_status_text(repo), encoding="utf-8")
@@ -1084,7 +1097,7 @@ def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[
     git_ops.write_git_diff(repo, current.get("before_head"), after_head, diff_path)
 
     slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
-    report = evaluate_floor(repo, state, slices, slice_id, artifact_dir=artifact_dir, pane_text=pane_text)
+    report = evaluate_floor(repo, state, slices, slice_id, artifact_dir=artifact_dir)
     return report, artifact_dir
 
 
@@ -1278,6 +1291,9 @@ class AcceptOutcome:
     report: FloorReport | None = None
     assessment_path: Path | None = None
     message: str = ""
+    # Carried on every outcome, refusals included: the pane is PM's evidence
+    # on the accept path and its diagnosis on the refusal paths.
+    pane_path: Path | None = None
 
 
 def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, risk: str | None = None) -> AcceptOutcome:
@@ -1319,6 +1335,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         return AcceptOutcome(
             kind="floor_failed", slice_id=slice_id, report=report,
             message=f"floor failed for {slice_id}: {failed_names}; nothing accepted",
+            pane_path=artifact_dir / "pane.txt",
         )
 
     effective_risk = entry.get("risk") or "standard"
@@ -1340,6 +1357,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
                     f"acceptance refused: missing or stale review(s) for {', '.join(missing)} "
                     f"against HEAD {head}; re-run review --skill <name> against the current HEAD"
                 ),
+                pane_path=artifact_dir / "pane.txt",
             )
 
     reviews_text = _reviews_consulted_text(reviews, head, effective_risk, grant_count)
@@ -1381,7 +1399,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
 
     return AcceptOutcome(
         kind="accepted", slice_id=slice_id, report=report, assessment_path=assessment_original,
-        message=f"{slice_id} accepted",
+        message=f"{slice_id} accepted", pane_path=artifact_dir / "pane.txt",
     )
 
 
@@ -1514,6 +1532,9 @@ class StopDecisionOutcome:
     slice_id: str
     assessment_path: Path
     report: FloorReport
+    # A stop records an assessment, so it gets the same pane evidence an
+    # acceptance does — often more relevant, since the pane is frequently why.
+    pane_path: Path | None = None
 
 
 def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: str | None = None) -> StopDecisionOutcome:
@@ -1577,7 +1598,10 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
     state_mod.append_event(run_dir, "slice-stop", slice_id=slice_id, note=first_line, evidence=str(assessment_original))
     regenerate_report(repo, run_dir, state)
 
-    return StopDecisionOutcome(slice_id=slice_id, assessment_path=assessment_original, report=report)
+    return StopDecisionOutcome(
+        slice_id=slice_id, assessment_path=assessment_original, report=report,
+        pane_path=artifact_dir / "pane.txt",
+    )
 
 
 # --- stop -----------------------------------------------------------------

@@ -131,9 +131,9 @@ def write_fake_harness(path: Path, body: str) -> Path:
 #   `send_prompt` settles), so the event either races the launch or has to be
 #   padded until it is slow as well as racy.
 #
-# All of them must come up with a pane clear of hard-stop markers:
+# All of them must come up with a pane clear of dialog markers:
 # `send_prompt` refuses to inject the launch pointer into a visible
-# credential/approval/side-effect prompt, so a harness that printed a marker
+# credential/trust/approval dialog, so a harness that printed a marker
 # before injection would fail `start-slice` and never reach the behaviour
 # under test.
 
@@ -227,7 +227,7 @@ def trigger_gated_exit_script(trigger_path: Path) -> str:
 
 def trigger_gated_churn_script(trigger_path: Path) -> str:
     """Holds the pane still until `trigger_path` exists, then changes it every
-    0.3s forever. Never writes result.json and never prints a hard-stop marker.
+    0.3s forever. Never writes result.json and never prints a dialog marker.
 
     The quiet period is load-bearing. Readiness for a non-codex/opencode
     harness is inferred from the pane HOLDING STILL for 1.5s

@@ -1,4 +1,4 @@
-"""Protected behaviours: the mechanical floor's eight facts.
+"""Protected behaviours: the mechanical floor's seven facts.
 
 Pure git + filesystem tests, no tmux. One class per fact: a happy-path
 baseline, then one deliberate perturbation per test, so each fact is shown
@@ -85,7 +85,7 @@ class FloorTestCase(PmTestCase):
 
 
 class TestFloorHappyPath(FloorTestCase):
-    def test_all_eight_facts_pass(self) -> None:
+    def test_all_seven_facts_pass(self) -> None:
         _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
         self._commit_authorized_change()
         self._write_result()
@@ -94,11 +94,11 @@ class TestFloorHappyPath(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text="Slice complete. Tests passed."
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
 
         self.assertTrue(report.passed)
-        self.assertEqual([fact.number for fact in report.facts], list(range(1, 9)))
+        self.assertEqual([fact.number for fact in report.facts], list(range(1, 8)))
         self.assertEqual(
             [fact.name for fact in report.facts],
             [
@@ -109,20 +109,10 @@ class TestFloorHappyPath(FloorTestCase):
                 "surface",
                 "commit-ancestry",
                 "clean-worktree",
-                "hard-stop-scan",
             ],
         )
         for fact in report.facts:
             self.assertTrue(fact.passed, f"{fact.name} unexpectedly failed: {fact.detail}")
-
-        # An empty pane is also clear, on the same fixture rather than a second
-        # full git-repo test: a pane the harness never wrote to must not read
-        # as a hard stop.
-        empty_pane_report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
-        )
-        self.assertTrue(empty_pane_report.passed)
-        self.assertTrue(_facts_by_name(empty_pane_report)["hard-stop-scan"].passed)
 
 
 class TestFactPlanDigest(FloorTestCase):
@@ -138,12 +128,12 @@ class TestFactPlanDigest(FloorTestCase):
             handle.write("\n<!-- edited after run creation -->\n")
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         facts = _facts_by_name(report)
         self.assertFalse(report.passed)
         self.assertFalse(facts["plan-digest"].passed)
-        for name in ("identity-branch", "approval", "result", "surface", "commit-ancestry", "clean-worktree", "hard-stop-scan"):
+        for name in ("identity-branch", "approval", "result", "surface", "commit-ancestry", "clean-worktree"):
             self.assertTrue(facts[name].passed, f"{name} unexpectedly failed: {facts[name].detail}")
 
     def test_missing_plan_file_fails_never_raises(self) -> None:
@@ -156,7 +146,7 @@ class TestFactPlanDigest(FloorTestCase):
         plan_path.unlink()
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["plan-digest"].passed)
 
@@ -172,7 +162,7 @@ class TestFactIdentityBranch(FloorTestCase):
         self._git("checkout", "-q", "-b", "other-branch")
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(report.passed)
         self.assertFalse(_facts_by_name(report)["identity-branch"].passed)
@@ -190,7 +180,7 @@ class TestFactIdentityBranch(FloorTestCase):
         self.subprocess_run_init(other_repo)
 
         report = floor_mod.evaluate_floor(
-            other_repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            other_repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(report.passed)
         self.assertFalse(_facts_by_name(report)["identity-branch"].passed)
@@ -216,7 +206,7 @@ class TestFactApproval(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(report.passed)
         self.assertFalse(_facts_by_name(report)["approval"].passed)
@@ -231,7 +221,7 @@ class TestFactApproval(FloorTestCase):
         state = self.record_approval(state, token, run_dir, slice_id="Slice 1")
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertTrue(_facts_by_name(report)["approval"].passed)
 
@@ -267,7 +257,7 @@ class TestFactApproval(FloorTestCase):
         state = self.record_approval(state, token, run_dir, slice_id="Slice 1")
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["approval"].passed)
 
@@ -281,7 +271,7 @@ class TestFactResult(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["result"].passed)
 
@@ -294,7 +284,7 @@ class TestFactResult(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["result"].passed)
 
@@ -307,7 +297,7 @@ class TestFactResult(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["result"].passed)
 
@@ -324,7 +314,7 @@ class TestFactSurface(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["surface"].passed)
 
@@ -338,7 +328,7 @@ class TestFactSurface(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["surface"].passed)
 
@@ -359,7 +349,7 @@ class TestFactSurfaceGrants(FloorTestCase):
         state = self._record_grant(state, token, run_dir, slice_id="Slice 1", path="b.py")
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertTrue(_facts_by_name(report)["surface"].passed)
 
@@ -376,7 +366,7 @@ class TestFactSurfaceGrants(FloorTestCase):
         state = self._record_grant(state, token, run_dir, slice_id="Slice 1", path="b.py")
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["surface"].passed)
 
@@ -390,7 +380,7 @@ class TestFactSurfaceGrants(FloorTestCase):
         state = self._record_grant(state, token, run_dir, slice_id="Slice 1", path="b.py")
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         evidence = _facts_by_name(report)["surface"].evidence
         self.assertEqual(evidence["authorized_surface"], ["a.py"])
@@ -406,7 +396,7 @@ class TestFactCommitAncestry(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["commit-ancestry"].passed)
 
@@ -420,7 +410,7 @@ class TestFactCommitAncestry(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         facts = _facts_by_name(report)
         self.assertFalse(report.passed)
@@ -443,7 +433,7 @@ class TestFactCommitAncestry(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["commit-ancestry"].passed)
 
@@ -459,7 +449,7 @@ class TestFactCleanWorktree(FloorTestCase):
         )
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertFalse(_facts_by_name(report)["clean-worktree"].passed)
 
@@ -473,28 +463,9 @@ class TestFactCleanWorktree(FloorTestCase):
         # self.artifact_dir already carries litter under .pm/ (result.json).
 
         report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text=""
+            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir
         )
         self.assertTrue(_facts_by_name(report)["clean-worktree"].passed)
-
-
-class TestFactHardStopScan(FloorTestCase):
-    def test_credential_prompt_fails_only_hard_stop_fact(self) -> None:
-        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
-        self._commit_authorized_change()
-        self._write_result()
-        state = self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
-        )
-
-        report = floor_mod.evaluate_floor(
-            self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text="Enter API key to continue"
-        )
-        facts = _facts_by_name(report)
-        self.assertFalse(report.passed)
-        self.assertFalse(facts["hard-stop-scan"].passed)
-        for name in ("plan-digest", "identity-branch", "approval", "result", "surface", "commit-ancestry", "clean-worktree"):
-            self.assertTrue(facts[name].passed, f"{name} unexpectedly failed: {facts[name].detail}")
 
 
 class TestFloorNeverMutates(FloorTestCase):
@@ -509,7 +480,7 @@ class TestFloorNeverMutates(FloorTestCase):
         before_bytes = run_json.read_bytes()
         before_status = self._git("status", "--short").stdout
 
-        floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir, pane_text="benign text")
+        floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
 
         after_bytes = run_json.read_bytes()
         after_status = self._git("status", "--short").stdout

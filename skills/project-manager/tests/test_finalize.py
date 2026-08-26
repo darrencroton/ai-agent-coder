@@ -17,7 +17,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import contextlib
+import io
 import shutil
+import tempfile
 import subprocess
 import sys
 import time
@@ -40,6 +43,7 @@ from pm_test_helpers import (
     write_fake_harness,
 )
 
+from pm_lib import cli
 from pm_lib import sessions
 from pm_lib import slice_ops
 from pm_lib import state as state_mod
@@ -47,9 +51,14 @@ from pm_lib import state as state_mod
 _HAS_TMUX = shutil.which("tmux") is not None
 _PM_PY = Path(__file__).resolve().parents[1] / "scripts" / "pm.py"
 
+# Written to satisfy the acceptance contract it stands in for, pane sentence
+# included (SKILL.md "Reading the pane"): a fixture that models a reasoning
+# missing the only required trace of PM's pane read teaches the wrong shape to
+# every maintainer who copies it.
 _LONG_REASONING = (
     "This slice's diff matches the intended change exactly, validation.md shows the "
-    "test suite passing, and no deviations from the plan were observed."
+    "test suite passing, no deviations from the plan were observed, and the pane tail "
+    "was clear of dialogs and usage messages."
 )
 
 
@@ -171,12 +180,22 @@ class TestFullAcceptance(FinalizeTestCase):
         before_bytes = (run_dir / "run.json").read_bytes()
         code, out, _err = self.run_cli_in_repo(["finalize", "--token", token])
         self.assertEqual(code, 0, out)
-        self.assertEqual(out.count(" PASS "), 8)
-        for number in range(1, 9):
+        self.assertEqual(out.count(" PASS "), 7)
+        for number in range(1, 8):
             self.assertRegex(out, re.compile(rf"^{number} \S+ PASS", re.MULTILINE))
         self.assertIn("evidence: diff=", out)
-        self.assertIn("evidence: pane=", out)
         self.assertIn("evidence: result=", out)
+        # The pane is always accounted for, never silently omitted: PM's read
+        # of it is what stands where the retired eighth fact stood. Here the
+        # honest answer is that there is nothing to read — this harness commits
+        # and exits before anything observes it, so no live capture was ever
+        # taken — and saying so beats printing "0 of 0 lines", which reads like
+        # a clear pane. `_print_pane_tail` is unit-tested separately for the
+        # case where a capture does exist.
+        self.assertIn("pane", out)
+        self.assertIn("pane.txt", out)
+        self.assertIn("is empty", out)
+        self.assertNotIn("pane tail (", out)
 
         after = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
         before = json.loads(before_bytes.decode("utf-8"))
@@ -208,7 +227,7 @@ class TestFullAcceptance(FinalizeTestCase):
         assessment_text = assessment_path.read_text(encoding="utf-8")
         self.assertIn(_LONG_REASONING, assessment_text)
         self.assertIn("PM assessment only (standard risk)", assessment_text)
-        self.assertEqual(assessment_text.count(": PASS"), 8)
+        self.assertEqual(assessment_text.count(": PASS"), 7)
 
         mirror_path = self.repo / ".pm" / "runs" / run_id / "slices" / "slice-001" / "assessment.md"
         self.assertTrue(mirror_path.is_file())
@@ -1212,6 +1231,43 @@ class TestAcceptReapsHungReviewer(FinalizeTestCase):
 
 
 # --- _attempts_summary: exact multiline formatting, no tmux required --------
+
+
+class TestPaneTailPrinter(unittest.TestCase):
+    """`finalize`'s pane output, on its own: no run, no tmux, no session.
+
+    The acceptance-path tests reach this printer only with an empty capture,
+    because a fake harness that commits and exits is never observed alive. The
+    branch that matters for the real discipline — a capture exists, so print
+    its tail — needs pinning somewhere, and here it costs nothing.
+    """
+
+    def _render(self, text: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            pane = Path(tmp) / "pane.txt"
+            pane.write_text(text, encoding="utf-8")
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                cli._print_pane_tail(pane)
+            return buffer.getvalue()
+
+    def test_a_capture_prints_its_tail_bounded_to_the_last_lines(self) -> None:
+        out = self._render("\n".join(f"line-{n}" for n in range(1, 101)) + "\n")
+        self.assertIn(f"pane tail ({cli._PANE_TAIL_LINES} of 100 lines", out)
+        self.assertIn("line-100", out)
+        self.assertIn(f"line-{101 - cli._PANE_TAIL_LINES}", out)
+
+    def test_a_short_capture_prints_whole_and_counts_honestly(self) -> None:
+        out = self._render("Enter API key to continue\n")
+        self.assertIn("pane tail (1 of 1 lines", out)
+        self.assertIn("Enter API key to continue", out)
+
+    def test_a_missing_capture_is_named_as_missing_not_as_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                cli._print_pane_tail(Path(tmp) / "absent.txt")
+        self.assertIn("not captured", buffer.getvalue())
 
 
 class TestAttemptsSummaryFormatting(unittest.TestCase):

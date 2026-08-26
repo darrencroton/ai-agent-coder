@@ -19,6 +19,7 @@ from . import IntegrityError, PmError
 from . import git_ops
 from . import plan as plan_mod
 from . import review as review_mod
+from . import sessions
 from . import slice_ops
 from . import state as state_mod
 
@@ -452,9 +453,12 @@ def _run_observe(args: argparse.Namespace) -> int:
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
     print(f"result present: {outcome.result_present}{status_note}")
     if outcome.hard_stop["present"]:
-        print(f"hard-stop scan: {', '.join(outcome.hard_stop['kinds'])}")
+        # Named as a signal, not a verdict: no fact reads this, PM decides what
+        # a marker means. Carries the matched literal for the same reason the
+        # send refusals do — a kind alone cannot be judged.
+        print(f"dialog marker: {sessions.marker_detail(outcome.hard_stop)}")
     else:
-        print("hard-stop scan: clear")
+        print("dialog marker: clear")
 
     # Printed, never enforced — length is the PM's judgement call.
     if outcome.no_signal:
@@ -490,6 +494,38 @@ def _print_floor_facts(report) -> None:
         print(f"{fact.number} {fact.name} {status} {fact.detail}")
 
 
+_PANE_TAIL_LINES = 40
+
+
+def _print_pane_tail(pane_path: Path | None) -> None:
+    """Print the tail of the captured pane on every path that records an assessment.
+
+    No floor fact reads the pane any more, so PM's own read is the only thing
+    standing where fact 8 stood — and an unread pane is exactly the failure to
+    design against. Printing it here means deciding a slice without the pane
+    on screen takes deliberate effort, and SKILL.md requires the acceptance
+    reasoning to say what it showed, so a skipped read is visible in the
+    assessment rather than merely undetectable.
+
+    `--steer` deliberately does not print it: a steer records no assessment
+    and the session it is correcting is still running, so its pane is a moving
+    target that the next `finalize` before acceptance shows properly.
+    """
+    if pane_path is None or not Path(pane_path).is_file():
+        print("pane: (not captured — no live session at finalize)")
+        return
+    lines = Path(pane_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        # Said outright rather than printed as "0 of 0 lines", which reads like
+        # a clear pane. An empty capture is absence of evidence, not evidence
+        # of absence, and the reasoning that cites it should say which.
+        print(f"pane: (capture at {pane_path} is empty — the session wrote nothing, or had already exited)")
+        return
+    print(f"pane tail ({min(len(lines), _PANE_TAIL_LINES)} of {len(lines)} lines, full capture at {pane_path}):")
+    for line in lines[-_PANE_TAIL_LINES:]:
+        print(f"  | {line}")
+
+
 def _run_finalize(args: argparse.Namespace) -> int:
     token = _require_token(args)
     repo = _repo_from_cwd()
@@ -507,6 +543,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         print(f"slice: {outcome.slice_id}")
         if outcome.report:
             _print_floor_facts(outcome.report)
+        _print_pane_tail(outcome.pane_path)
         if outcome.kind == "accepted":
             print(f"ACCEPTED {outcome.slice_id}")
             print(f"assessment: {outcome.assessment_path}")
@@ -527,6 +564,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         outcome = slice_ops.finalize_stop(repo, run_dir, token, reason=args.stop, risk=args.risk)
         print(f"STOPPED {outcome.slice_id}")
         _print_floor_facts(outcome.report)
+        _print_pane_tail(outcome.pane_path)
         print(f"assessment: {outcome.assessment_path}")
         return 0
 
@@ -537,8 +575,8 @@ def _run_finalize(args: argparse.Namespace) -> int:
     print(f"evidence: status-before={outcome.status_before_path}")
     print(f"evidence: status-after={outcome.status_after_path}")
     print(f"evidence: diff={outcome.diff_path}")
-    print(f"evidence: pane={outcome.pane_path}")
     print(f"evidence: result={outcome.result_path}")
+    _print_pane_tail(outcome.pane_path)
     return 0 if outcome.report.passed else 1
 
 

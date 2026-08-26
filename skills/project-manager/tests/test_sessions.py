@@ -1,4 +1,4 @@
-"""Protected behaviours: tmux session lifecycle and the hard-stop marker floor.
+"""Protected behaviours: tmux session lifecycle and the dialog-marker guard.
 
 `scan_hard_stop`, `session_name`, and the env-token assertion run without
 tmux. Everything that drives a real pane is gated with
@@ -84,52 +84,44 @@ class TestScanHardStopPositiveFixtures(unittest.TestCase):
         self.assertTrue(result["present"])
         self.assertIn("permission_prompt", result["kinds"])
 
-    def test_external_side_effect_push_to_remote_shape(self) -> None:
-        result = sessions.scan_hard_stop("Push to remote origin/main now?")
-        self.assertTrue(result["present"])
-        self.assertIn("external_side_effect_request", result["kinds"])
-
-    def test_external_side_effect_approve_shape(self) -> None:
-        result = sessions.scan_hard_stop("Approve deploy to production? [y/n]")
-        self.assertTrue(result["present"])
-        self.assertIn("external_side_effect_request", result["kinds"])
-
-    def test_usage_limit_weekly(self) -> None:
-        result = sessions.scan_hard_stop("Weekly usage limit reached. Try again next week.")
-        self.assertTrue(result["present"])
-        self.assertIn("usage_limit_hard_stop", result["kinds"])
-
-    def test_usage_limit_monthly(self) -> None:
-        result = sessions.scan_hard_stop("Monthly quota cap reached for this workspace.")
-        self.assertTrue(result["present"])
-        self.assertIn("usage_limit_hard_stop", result["kinds"])
-
-    def test_usage_limit_billing_credits(self) -> None:
-        result = sessions.scan_hard_stop("Subscription plan limit exhausted. Upgrade billing to continue.")
-        self.assertTrue(result["present"])
-        self.assertIn("usage_limit_hard_stop", result["kinds"])
-
-    def test_usage_limit_generic_reached(self) -> None:
-        result = sessions.scan_hard_stop("Usage limit reached.")
-        self.assertTrue(result["present"])
-        self.assertIn("usage_limit_hard_stop", result["kinds"])
-
 
 class TestScanHardStopNegativeFixtures(unittest.TestCase):
-    def test_informational_sub_100_percent_usage_warning_is_not_stopping(self) -> None:
-        result = sessions.scan_hard_stop("You've used 80% of your weekly limit.")
-        self.assertFalse(result["present"])
-        self.assertEqual(result["kinds"], [])
+    def test_claude_code_weekly_limit_banner_is_not_a_dialog(self) -> None:
+        """The verbatim banner that stopped a real run. A usage window is an
+        operational recovery decision (docs/VISION.md), so PM reads it from the
+        pane and decides — waiting out the reset is often the right call, and a
+        scan that stopped the run could not offer that."""
+        for text in (
+            "You've reached 85% of your weekly limit - resets at 12am (Australia/Melbourne)",
+            "Weekly usage limit reached. Try again next week.",
+            "Subscription plan limit exhausted. Upgrade billing to continue.",
+        ):
+            with self.subTest(text=text):
+                result = sessions.scan_hard_stop(text)
+                self.assertFalse(result["present"])
+                self.assertEqual(result["kinds"], [])
 
-    def test_conditional_if_you_hit_your_limit_is_not_stopping(self) -> None:
-        result = sessions.scan_hard_stop("If you hit your limit, you can continue on usage credits.")
-        self.assertFalse(result["present"])
-        self.assertEqual(result["kinds"], [])
+    def test_domain_vocabulary_is_not_a_dialog(self) -> None:
+        """release/publish/deploy/plan/credit are ordinary words in a repository
+        that ships software. The retired side-effect and billing regexes fired
+        on every line below; a real harness confirmation renders through its
+        TUI's own dialog text instead, which the literal markers hold."""
+        for text in (
+            "Update the release notes for this change?",
+            "Does the release config need a new flag?",
+            "Confirm the release checklist entries",
+            "slice 3 has a rate limit cap of 5 requests",
+            "Plan: add credits limit to billing module",
+        ):
+            with self.subTest(text=text):
+                result = sessions.scan_hard_stop(text)
+                self.assertFalse(result["present"])
+                self.assertEqual(result["kinds"], [])
 
     def test_bare_word_marker_inside_an_unrelated_word_is_not_stopping(self) -> None:
         """A one-word marker matches on boundaries: "MFA" inside a temp path is
-        not a credential prompt, and a false hard stop refuses every send,
-        fails floor fact 8, and ends `observe --wait` early."""
+        not a credential prompt, and a false marker refuses every send and ends
+        `observe --wait` early."""
         result = sessions.scan_hard_stop("PM_TMPDIR=/tmp/tmpq8mfa2z1/fake.sh")
         self.assertFalse(result["present"])
         self.assertEqual(result["kinds"], [])
@@ -137,8 +129,8 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
     def test_permission_denied_outcome_is_not_a_prompt(self) -> None:
         """An operation that already failed is not a prompt waiting on a human.
         A slice whose own test asserts an unwritable directory puts this phrase
-        in the pane, and a false hard stop there fails floor fact 8 with no
-        route back: the pane is scrollback the PM must not clear."""
+        in the pane, and a false marker there refuses the steer that would fix
+        it."""
         for text in (
             "bash: /etc/shadow: Permission denied",
             "'... is not writable: could not create a probe file there: Permission denied'",
@@ -156,12 +148,6 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
 
 
 class TestScanHardStopWrapping(unittest.TestCase):
-    def test_prompt_wrapped_across_lines_still_matches(self) -> None:
-        wrapped = "Weekly usage\nlimit reached across\ntwo terminal rows."
-        result = sessions.scan_hard_stop(wrapped)
-        self.assertTrue(result["present"])
-        self.assertIn("usage_limit_hard_stop", result["kinds"])
-
     def test_credential_prompt_wrapped_across_lines_still_matches(self) -> None:
         wrapped = "Enter API\nkey to continue"
         result = sessions.scan_hard_stop(wrapped)
@@ -171,7 +157,7 @@ class TestScanHardStopWrapping(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real pane")
 class TestPaneTextRejoinsHardWraps(unittest.TestCase):
-    """The capture half of the same floor: whitespace normalization cannot
+    """The capture half of the same guard: whitespace normalization cannot
     repair a marker tmux split MID-TOKEN at the pane edge ("Ente"/"r API
     key" normalizes to "Ente r API key"), so `pane_text` must pass `-J`.
     Driven at a pinned 20-column width because the defect is width-

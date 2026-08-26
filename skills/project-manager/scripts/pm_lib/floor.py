@@ -1,11 +1,18 @@
-"""The mechanical floor: eight non-waivable facts.
+"""The mechanical floor: seven non-waivable facts.
 
-One function surface, no decisions. `evaluate_floor` runs the eight
+One function surface, no decisions. `evaluate_floor` runs the seven
 `_fact_*` functions below, in order, and each computes a true/false
-condition from git, the filesystem, run state, and a pane-text string handed
-in by the caller — never a model call, never prose semantics, never a tmux
-shell-out (that boundary belongs to `sessions.py`; this module only imports
-its pure `scan_hard_stop` text parser for fact 8).
+condition from git, the filesystem, and run state — never a model call,
+never prose semantics, never a tmux shell-out (that boundary belongs to
+`sessions.py`).
+
+Every fact here is a property of repository state: a digest, a branch, an
+ancestor, a file set. There is deliberately no fact for "a blocking prompt is
+visible in the pane". That one read a rendered TUI and inferred a semantic
+conclusion from keywords — judgement dressed as determinism, which
+docs/VISION.md principle 2 forbids and its mechanical-guarantee list never
+claimed. It is now the PM agent's reading of the captured pane, recorded in
+the slice assessment.
 
 A fact that cannot be established (a missing file, a git command that fails)
 is `passed=False` with the reason in `detail`: this module never raises on
@@ -13,7 +20,7 @@ ordinary git/filesystem absence or failure, and it never writes state,
 contacts a session, or renders an accept/reject verdict. That judgement is
 the PM agent's, above this floor.
 
-The eight facts, in evaluation order — each `_fact_*` function below carries
+The seven facts, in evaluation order — each `_fact_*` function below carries
 the exact pass/fail wording in its `detail` strings:
 
 1. plan-digest — the plan file still hashes to the run's frozen digest.
@@ -25,7 +32,6 @@ the exact pass/fail wording in its `detail` strings:
 6. commit-ancestry — a commit exists, descends from before_head, and is the
    recorded branch's tip.
 7. clean-worktree — nothing dirty outside `.pm/`.
-8. hard-stop-scan — no credential/trust/approval/billing marker in the pane.
 """
 
 from __future__ import annotations
@@ -42,7 +48,6 @@ from .plan import effective_authorized_files
 from .plan import plan_digest as compute_plan_digest
 from .plan import plan_slice_by_id
 from .plan import slice_grants
-from .sessions import scan_hard_stop
 
 
 @dataclass(frozen=True)
@@ -247,18 +252,6 @@ def _fact_clean_worktree(repo: Path) -> FloorFact:
     return FloorFact(7, "clean-worktree", passed, detail, evidence)
 
 
-def _fact_hard_stop_scan(pane_text: str) -> FloorFact:
-    result = scan_hard_stop(pane_text)
-    evidence = {"kinds": list(result["kinds"]), "markers": list(result["markers"])}
-    passed = not result["present"]
-    detail = (
-        "no hard-stop marker is visible in the captured pane"
-        if passed
-        else "a hard-stop marker is visible in the captured pane"
-    )
-    return FloorFact(8, "hard-stop-scan", passed, detail, evidence)
-
-
 def evaluate_floor(
     repo: Path,
     state: dict[str, Any],
@@ -266,7 +259,6 @@ def evaluate_floor(
     slice_id: str,
     *,
     artifact_dir: Path,
-    pane_text: str,
 ) -> FloorReport:
     plan_slice = plan_slice_by_id(slices, slice_id)
     facts = (
@@ -277,6 +269,5 @@ def evaluate_floor(
         _fact_surface(repo, state, plan_slice),
         _fact_commit_ancestry(repo, state),
         _fact_clean_worktree(repo),
-        _fact_hard_stop_scan(pane_text),
     )
     return FloorReport(facts=facts)

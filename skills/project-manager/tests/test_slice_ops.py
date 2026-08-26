@@ -679,7 +679,7 @@ _WAITED_RE = re.compile(r"^waited:\s*([\d.]+)s \(requested ([\d.]+)s\)$", re.MUL
 class TestObserveWaitSemantics(SliceOpsTestCase):
     """`observe --wait` honest-wait semantics: the wait runs the full
     requested duration and breaks early ONLY on session death, `result.json`
-    appearing, or a hard-stop marker — never on a mere pane byte-change."""
+    appearing, or a dialog marker — never on a mere pane byte-change."""
 
     def _observe_wait(self, wait_seconds: float) -> tuple[int, str, str, float, float]:
         """Run `observe --wait` and return (code, out, err, test_elapsed,
@@ -799,13 +799,16 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self._launch(trigger_gated_credential_prompt_script(trigger))
         result = self._wait_then_trigger(trigger)
         self.assertIn("session running: True", result["out"])
-        self.assertIn("hard-stop scan:", result["out"])
-        self.assertNotIn("hard-stop scan: clear", result["out"])
-        self.assertNotIn("note:", result["out"], "a hard-stop is a signal, not a no-signal wait")
+        self.assertIn("dialog marker: credential_prompt", result["out"])
+        self.assertNotIn("dialog marker: clear", result["out"])
+        # The matched literal, not just the kind: PM cannot judge a marker it
+        # cannot see, and judging it is now the only thing that happens here.
+        self.assertIn("Enter API key", result["out"])
+        self.assertNotIn("note:", result["out"], "a dialog marker is a signal, not a no-signal wait")
 
     def test_a_wait_with_no_signal_prints_a_note(self) -> None:
         """A requested wait that elapses with the session still running, no
-        result, and no hard-stop is exactly the pattern worth flagging: the
+        result, and no dialog marker is exactly the pattern worth flagging: the
         PM should wait longer next time, not re-ask at the same length."""
         from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
 
@@ -937,6 +940,10 @@ class TestSendNudge(SliceOpsTestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("credential_prompt", err)
+        # The refusal names the literal it matched: a PM told only
+        # "credential_prompt" cannot see what fired, and so cannot judge whether
+        # the pane really holds a dialog awaiting input.
+        self.assertIn("Enter API key", err)
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")

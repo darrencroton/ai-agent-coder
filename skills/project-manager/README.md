@@ -1,6 +1,6 @@
 # Project Manager (Mode B) — Operator Guide
 
-Mode B runs a frozen implementation plan autonomously under a supervising PM agent: one fresh Developer session per slice, a mechanical floor of eight non-waivable checks, a recorded PM assessment for every decided slice, independent reviews commissioned by PM where risk warrants, and a durable audit trail. The PM's operating contract is [SKILL.md](SKILL.md); this file covers the toolkit, layout, privacy, and a verify-your-setup trial.
+Mode B runs a frozen implementation plan autonomously under a supervising PM agent: one fresh Developer session per slice, a mechanical floor of seven non-waivable checks, a recorded PM assessment for every decided slice, independent reviews commissioned by PM where risk warrants, and a durable audit trail. The PM's operating contract is [SKILL.md](SKILL.md); this file covers the toolkit, layout, privacy, and a verify-your-setup trial.
 
 ## Launcher
 
@@ -31,9 +31,9 @@ All commands: `python3 skills/project-manager/scripts/pm.py <command> …`, run 
 | `approve --slice ID --reason TEXT` | record a **human** approval for a plan-gated slice |
 | `grant --slice ID --path PATH --evidence TEXT [--run ID] [--token T]` | extend the in-flight slice's effective authorized surface by one exact file path on recorded evidence; ratchets the slice to elevated **and stales every review already recorded for it**, so both mandatory reviews must be re-commissioned after the last grant. Refused, not warned, on a directory, glob, or dependency/lockfile/license/whole-repo-shaped path — isolate those into their own approval-gated slice |
 | `start-slice [--model M] [--effort E] [--risk elevated] [--reviewer-tools T,…] [--harness-command CMD]` | launch (or relaunch) the next eligible slice in a fresh tmux session |
-| `observe [--wait N]` | evidence: liveness, pane tail, result presence, hard-stop markers; a wait returns early only on session death, `result.json` appearing, or a hard-stop marker (never a mere pane change), and reports elapsed wait time |
-| `send --text T --reason R` | one-line nudge into the live session (refused over hard prompts; costs nothing) |
-| `finalize` | run the eight-fact floor and collect evidence (decides nothing) |
+| `observe [--wait N]` | evidence: liveness, pane tail, result presence, and any interactive-dialog marker with the literal it matched; a wait returns early only on session death, `result.json` appearing, or such a marker (never a mere pane change), and reports elapsed wait time. The marker is a signal for PM to weigh, not a verdict |
+| `send --text T --reason R` | one-line nudge into the live session (refused while an interactive dialog marker is visible, so a blind Enter cannot answer it; the refusal names the literal it matched). Costs nothing |
+| `finalize` | run the seven-fact floor, collect evidence, and print the captured pane tail (decides nothing) |
 | `finalize --accept "reasoning" \| --steer "correction" \| --stop "reason" [--risk elevated]` | PM's recorded decision; accept requires a passing floor (+ both fresh reviews when elevated); steer costs an attempt |
 | `review --slice ID --skill drift-audit\|code-review [--tool T] [--model M] [--effort E] [--timeout N] [--adjudicated TEXT …]` | commission an independent review pinned to `before_head..HEAD` (`--tool` ∈ codex/claude/copilot/opencode/qwen); prints the report path, stderr path, and reviewer process-group id at launch, before waiting. Blocks until the reviewer exits; `--timeout` (default 3600s) kills its process group and fails closed, as a backstop against a hang rather than a cadence — raise it for a slow cold local model. `--adjudicated` (repeatable) names rulings PM already settled so a reviewer stops re-raising them — it bounds attention only, still gets a full dissenting finding from a reviewer that disagrees, and the rendered prompt is persisted for audit |
 | `notes --append TEXT \| --set TEXT [--run ID]` | update the run's curated `notes.md` — writes the state-dir original then re-mirrors; never hand-edit the `.pm/` mirror |
@@ -95,9 +95,15 @@ then add to `~/.claude/settings.json` (merging with any existing `hooks` block):
 
 Installing only the `Read` matcher is supported and still worth doing; the `Bash` matcher is what closes the hand-rolled-waiter route around it. Use an absolute path if your harness does not expand `~`. The guard keeps a per-session digest stamp under `~/.claude/hooks/.pm-poll-guard/`; delete that directory any time. Other harnesses in the PM seat have no equivalent, and the run works without the guard — it costs more.
 
+### The pane is PM's read, not a fact
+
+No floor fact examines the pane, so the toolkit's job is to make PM's own read unavoidable and its result durable: `finalize` prints the captured tail on every path that records an assessment — the bare evidence run, `--accept`, and `--stop` — and [SKILL.md](SKILL.md) requires the acceptance reasoning to state what it showed. That sentence in `assessment.md` is the audit trace — a PM that skipped the read is visible in the record instead of merely unmeasured. Deliberately absent is any check that the reasoning *mentions* the pane: scanning PM's prose for a keyword would be the same defect as the fact this replaced.
+
+What remains in code is a guard on PM's own keystrokes, not a verdict on the run. `send_prompt`/`send_line` send text, then Enter, then a second Enter after a settle — and if the first Enter surfaces a trust or credential dialog, the second would answer it. That window is sub-second and inside one call, so no PM turn can interpose and it has to be code. It matches only the literal dialog strings the harnesses actually render, and names what it matched when it refuses, so PM can tell a real dialog from ordinary output that happens to contain one.
+
 ### What the toolkit does instead of guarding
 
-Wait *length* is the PM's judgement, not the hook's business, so the toolkit advises rather than refuses: when `observe --wait` elapses with no session-death, result, or hard-stop signal, it prints a note suggesting a longer wait or an action instead. It never changes the exit code. Measured across two real runs, the wasteful pattern was not re-polling an answered question but repeating a too-short wait — `20/20/20/20` against a Developer that needed 85 minutes — so the note nudges toward waiting once, longer.
+Wait *length* is the PM's judgement, not the hook's business, so the toolkit advises rather than refuses: when `observe --wait` elapses with no session-death, result, or dialog-marker signal, it prints a note suggesting a longer wait or an action instead. It never changes the exit code. Measured across two real runs, the wasteful pattern was not re-polling an answered question but repeating a too-short wait — `20/20/20/20` against a Developer that needed 85 minutes — so the note nudges toward waiting once, longer.
 
 ## Layout: who owns what
 
@@ -107,9 +113,9 @@ Wait *length* is the PM's judgement, not the hook's business, so the toolkit adv
 
 ## Trust model, honestly
 
-Mechanical and non-waivable: the eight floor facts (frozen plan digest; repo/branch identity; recorded approvals; result presence/identity; changed files ⊆ effective surface (frozen plan surface + recorded grants); commit ancestry and branch head; clean worktree; no visible hard-stop prompt). Everything semantic — is the change good, is the evidence sufficient — is the PM agent's recorded judgement; read the assessments.
+Mechanical and non-waivable: the seven floor facts (frozen plan digest; repo/branch identity; recorded approvals; result presence/identity; changed files ⊆ effective surface (frozen plan surface + recorded grants); commit ancestry and branch head; clean worktree). Every one is a property of repository state. Everything semantic — is the change good, is the evidence sufficient, does what the pane shows mean this run must stop — is the PM agent's recorded judgement; read the assessments.
 
-Known limits, inherited and stated: the floor sees final Git-visible worktree state only (ignored files, Git hooks/metadata, write-then-revert effects, and anything a Developer writes outside the repository escape it — containment is your sandbox around the run, not the harness); dependency/license/side-effect stops are heuristic (pane markers + prompt prohibitions + plan-level surface exclusion); role authority is capability-token-raised, not OS-enforced — a same-user process that steals the token or subverts the PM agent is outside the threat model; `attested` slices are operator narration; PM-seat quality is load-bearing — a weak model in the PM seat weakens the judgement layer itself.
+Known limits, inherited and stated: the floor sees final Git-visible worktree state only (ignored files, Git hooks/metadata, write-then-revert effects, and anything a Developer writes outside the repository escape it — containment is your sandbox around the run, not the harness); dependency/license/side-effect stops rest on the Developer contract's explicit prohibition (`references/developer-prompt.md`), plan-level surface exclusion, and the operator's sandbox, with PM's pane read catching only a harness that actually prompts — and Developer seats launch at full autonomy, so often none does; role authority is capability-token-raised, not OS-enforced — a same-user process that steals the token or subverts the PM agent is outside the threat model; `attested` slices are operator narration; PM-seat quality is load-bearing — a weak model in the PM seat weakens the judgement layer itself.
 
 ## Privacy & sensitive artifacts
 
@@ -171,8 +177,8 @@ python3 $PM init --repo . --plan ../trial-plan.md --harness fake --create-branch
 export PM_RUN_TOKEN=<the token line init printed>
 python3 $PM start-slice
 python3 $PM observe --wait 30
-python3 $PM finalize                       # expect: eight PASS lines
-python3 $PM finalize --accept "Trial slice: diff creates hello.txt exactly per contract; validation output shows the expected content; floor 8/8."
+python3 $PM finalize                       # expect: seven PASS lines
+python3 $PM finalize --accept "Trial slice: diff creates hello.txt exactly per contract; validation output shows the expected content; floor 7/7; pane tail clear, no dialog or usage message."
 python3 $PM rate --text "Developer (fake harness):
 Process discipline: 5/5 — no incidents.
 Reporting reliability: 5/5 — result matched.
@@ -180,8 +186,8 @@ Output quality: 5/5 — trial slice exactly per contract."
 python3 $PM status --report                # then read .pm/runs/<id>/run-report.md
 ```
 
-You should see the floor pass 8/8, the acceptance land with an assessment, and a run report you can read end-to-end. `stop --scavenge --reason cleanup` tears down anything left.
+You should see the floor pass 7/7, the acceptance land with an assessment, and a run report you can read end-to-end. `stop --scavenge --reason cleanup` tears down anything left.
 
 ## Maintainer map
 
-`scripts/pm.py` (entry) → `pm_lib/`: `cli` (parsing/dispatch) · `plan` (parser, lint, risk derivation) · `state` (lite-1 authenticated state, events, report) · `git_ops` (facts + surface matching) · `floor` (the eight facts) · `sessions` (all tmux contact + hard-stop markers) · `profiles` (harness table) · `slice_ops` (command orchestration) · `review` (PM-commissioned reviewers) · `prompts` (template rendering). Tests in `tests/` use fake harnesses via `--harness-command`; tmux-dependent tests skip when tmux is absent. `pm_test_helpers` owns the shared fixtures — `PlanTestCase` (plain temp directory), `PmTestCase` (adds a git repo), `TmuxRunTestCase` (adds the session reaper and `init`/wait helpers), and the fake-harness builders — and pins `PM_TMUX_SOCKET` so each test process drives its own tmux server. Modules are independent and safe to run in parallel.
+`scripts/pm.py` (entry) → `pm_lib/`: `cli` (parsing/dispatch) · `plan` (parser, lint, risk derivation) · `state` (lite-1 authenticated state, events, report) · `git_ops` (facts + surface matching) · `floor` (the seven facts) · `sessions` (all tmux contact + interactive-dialog markers) · `profiles` (harness table) · `slice_ops` (command orchestration) · `review` (PM-commissioned reviewers) · `prompts` (template rendering). Tests in `tests/` use fake harnesses via `--harness-command`; tmux-dependent tests skip when tmux is absent. `pm_test_helpers` owns the shared fixtures — `PlanTestCase` (plain temp directory), `PmTestCase` (adds a git repo), `TmuxRunTestCase` (adds the session reaper and `init`/wait helpers), and the fake-harness builders — and pins `PM_TMUX_SOCKET` so each test process drives its own tmux server. Modules are independent and safe to run in parallel.

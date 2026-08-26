@@ -88,7 +88,7 @@ Both launchers: [`skills/implementation-plan/SKILL.md`](skills/implementation-pl
 
 ### 3. Mode B — supervised autonomy (Project Manager)
 
-The gatekeeper moves outside the implementing agent. A deterministic toolkit owns durable run state, fresh tmux-backed sessions (one per slice, which is the context reset that makes long plans tractable), artifact capture, and an eight-fact mechanical floor. The PM agent owns everything semantic: it assesses each completed slice from the diff, commit, and validation evidence; records its reasoning in a durable assessment; commissions independent drift-audit and code-review sessions where risk warrants; steers bounded corrections; and stops for a human on anything the plan or the floor reserves for one.
+The gatekeeper moves outside the implementing agent. A deterministic toolkit owns durable run state, fresh tmux-backed sessions (one per slice, which is the context reset that makes long plans tractable), artifact capture, and a seven-fact mechanical floor. The PM agent owns everything semantic: it assesses each completed slice from the diff, commit, and validation evidence; records its reasoning in a durable assessment; commissions independent drift-audit and code-review sessions where risk warrants; steers bounded corrections; and stops for a human on anything the plan or the floor reserves for one.
 
 The PM seat is a model you choose, including a local one.
 
@@ -120,7 +120,7 @@ Run state, artifacts, transcripts, and review evidence stay on your machine. Wha
 - **Drift audit** — the authorization gate: compares actual changes against the frozen contract, before any quality judgment.
 - **Differential lint** — `lint`'s default question: not "is this code clean?" but "does this change introduce a finding that was not there before?"
 - **Gate** — a check that must pass before work advances. In Mode A these are the in-session chain steps (validation, drift audit, code review, commit evidence); in Mode B there are exactly three: the mechanical floor, PM assessment, and human approval.
-- **Floor** — the eight mechanical, non-waivable facts checked at finalize, enumerated in `project-manager`'s `SKILL.md`. Any failure blocks acceptance.
+- **Floor** — the seven mechanical, non-waivable facts checked at finalize, enumerated in `project-manager`'s `SKILL.md`. Any failure blocks acceptance.
 - **Harness** — a coding-agent CLI (Codex CLI, Claude Code, OpenCode, Copilot CLI, and others) that PM or you run a session in.
 - **Developer** — the context-rich agent that owns implementation, validation, session management, gates, commits, and delivery. Under PM it is the supervised per-slice session and has no authority above PM.
 - **Delegate** — orchestrator's term for a harness session the Developer launches: **read-only** (investigation, evidence gathering, drift audit, code review — a synonym for Reviewer) or **read-write** (a bounded implementer confined to an explicit authorized surface). Neither commits, mutates Git/GitHub state, or re-delegates; the Developer reviews and accepts its output either way.

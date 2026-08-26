@@ -2,8 +2,10 @@
 
 This module owns *all* tmux and harness-process contact — no other module in
 this package shells out to tmux. It never judges anything beyond the
-hard-stop marker scan (`scan_hard_stop`), which is pure text parsing shared
-by `send_line`, `observe`, and `floor.py`'s fact 8.
+interactive-dialog marker scan (`scan_hard_stop`), which is pure text parsing
+guarding PM's own keystrokes in `send_prompt`/`send_line` and reported as a
+signal by `observe`. It is not a floor fact: whether a visible message means
+the run must stop is the PM agent's reading, not this module's.
 
 No injection path here sends more than one line into a pane: both `send_prompt`
 and `send_line` refuse a newline, so multi-line content only ever reaches a
@@ -76,43 +78,6 @@ _LITERAL_MARKERS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Detects "push / create PR / deploy / install dependency / license change" prompts.
-EXTERNAL_SIDE_EFFECT_PROMPT_RE = re.compile(
-    r"\b(?:do you want to|approve|confirm|allow|permission to|shall i|should i|ready to)\b"
-    r"[^.\n?]{0,120}\b(?:push(?: to remote)?|create (?:a )?(?:pull request|pr)|open (?:a )?(?:pull request|pr)|"
-    r"deploy|release|publish|install (?:a )?dependenc(?:y|ies)|change (?:the )?license|license change)\b"
-    r"|"
-    r"\b(?:push to remote|create (?:a )?(?:pull request|pr)|open (?:a )?(?:pull request|pr)|deploy|release|publish|"
-    r"install (?:a )?dependenc(?:y|ies)|license change)\b[^.\n]{0,60}(?:\?|yes/no|\[y/n\]|approve|confirm)",
-    re.IGNORECASE,
-)
-
-# usage_limit_hard_stop: weekly/monthly-window and account/billing/subscription/
-# credit phrasings, plus the generic "usage/session/rate/quota/limit/cap ...
-# reached/exceeded/exhausted" pattern. The weekly/monthly/account patterns are
-# suppressed when the same text carries the informational sub-100% usage
-# warning or the conditional "if you hit your limit" phrasing — both are
-# explicitly non-stopping.
-_WEEKLY_LIMIT_RE = re.compile(r"\bweekly\b[^.\n]{0,80}\b(?:limit|quota|cap)\b|\b(?:limit|quota|cap)\b[^.\n]{0,80}\bweekly\b")
-_MONTHLY_LIMIT_RE = re.compile(
-    r"\bmonthly\b[^.\n]{0,80}\b(?:limit|quota|cap)\b|\b(?:limit|quota|cap)\b[^.\n]{0,80}\bmonthly\b"
-)
-_ACCOUNT_BILLING_LIMIT_RE = re.compile(
-    r"\b(?:account|billing|subscription|plan|credit|credits)\b[^.\n]{0,100}\b(?:limit|quota|cap|exhausted|upgrade|billing)\b"
-)
-_GENERIC_LIMIT_RE = re.compile(r"\b(?:usage|session|rate|quota|limit|cap)\b[^.\n]{0,80}\b(?:reached|exceeded|exhausted)\b")
-_INFORMATIONAL_USAGE_RE = re.compile(
-    # Deliberately no \b right after the '%': '%' is punctuation, so a \b
-    # there never matches when followed by whitespace (both sides are
-    # non-word characters). Adding one would stop the informational fixture
-    # ("used 80% of your weekly limit") being recognized as non-stopping —
-    # and a false usage_limit_hard_stop refuses every send, fails floor
-    # fact 8, and ends `observe --wait` early.
-    r"\b(?:you(?:'ve| have)\s+used|used)\s+(\d{1,3})%[^.\n]{0,120}"
-    r"\b(?:hourly|daily|weekly|monthly|5[- ]?hour|five[- ]?hour)?\s*(?:usage\s*)?(?:limit|quota|cap)\b"
-)
-_CONDITIONAL_LIMIT_RE = re.compile(r"\bif you hit your limit\b")
-
 
 @functools.lru_cache(maxsize=None)
 def _literal_marker_re(marker: str) -> re.Pattern[str]:
@@ -121,8 +86,7 @@ def _literal_marker_re(marker: str) -> re.Pattern[str]:
 
     "MFA" as a substring matched inside unrelated words — any pane showing a
     path like `/tmp/tmpq8mfa2z1/` scanned as a credential prompt, and a false
-    hard stop refuses every send, fails floor fact 8, and ends `observe
-    --wait` early. Everything else keeps substring matching so a real prompt
+    marker refuses every send and ends `observe --wait` early. Everything else keeps substring matching so a real prompt
     a pane renders flush against other characters ("xxxEnter API key", the
     mid-token wrap case) still matches; the accepted cost is that negated or
     quoted prose can match too ("no approval required", "disallow access"),
@@ -138,48 +102,46 @@ def _literal_marker_re(marker: str) -> re.Pattern[str]:
 
 
 def scan_hard_stop(text: str) -> dict[str, Any]:
-    """The hard-stop marker floor, shared by send_line, observe, and floor fact 8.
+    """The interactive-dialog marker scan that guards PM's own keystrokes.
 
-    Whitespace-normalizes and lowercases for keyword matching. A prompt
-    wrapped across terminal rows still matches because capture rejoins wrapped
-    lines first (`pane_text`); this normalization alone would not rescue a
-    marker split mid-token. No confidence grades, no subtypes beyond the kind
-    labels, no reset-time parsing — the PM agent reads the pane itself.
+    Whitespace-normalizes and lowercases, then looks for the literal dialog
+    strings above. A prompt wrapped across terminal rows still matches because
+    capture rejoins wrapped lines first (`pane_text`); this normalization alone
+    would not rescue a marker split mid-token.
+
+    Deliberately narrow, and deliberately not a stop-condition oracle. Two
+    keyword families used to live here and were removed: usage-limit regexes
+    that stopped a run on Claude Code's informational "You've reached 85% of
+    your weekly limit", and an external-side-effect regex that fired on
+    ordinary domain prose ("Update the release notes for this change?").
+    Both were trying to reach a semantic conclusion — that a human is being
+    asked something — from keyword matching on a rendered TUI. That is the PM
+    agent's reading of the pane, recorded in its assessment. What is left are
+    the literal dialog strings the harnesses actually render, which is what a
+    blind Enter could answer.
     """
     normalized = re.sub(r"\s+", " ", text or "")
     lowered = normalized.lower()
     matches: dict[str, Any] = {"present": False, "kinds": [], "markers": []}
 
-    def _add(kind: str, marker_text: str) -> None:
-        matches["present"] = True
-        if kind not in matches["kinds"]:
-            matches["kinds"].append(kind)
-        matches["markers"].append(marker_text)
-
     for kind, markers in _LITERAL_MARKERS.items():
         for marker in markers:
             if _literal_marker_re(marker).search(lowered):
-                _add(kind, marker)
-
-    external_match = EXTERNAL_SIDE_EFFECT_PROMPT_RE.search(normalized)
-    if external_match:
-        _add("external_side_effect_request", external_match.group(0).strip())
-
-    informational_match = _INFORMATIONAL_USAGE_RE.search(lowered)
-    informational = bool(informational_match and int(informational_match.group(1)) < 100)
-    conditional = bool(_CONDITIONAL_LIMIT_RE.search(lowered))
-
-    if not informational and not conditional:
-        for pattern in (_WEEKLY_LIMIT_RE, _MONTHLY_LIMIT_RE, _ACCOUNT_BILLING_LIMIT_RE):
-            match = pattern.search(lowered)
-            if match:
-                _add("usage_limit_hard_stop", match.group(0).strip())
-
-    generic_match = _GENERIC_LIMIT_RE.search(lowered)
-    if generic_match:
-        _add("usage_limit_hard_stop", generic_match.group(0).strip())
+                matches["present"] = True
+                if kind not in matches["kinds"]:
+                    matches["kinds"].append(kind)
+                matches["markers"].append(marker)
 
     return matches
+
+
+def marker_detail(hard_stop: dict[str, Any]) -> str:
+    """Kinds plus the matched strings — a refusal that names only its kinds
+    leaves PM guessing which line of the pane it objected to, and so unable to
+    tell a real dialog from a false match."""
+    kinds = ", ".join(hard_stop["kinds"])
+    markers = "; ".join(repr(marker) for marker in hard_stop["markers"])
+    return f"{kinds} (matched {markers})" if markers else kinds
 
 
 # --- tmux process plumbing --------------------------------------------------
@@ -446,7 +408,9 @@ def send_prompt(session: str, pointer: str) -> None:
     hard_stop = scan_hard_stop(pane_text(session))
     if hard_stop["present"]:
         raise PmError(
-            "refusing to inject the slice launch pointer into a visible hard prompt: " + ", ".join(hard_stop["kinds"])
+            "refusing to inject the slice launch pointer into a visible dialog: "
+            + marker_detail(hard_stop)
+            + "; trust or authenticate the harness before launching, then start the slice again"
         )
     _tmux_or_raise(["send-keys", "-t", session, "-l", "--", pointer], "tmux launch pointer send failed")
     time.sleep(1.0)
@@ -475,7 +439,12 @@ def send_line(session: str, text: str) -> None:
     capture = pane_text(session)
     hard_stop = scan_hard_stop(capture)
     if hard_stop["present"]:
-        raise PmError("refusing to send into hard prompt on screen: " + ", ".join(hard_stop["kinds"]))
+        raise PmError(
+            "refusing to send into a dialog on screen: "
+            + marker_detail(hard_stop)
+            + "; a blind Enter would answer it. If the session is genuinely stuck at this dialog it is a"
+            " human decision; relaunch or stop rather than answering it here"
+        )
     _tmux_or_raise(["send-keys", "-t", session, "-l", "--", text], "tmux literal send failed")
     time.sleep(1.0)
     _tmux_or_raise(["send-keys", "-t", session, "C-m"], "tmux submit failed; text typed but not sent")
