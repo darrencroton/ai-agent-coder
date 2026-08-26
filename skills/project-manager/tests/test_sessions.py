@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -32,6 +33,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from pm_test_helpers import tmux_argv, write_fake_harness
 
 from pm_lib import PmError
+from pm_lib import TypedNotSubmitted
 from pm_lib import sessions
 
 _HAS_TMUX = shutil.which("tmux") is not None
@@ -147,12 +149,92 @@ class TestScanHardStopNegativeFixtures(unittest.TestCase):
         self.assertEqual(result["markers"], [])
 
 
+class TestPostTypingRefusalWithholdsTheEnter(unittest.TestCase):
+    """Both injection paths, on the window between typing and the first Enter.
+
+    Asserting only that `TypedNotSubmitted` is raised is not enough: moving the
+    scan to *after* the first `C-m` would still raise it, while the dialog had
+    already been answered — the precise harm these scans exist to prevent. So
+    each case asserts that no `C-m` reached tmux at all. Fully mocked, because
+    the behaviour under test is the ORDER of a scan against a keystroke, not
+    anything a real pane contributes; a 1s race would be flaky and prove less.
+    """
+
+    def _run(self, call):
+        clear = {"present": False, "kinds": [], "markers": []}
+        dialog = sessions.scan_hard_stop("Enter API key to continue")
+        sent: list[tuple[str, ...]] = []
+
+        def record(*args, **kwargs):
+            argv = tuple(args[0]) if args and isinstance(args[0], list) else tuple(args)
+            sent.append(argv)
+            return subprocess.CompletedProcess(args=list(argv), returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(sessions, "scan_live_hard_stop", side_effect=[clear, dialog]), \
+             mock.patch.object(sessions, "session_exists", return_value=True), \
+             mock.patch.object(sessions, "_tmux_or_raise", side_effect=record), \
+             mock.patch.object(sessions, "_run_tmux", side_effect=record), \
+             mock.patch.object(sessions.time, "sleep"):
+            with self.assertRaises(TypedNotSubmitted) as ctx:
+                call()
+        return sent, str(ctx.exception)
+
+    def test_send_line_types_but_never_presses_enter(self) -> None:
+        sent, message = self._run(lambda: sessions.send_line("pm-mocked", "please continue"))
+        self.assertTrue(any("please continue" in part for argv in sent for part in argv),
+                        "the line should have been typed before the dialog was noticed")
+        self.assertFalse([argv for argv in sent if "C-m" in argv],
+                         f"no Enter may be sent once a dialog is visible; got {sent!r}")
+        self.assertIn("credential_prompt", message)
+        self.assertIn("typed but unsubmitted", message)
+
+    def test_send_prompt_types_but_never_presses_enter(self) -> None:
+        sent, message = self._run(lambda: sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md"))
+        self.assertFalse([argv for argv in sent if "C-m" in argv],
+                         f"no Enter may be sent once a dialog is visible; got {sent!r}")
+        self.assertIn("credential_prompt", message)
+
+
 class TestScanHardStopWrapping(unittest.TestCase):
     def test_credential_prompt_wrapped_across_lines_still_matches(self) -> None:
         wrapped = "Enter API\nkey to continue"
         result = sessions.scan_hard_stop(wrapped)
         self.assertTrue(result["present"])
         self.assertIn("credential_prompt", result["kinds"])
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real pane")
+class TestVisiblePaneExcludesScrollback(unittest.TestCase):
+    """The scoping the whole change turns on: the keystroke guard reads the
+    VISIBLE pane, `pane_text` keeps full scrollback for evidence.
+
+    A dialog answered and scrolled away an hour ago is not a dialog awaiting
+    input, but it stays in `pane_text`'s 32k lines forever — and a guard that
+    saw it there refused every `send` and `finalize --steer` for the rest of
+    the session. Pinned to a short window so the marker is provably pushed off
+    screen, since without a forced scroll this passes either way."""
+
+    def test_marker_scrolled_off_screen_is_absent_from_the_visible_pane(self) -> None:
+        session = "pm-test-visible-s01a0"
+        subprocess.run(
+            tmux_argv("new-session", "-d", "-s", session, "-x", "80", "-y", "5",
+                      "sh -c 'echo Enter API key to continue; "
+                      "for i in 1 2 3 4 5 6 7 8 9 10; do echo filler-$i; done; sleep 30'"),
+            check=True, capture_output=True,
+        )
+        self.addCleanup(sessions.force_stop, session)
+        subprocess.run(tmux_argv("set-option", "-t", session, "window-size", "manual"),
+                       check=False, capture_output=True)
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and "filler-10" not in sessions.pane_text(session):
+            time.sleep(0.1)
+
+        # Scrollback still holds it — that is what evidence capture wants.
+        self.assertIn("Enter API key", sessions.pane_text(session))
+        # The guard's view does not, so it does not refuse.
+        self.assertNotIn("Enter API key", sessions.visible_pane_text(session))
+        self.assertFalse(sessions.scan_live_hard_stop(session)["present"])
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real pane")

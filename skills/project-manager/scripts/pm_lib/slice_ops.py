@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import IntegrityError, PmError
+from . import IntegrityError, PmError, TypedNotSubmitted
 from . import git_ops
 from . import plan as plan_mod
 from . import profiles
@@ -920,7 +920,7 @@ class ObserveOutcome:
     slice_id: str | None = None
     elapsed_seconds: float = 0.0
     # True when a requested wait elapsed with no session-death, result, or
-    # hard-stop signal — the caller should wait longer next time, not re-ask.
+    # dialog-marker signal — the caller should wait longer next time, not re-ask.
     no_signal: bool = False
 
 
@@ -944,18 +944,41 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     wait_start = time.monotonic()
     activity = sessions.detect_activity(session, previous_capture)
     # Wait exits early ONLY on a meaningful signal — session death, result.json
-    # appearing, or a hard-stop marker in the fresh capture — never on a mere
+    # appearing, or a dialog marker on the visible pane — never on a mere
     # pane byte-change, which `detect_activity`'s "active" flags on any TUI
     # spinner/stream churn and would otherwise defeat the wait almost immediately.
+    break_hard_stop: dict[str, Any] | None = None
     while deadline is not None and time.monotonic() < deadline:
-        if (
-            not activity["running"]
-            or result_path.is_file()
-            or sessions.scan_hard_stop(activity["capture"])["present"]
-        ):
+        live = sessions.scan_live_hard_stop(session)
+        if live["present"]:
+            # Kept, because the post-loop scan below can miss it: a TUI redraw
+            # between the two reads would otherwise have `observe` report
+            # "clear" and a no-signal wait on the very marker that ended it.
+            # The accepted cost is the mirror case — a dialog dismissed in that
+            # same gap is still reported — which errs toward telling PM to look
+            # at a pane it was going to read anyway.
+            break_hard_stop = live
+            break
+        if not activity["running"] or result_path.is_file():
             break
         time.sleep(_OBSERVE_POLL_SECONDS)
         activity = sessions.detect_activity(session, previous_capture)
+    if break_hard_stop is not None:
+        # The marker was found on a pane read *after* the last `detect_activity`,
+        # so `activity["capture"]` predates it: reporting that would name a
+        # dialog in `hard_stop` while showing a tail that does not contain it,
+        # and leave the same stale screen in `pane-live.txt` for finalize to
+        # fall back to. Re-read, and keep the older capture only when the
+        # re-read is empty, which means the session died in the interval —
+        # discarding the screen that showed the marker is the one outcome worse
+        # than a slightly stale one.
+        refreshed = sessions.pane_text(session)
+        if refreshed:
+            activity = {**activity, "capture": refreshed}
+    # Liveness is re-read directly rather than through `detect_activity`, which
+    # would overwrite `capture` with the empty string a dead session returns
+    # and undo exactly the preservation above.
+    running = sessions.session_exists(session)
     elapsed_seconds = time.monotonic() - wait_start
 
     capture = activity["capture"]
@@ -974,21 +997,24 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         except (OSError, json.JSONDecodeError):
             result_status = None
 
-    hard_stop = sessions.scan_hard_stop(capture)
+    # Visible pane, not the scrollback `capture` above: an interactive dialog
+    # is only actionable while it is on screen, and a dead session captures
+    # nothing (so this reads clear, as it should).
+    hard_stop = break_hard_stop or sessions.scan_live_hard_stop(session)
     tail_lines = capture.splitlines()[-_OBSERVE_TAIL_LINES:]
     tail = "\n".join(tail_lines)
 
-    liveness_changed = activity["running"] != initial_running
+    liveness_changed = running != initial_running
     result_newly_appeared = result_present and not result_existed_before
     # A full requested wait that ended in none of the above is exactly the
     # pattern worth telling the caller about: re-asking at the same length
     # cannot return anything a longer wait would not have.
-    no_signal = bool(wait) and activity["running"] and not result_present and not hard_stop["present"]
+    no_signal = bool(wait) and running and not result_present and not hard_stop["present"]
     changed = pane_changed or liveness_changed or result_newly_appeared
     if changed or no_signal:
         note = (
             f"pane_changed={pane_changed} liveness_changed={liveness_changed} "
-            f"running={activity['running']} result_present={result_present} "
+            f"running={running} result_present={result_present} "
             f"elapsed={elapsed_seconds:.1f}s"
         )
         evidence = str(pane_live_path) if pane_changed else None
@@ -1004,7 +1030,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
 
     return ObserveOutcome(
         has_current_slice=True,
-        running=activity["running"],
+        running=running,
         pane_changed=pane_changed,
         result_present=result_present,
         result_status=result_status,
@@ -1475,7 +1501,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # This must stay BEFORE the send below: rotating after delivery would
     # race the live session, which may write its fresh post-steer result
     # before we rotate — archiving the NEW result instead of the stale one.
-    # If the send below raises (dead-session race, hard-stop refusal) the
+    # If the send below raises (dead-session race, marker refusal) the
     # rotation is harmless: the result is preserved under attempt-<n>/, the
     # attempt increment is not persisted, and a later relaunch re-rotates
     # idempotently (nothing left at top level → no-op).
@@ -1504,6 +1530,12 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
         ) from exc
     try:
         sessions.send_line(session, prompts.render_steer_pointer(correction_path))
+    except TypedNotSubmitted:
+        # Deliberately NOT unlinked: the pointer to this file is sitting typed
+        # in the Developer's input line, so deleting it would leave the pane
+        # naming a file that no longer exists — and if the dialog is dismissed
+        # and that line submitted, the Developer reads a dangling pointer.
+        raise
     except PmError:
         try:
             correction_path.unlink(missing_ok=True)

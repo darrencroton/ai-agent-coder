@@ -14,7 +14,7 @@ newline refusal defeats paste splitting outright, while truncation is only
 defeated by pointers staying far below any observed input limit — a guarantee
 of practice, not of code. See `send_prompt` for both failure modes.
 
-The readiness banners and hard-stop marker strings are field observations of
+The readiness banners and dialog-marker strings are field observations of
 external tools; the code around them is independent.
 """
 
@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import PmError
+from . import TypedNotSubmitted
 
 # --- Hard-stop markers ------------------------------------------------------
 
@@ -224,10 +225,28 @@ def pane_text(session: str) -> str:
     `-J` rejoins lines tmux hard-wrapped at the pane width. Without it a
     marker split mid-token ("Ente" / "r API key to continue") survives
     `scan_hard_stop`'s whitespace normalization as "Ente r API key" and
-    matches nothing, making hard-stop detection depend on pane width.
+    matches nothing, making marker detection depend on pane width.
     """
     result = _run_tmux("capture-pane", "-p", "-J", "-S", "-32768", "-t", session)
     return result.stdout if result.returncode == 0 else ""
+
+
+def visible_pane_text(session: str) -> str:
+    """`capture-pane -p -J` — the visible pane only, no scrollback.
+
+    What the keystroke guard needs to know is whether a dialog is on screen
+    *now*, so history is not merely unnecessary here but wrong: a trust
+    dialog answered an hour ago still sits inside `pane_text`'s 32k lines,
+    and scanning those refused every later send for the life of the session.
+    Full scrollback stays the right capture for evidence (`capture_to`).
+    """
+    result = _run_tmux("capture-pane", "-p", "-J", "-t", session)
+    return result.stdout if result.returncode == 0 else ""
+
+
+def scan_live_hard_stop(session: str) -> dict[str, Any]:
+    """`scan_hard_stop` over the visible pane of a live session."""
+    return scan_hard_stop(visible_pane_text(session))
 
 
 def capture_to(session: str, destination: Path) -> None:
@@ -389,9 +408,10 @@ def send_prompt(session: str, pointer: str) -> None:
     misread, and the short pointer stays far below any observed input
     limit — a guarantee of practice, not of code.
 
-    Refuses outright when any hard-stop marker is visible in the pane — the
-    initial injection is a send like any other, and submitting anything blind
-    into a credential/approval/side-effect dialog would answer it. Refuses a
+    Refuses outright when any dialog marker is visible in the pane, both
+    before typing and again immediately before the Enter — the initial
+    injection is a send like any other, and submitting anything blind into a
+    credential/approval/trust dialog would answer it. Refuses a
     newline: the pointer must stay a single `send-keys -l` line.
 
     A single C-m right after the send can be consumed finalizing the line
@@ -405,30 +425,48 @@ def send_prompt(session: str, pointer: str) -> None:
     """
     if "\n" in pointer or "\r" in pointer:
         raise PmError("launch pointer must be a single line; the contract itself goes in the prompt.md file it names")
-    hard_stop = scan_hard_stop(pane_text(session))
+    hard_stop = scan_live_hard_stop(session)
     if hard_stop["present"]:
         raise PmError(
             "refusing to inject the slice launch pointer into a visible dialog: "
             + marker_detail(hard_stop)
-            + "; trust or authenticate the harness before launching, then start the slice again"
+            + "; trust/authenticate the harness before launching, then start the slice again"
         )
     _tmux_or_raise(["send-keys", "-t", session, "-l", "--", pointer], "tmux launch pointer send failed")
     time.sleep(1.0)
+    # Same settle window as `send_line`'s: a trust or credential dialog can
+    # draw itself during this second, and the Enter below would confirm it.
+    pre_submit = scan_live_hard_stop(session)
+    if pre_submit["present"]:
+        raise TypedNotSubmitted(
+            "a dialog appeared while the launch pointer was being typed; refusing to submit into it: "
+            + marker_detail(pre_submit)
+            + " (the pointer is typed but unsubmitted; read the pane before retrying)"
+        )
     _run_tmux("send-keys", "-t", session, "C-m")
     time.sleep(1.0)
-    if session_exists(session) and not scan_hard_stop(pane_text(session))["present"]:
+    if session_exists(session) and not scan_live_hard_stop(session)["present"]:
         _run_tmux("send-keys", "-t", session, "C-m")
 
 
 def send_line(session: str, text: str) -> None:
     """A single steering line — a free `send` nudge or a `finalize --steer`
     correction pointer: refuses newlines, a dead session, and a visible
-    hard-stop prompt; otherwise `send-keys -l -- <text>` then double-C-m.
+    dialog marker; otherwise `send-keys -l -- <text>` then double-C-m.
+
+    The dialog scan is not overridable. A marker literal is not a dialog
+    identity — `Enter API key` in a test log and a real credential dialog scan
+    identically — so no comparison may authorize a keystroke this function is
+    about to send blind. Nothing is walled off by refusing: the scan reads the
+    *visible* pane, so a false match from ordinary output clears as the
+    Developer prints its next line and PM re-issues after the next `observe`,
+    while a marker persisting on a static screen is a session that is not
+    progressing — a relaunch or a stop.
 
     The first C-m is checked, unlike `send_prompt`'s: callers treat a return
     as delivery, and a pane exiting before it leaves the text typed but never
-    submitted. The second is withheld when the pane has died or now shows a
-    hard stop — the first C-m can itself surface a credential/approval/trust
+    submitted. The second is withheld when the pane has died or shows any
+    marker — the first C-m can itself surface a credential/approval/trust
     prompt, and a blind second would answer it. Withholding is safe: if the
     first already submitted, the second was redundant.
     """
@@ -436,18 +474,29 @@ def send_line(session: str, text: str) -> None:
         raise PmError("send text must be a single line; write multi-line content to a file and send a one-line pointer")
     if not session_exists(session):
         raise PmError(f"tmux session is not running: {session}")
-    capture = pane_text(session)
-    hard_stop = scan_hard_stop(capture)
+    hard_stop = scan_live_hard_stop(session)
     if hard_stop["present"]:
         raise PmError(
             "refusing to send into a dialog on screen: "
             + marker_detail(hard_stop)
-            + "; a blind Enter would answer it. If the session is genuinely stuck at this dialog it is a"
-            " human decision; relaunch or stop rather than answering it here"
+            + "; if this is ordinary output rather than a dialog it clears as the pane scrolls, so"
+            " re-issue after the next observe — a marker that persists on a static screen is a"
+            " relaunch or a stop"
         )
     _tmux_or_raise(["send-keys", "-t", session, "-l", "--", text], "tmux literal send failed")
     time.sleep(1.0)
+    # Re-scanned immediately before the Enter, not only before the typing: the
+    # settle above is a full second in which an asynchronous dialog can draw
+    # itself over a pane that was clear when this call began, and it is the
+    # Enter — never the typing — that would answer it.
+    pre_submit = scan_live_hard_stop(session)
+    if pre_submit["present"]:
+        raise TypedNotSubmitted(
+            "a dialog appeared while the line was being typed; refusing to submit into it: "
+            + marker_detail(pre_submit)
+            + " (the text is typed but unsubmitted; read the pane before retrying)"
+        )
     _tmux_or_raise(["send-keys", "-t", session, "C-m"], "tmux submit failed; text typed but not sent")
     time.sleep(1.0)
-    if session_exists(session) and not scan_hard_stop(pane_text(session))["present"]:
+    if session_exists(session) and not scan_live_hard_stop(session)["present"]:
         _run_tmux("send-keys", "-t", session, "C-m")

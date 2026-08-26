@@ -679,7 +679,8 @@ _WAITED_RE = re.compile(r"^waited:\s*([\d.]+)s \(requested ([\d.]+)s\)$", re.MUL
 class TestObserveWaitSemantics(SliceOpsTestCase):
     """`observe --wait` honest-wait semantics: the wait runs the full
     requested duration and breaks early ONLY on session death, `result.json`
-    appearing, or a dialog marker — never on a mere pane byte-change."""
+    appearing, or a dialog marker on the visible pane — never on a mere pane
+    byte-change."""
 
     def _observe_wait(self, wait_seconds: float) -> tuple[int, str, str, float, float]:
         """Run `observe --wait` and return (code, out, err, test_elapsed,
@@ -801,8 +802,9 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertIn("session running: True", result["out"])
         self.assertIn("dialog marker: credential_prompt", result["out"])
         self.assertNotIn("dialog marker: clear", result["out"])
-        # The matched literal, not just the kind: PM cannot judge a marker it
-        # cannot see, and judging it is now the only thing that happens here.
+        # The matched text, not just the kind: a PM told only "credential_prompt"
+        # cannot tell a real dialog from a literal marker inside ordinary output,
+        # and cannot tell whether waiting for the pane to scroll will clear it.
         self.assertIn("Enter API key", result["out"])
         self.assertNotIn("note:", result["out"], "a dialog marker is a signal, not a no-signal wait")
 
@@ -940,10 +942,72 @@ class TestSendNudge(SliceOpsTestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("credential_prompt", err)
-        # The refusal names the literal it matched: a PM told only
-        # "credential_prompt" cannot see what fired, and so cannot judge whether
-        # the pane really holds a dialog awaiting input.
+        # Both halves of the refusal matter: the matched literal, so PM can see
+        # what fired and judge it, and the way forward, since the guard is not
+        # overridable and a PM told only "credential_prompt" would otherwise
+        # reach for a relaunch that costs an attempt.
         self.assertIn("Enter API key", err)
+        self.assertIn("re-issue after the next observe", err)
+
+
+class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
+    """The race the two isolated `observe` tests cannot reach: a marker ends
+    the wait and the session dies inside the same poll window.
+
+    Every mock here is ORDERED, and that is the point. An earlier version
+    returned constant values, which made the test pass with marker retention
+    and capture preservation both reverted — it happened to pin only the
+    liveness re-read. Constant mocks cannot distinguish "kept the marker we
+    saw" from "saw the same marker again on a later read", so the sequence has
+    to be alive-then-dead and marker-then-clear for each claimed invariant to
+    be independently necessary.
+    """
+
+    def test_marker_wins_the_break_without_losing_liveness_or_the_capture(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "pane-live.txt").write_text("earlier screen\n", encoding="utf-8")
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=None,
+            artifact_dir=artifact_dir, tmux_session="pm-not-a-real-session",
+        )
+
+        marker_screen = "working...\nEnter API key to continue\n"
+        dialog = sessions.scan_hard_stop(marker_screen)
+        clear = {"present": False, "kinds": [], "markers": []}
+
+        with mock.patch.object(
+            slice_ops.sessions, "detect_activity",
+            # The pre-marker screen: the loop reads this BEFORE the dialog draws,
+            # so a tail taken from it would not contain the marker.
+            return_value={"running": True, "active": True, "capture": "working...\n"},
+        ), mock.patch.object(
+            # Marker on the first scan, clear afterwards: a post-loop re-scan
+            # instead of the retained one would report "clear".
+            slice_ops.sessions, "scan_live_hard_stop", side_effect=[dialog, clear, clear],
+        ), mock.patch.object(
+            # Alive when the wait began, dead by the time liveness is re-read.
+            slice_ops.sessions, "session_exists", side_effect=[True, False, False],
+        ), mock.patch.object(
+            slice_ops.sessions, "pane_text", return_value=marker_screen,
+        ):
+            outcome = slice_ops.observe(self.repo, run_dir, wait=30.0, token=token)
+
+        self.assertTrue(outcome.hard_stop["present"], "the marker that ended the wait must be retained")
+        self.assertIn("credential_prompt", outcome.hard_stop["kinds"])
+        self.assertFalse(outcome.running, "liveness must be re-read after a marker break")
+        self.assertIn(
+            "Enter API key", outcome.tail,
+            "the tail must be the screen that showed the marker, not the poll before it",
+        )
+        self.assertIn(
+            "Enter API key", (artifact_dir / "pane-live.txt").read_text(encoding="utf-8"),
+            "finalize falls back to this file, so it must hold the marker screen too",
+        )
+        self.assertFalse(outcome.no_signal, "a marker is a signal, not a no-signal wait")
+        self.assertLess(outcome.elapsed_seconds, 30.0, "the wait must break early, not run to term")
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
