@@ -274,6 +274,47 @@ class TestGuardCaptureFailureWithholdsTheEnter(unittest.TestCase):
                 self.assertEqual(sum("C-m" in argv for argv in sent), 1, sent)
 
 
+class TestSendPromptToleratesFastFinishBeforePresubmitScan(unittest.TestCase):
+    """A harness that finishes and exits between the pointer send and the
+    pre-Enter safety scan is a normal completion, not a dialog PM cannot see:
+    `send_prompt` must return quietly rather than raising `TypedNotSubmitted`.
+    `send_line` keeps no such exemption — it refuses outright, before ever
+    typing, once the session is confirmed gone; callers treat a `send_line`
+    return as delivery, so there is no "typed but the harness raced us"
+    outcome to tolerate the way `send_prompt`'s advisory pointer allows."""
+
+    def test_send_prompt_returns_quietly_when_session_is_gone(self) -> None:
+        codes = iter([0, 1])
+        sent: list[tuple[str, ...]] = []
+
+        def fake_tmux(*args):
+            if args[0] == "capture-pane":
+                code = next(codes)
+                return subprocess.CompletedProcess(
+                    args=list(args), returncode=code, stdout="clear pane" if code == 0 else "", stderr="no server running"
+                )
+            sent.append(tuple(args))
+            return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux), \
+             mock.patch.object(sessions, "session_exists", return_value=False), \
+             mock.patch.object(sessions.time, "sleep"):
+            sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md")
+
+        self.assertFalse([argv for argv in sent if "C-m" in argv], sent)
+        self.assertTrue(any("-l" in argv for argv in sent), sent)
+
+    def test_send_line_refuses_outright_when_session_is_gone(self) -> None:
+        with mock.patch.object(sessions, "_run_tmux") as fake, \
+             mock.patch.object(sessions, "session_exists", return_value=False), \
+             mock.patch.object(sessions.time, "sleep"):
+            with self.assertRaises(PmError) as ctx:
+                sessions.send_line("pm-mocked", "please continue")
+
+        self.assertNotIsInstance(ctx.exception, TypedNotSubmitted)
+        fake.assert_not_called()
+
+
 class TestSubmitFailurePreservesTypedState(unittest.TestCase):
     def test_send_line_reports_typed_not_submitted_when_first_enter_fails(self) -> None:
         clear = sessions.PaneObservation(

@@ -449,9 +449,11 @@ def send_prompt(session: str, pointer: str) -> None:
     only after re-scanning the pane, so a credential/approval/side-effect
     prompt the first C-m may have surfaced is never blindly answered by the
     second (when one C-m already submitted, withholding the second is
-    harmless). Both C-m sends tolerate a session that has already exited — a
-    fast-finishing harness can exit before either fires, a normal completion
-    path, not a send_prompt failure.
+    harmless). The pre-Enter safety scan itself tolerates the same thing: a
+    session that no longer exists by then is a fast-finishing harness, not an
+    unreadable pane a dialog could be hiding in, so it is treated as the
+    normal completion path below rather than a send_prompt failure. Both C-m
+    sends tolerate it too.
     """
     if "\n" in pointer or "\r" in pointer:
         raise PmError("launch pointer must be a single line; the contract itself goes in the prompt.md file it names")
@@ -466,9 +468,15 @@ def send_prompt(session: str, pointer: str) -> None:
     time.sleep(1.0)
     # Same settle window as `send_line`'s: a trust or credential dialog can
     # draw itself during this second, and the Enter below would confirm it.
+    # A session that has already exited by now is a fast-finishing harness —
+    # a normal completion, not a safety failure — so a capture failure caused
+    # by the session's own absence is tolerated; anything else on a
+    # still-live session fails closed.
     try:
         pre_submit = scan_visible_pane(session, required=True).dialog_markers
     except PmError as exc:
+        if not session_exists(session):
+            return
         raise TypedNotSubmitted(
             f"{exc}; the launch pointer is typed but unsubmitted — do not retry into this session; relaunch"
         ) from exc
