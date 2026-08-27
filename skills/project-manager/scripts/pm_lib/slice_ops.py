@@ -635,19 +635,49 @@ class StartSliceOutcome:
     notes_warning: str | None = None
 
 
-def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> None:
+def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> list[str]:
     # `validation.md` rotates with the rest: it is Developer-authored evidence
     # PM assesses the attempt against, so a steer or relaunch that left the
     # prior attempt's copy in place would present stale evidence as this
     # attempt's own.
+    #
+    # Returns the names actually moved (empty if there was nothing to rotate)
+    # so a caller that later fails to deliver can restore exactly those names
+    # with `_restore_rotated_attempt` — see finalize_steer.
     names = ("result.json", "pane.txt", "pane-live.txt", "validation.md")
     present = [name for name in names if (artifact_dir / name).exists()]
     if not present:
-        return
+        return []
     destination = artifact_dir / f"attempt-{superseded_attempt}"
     destination.mkdir(parents=True, exist_ok=True)
     for name in present:
         (artifact_dir / name).rename(destination / name)
+    return present
+
+
+def _restore_rotated_attempt(artifact_dir: Path, superseded_attempt: int, names: list[str]) -> None:
+    # Mirror image of `_rotate_prior_attempt`, for a caller that rotated
+    # speculatively and then proved delivery never happened: moves `names`
+    # back from attempt-<n>/ to the top level. A no-op if rotation itself
+    # was a no-op (names == []).
+    if not names:
+        return
+    source = artifact_dir / f"attempt-{superseded_attempt}"
+    for name in names:
+        source_path = source / name
+        destination = artifact_dir / name
+        try:
+            # Hardlink-then-unlink instead of rename: os.link is atomic
+            # against an existing destination (unlike exists()-then-rename),
+            # so a fresh file the live session writes in this same window
+            # (e.g. it finishes right as send_line's dead-session recheck
+            # fires) can never be clobbered by the stale archived copy.
+            # Best-effort: any failure here (including that FileExistsError)
+            # must not mask the proven-undelivered PmError being raised.
+            os.link(source_path, destination)
+            source_path.unlink()
+        except OSError:
+            continue
 
 
 def start_slice(
@@ -1506,12 +1536,14 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # This must stay BEFORE the send below: rotating after delivery would
     # race the live session, which may write its fresh post-steer result
     # before we rotate — archiving the NEW result instead of the stale one.
-    # If the send below raises (dead-session race, marker refusal) the
-    # rotation is harmless: the result is preserved under attempt-<n>/, the
-    # attempt increment is not persisted, and a later relaunch re-rotates
-    # idempotently (nothing left at top level → no-op).
+    # If the send below raises with nothing typed, the except PmError block
+    # restores the rotation so the slice isn't left with no live result.
+    # TypedNotSubmitted is excluded from that restore: delivery is still
+    # possible there (a human could clear the dialog and submit the typed
+    # line later), so restoring would risk the same race this ordering
+    # exists to avoid.
     artifact_dir = Path(current["artifact_dir"])
-    _rotate_prior_attempt(artifact_dir, attempts - 1)
+    rotated = _rotate_prior_attempt(artifact_dir, attempts - 1)
 
     # File plus one-line pointer, the split `start_slice` uses for prompt.md:
     # no harness TUI is trusted with long multi-line input (sessions.send_prompt).
@@ -1524,28 +1556,34 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # not proven — hence a stop for a human rather than either default.
     correction_path = artifact_dir / f"steer-attempt-{attempts}.md"
     try:
-        with correction_path.open("x", encoding="utf-8") as handle:
-            handle.write(correction)
-    except FileExistsError as exc:
-        raise PmError(
-            f"{correction_path} already exists: a correction for attempt {attempts} was written but "
-            "its attempt was never persisted, so whether the Developer received it is unknown. Read "
-            "that file and the pane, then decide as a human — accept, stop, or relaunch; this will "
-            "not overwrite it"
-        ) from exc
-    try:
-        sessions.send_line(session, prompts.render_steer_pointer(correction_path))
+        try:
+            with correction_path.open("x", encoding="utf-8") as handle:
+                handle.write(correction)
+        except FileExistsError as exc:
+            raise PmError(
+                f"{correction_path} already exists: a correction for attempt {attempts} was written but "
+                "its attempt was never persisted, so whether the Developer received it is unknown. Read "
+                "that file and the pane, then decide as a human — accept, stop, or relaunch; this will "
+                "not overwrite it"
+            ) from exc
+        try:
+            sessions.send_line(session, prompts.render_steer_pointer(correction_path))
+        except TypedNotSubmitted:
+            # Deliberately NOT unlinked: the pointer to this file is sitting typed
+            # in the Developer's input line, so deleting it would leave the pane
+            # naming a file that no longer exists — and if the dialog is dismissed
+            # and that line submitted, the Developer reads a dangling pointer.
+            raise
+        except PmError:
+            try:
+                correction_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
     except TypedNotSubmitted:
-        # Deliberately NOT unlinked: the pointer to this file is sitting typed
-        # in the Developer's input line, so deleting it would leave the pane
-        # naming a file that no longer exists — and if the dialog is dismissed
-        # and that line submitted, the Developer reads a dangling pointer.
         raise
     except PmError:
-        try:
-            correction_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _restore_rotated_attempt(artifact_dir, attempts - 1, rotated)
         raise
 
     state_mod.save_state(run_dir, state, token)

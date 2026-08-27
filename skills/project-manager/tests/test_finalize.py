@@ -838,6 +838,99 @@ class TestSteer(FinalizeTestCase):
             "an undelivered correction must not be left looking delivered",
         )
 
+    def test_steer_restores_rotation_on_proven_undelivered_send(self) -> None:
+        """A send refusal proves nothing reached the Developer, so the
+        pre-steer rotation (test_steer_rotates_stale_pre_steer_result) must be
+        undone: the slice is left exactly as finalize_steer found it, not
+        with its only evidence stranded under attempt-0/."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_then_drain_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        artifact_dir = Path(
+            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
+        )
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
+
+        with mock.patch.object(
+            slice_ops.sessions, "send_line", side_effect=PmError("never reached the pane")
+        ):
+            with self.assertRaises(PmError):
+                slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the other thing")
+
+        self.assertTrue(
+            (artifact_dir / "result.json").is_file(),
+            "a proven-undelivered steer must restore the rotated result, not strand it under attempt-0/",
+        )
+        self.assertFalse((artifact_dir / "attempt-0" / "result.json").exists())
+        self.assertEqual(state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 0)
+
+    def test_steer_restore_does_not_clobber_a_result_written_during_the_race(self) -> None:
+        """A restore must not overwrite a fresh result the live session
+        writes in the gap between rotate and the failed send."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_then_drain_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        artifact_dir = Path(
+            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
+        )
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
+
+        def _race_a_fresh_result(*_args, **_kwargs):
+            (artifact_dir / "result.json").write_text('{"status": "fresh"}', encoding="utf-8")
+            raise PmError("never reached the pane")
+
+        with mock.patch.object(slice_ops.sessions, "send_line", side_effect=_race_a_fresh_result):
+            with self.assertRaises(PmError):
+                slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the other thing")
+
+        self.assertEqual(
+            (artifact_dir / "result.json").read_text(encoding="utf-8"), '{"status": "fresh"}'
+        )
+        self.assertTrue((artifact_dir / "attempt-0" / "result.json").is_file())
+
+    def test_steer_leaves_rotation_in_place_when_send_might_still_deliver(self) -> None:
+        """TypedNotSubmitted means the correction may still land later (a
+        human clears the dialog and submits the typed line) — restoring the
+        rotation here would race that possible delivery, so it must stay
+        rotated, matching the (deliberately) un-unlinked correction file."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _result_then_drain_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        artifact_dir = Path(
+            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
+        )
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
+
+        with mock.patch.object(
+            slice_ops.sessions, "send_line", side_effect=TypedNotSubmitted("typed but unconfirmed")
+        ):
+            with self.assertRaises(TypedNotSubmitted):
+                slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the other thing")
+
+        self.assertTrue((artifact_dir / "attempt-0" / "result.json").is_file())
+        self.assertFalse((artifact_dir / "result.json").exists())
+
     def test_accepted_assessment_retains_full_correction_narrative(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
