@@ -11,7 +11,7 @@ Use this skill for a separate improvement pass over code that already works. It 
 
 - **Preserve functionality exactly.** Product behaviour, public contracts, data shapes, test meaning, and accepted edge cases are fixed. If a meaningful simplification would require changing any of them, report it as a recommendation instead of making the change.
 - **Respect frozen contracts.** After an implementation-plan or scoped-implementation workflow, treat the implemented behaviour and its accepted edge cases as part of the contract. Simplification is never a back door for scope expansion.
-- **Use the requested scope.** For a holistic pass, inspect enough surrounding code to simplify the design coherently. For a narrow request, refine only the named files or functions.
+- **Use the requested scope.** For a holistic pass, inspect enough surrounding code to simplify the design coherently, and run the `code-health` skill yourself if no report is already supplied — differentially against a base ref when one exists, or `--all` when working on completed/pre-existing code with no diff to compare against — to surface duplication, complexity, and dependency hotspots as evidence before deciding what to simplify. For a narrow request, refine only the named files or functions and skip `code-health`.
 
 ## Standards Come From the Project
 

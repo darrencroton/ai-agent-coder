@@ -68,7 +68,7 @@ Do not repeat the script's entire top-N list. Investigate the few candidates wit
 
 ## Where It Runs
 
-Structural evidence feeds review, never a mechanical gate, so it has one touchpoint per mode. In Mode A the Developer runs it differentially before `code-review` on a broad or structural change and supplies the report as review evidence. In Mode B the PM runs it during assessment when a slice materially changes structure; a candidate alone never justifies a steer.
+Structural evidence feeds review, never a mechanical gate. In Mode A the Developer runs it differentially before `code-review` on a broad or structural change and supplies the report as review evidence; `code-review` and, for a holistic pass, `code-simplifier` also run it themselves — differentially, or `--all` when there is no diff to compare against — whenever the change qualifies and no report was already supplied, so a standalone call still gets structural coverage. In Mode B the PM runs it during assessment when a slice materially changes structure; a candidate alone never justifies a steer.
 
 ## Metric Semantics
 
