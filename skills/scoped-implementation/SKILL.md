@@ -22,6 +22,8 @@ Before coding, identify the frozen contract:
 
 If the contract is missing or too vague, stop after drafting a candidate contract and ask the user to approve it. Do not implement a non-trivial change without an auditable slice.
 
+When the `style-guide` skill is available in this session, load its applicable standard here, before writing code — see its `write` mode: the project's own drafted guide if one exists, or its baseline otherwise. This is the point where style guidance is worth the most and costs the least: it shapes code as it is written instead of flagging it afterward. No separate skill invocation is required; reading the relevant portions is cheap enough to fold into this step. When `style-guide` is not available in this session, this step is skipped — scoped-implementation remains fully self-contained and follows the project's own documented conventions and dominant local pattern, as it already does for every other aspect of the code it writes.
+
 ## Workflow
 
 1. **Confirm contract** - restate the authorized surface and non-goals briefly.

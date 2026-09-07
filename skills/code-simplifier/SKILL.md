@@ -15,7 +15,7 @@ Use this skill for a separate improvement pass over code that already works. It 
 
 ## Standards Come From the Project
 
-Discover conventions rather than importing them: read `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING`, linter/formatter configuration, and the surrounding code, then match what the project actually does — naming, module layout, error-handling idiom, comment density, import style, test structure. Do not impose conventions from another ecosystem onto this one.
+Discover conventions rather than importing them: read `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING`, linter/formatter configuration, and the surrounding code, then match what the project actually does — naming, module layout, error-handling idiom, comment density, import style, test structure. Do not impose conventions from another ecosystem onto this one. When no such doc exists, or the discovered convention is itself inconsistent: if the `style-guide` skill is also available in the current session, treat its baseline style guide as the fallback; otherwise preserve the narrowest coherent local convention you can find and report the ambiguity rather than guessing or importing a foreign convention.
 
 ## What To Improve
 
