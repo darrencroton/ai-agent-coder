@@ -42,7 +42,11 @@ SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 # it is being asked to do.
 NEVER_DELEGATE_SKILLS = {"commit", "orchestrator", "scoped-implementation", "project-manager"}
 # Edit-oriented; fine for a read-write delegate, never for a read-only one.
-WRITE_ONLY_SKILLS = {"code-simplifier"}
+# style-guide's `draft` and `write` modes both create or edit files, so the
+# whole skill is write-only even though its `audit` mode alone is read-only
+# safe — this mechanism has no per-mode granularity, so the conservative
+# whole-skill call applies, same as code-simplifier.
+WRITE_ONLY_SKILLS = {"code-simplifier", "style-guide"}
 # Bookkeeping/log/archive directories, not review content.
 SCOPE_SKIP_DIRS = (".pm/", ".orchestrator/", "archive/")
 SCOPE_SKIP_NOTE = (

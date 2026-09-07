@@ -246,23 +246,25 @@ class DelegateContractTests(unittest.TestCase):
                 self.assertEqual(raised.exception.issues[0].code, "skill-not-permitted")
 
     def test_write_only_skill_is_read_write_only(self):
-        read_only_request = dict(self.request, required_skills=["code-simplifier"])
-        with self.assertRaises(delegate_contract.DelegateContractError) as raised:
-            delegate_contract.validate_contract(self.policy, read_only_request, self.run_dir)
-        issue = raised.exception.issues[0]
-        self.assertEqual(issue.code, "skill-not-permitted-for-access")
-        self.assertEqual(issue.field, "required_skills[0]")
+        for skill in ("code-simplifier", "style-guide"):
+            with self.subTest(skill=skill):
+                read_only_request = dict(self.request, required_skills=[skill])
+                with self.assertRaises(delegate_contract.DelegateContractError) as raised:
+                    delegate_contract.validate_contract(self.policy, read_only_request, self.run_dir)
+                issue = raised.exception.issues[0]
+                self.assertEqual(issue.code, "skill-not-permitted-for-access")
+                self.assertEqual(issue.field, "required_skills[0]")
 
-        write_policy = dict(self.policy, required_access=["read-only", "read-write"])
-        write_request = dict(
-            self.request,
-            required_skills=["code-simplifier"],
-            access="read-write",
-            authorized_surface=["target.py"],
-            non_goals=["none"],
-        )
-        contract = delegate_contract.validate_contract(write_policy, write_request, self.run_dir)
-        self.assertEqual(contract["required_skills"], ["code-simplifier"])
+                write_policy = dict(self.policy, required_access=["read-only", "read-write"])
+                write_request = dict(
+                    self.request,
+                    required_skills=[skill],
+                    access="read-write",
+                    authorized_surface=["target.py"],
+                    non_goals=["none"],
+                )
+                contract = delegate_contract.validate_contract(write_policy, write_request, self.run_dir)
+                self.assertEqual(contract["required_skills"], [skill])
 
     def test_malformed_skill_name_is_rejected(self):
         for skill in ("../../etc/passwd", "Code-Review", "code_review", "/etc/passwd", ""):

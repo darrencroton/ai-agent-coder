@@ -44,6 +44,7 @@ Each skill's `SKILL.md` is the source of truth for trigger conditions, workflow,
 | [`project-manager`](skills/project-manager/) | Supervises execution of an existing plan one slice at a time: durable run state, plan sanity check, fresh tmux-backed session per slice, mechanical floor, recorded assessments, commissioned independent reviews. |
 | [`orchestrator`](skills/orchestrator/) | Delegates bounded read-only or read-write work through validated contracts, with session tracking and continuation. The Developer retains verification, gates, commits, and final responsibility. |
 | [`code-simplifier`](skills/code-simplifier/) | Behaviour-preserving clarity pass over working code. A separate cleanup step, not part of the default chain. |
+| [`style-guide`](skills/style-guide/) | Draft a project style guide from a portable baseline, audit code against it, or write code following it. `write` mode folds into `scoped-implementation` when available; not a gate anywhere. |
 | [`handoff`](skills/handoff/) | Compact continuation state for the next session: status, blockers, frozen contract, exact next action. |
 | [`report`](skills/report/) | Evidence-backed written synthesis when explicitly requested. Outside the gate chain. |
 
@@ -54,7 +55,7 @@ Call skills explicitly. Do not rely on the model to guess which workflow applies
 The default flow for feature or bug work, at every level:
 
 1. **Plan** — `implementation-plan`: define slices, freeze contracts, flag risky surfaces.
-2. **Implement** — `scoped-implementation` against one frozen slice, in a fresh session.
+2. **Implement** — `scoped-implementation` against one frozen slice, in a fresh session. When `style-guide` is available, its `write` mode loads the applicable style standard here too — the project's own drafted guide, or its portable baseline if none exists yet.
 3. **Lint** — `lint`, differential against the starting commit so pre-existing debt cannot block. Runs before the reviews because its findings are unarguable and free.
 4. **Audit scope** — `drift-audit`: was what happened authorized? Always before quality review.
 5. **Measure structure** (optional) — `code-health`, for broad, architectural, or maintainability-sensitive changes; supplies evidence, never a gate verdict.
