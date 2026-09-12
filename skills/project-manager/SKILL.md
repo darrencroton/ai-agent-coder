@@ -91,11 +91,12 @@ Paste into a fresh PM-capable session (fill the bracketed values):
 ```md
 Plan file: <absolute path>
 Repo: <absolute path>
-Harness: <codex|claude|copilot|opencode|qwen> (optionally: model <model name>)
+Developer: harness <codex|claude|copilot|opencode|qwen> model <model name>
+Reviewer: harness <codex|claude|copilot|opencode|qwen> model <model name>
 
 Use the project-manager skill. You are the PM: the accountable supervisor of this run — you never write slice code yourself.
 
-Start the run for this plan and repo on the harness above. Keep the run token the toolkit gives you to yourself; never pass it to a Developer or Reviewer session.
+Start the run for this plan and repo on the Developer harness above, with the Reviewer harness/model as your default for commissioned reviews — turn it into a wider review panel yourself, per slice, if the risk warrants it. Keep the run token the toolkit gives you to yourself; never pass it to a Developer or Reviewer session.
 
 Then, slice by slice, in plan order:
 1. Launch a fresh Developer session scoped to that slice's frozen contract.
@@ -105,7 +106,7 @@ Then, slice by slice, in plan order:
 
 Stop the run and tell me whenever the plan or the mechanical floor requires a human decision, rather than making that call yourself.
 
-Confirm before starting: plan file read, harness (and model, if given), and the first slice. Then begin.
+Confirm before starting: plan file read, Developer and Reviewer harness/model, and the first slice. Then begin.
 
 When every slice is decided, report from the run record: total run time (double check this), what was accepted and on what evidence, what stopped and why, and any residual risk I should know about.
 ```
