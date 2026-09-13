@@ -168,6 +168,8 @@ def _validate_shape(state: dict[str, Any]) -> None:
         # fail closed here, not surface as an AttributeError on `.append`.
         if "grants" in entry and not isinstance(entry["grants"], list):
             raise PmError(f"run state slice {entry.get('id')!r} has a non-list 'grants' field")
+        if "review_judgments" in entry and not isinstance(entry["review_judgments"], list):
+            raise PmError(f"run state slice {entry.get('id')!r} has a non-list 'review_judgments' field")
         for grant in entry.get("grants") or []:
             if not isinstance(grant, dict) or not str(grant.get("path") or "").strip():
                 raise PmError(
@@ -568,6 +570,11 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
         )
     lines.append("")
 
+    lines.append("## Reviewer Judgments")
+    lines.append("")
+    lines.extend(_render_reviewer_judgments(state, events, slices))
+    lines.append("")
+
     lines.append("## Assessments")
     any_assessment = False
     for entry in slices:
@@ -624,3 +631,89 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _judgment_attempt_label(judgment: dict[str, Any], entry: dict[str, Any], events: list[dict[str, Any]]) -> str:
+    """Best-effort human attempt label from a stored commission origin."""
+    review_ids = (
+        judgment.get("review_ids") if judgment.get("status") == "unavailable"
+        else [judgment.get("review_id")] if judgment.get("skill") == "drift-audit"
+        else [review_id for group in judgment.get("rank_groups") or [] for review_id in group]
+    )
+    reviews = {review.get("review_id"): review for review in entry.get("reviews") or [] if isinstance(review, dict)}
+    origins = [reviews.get(review_id, {}).get("origin_event") for review_id in review_ids]
+    origin = origins[0] if origins and all(item == origins[0] for item in origins) else None
+    if not isinstance(origin, dict) or type(origin.get("index")) is not int:
+        return "unknown"
+    index = origin["index"]
+    if index < 0 or index >= len(events):
+        return "unknown"
+    event = events[index]
+    if event.get("slice") != entry.get("id") or event.get("kind") != origin.get("kind"):
+        return "unknown"
+    return str(sum(
+        event.get("slice") == entry.get("id") and event.get("kind") in {"launch", "relaunch", "steer"}
+        for event in events[: index + 1]
+    ) or "unknown")
+
+
+def _review_display(review_id: Any, reviews: dict[str, dict[str, Any]]) -> str:
+    review = reviews.get(review_id)
+    if review is None:
+        return str(review_id)
+    model = review.get("model") or "unknown model"
+    effort = review.get("effort") if review.get("effort") is not None else "unknown"
+    suffix = f"/{model} effort={effort}"
+    return f"{review_id} ({review.get('tool')}{suffix})"
+
+
+def _render_reviewer_judgments(state: dict[str, Any], events: list[dict[str, Any]], slices: list[dict[str, Any]]) -> list[str]:
+    """Compact report section derived only from signed structured records."""
+    from . import judgments
+
+    lines: list[str] = []
+    any_record = False
+    for entry in slices:
+        reviews = {
+            review.get("review_id"): review for review in entry.get("reviews") or []
+            if isinstance(review, dict) and isinstance(review.get("review_id"), str)
+        }
+        superseded = {
+            item.get("supersedes") for item in entry.get("review_judgments") or []
+            if isinstance(item, dict) and isinstance(item.get("supersedes"), str)
+        }
+        for judgment in entry.get("review_judgments") or []:
+            if not isinstance(judgment, dict):
+                continue
+            any_record = True
+            label = judgment.get("judgment_id", "unknown")
+            prefix = f"- {entry.get('id')} attempt {_judgment_attempt_label(judgment, entry, events)} {label}: "
+            if label in superseded:
+                prefix += "superseded "
+            if judgment.get("status") == "unavailable":
+                detail = f"{judgment.get('skill')} unavailable for " + ", ".join(
+                    _review_display(review_id, reviews) for review_id in judgment.get("review_ids") or []
+                )
+            elif judgment.get("skill") == "drift-audit":
+                review_id = judgment.get("review_id")
+                detail = f"drift {_review_display(review_id, reviews)} score {judgment.get('score')}"
+            else:
+                groups = judgment.get("rank_groups") or []
+                order = " > ".join(
+                    " = ".join(_review_display(review_id, reviews) for review_id in group) for group in groups
+                )
+                detail = f"code panel {order}"
+                if len(groups) == 1 and len(groups[0]) == 1:
+                    detail += " (singleton/unranked)"
+            lines.append(prefix + detail + f" — {judgment.get('reason', '')}")
+    missing = judgments.unjudged_review_ids(state)
+    if missing:
+        any_record = True
+        lines.append("- Unjudged: " + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in missing))
+    historical = judgments.historical_review_count(state)
+    if historical:
+        any_record = True
+        lines.append(f"- Historical/unjudged: {historical} review record(s) lack stable IDs")
+    if not any_record:
+        lines.append("(none; no stable review judgments recorded)")
+    return lines

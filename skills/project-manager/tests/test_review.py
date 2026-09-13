@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import re
 import stat
@@ -308,14 +309,17 @@ class TestRenderReviewerPrompt(unittest.TestCase):
             lock = threading.Lock()
             barrier = threading.Barrier(16)
 
-            def claim() -> None:
+            tools = ["opencode", "codex"]
+
+            def claim(number: int) -> None:
                 barrier.wait()
-                seq, path = review_mod._claim_commission_seq(slice_dir, 0, "code-review", "opencode")
+                skill = "code-review" if number % 2 else "drift-audit"
+                seq, path = review_mod._claim_commission_seq(slice_dir, 0, skill, tools[number % 2])
                 self.assertTrue(path.exists())
                 with lock:
                     claimed.append(seq)
 
-            threads = [threading.Thread(target=claim) for _ in range(16)]
+            threads = [threading.Thread(target=claim, args=(number,)) for number in range(16)]
             for thread in threads:
                 thread.start()
             for thread in threads:
@@ -389,6 +393,12 @@ class ReviewCommandTestCase(PmTestCase):
         self._git("add", filename)
         self._git("commit", "-q", "-m", "advance head")
 
+    def set_current_slice(self, state, token, run_dir, **kwargs):
+        """Manual review fixtures still need the provenance real launches record."""
+        updated = super().set_current_slice(state, token, run_dir, **kwargs)
+        state_mod.append_event(run_dir, "launch", slice_id=kwargs["slice_id"], note="test launch")
+        return updated
+
 
 class TestReviewEndToEnd(ReviewCommandTestCase):
     def test_unsupported_opencode_variant_refused_before_launching(self) -> None:
@@ -448,6 +458,12 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         review_record = entry["reviews"][0]
         self.assertEqual(review_record["skill"], "code-review")
         self.assertEqual(review_record["tool"], "faketool")
+        self.assertEqual(review_record["review_id"], "review-1")
+        self.assertIsNone(review_record["model"])
+        self.assertIsNone(review_record["effort"])
+        self.assertEqual(review_record["origin_event"]["kind"], "launch")
+        self.assertEqual(review_record["origin_event"]["slice"], "Slice 1")
+        self.assertEqual(review_record["review_context"], {"pm_adjudications": None, "drift_review": None})
         head = self._git("rev-parse", "HEAD").stdout.strip()
         self.assertEqual(review_record["head"], head)
         self.assertEqual(review_record["before_head"], before_head)
@@ -519,6 +535,19 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self.assertIn(f"Independent drift-audit report for this range: {mirror.resolve()}", prompt_text)
         # ...and the forged verdict was overwritten by the authenticated one.
         self.assertNotIn("forged", mirror.read_text(encoding="utf-8"))
+        reviews = state_mod.load_state(run_dir, token)["slices"][0]["reviews"]
+        self.assertEqual([review["review_id"] for review in reviews[:2]], ["review-1", "review-2"])
+        self.assertEqual(reviews[1]["review_context"]["drift_review"], {
+            "review_id": "review-1", "artifact": reviews[0]["artifact"], "sha256": reviews[0]["sha256"],
+        })
+        judgment_input = self.repo.parent / "drift-judgment.json"
+        judgment_input.write_text(json.dumps({
+            "schema_version": 1, "slice": "Slice 1", "skill": "drift-audit", "review_id": "review-1",
+            "score": 2, "reason": "The PM verified the audit report.",
+        }), encoding="utf-8")
+        code, _, err = self.run_cli_in_repo(["judge-reviews", "--file", str(judgment_input), "--token", token])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"][0]["score"], 2)
         # A drift audit is never handed a prior report, so a second audit of the
         # same commit stays independent of the first one's verdict. Asserted on a
         # SECOND audit at the same HEAD: the first ran with no reviews recorded at

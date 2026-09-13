@@ -17,6 +17,7 @@ from pathlib import Path
 
 from . import IntegrityError, PmError
 from . import git_ops
+from . import judgments
 from . import plan as plan_mod
 from . import review as review_mod
 from . import sessions
@@ -160,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review.add_argument("--run")
     review.add_argument("--token")
+
+    judge = subparsers.add_parser("judge-reviews", help="Record PM's structured reviewer-usefulness judgment")
+    judge.add_argument("--file", required=True, help="JSON judgment input; it is not authoritative state")
+    judge.add_argument("--run")
+    judge.add_argument("--token")
 
     notes = subparsers.add_parser(
         "notes", help="Update the run notes safely (authoritative original, then mirror)"
@@ -321,6 +327,15 @@ def _run_status(args: argparse.Namespace) -> int:
             f"risk={entry.get('risk'):<9} attempts={entry.get('attempts', 0)}/{max_attempts} "
             f"commit={commit_short}"
         )
+
+    missing = judgments.unjudged_review_ids(state)
+    if missing:
+        print("unjudged reviews: " + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in missing))
+    else:
+        print("unjudged reviews: none")
+    historical = judgments.historical_review_count(state)
+    if historical:
+        print(f"historical/unjudged reviews without stable IDs: {historical}")
 
     current = state.get("current_slice")
     if current:
@@ -610,11 +625,32 @@ def _run_review(args: argparse.Namespace) -> int:
     )
     print(f"slice: {outcome.slice_id}")
     print(f"skill: {outcome.skill}  tool: {outcome.tool}")
+    print(f"review id: {outcome.review_id}  model: {outcome.model}  effort: {outcome.effort}")
     print(f"reviewed head: {outcome.head}  before_head: {outcome.before_head}")
     print(f"diff: {outcome.diff_path}")
     print(f"changed files: {len(outcome.changed_files)}")
     print(f"report: {outcome.artifact_path}")
     print(f"sha256: {outcome.sha256}")
+    return 0
+
+
+def _run_judge_reviews(args: argparse.Namespace) -> int:
+    repo = _repo_from_cwd()
+    token = _require_token(args)
+    run_dir = state_mod.resolve_run_dir(repo, args.run)
+    data = judgments.load_input(Path(args.file))
+    outcome = judgments.record_judgment(run_dir, token, data)
+    try:
+        judgments.publish_event(run_dir, token, outcome.judgment_id, outcome.slice_id)
+    except IntegrityError:
+        raise
+    except (OSError, PmError) as exc:
+        raise PmError(
+            f"judgment {outcome.slice_id}/{outcome.judgment_id} was stored but event publication failed; "
+            f"resolve the publication error, then retry the same input: {exc}"
+        ) from exc
+    verb = "recorded" if outcome.created else "already recorded"
+    print(f"review judgment {verb}: {outcome.judgment_id}")
     return 0
 
 
@@ -697,6 +733,7 @@ _HANDLERS = {
     "send": _run_send,
     "finalize": _run_finalize,
     "review": _run_review,
+    "judge-reviews": _run_judge_reviews,
     "notes": _run_notes,
     "rate": _run_rate,
     "stop": _run_stop,

@@ -1288,6 +1288,7 @@ class HungReviewerTestCase(PmTestCase):
         self.set_current_slice(
             state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
         )
+        state_mod.append_event(run_dir, "launch", slice_id="Slice 1", note="test launch")
         (self.repo / "a.py").write_text("changed\n", encoding="utf-8")
         self._git("add", "a.py")
         self._git("commit", "-q", "-m", "advance head")

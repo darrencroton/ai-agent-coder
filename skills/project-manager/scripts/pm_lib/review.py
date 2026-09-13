@@ -152,9 +152,8 @@ def _resolve_tool(state: dict[str, Any], tool_arg: str | None, *, has_override: 
 
 def _fresh_drift_audit_report(
     repo: Path, run_dir: Path, run_id: str, entry: dict[str, Any] | None, head: str, grant_count: int
-) -> str | None:
-    """A reviewer-readable path to a drift-audit report already recorded fresh
-    against `head`, or None.
+) -> tuple[dict[str, Any], str] | None:
+    """A fresh drift review record and reviewer-readable report path, or None.
 
     Freshness reuses `slice_ops.is_review_fresh` — the same rule that decides
     whether an elevated slice's mandatory reviews still hold — so a report
@@ -173,10 +172,27 @@ def _fresh_drift_audit_report(
         try:
             relative = original.relative_to(run_dir)
         except ValueError:
-            return str(original)
+            return review, str(original)
         slice_ops.mirror_artifact(repo, run_dir, run_id, str(relative))
-        return str(slice_ops.run_artifact_dir(repo, run_id) / relative)
+        return review, str(slice_ops.run_artifact_dir(repo, run_id) / relative)
     return None
+
+
+def _commission_origin(run_dir: Path, slice_id: str) -> dict[str, Any]:
+    """Return the launch/relaunch/steer event that defines this review's attempt.
+
+    The event-log index is in the parsed valid-event sequence returned by
+    ``read_events``. New commissions refuse without this provenance rather
+    than guessing from a budget counter that can reset after a stop.
+    """
+    events = state_mod.read_events(run_dir)
+    for index in range(len(events) - 1, -1, -1):
+        event = events[index]
+        if event.get("slice") == slice_id and event.get("kind") in {"launch", "relaunch", "steer"}:
+            return {"index": index, "kind": event["kind"], "slice": slice_id}
+    raise PmError(
+        f"cannot commission {slice_id}: no launch, relaunch, or steer event records its current attempt"
+    )
 
 
 def _tail(path: Path, max_chars: int = _STDERR_TAIL_CHARS) -> str:
@@ -230,14 +246,15 @@ def _claim_commission_seq(slice_dir: Path, recorded_reviews: int, skill: str, to
     Scanning then writing raced: concurrent commissions picked the same
     sequence and the loser overwrote the winner's evidence.
     """
-    seq = _next_commission_seq(slice_dir, recorded_reviews)
-    while True:
-        stderr_path = slice_dir / f"review-{seq}-{skill}-{tool}-stderr.txt"
-        try:
-            os.close(os.open(stderr_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
-            return seq, stderr_path
-        except FileExistsError:
-            seq += 1
+    with state_mod._advisory_lock(slice_dir / ".commission.lock"):
+        seq = _next_commission_seq(slice_dir, recorded_reviews)
+        while True:
+            stderr_path = slice_dir / f"review-{seq}-{skill}-{tool}-stderr.txt"
+            try:
+                os.close(os.open(stderr_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
+                return seq, stderr_path
+            except FileExistsError:
+                seq += 1
 
 
 # --- the review command --------------------------------------------------
@@ -249,6 +266,8 @@ class ReviewOutcome:
     skill: str
     tool: str
     model: str | None
+    effort: str | None
+    review_id: str
     head: str
     before_head: str | None
     diff_path: Path
@@ -365,13 +384,14 @@ def run_review(
     # happened to finish.
     commissioned_grants = plan_mod.slice_grants(state, slice_id)
 
+    drift_record = None if skill == "drift-audit" else _fresh_drift_audit_report(
+        repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head, len(commissioned_grants)
+    )
+    origin_event = _commission_origin(run_dir, slice_id)
     prompt_text = prompts.render_reviewer_prompt(
         # Never handed to a drift audit itself: a second audit of the same
         # commit must stay independent of the first one's verdict.
-        drift_audit_report=None if skill == "drift-audit" else _fresh_drift_audit_report(
-            repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head,
-            len(commissioned_grants),
-        ),
+        drift_audit_report=drift_record[1] if drift_record else None,
         pm_adjudications=pm_adjudications,
         pm_surface_grants=commissioned_grants,
         skill_name=skill,
@@ -505,7 +525,9 @@ def run_review(
                 {
                     "skill": skill,
                     "tool": resolved_tool,
-                    "model": resolved_model,
+                    "model": None if reviewer_command else resolved_model,
+                    "effort": None if reviewer_command else resolved_effort,
+                    "review_id": f"review-{seq}",
                     "head": reviewed_head,
                     "before_head": before_head,
                     "artifact": str(report_original),
@@ -516,6 +538,18 @@ def run_review(
                     # carries a different number, so a grant landing mid-review
                     # cannot be papered over by a later completion stamp.
                     "grants_seen": len(commissioned_grants),
+                    "origin_event": origin_event,
+                    "review_context": {
+                        "pm_adjudications": pm_adjudications,
+                        "drift_review": (
+                            {
+                                "review_id": drift_record[0].get("review_id"),
+                                "artifact": drift_record[0].get("artifact"),
+                                "sha256": drift_record[0].get("sha256"),
+                            }
+                            if drift_record else None
+                        ),
+                    },
                 },
             ]
     state_mod.append_event(
@@ -526,7 +560,9 @@ def run_review(
         slice_id=slice_id,
         skill=skill,
         tool=resolved_tool,
-        model=resolved_model,
+        model=None if reviewer_command else resolved_model,
+        effort=None if reviewer_command else resolved_effort,
+        review_id=f"review-{seq}",
         head=reviewed_head,
         before_head=before_head,
         diff_path=diff_path,
