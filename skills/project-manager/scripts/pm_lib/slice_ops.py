@@ -878,6 +878,7 @@ def start_slice(
         _reap_reviewers(current if relaunch else None)
 
         now = state_mod.utc_now_iso()
+        launch_kind = "relaunch" if relaunch else "launch"
         new_current: dict[str, Any] = {
             "id": plan_slice.slice_id,
             "artifact_dir": str(artifact_dir),
@@ -888,6 +889,11 @@ def start_slice(
             "risk": entry.get("risk", plan_slice.plan_risk),
             "plan_risk": plan_slice.plan_risk,
             "reviewer_pids": [],
+            "developer": {
+                "tool": "custom" if effective_override else harness_name,
+                "model": None if effective_override else launch_model,
+                "effort": None if effective_override else launch_effort,
+            },
         }
         launch_overrides: dict[str, Any] = {key: value for key, value in (("model", model), ("effort", effort)) if value}
         if reviewer_tools:
@@ -919,7 +925,7 @@ def start_slice(
         note += f"; reaped stale sessions: {', '.join(reaped)}"
     state_mod.append_event(
         run_dir,
-        "relaunch" if relaunch else "launch",
+        launch_kind,
         slice_id=plan_slice.slice_id,
         note=note,
         evidence=str(prompt_path),

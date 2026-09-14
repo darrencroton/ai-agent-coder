@@ -549,6 +549,10 @@ class TestAttemptAccounting(SliceOpsTestCase):
         # Fresh state load in a new call: attempts persisted as 1.
         reloaded = state_mod.load_state(run_dir, token)
         self.assertEqual(reloaded["current_slice"]["attempts"], 1)
+        self.assertEqual(
+            reloaded["current_slice"]["developer"],
+            {"tool": "custom", "model": None, "effort": None},
+        )
         by_id = {entry["id"]: entry for entry in reloaded["slices"]}
         self.assertEqual(by_id["Slice 1"]["attempts"], 1)
         # Attempt 0's result.json was rotated out of the way before the
@@ -1196,6 +1200,11 @@ class TestRealHarnessComposition(SliceOpsTestCase):
         self.assertEqual(len(composed), 1)
         argv = shlex.split(composed[0])
         self.assertEqual(argv, ["codex", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"])
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        self.assertEqual(
+            state_mod.load_state(run_dir, token)["current_slice"]["developer"],
+            {"tool": "codex", "model": None, "effort": None},
+        )
 
 
 if __name__ == "__main__":

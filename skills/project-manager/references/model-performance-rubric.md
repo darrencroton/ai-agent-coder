@@ -15,7 +15,7 @@ Score exactly these three dimensions per block, each 1–5, each with one line o
 - **Reporting reliability** — Developer: how often its self-reported result/validation matched what PM independently verified. Reviewer: how *consistent* its review quality was across the slices it covered — did it perform evenly, or swing between sharp and superficial, catching real issues on some slices and missing equivalent ones on others?
 - **Output quality** — PM's bottom-line read on this model's contribution across the run (Developer: accepted work's correctness/completeness; Reviewer: overall accuracy and usefulness of what it found — real defects caught, false positives avoided, issues PM had to catch itself because the review missed them), informed by but not identical to review verdicts.
 
-Per-round reviewer usefulness is recorded separately in signed `run.json` with `judge-reviews`; see [review-judgments.md](review-judgments.md). Keep this final narrative as qualitative context. Do not parse it to fabricate round judgments or use it as their authoritative store.
+Per-submission Developer contribution and per-report reviewer usefulness are recorded separately as 0–2 ratings in signed `run.json` with `judge-developer` and `judge-reviews`; code-review panels additionally retain their comparative order and ties. See [review-judgments.md](review-judgments.md). Keep this final narrative as qualitative context across the run. Do not parse it to fabricate submission ratings or panel comparisons, convert its 1–5 scores into 0–2 ratings, or use it as their authoritative store.
 
 ## Scale
 

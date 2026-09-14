@@ -167,6 +167,13 @@ def build_parser() -> argparse.ArgumentParser:
     judge.add_argument("--run")
     judge.add_argument("--token")
 
+    developer_judge = subparsers.add_parser(
+        "judge-developer", help="Record PM's structured developer-contribution judgment"
+    )
+    developer_judge.add_argument("--file", required=True, help="JSON judgment input; it is not authoritative state")
+    developer_judge.add_argument("--run")
+    developer_judge.add_argument("--token")
+
     notes = subparsers.add_parser(
         "notes", help="Update the run notes safely (authoritative original, then mirror)"
     )
@@ -336,6 +343,25 @@ def _run_status(args: argparse.Namespace) -> int:
     historical = judgments.historical_review_count(state)
     if historical:
         print(f"historical/unjudged reviews without stable IDs: {historical}")
+
+    unranked = judgments.unranked_code_review_ids(state)
+    if unranked:
+        print(
+            "code reviews outside recorded panels (informational): "
+            + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in unranked)
+        )
+    else:
+        print("code reviews outside recorded panels (informational): none")
+
+    events = state_mod.read_events(run_dir)
+    missing_developers = judgments.unjudged_developer_origins(state, events)
+    if missing_developers:
+        print(
+            "unjudged developer submissions: "
+            + ", ".join(f"{slice_id}/event-{index} ({kind})" for slice_id, index, kind in missing_developers)
+        )
+    else:
+        print("unjudged developer submissions: none")
 
     current = state.get("current_slice")
     if current:
@@ -634,24 +660,46 @@ def _run_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_judge_reviews(args: argparse.Namespace) -> int:
+def _run_judgment(
+    args: argparse.Namespace, *, recorder, event_kind: str, label: str
+) -> int:
     repo = _repo_from_cwd()
     token = _require_token(args)
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     data = judgments.load_input(Path(args.file))
-    outcome = judgments.record_judgment(run_dir, token, data)
+    outcome = recorder(run_dir, token, data)
     try:
-        judgments.publish_event(run_dir, token, outcome.judgment_id, outcome.slice_id)
+        judgments.publish_event(
+            run_dir, token, outcome.judgment_id, outcome.slice_id, kind=event_kind
+        )
     except IntegrityError:
         raise
     except (OSError, PmError) as exc:
         raise PmError(
-            f"judgment {outcome.slice_id}/{outcome.judgment_id} was stored but event publication failed; "
+            f"{label} judgment {outcome.slice_id}/{outcome.judgment_id} was stored but event publication failed; "
             f"resolve the publication error, then retry the same input: {exc}"
         ) from exc
     verb = "recorded" if outcome.created else "already recorded"
-    print(f"review judgment {verb}: {outcome.judgment_id}")
+    print(f"{label} judgment {verb}: {outcome.judgment_id}")
     return 0
+
+
+def _run_judge_reviews(args: argparse.Namespace) -> int:
+    return _run_judgment(
+        args,
+        recorder=judgments.record_judgment,
+        event_kind="review-judgment",
+        label="review",
+    )
+
+
+def _run_judge_developer(args: argparse.Namespace) -> int:
+    return _run_judgment(
+        args,
+        recorder=judgments.record_developer_judgment,
+        event_kind="developer-judgment",
+        label="developer",
+    )
 
 
 # --- stop -----------------------------------------------------------------
@@ -734,6 +782,7 @@ _HANDLERS = {
     "finalize": _run_finalize,
     "review": _run_review,
     "judge-reviews": _run_judge_reviews,
+    "judge-developer": _run_judge_developer,
     "notes": _run_notes,
     "rate": _run_rate,
     "stop": _run_stop,

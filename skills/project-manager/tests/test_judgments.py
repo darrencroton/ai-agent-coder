@@ -40,7 +40,7 @@ class TestReviewerJudgments(PmTestCase):
                     "grants_seen": 0,
                     "artifact": str(path),
                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                    "origin_event": {"index": 1, "kind": "launch", "slice": "Slice 1"},
+                    "origin_event": {"index": 0, "kind": "launch", "slice": "Slice 1"},
                     "review_context": {"pm_adjudications": None, "drift_review": None},
                 }
             )
@@ -53,6 +53,31 @@ class TestReviewerJudgments(PmTestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
         return self.run_cli_in_repo(
             ["judge-reviews", "--file", str(path), "--token", token]
+        )
+
+    def _run_with_developer(self) -> tuple[str, Path]:
+        plan_path = self.write_plan(self.repo.parent / "developer-plan.md")
+        _state, token, run_dir = self.make_run(
+            plan_path=plan_path,
+            harness={"name": "codex", "model": "first-model", "effort": "medium"},
+        )
+        state_mod.append_event(run_dir, "launch", slice_id="Slice 1", note="attempt 0")
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+        self.set_current_slice(
+            state_mod.load_state(run_dir, token),
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=head,
+            developer={"tool": "codex", "model": "first-model", "effort": "medium"},
+        )
+        return token, run_dir
+
+    def _judge_developer(self, token: str, data: dict) -> tuple[int, str, str]:
+        path = self.repo.parent / "developer-judgment.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return self.run_cli_in_repo(
+            ["judge-developer", "--file", str(path), "--token", token]
         )
 
     def test_drift_score_is_signed_idempotent_and_reported(self) -> None:
@@ -114,6 +139,163 @@ class TestReviewerJudgments(PmTestCase):
             run_dir,
         )
         self.assertIn("singleton/unranked", report)
+
+    def test_code_rating_and_panel_comparison_cover_independently(self) -> None:
+        _state, token, run_dir = self._run_with_reviews(count=3)
+        rating = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "skill": "code-review",
+            "review_id": "review-2",
+            "score": 2,
+            "reason": "The report identified and demonstrated the regression.",
+        }
+        comparison = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "skill": "code-review",
+            "rank_groups": [["review-3"]],
+            "reason": "This panel only needed the second code review report.",
+        }
+        self.assertEqual(self._judge(token, run_dir, rating)[0], 0)
+        self.assertEqual(self._judge(token, run_dir, comparison)[0], 0)
+        stored = state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"]
+        self.assertEqual([item["assessment"] for item in stored], ["rating", "comparison"])
+        state = state_mod.load_state(run_dir, token)
+        self.assertIn(("Slice 1", "review-2"), judgments.unranked_code_review_ids(state))
+        self.assertNotIn(("Slice 1", "review-2"), judgments.unjudged_review_ids(state))
+        report = state_mod.render_run_report(
+            state, state_mod.read_events(run_dir), run_dir
+        )
+        self.assertIn("Slice 1 attempt 1 judgment-1: code review-2", report)
+        self.assertIn("Outside recorded code panels (informational): Slice 1/review-2", report)
+
+    def test_developer_judgment_retries_and_historical_corrections_preserve_identity(self) -> None:
+        token, run_dir = self._run_with_developer()
+        first = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "origin_event_index": 0,
+            "score": 1,
+            "reason": "The implementation met the requested contract with minor follow-up.",
+        }
+        self.assertEqual(self._judge_developer(token, first)[0], 0)
+        state = state_mod.load_state(run_dir, token)
+        state["current_slice"] = None
+        state_mod.save_state(run_dir, state, token)
+        self.assertEqual(self._judge_developer(token, first)[0], 0)
+
+        state = state_mod.load_state(run_dir, token)
+        state_mod.append_event(run_dir, "relaunch", slice_id="Slice 1", note="attempt 1")
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+        self.set_current_slice(
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=head,
+            developer={"tool": "codex", "model": "later-model", "effort": "high"},
+        )
+        correction = {
+            **first,
+            "score": 2,
+            "reason": "A later PM check confirmed the original submission was excellent.",
+            "supersedes": "developer-judgment-1",
+        }
+        self.assertEqual(self._judge_developer(token, correction)[0], 0)
+        stored = state_mod.load_state(run_dir, token)["slices"][0]["developer_judgments"]
+        self.assertEqual(stored[1]["developer"], stored[0]["developer"])
+        self.assertEqual(stored[1]["submission"], stored[0]["submission"])
+
+    def test_developer_submission_change_requires_supersession(self) -> None:
+        token, run_dir = self._run_with_developer()
+        first = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "origin_event_index": 0,
+            "score": 1,
+            "reason": "The submission is adequate for the planned slice.",
+        }
+        self.assertEqual(self._judge_developer(token, first)[0], 0)
+        state = state_mod.load_state(run_dir, token)
+        state["slices"][0]["grants"] = [{"path": "extra.py", "at": "now"}]
+        state_mod.save_state(run_dir, state, token)
+        code, _out, err = self._judge_developer(token, first)
+        self.assertEqual(code, 2)
+        self.assertIn("submission changed", err)
+        corrected = {
+            **first,
+            "score": 2,
+            "reason": "The corrected submission now meets the expanded authorized surface.",
+            "supersedes": "developer-judgment-1",
+        }
+        self.assertEqual(self._judge_developer(token, corrected)[0], 0)
+        stored = state_mod.load_state(run_dir, token)["slices"][0]["developer_judgments"]
+        self.assertEqual(stored[1]["submission"]["grants_seen"], 1)
+
+    def test_developer_unavailable_event_retry_keeps_one_signed_judgment(self) -> None:
+        token, run_dir = self._run_with_developer()
+        data = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "origin_event_index": 0,
+            "status": "unavailable",
+            "reason": "The PM could not assess this submission from the available evidence.",
+        }
+        from unittest import mock
+
+        with mock.patch.object(
+            judgments.state_mod,
+            "_append_event_unlocked",
+            side_effect=OSError("disk full"),
+        ):
+            code, _out, err = self._judge_developer(token, data)
+        self.assertEqual(code, 2)
+        self.assertIn("was stored but event publication failed", err)
+        state = state_mod.load_state(run_dir, token)
+        [stored] = state["slices"][0]["developer_judgments"]
+        self.assertEqual(stored["status"], "unavailable")
+        self.assertNotIn("score", stored)
+
+        state["current_slice"] = None
+        state_mod.save_state(run_dir, state, token)
+        self.assertEqual(self._judge_developer(token, data)[0], 0)
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(len(state["slices"][0]["developer_judgments"]), 1)
+        events = [
+            event for event in state_mod.read_events(run_dir)
+            if event["kind"] == "developer-judgment"
+        ]
+        self.assertEqual(len(events), 1)
+        report = state_mod.render_run_report(state, state_mod.read_events(run_dir), run_dir)
+        self.assertIn("developer codex/first-model effort=medium unavailable", report)
+
+    def test_developer_correction_on_current_slice_fails_closed_on_unreadable_event_log(self) -> None:
+        token, run_dir = self._run_with_developer()
+        first = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "origin_event_index": 0,
+            "score": 1,
+            "reason": "The submission met the requested contract.",
+        }
+        self.assertEqual(self._judge_developer(token, first)[0], 0)
+        correction = {
+            **first,
+            "score": 2,
+            "reason": "A later PM check confirmed the original submission was excellent.",
+            "supersedes": "developer-judgment-1",
+        }
+        from unittest import mock
+
+        with mock.patch.object(
+            judgments.state_mod, "read_events", side_effect=OSError("disk full")
+        ):
+            code, _out, err = self._judge_developer(token, correction)
+        self.assertEqual(code, 2)
+        self.assertIn("could not read PM event log", err)
+        stored = state_mod.load_state(run_dir, token)["slices"][0]["developer_judgments"]
+        self.assertEqual(len(stored), 1)
 
     def test_ordered_panel_and_unavailable_mixed_context_are_independent(self) -> None:
         state, token, run_dir = self._run_with_reviews(count=5)

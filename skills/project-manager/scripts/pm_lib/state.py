@@ -170,6 +170,8 @@ def _validate_shape(state: dict[str, Any]) -> None:
             raise PmError(f"run state slice {entry.get('id')!r} has a non-list 'grants' field")
         if "review_judgments" in entry and not isinstance(entry["review_judgments"], list):
             raise PmError(f"run state slice {entry.get('id')!r} has a non-list 'review_judgments' field")
+        if "developer_judgments" in entry and not isinstance(entry["developer_judgments"], list):
+            raise PmError(f"run state slice {entry.get('id')!r} has a non-list 'developer_judgments' field")
         for grant in entry.get("grants") or []:
             if not isinstance(grant, dict) or not str(grant.get("path") or "").strip():
                 raise PmError(
@@ -575,6 +577,11 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     lines.extend(_render_reviewer_judgments(state, events, slices))
     lines.append("")
 
+    lines.append("## Developer Judgments")
+    lines.append("")
+    lines.extend(_render_developer_judgments(state, events, slices))
+    lines.append("")
+
     lines.append("## Assessments")
     any_assessment = False
     for entry in slices:
@@ -637,12 +644,17 @@ def _judgment_attempt_label(judgment: dict[str, Any], entry: dict[str, Any], eve
     """Best-effort human attempt label from a stored commission origin."""
     review_ids = (
         judgment.get("review_ids") if judgment.get("status") == "unavailable"
-        else [judgment.get("review_id")] if judgment.get("skill") == "drift-audit"
+        else [judgment.get("review_id")] if "review_id" in judgment
         else [review_id for group in judgment.get("rank_groups") or [] for review_id in group]
     )
     reviews = {review.get("review_id"): review for review in entry.get("reviews") or [] if isinstance(review, dict)}
     origins = [reviews.get(review_id, {}).get("origin_event") for review_id in review_ids]
     origin = origins[0] if origins and all(item == origins[0] for item in origins) else None
+    return _origin_attempt_label(origin, entry, events)
+
+
+def _origin_attempt_label(origin: Any, entry: dict[str, Any], events: list[dict[str, Any]]) -> str:
+    """Return a verified human attempt number for one stored origin event."""
     if not isinstance(origin, dict) or type(origin.get("index")) is not int:
         return "unknown"
     index = origin["index"]
@@ -690,13 +702,15 @@ def _render_reviewer_judgments(state: dict[str, Any], events: list[dict[str, Any
             prefix = f"- {entry.get('id')} attempt {_judgment_attempt_label(judgment, entry, events)} {label}: "
             if label in superseded:
                 prefix += "superseded "
+            assessment = judgments.assessment_of(judgment)
             if judgment.get("status") == "unavailable":
-                detail = f"{judgment.get('skill')} unavailable for " + ", ".join(
+                detail = f"{judgment.get('skill')} {assessment} unavailable for " + ", ".join(
                     _review_display(review_id, reviews) for review_id in judgment.get("review_ids") or []
                 )
-            elif judgment.get("skill") == "drift-audit":
+            elif assessment == "rating":
                 review_id = judgment.get("review_id")
-                detail = f"drift {_review_display(review_id, reviews)} score {judgment.get('score')}"
+                label_text = "drift" if judgment.get("skill") == "drift-audit" else "code"
+                detail = f"{label_text} {_review_display(review_id, reviews)} score {judgment.get('score')}"
             else:
                 groups = judgment.get("rank_groups") or []
                 order = " > ".join(
@@ -710,10 +724,63 @@ def _render_reviewer_judgments(state: dict[str, Any], events: list[dict[str, Any
     if missing:
         any_record = True
         lines.append("- Unjudged: " + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in missing))
+    unranked = judgments.unranked_code_review_ids(state)
+    if unranked:
+        any_record = True
+        lines.append(
+            "- Outside recorded code panels (informational): "
+            + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in unranked)
+        )
     historical = judgments.historical_review_count(state)
     if historical:
         any_record = True
         lines.append(f"- Historical/unjudged: {historical} review record(s) lack stable IDs")
     if not any_record:
         lines.append("(none; no stable review judgments recorded)")
+    return lines
+
+
+def _developer_display(developer: dict[str, Any]) -> str:
+    tool = developer.get("tool") or "unknown tool"
+    model = developer.get("model") or "unknown model"
+    effort = developer.get("effort") if developer.get("effort") is not None else "unknown"
+    return f"{tool}/{model} effort={effort}"
+
+
+def _render_developer_judgments(state: dict[str, Any], events: list[dict[str, Any]], slices: list[dict[str, Any]]) -> list[str]:
+    """Compact report section derived only from signed structured records."""
+    from . import judgments
+
+    lines: list[str] = []
+    any_record = False
+    for entry in slices:
+        records = [
+            item for item in entry.get("developer_judgments") or [] if isinstance(item, dict)
+        ]
+        superseded = {
+            item.get("supersedes") for item in records if isinstance(item.get("supersedes"), str)
+        }
+        for judgment in records:
+            any_record = True
+            label = judgment.get("judgment_id", "unknown")
+            origin = (judgment.get("submission") or {}).get("origin_event")
+            attempt = _origin_attempt_label(origin, entry, events)
+            prefix = f"- {entry.get('id')} attempt {attempt} {label}: "
+            if label in superseded:
+                prefix += "superseded "
+            developer = judgment.get("developer") if isinstance(judgment.get("developer"), dict) else {}
+            if judgment.get("status") == "unavailable":
+                detail = f"developer {_developer_display(developer)} unavailable"
+            else:
+                detail = f"developer {_developer_display(developer)} score {judgment.get('score')}"
+            lines.append(prefix + detail + f" — {judgment.get('reason', '')}")
+    missing = judgments.unjudged_developer_origins(state, events)
+    if missing:
+        any_record = True
+        lines.append(
+            "- Unjudged: "
+            + ", ".join(f"{slice_id}/event-{index} ({kind})" for slice_id, index, kind in missing)
+        )
+    if not any_record:
+        lines.append("(none; no developer judgments recorded)")
     return lines
