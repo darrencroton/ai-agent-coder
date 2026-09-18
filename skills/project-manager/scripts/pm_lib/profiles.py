@@ -127,7 +127,7 @@ def query_model_identity(harness: str, model: str) -> dict[str, Any] | None:
     failed query, a model id absent from the inventory, or unparseable/empty
     display-name metadata all raise ``PmError`` rather than letting the
     harness silently select a different model. The returned ``variants`` serve
-    the same purpose for reasoning effort (see ``assert_opencode_variant_supported``).
+    the same purpose for reasoning effort (see ``resolve_opencode_variant``).
     """
     profile = HARNESS_PROFILES.get(harness)
     if profile is None:
@@ -175,13 +175,19 @@ def query_model_identity(harness: str, model: str) -> dict[str, Any] | None:
     }
 
 
-def assert_opencode_variant_supported(model: str | None, variant: str) -> None:
-    """Fail closed unless `model` declares `variant` in opencode's inventory.
+def resolve_opencode_variant(model: str | None, variant: str, *, explicit: bool) -> str | None:
+    """Resolve the opencode `--variant` to send, or fail closed.
 
     opencode accepts an unknown ``--variant`` silently and runs the model at
     its default effort, so an unverified variant is a silent effort downgrade —
     exactly what refusing an unsupported effort was meant to prevent. Verifying
     it against the inventory is what makes passing effort through honest.
+
+    A model with no declared variants has exactly one way it runs, so an
+    inherited (non-``explicit``) request resolves to ``None`` — no
+    ``--variant`` sent, caller records "default". An ``explicit`` request
+    against such a model still fails closed: that would be the same silent
+    downgrade this function exists to prevent.
     """
     if not model:
         raise PmError(
@@ -189,12 +195,21 @@ def assert_opencode_variant_supported(model: str | None, variant: str) -> None:
             "--variant, which is per-model and cannot be verified without one"
         )
     supported = query_model_identity("opencode", model)["variants"]
+    if not supported:
+        if explicit:
+            raise PmError(
+                f"opencode model {model!r} declares no effort variants; it runs only at its "
+                f"default effort, so --effort {variant!r} cannot be honoured. Omit --effort for "
+                "this model, or choose a model that declares variants."
+            )
+        return None
     if variant not in supported:
-        offered = ", ".join(supported) if supported else "none"
+        offered = ", ".join(supported)
         raise PmError(
             f"opencode model {model!r} does not offer variant {variant!r} (offers: {offered}); "
             "it would be accepted silently and run at the model's default effort"
         )
+    return variant
 
 
 def parse_reviewer_tools(value: str | None) -> tuple[str, ...]:

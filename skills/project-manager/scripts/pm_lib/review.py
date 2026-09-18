@@ -274,6 +274,12 @@ class ReviewOutcome:
     changed_files: list[str] = field(default_factory=list)
     artifact_path: Path | None = None
     sha256: str = ""
+    # True whenever `--reviewer-command` built this commission: `tool` alone
+    # cannot signal this (an operator can still pass a real `--tool` name
+    # alongside the override), so without this a fully composed,
+    # inventory-verified commission and an unverifiable override sharing the
+    # same (tool, model, effort) would be indistinguishable identity-wise.
+    command_override: bool = False
 
 
 def run_review(
@@ -413,7 +419,16 @@ def run_review(
     # I/O-free. opencode is the only tool whose effort flag needs verifying
     # against the model; the others take effort verbatim or refuse it.
     if resolved_tool == "opencode" and resolved_effort and not reviewer_command:
-        profiles.assert_opencode_variant_supported(resolved_model, resolved_effort)
+        resolved_effort = profiles.resolve_opencode_variant(resolved_model, resolved_effort, explicit=bool(effort))
+
+    # `resolved_effort` (possibly None) is what goes on the command line.
+    # What gets RECORDED is a distinct value on the COMPOSED path only: an
+    # omitted effort there is a known, repeatable fact -- ran at the
+    # harness/model's own default -- never an unattributed null. Under
+    # `--reviewer-command` there is no harness profile in play, so pm_lib
+    # cannot know what an omitted effort means to the wrapper; that stays
+    # an honest null rather than an invented "default".
+    recorded_effort = resolved_effort if reviewer_command else (resolved_effort or "default")
 
     command = _build_reviewer_command(
         resolved_tool, prompt_text, model=resolved_model, effort=resolved_effort, repo=repo,
@@ -525,8 +540,9 @@ def run_review(
                 {
                     "skill": skill,
                     "tool": resolved_tool,
-                    "model": None if reviewer_command else resolved_model,
-                    "effort": None if reviewer_command else resolved_effort,
+                    "model": resolved_model,
+                    "effort": recorded_effort,
+                    "command_override": bool(reviewer_command),
                     "review_id": f"review-{seq}",
                     "head": reviewed_head,
                     "before_head": before_head,
@@ -560,8 +576,9 @@ def run_review(
         slice_id=slice_id,
         skill=skill,
         tool=resolved_tool,
-        model=None if reviewer_command else resolved_model,
-        effort=None if reviewer_command else resolved_effort,
+        model=resolved_model,
+        effort=recorded_effort,
+        command_override=bool(reviewer_command),
         review_id=f"review-{seq}",
         head=reviewed_head,
         before_head=before_head,

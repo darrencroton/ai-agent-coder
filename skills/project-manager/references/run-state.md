@@ -43,7 +43,7 @@ A run id is `<UTC timestamp>-<random nonce>`. The nonce is load-bearing, not dec
     "id": "Slice 3", "artifact_dir": "…", "tmux_session": "pm-<run-id>-s03a0",
     "before_head": "…", "started_at": "…", "attempts": 0,
     "risk": "standard", "plan_risk": "standard",
-    "developer": {"tool": "codex", "model": null, "effort": null},
+    "developer": {"tool": "codex", "model": null, "effort": "default"},
     "reviewer_pids": []
   },
   "slices": [
@@ -51,7 +51,7 @@ A run id is `<UTC timestamp>-<random nonce>`. The nonce is load-bearing, not dec
      "risk": "standard", "plan_risk": "standard", "commit": null, "attempts": 0,
      "decision": "…", "reviews": [{
        "review_id": "review-1", "skill": "code-review", "tool": "…",
-       "model": null, "effort": null, "head": "…", "grants_seen": 0,
+       "model": null, "effort": "default", "command_override": false, "head": "…", "grants_seen": 0,
        "before_head": "…", "artifact": "…", "sha256": "…", "at": "…",
        "origin_event": {"index": 1, "kind": "launch", "slice": "Slice 1"},
        "review_context": {

@@ -193,20 +193,37 @@ class TestQueryModelIdentityOpencode(unittest.TestCase):
             identity = profiles.query_model_identity("opencode", "local/m")
         self.assertEqual(identity["variants"], ())
 
-    def test_assert_opencode_variant_supported_accepts_declared_variant(self) -> None:
-        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, self._WITH_VARIANTS)):
-            profiles.assert_opencode_variant_supported("local/m", "max")
+    _NO_VARIANTS = 'local/tiny\n{"name": "Tiny"}\n'
 
-    def test_assert_opencode_variant_supported_rejects_undeclared_variant(self) -> None:
+    def test_resolve_opencode_variant_accepts_declared_variant(self) -> None:
+        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, self._WITH_VARIANTS)):
+            resolved = profiles.resolve_opencode_variant("local/m", "max", explicit=True)
+        self.assertEqual(resolved, "max")
+
+    def test_resolve_opencode_variant_rejects_undeclared_variant(self) -> None:
         with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, self._WITH_VARIANTS)):
             with self.assertRaises(PmError) as ctx:
-                profiles.assert_opencode_variant_supported("local/m", "xhigh")
+                profiles.resolve_opencode_variant("local/m", "xhigh", explicit=True)
         self.assertIn("does not offer variant", str(ctx.exception))
 
-    def test_assert_opencode_variant_supported_requires_explicit_model(self) -> None:
+    def test_resolve_opencode_variant_requires_explicit_model(self) -> None:
         with self.assertRaises(PmError) as ctx:
-            profiles.assert_opencode_variant_supported(None, "max")
+            profiles.resolve_opencode_variant(None, "max", explicit=True)
         self.assertIn("explicit", str(ctx.exception))
+
+    def test_resolve_opencode_variant_inherited_default_on_a_zero_variant_model(self) -> None:
+        # Most local models declare no variants at all -- an inherited
+        # run-level effort resolves to the model's sole behaviour rather
+        # than failing closed.
+        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, self._NO_VARIANTS)):
+            resolved = profiles.resolve_opencode_variant("local/tiny", "high", explicit=False)
+        self.assertIsNone(resolved)
+
+    def test_resolve_opencode_variant_explicit_request_on_a_zero_variant_model_fails_closed(self) -> None:
+        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, self._NO_VARIANTS)):
+            with self.assertRaises(PmError) as ctx:
+                profiles.resolve_opencode_variant("local/tiny", "high", explicit=True)
+        self.assertIn("declares no effort variants", str(ctx.exception))
 
 
 class TestParseReviewerTools(unittest.TestCase):
