@@ -1203,7 +1203,27 @@ class TestRealHarnessComposition(SliceOpsTestCase):
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
         self.assertEqual(
             state_mod.load_state(run_dir, token)["current_slice"]["developer"],
-            {"tool": "codex", "model": None, "effort": None},
+            {"tool": "codex", "model": None, "effort": "default"},
+        )
+
+    def test_harness_command_override_with_a_model_keeps_it_instead_of_recording_null(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        code, out, _err = self._init(plan_path, harness, extra=["--model", "opencode-go/tiny"])
+        self.assertEqual(code, 0, out)
+        run_id, token = parse_init_output(out)
+
+        code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self._track_current_session(run_id, token)
+        self.assertEqual(code, 0, out)
+
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        # No harness profile is in play under an override, so pm_lib cannot
+        # know what an omitted effort means to the wrapper -- an honest
+        # null, not an invented "default".
+        self.assertEqual(
+            state_mod.load_state(run_dir, token)["current_slice"]["developer"],
+            {"tool": "custom", "model": "opencode-go/tiny", "effort": None},
         )
 
 

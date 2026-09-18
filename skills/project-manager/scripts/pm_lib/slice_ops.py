@@ -891,8 +891,15 @@ def start_slice(
             "reviewer_pids": [],
             "developer": {
                 "tool": "custom" if effective_override else harness_name,
-                "model": None if effective_override else launch_model,
-                "effort": None if effective_override else launch_effort,
+                "model": launch_model,
+                # An omitted effort is a known, repeatable fact on the
+                # COMPOSED path only -- ran at the harness/model's own
+                # default. Under an override there is no harness profile in
+                # play, so an omitted effort stays an honest null rather
+                # than an invented "default". `launch_model` may still
+                # legitimately be unset with no override (no model
+                # configured at all).
+                "effort": launch_effort if effective_override else (launch_effort or "default"),
             },
         }
         launch_overrides: dict[str, Any] = {key: value for key, value in (("model", model), ("effort", effort)) if value}

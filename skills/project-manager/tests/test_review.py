@@ -461,6 +461,7 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self.assertEqual(review_record["review_id"], "review-1")
         self.assertIsNone(review_record["model"])
         self.assertIsNone(review_record["effort"])
+        self.assertTrue(review_record["command_override"])
         self.assertEqual(review_record["origin_event"]["kind"], "launch")
         self.assertEqual(review_record["origin_event"]["slice"], "Slice 1")
         self.assertEqual(review_record["review_context"], {"pm_adjudications": None, "drift_review": None})
@@ -482,6 +483,71 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
 
         events = state_mod.read_events(run_dir)
         self.assertTrue(any(e["kind"] == "review" for e in events))
+
+    def test_inherited_effort_on_a_zero_variant_model_commissions_at_default(self) -> None:
+        """The mechanical bug this diff exists to fix: a run-level default
+        effort inherited (not requested by name) against a model that
+        declares no variants must commission normally at the model's own
+        default, never force the --reviewer-command escape hatch."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        state, token, run_dir = self.make_run(
+            plan_path=plan_path, reviewer={"tools": ["opencode"], "model": "local/tiny", "effort": "high"}
+        )
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+
+        fake = _write_fake_reviewer(self.repo.parent / "fake_opencode.sh", 'echo "FAKE REVIEW REPORT"\nexit 0')
+        with mock.patch.object(
+            profiles, "query_model_identity", return_value={"variants": ()}
+        ), mock.patch.object(review_mod, "compose_reviewer_command", return_value=[str(fake)]) as compose:
+            code, _out, err = self.run_cli_in_repo(
+                ["review", "--slice", "Slice 1", "--skill", "code-review", "--token", token]
+            )
+        self.assertEqual(code, 0, err)
+        # No --variant on the wire: nothing to verify or downgrade.
+        self.assertIsNone(compose.call_args.kwargs["effort"])
+
+        review_record = state_mod.load_state(run_dir, token)["slices"][0]["reviews"][0]
+        self.assertEqual(review_record["tool"], "opencode")
+        self.assertEqual(review_record["model"], "local/tiny")
+        self.assertEqual(review_record["effort"], "default")
+        self.assertFalse(review_record["command_override"])
+
+    def test_reviewer_command_with_a_model_keeps_it_instead_of_recording_null(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
+        )
+        self._advance_head()
+
+        fake = _write_fake_reviewer(
+            self.repo.parent / "fake_reviewer.sh", 'echo "FAKE REVIEW REPORT"\nexit 0',
+        )
+
+        # --tool names a real profile deliberately: `tool` alone must not
+        # make this override commission look like a genuinely composed,
+        # inventory-verified opencode one sharing the same identity.
+        code, out, err = self.run_cli_in_repo(
+            [
+                "review", "--slice", "Slice 1", "--skill", "code-review",
+                "--tool", "opencode", "--reviewer-command", str(fake), "--model", "opencode-go/tiny",
+                "--token", token,
+            ]
+        )
+        self.assertEqual(code, 0, err)
+
+        review_record = state_mod.load_state(run_dir, token)["slices"][0]["reviews"][0]
+        self.assertEqual(review_record["tool"], "opencode")
+        self.assertEqual(review_record["model"], "opencode-go/tiny")
+        # No harness profile is in play under an override, so pm_lib cannot
+        # know what an omitted effort means to the wrapper -- an honest
+        # null, not an invented "default".
+        self.assertIsNone(review_record["effort"])
+        self.assertTrue(review_record["command_override"])
 
     def test_code_review_prompt_names_a_fresh_drift_audit_report(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
