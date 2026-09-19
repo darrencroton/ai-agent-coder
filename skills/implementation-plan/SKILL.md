@@ -153,17 +153,17 @@ The same plan file serves two run modes — Mode A (one agent session, checkpoin
 - Do not put dependency manifests, lockfiles, or license files in the authorized surface of a slice that runs unattended. Runtime dependency/license stops are heuristic, not diff inspection, so the plan is the real control: isolate such changes into their own slice and mark it `Approval needed before implementation: yes`.
 - If discovery shows the planned surface is too broad, recommend a smaller first slice.
 - If the repository state is unclear or dirty in relevant files, call that out before finalising the plan.
-- Include a final `Next Chat Prompt` using the format below. Pick the run mode that fits the plan, set the plan file path and slice selection, and reference the plan file rather than pasting receipts so the launcher stays lean.
+- Include final `Next Chat Prompts` using the formats below: one Mode A launcher and one Mode B launcher, so the user can choose how to run the plan. Set the plan file path and Mode A slice selection, and reference the plan file rather than pasting receipts so each launcher stays lean.
 
 ## Next Chat Prompt Format
 
-End the plan with a copyable launcher for the next chat. The skill chain uses the same skills in every mode (`scoped-implementation`, `drift-audit`, `code-review`, `commit`, with `orchestrator` for read-only Reviewer delegation and `handoff` at boundaries); the modes differ in who holds the gates, when handoff happens, and ordering — Mode A reviews before the commit, while Mode B commits the slice first and PM commissions reviews against the committed diff before accepting.
+End the plan with two copyable launchers for the next chat: the most suitable Mode A launcher, followed by the Mode B launcher. The skill chain uses the same skills in every mode (`scoped-implementation`, `drift-audit`, `code-review`, `commit`, with `orchestrator` for read-only Reviewer delegation and `handoff` at boundaries); the modes differ in who holds the gates, when handoff happens, and ordering — Mode A reviews before the commit, while Mode B commits the slice first and PM commissions reviews against the committed diff before accepting.
 
-Choose the launcher for the plan:
+Choose the appropriate Mode A launcher for the plan, then include Mode B as an alternative:
 
 - **Mode A, checkpointed (default)** — when slices are risky, touch flagged surfaces, or you want a checkpoint between them. You stay in the loop, approve before risky slices, review findings, and approve each commit. One slice (or a few tightly-coupled slices) per chat, then a handoff to the next session.
 - **Mode A, autonomous session (alternate usage)** — the same Developer session runs in a loop over all remaining slices, for when the plan is straightforward, the selected models are suitable, the work fits one session, and the user does not want to stand up an external supervisor. The Developer prefers a read-only Reviewer for the hostile drift-audit skill and independent code-review pass, recovers from findings itself, and commits each slice that clears all gates. If the launcher omits Reviewer configuration, the Developer self-audits and records that provenance explicitly. You assess at the end.
-- **Mode B (Supervised autonomy)** — when the plan is long, the run is unattended, models are weaker or cheaper, or the user wants external verification with a durable audit trail. Do not embed a launcher for this mode: end the plan with a pointer to the single authoritative Mode B launcher in `project-manager`'s `SKILL.md` ("Launcher") with the plan file path filled into its first line. A plan destined for Mode B must keep every slice independently gateable — PM ignores batches — and should pass `check-plan` cleanly.
+- **Mode B (Supervised autonomy)** — an alternative when the plan is long, the run is unattended, models are weaker or cheaper, or the user wants external verification with a durable audit trail. Include the launcher below, which mirrors the authoritative launcher in `project-manager`'s `SKILL.md`, with the plan file and repository paths filled in. Every slice must remain independently gateable because PM ignores batches, and the plan should pass `check-plan` cleanly.
 
 Every launcher keeps two non-negotiables: a slice whose Risk Flags mark approval-needed pauses (checkpointed Mode A) or stops the run (autonomous Mode A and Mode B), and each slice reports its authorization-gate result before quality review.
 
@@ -219,4 +219,29 @@ Stop the run early on: an approval-gated slice, a blocker, an unapproved scope c
 When all slices are complete, use the report skill to write a final report covering slices committed, gate results and audit provenance per slice, validation, and every residual or post-plan consideration left for me to assess. Identify each Reviewer tool/label used and every Developer self-audit with its fallback context. Do not lose a non-blocking observation merely because it did not belong in the frozen plan.
 
 Confirm before starting: plan file read, branch name, the ordered slice list you'll execute, and the first slice. Then begin.
+```
+
+### Mode B — Supervised autonomy (alternative)
+
+```md
+Plan file: <path>
+Repo: <path>
+Developer: harness <codex|claude|copilot|opencode|qwen> model <model name>
+Reviewer: harness <codex|claude|copilot|opencode|qwen> model <model name>
+
+Use the project-manager skill. You are the PM: the accountable supervisor of this run — you never write slice code yourself.
+
+Start the run for this plan and repo on the Developer harness above, with the Reviewer harness/model as your default for commissioned reviews — turn it into a wider review panel yourself, per slice, if the risk warrants it. Keep the run token the toolkit gives you to yourself; never pass it to a Developer or Reviewer session.
+
+Then, slice by slice, in plan order:
+1. Launch a fresh Developer session scoped to that slice's frozen contract.
+2. Wait on it with a single long `observe --wait` rather than repeated checks; nudge it only if it genuinely stalls, and otherwise let the session's own signal — result, death, or a dialog marker — end the wait.
+3. Assess what it produced against the plan, the diff, and the validation evidence; run lint, investigate differential code-health when structure materially changed, and commission an independent review when risk warrants it. A review blocks until it returns or its timeout kills it; leave it to run rather than watching it.
+4. Record your decision: accept, send it back for correction, or stop for a human — whichever the evidence and the plan's gates call for.
+
+Stop the run and tell me whenever the plan or the mechanical floor requires a human decision, rather than making that call yourself.
+
+Confirm before starting: plan file read, Developer and Reviewer harness/model, and the first slice. Then begin.
+
+When every slice is decided, report from the run record: total run time (double check this), what was accepted and on what evidence, what stopped and why, and any residual risk I should know about.
 ```

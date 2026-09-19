@@ -97,8 +97,8 @@ Integrity breaches (tampered state — any `INTEGRITY:` error, rewritten history
 Paste into a fresh PM-capable session (fill the bracketed values):
 
 ```md
-Plan file: <absolute path>
-Repo: <absolute path>
+Plan file: <path>
+Repo: <path>
 Developer: harness <codex|claude|copilot|opencode|qwen> model <model name>
 Reviewer: harness <codex|claude|copilot|opencode|qwen> model <model name>
 
