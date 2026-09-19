@@ -154,14 +154,23 @@ def _parse_ruff_check(out: str, err: str, cwd: str) -> list[Finding]:
 
 # -- ruff format ------------------------------------------------------------- #
 
-_RUFF_FMT = re.compile(r"^Would reformat:\s*(.+)$", re.MULTILINE)
+# ruff < ~0.6 (old): "Would reformat: <path>", one line per file.
+_RUFF_FMT_OLD = re.compile(r"^Would reformat:\s*(?P<path>.+)$", re.MULTILINE)
+# ruff 0.16+ (current): each affected file gets a block headed "unformatted:
+# ..." followed by a "   --> <path>:<line>:<col>" location line. The path is
+# taken from that location line; line/col are ignored, consistent with this
+# tool reporting line=0 for every format finding (see the old pattern above).
+_RUFF_FMT_NEW = re.compile(
+    r"^unformatted:.*\n\s*-->\s*(?P<path>.+?):\d+:\d+\s*$", re.MULTILINE)
 
 
 def _parse_ruff_format(out: str, err: str, cwd: str) -> list[Finding]:
+    text = out + "\n" + err
+    paths = [m.group("path").strip() for m in _RUFF_FMT_OLD.finditer(text)]
+    paths += [m.group("path").strip() for m in _RUFF_FMT_NEW.finditer(text)]
     return [
-        Finding("ruff-format", "format", _rel(cwd, m.group(1).strip()), 0,
-                "file is not formatted")
-        for m in _RUFF_FMT.finditer(out + "\n" + err)
+        Finding("ruff-format", "format", _rel(cwd, p), 0, "file is not formatted")
+        for p in paths
     ]
 
 
@@ -441,6 +450,13 @@ TOOLS: list[Tool] = [
         name="ruff-format", language="python", extensions=PY, binary="ruff",
         build=lambda b, f: [b, "format", "--check", "--force-exclude", "--"] + f,
         parse=_parse_ruff_format,
+        # ruff format --check exit codes: 0 = nothing to reformat, 1 = some
+        # file(s) would be reformatted, 2 = error. Exit 1 is accepted only
+        # when findings were actually parsed -- see run_tool's `rc not in
+        # ok_codes and not findings` branch. Exit 1 with nothing parsed means
+        # ruff's output format changed underneath the parser, which must be
+        # an error, not a silent clean pass.
+        ok_codes=(0,),
         note="Black-compatible formatting check.",
     ),
     Tool(

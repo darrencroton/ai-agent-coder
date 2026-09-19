@@ -132,10 +132,46 @@ class TestParsers(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             lint._parse_ruff_check("not json", "", "/repo")
 
-    def test_ruff_format(self):
+    def test_ruff_format_old_cli_output(self):
+        """Pre-0.6 ruff: "Would reformat: <path>", one line per file."""
         got = lint._parse_ruff_format("Would reformat: a.py\n1 file would be reformatted\n",
                                       "", "/repo")
         self.assertEqual([f.path for f in got], ["a.py"])
+
+    def test_ruff_format_current_cli_output(self):
+        """ruff 0.16+ dropped the "Would reformat:" line entirely in favour of
+        an "unformatted:" block header plus a "--> path:line:col" location
+        line. The old regex matched nothing against this, silently returning
+        zero findings even though ruff's own exit code says files need
+        reformatting -- this is the exact bug this test pins."""
+        out = (
+            "unformatted: File would be reformatted\n"
+            "   --> src/calc.py:1:1\n"
+            "    | ...\n"
+            "--------------------------------------------------------------------------------\n"
+            "unformatted: File would be reformatted\n"
+            "   --> src/merger_rate.py:1:1\n"
+            "    | ...\n"
+            "\n"
+            "2 files would be reformatted\n"
+        )
+        got = lint._parse_ruff_format(out, "", "/repo")
+        self.assertEqual([f.path for f in got], ["src/calc.py", "src/merger_rate.py"])
+        self.assertTrue(all(f.line == 0 for f in got))
+
+    def test_ruff_format_exit_1_with_no_findings_is_an_error(self):
+        """The hardening: ok_codes=(0,) on the ruff-format Tool means an exit
+        code of 1 (ruff's own "would reformat" signal) with output the parser
+        cannot recognize -- e.g. a future ruff CLI format change again -- must
+        surface as an error, not silently read as a clean pass."""
+        tool = lint.TOOLS_BY_NAME["ruff-format"]
+        self.assertEqual(tool.ok_codes, (0,))
+        with TempRepo() as repo, FakeTool(name="ruff", exit_code=1,
+                                          stdout="some future format ruff never emits today\n"):
+            repo.write("a.py", "x=1\n")
+            res = lint.run_tool(tool, ["a.py"], repo.dir, 30)
+            self.assertFalse(res.ran)
+            self.assertIsNotNone(res.error)
 
     def test_markdownlint_cli2_with_severity_word(self):
         """cli2 emits a severity token between location and rule; the parser
