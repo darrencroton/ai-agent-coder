@@ -717,6 +717,65 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self.assertIn("- second ruling", second_text)
         self.assertNotIn("first ruling", second_text)
 
+    def test_adjudicated_file_combines_with_flag_and_skips_blanks_and_comments(self) -> None:
+        """--adjudicated-file lets a panel's commissions share byte-identical
+        adjudication context (what judge-reviews' panel comparison requires)
+        instead of PM retyping the same ruling per call with a risk of wording
+        drift. File lines come first, blank/# lines are skipped, and any
+        --adjudicated flags are appended after."""
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+
+        adjudications_file = self.repo.parent / "adjudications.txt"
+        adjudications_file.write_text(
+            "first ruling\n\n# a comment, skipped\nsecond ruling\n", encoding="utf-8"
+        )
+        passing = _write_fake_reviewer(self.repo.parent / "fake_rv_pass.sh", 'echo "## Verdict\n- PASS"')
+
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "review", "--slice", "Slice 1", "--skill", "code-review",
+                "--tool", "faketool", "--reviewer-command", str(passing),
+                "--adjudicated-file", str(adjudications_file),
+                "--adjudicated", "third ruling", "--token", token,
+            ]
+        )
+        self.assertEqual(code, 0, err)
+
+        prompt = (run_dir / "slices" / "slice-001" / "review-1-code-review-faketool-prompt.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("- first ruling", prompt)
+        self.assertIn("- second ruling", prompt)
+        self.assertIn("- third ruling", prompt)
+        self.assertNotIn("comment, skipped", prompt)
+        # File lines must precede the --adjudicated flag, not just be present.
+        self.assertLess(
+            prompt.index("- second ruling"), prompt.index("- third ruling"),
+            "file-sourced rulings must render before --adjudicated flag rulings",
+        )
+
+    def test_adjudicated_file_missing_fails_closed(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "review", "--slice", "Slice 1", "--skill", "code-review",
+                "--tool", "faketool", "--reviewer-command", "irrelevant",
+                "--adjudicated-file", str(self.repo.parent / "does-not-exist.txt"),
+                "--token", token,
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("does-not-exist.txt", err)
+        events = state_mod.read_events(run_dir)
+        self.assertFalse(any(e["kind"] == "review" for e in events))
+
     def test_unreadable_artifact_dir_fails_closed(self) -> None:
         """Treating an unenumerable directory as empty would restore the
         collision: a known prompt pathname stays writable even when listing is

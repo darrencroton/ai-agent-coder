@@ -150,6 +150,14 @@ def build_parser() -> argparse.ArgumentParser:
         "repeatable. Bounds reviewer attention only — it can never widen the authorized surface "
         "or weaken a criterion, and a reviewer that disagrees still files a full finding",
     )
+    review.add_argument(
+        "--adjudicated-file", metavar="PATH",
+        help="one ruling per line (blank lines and lines starting with # are skipped) from a file "
+        "PM reuses byte-for-byte across every commission in a panel, instead of retyping the same "
+        "ruling per --adjudicated call with a risk of wording drift — a judge-reviews panel "
+        "comparison requires identical adjudication context across its members. Combined with any "
+        "--adjudicated flags, file lines first",
+    )
     review.add_argument("--reviewer-command", help="override the whole reviewer command (tests/unsupported tools)")
     review.add_argument(
         "--timeout", type=_positive_seconds, default=_REVIEW_DEFAULT_TIMEOUT_SECONDS,
@@ -623,10 +631,30 @@ def _run_finalize(args: argparse.Namespace) -> int:
 # --- review -----------------------------------------------------------------
 
 
+def _load_adjudications(args: argparse.Namespace) -> list[str]:
+    """Combine --adjudicated-file lines (file order first) with --adjudicated flags.
+
+    Reusing one file across a panel's review commissions guarantees byte-identical
+    adjudication context, which judge-reviews' panel comparison requires; retyping
+    the same ruling per invocation risks the wording drift that breaks it instead.
+    """
+    items: list[str] = []
+    if args.adjudicated_file:
+        try:
+            lines = Path(args.adjudicated_file).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PmError(f"could not read --adjudicated-file {args.adjudicated_file}: {exc}") from exc
+        items.extend(line for line in lines if line.strip() and not line.strip().startswith("#"))
+    if args.adjudicated:
+        items.extend(args.adjudicated)
+    return items
+
+
 def _run_review(args: argparse.Namespace) -> int:
     token = _require_token(args)
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
+    adjudications = _load_adjudications(args)
     outcome = review_mod.run_review(
         repo,
         run_dir,
@@ -644,8 +672,8 @@ def _run_review(args: argparse.Namespace) -> int:
         # contract in the prompt, so a multi-line item could otherwise imitate a
         # later prompt section rather than read as one ruling.
         pm_adjudications=(
-            "\n".join(f"- {' '.join(item.split())}" for item in args.adjudicated)
-            if args.adjudicated
+            "\n".join(f"- {' '.join(item.split())}" for item in adjudications)
+            if adjudications
             else None
         ),
     )
