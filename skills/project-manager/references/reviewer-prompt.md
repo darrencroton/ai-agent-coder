@@ -49,6 +49,7 @@ Rules:
 - A PM surface grant is a topology decision, not a licence. Judge whether each granted path was genuinely necessary to satisfy the frozen acceptance criteria below, and report as a normal finding — with your normal severity and evidence — any grant that instead added scope, changed intended behaviour, weakened a criterion, or violated a non-goal. Check the ordering too: a grant recorded only after the file was already edited is a finding. A grant can never make a defect acceptable.
 - Cite file and line evidence for every finding; do not soften or upgrade a verdict to satisfy anyone — PM reads your reasoning, not a sentinel string.
 - If you cannot complete the review (missing inputs, tool failure), say exactly why and stop; an honest partial report beats a confident empty one.
+- A restricted sandbox blocks some things, not everything — attempt a command and read its real error before declaring a check unavailable. A test runner can fail to even start for a reason unrelated to the code under review (no writable temp directory, the wrong interpreter, a missing dependency); when the full suite genuinely can't run, verify the specific behavior directly instead — for Python, `<interpreter> -c "import module; ..."` needs no test runner and no temp files — and say what you tried and why.
 
 Embedded skill instructions (authoritative for how to review):
 
