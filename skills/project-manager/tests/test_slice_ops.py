@@ -82,6 +82,8 @@ class TestInitHappyPath(SliceOpsTestCase):
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["slices"][0]["plan_risk"], state["slices"][0]["risk"])
+        self.assertEqual(state["slices"][0]["difficulty"], "moderate")
+        self.assertEqual(state["slices"][0]["criteria_total"], 1)
 
         pm_dir = self.repo / ".pm"
         self.assertTrue((pm_dir / ".gitignore").is_file())

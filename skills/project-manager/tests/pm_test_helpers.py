@@ -259,10 +259,11 @@ def render_slice(
     audit: str = "no",
     risky: str = "none",
     intended: str = "Do the thing.",
-    acceptance: str = "It works.",
+    acceptance: str = "- [ ] It works.",
     non_goals: str = "Nothing else.",
     validation: str = "Run the tests.",
     rollback: str = "git revert.",
+    difficulty: str = "moderate",
 ) -> str:
     """Render one '## Slice N: ...' block in the canonical plan shape.
 
@@ -297,6 +298,7 @@ def render_slice(
 - Risky surfaces touched: {risky}.
 - Approval needed before implementation: {approval}.
 - Independent audit required: {audit}.
+- Difficulty: {difficulty}.
 
 ### Validation Plan
 {validation}
@@ -418,6 +420,8 @@ class PmTestCase(PlanTestCase):
                 "status": statuses.get(s.slice_id),
                 "risk": s.plan_risk,
                 "plan_risk": s.plan_risk,
+                "difficulty": s.difficulty,
+                "criteria_total": s.criteria_total,
                 "commit": None,
                 "attempts": 0,
             }

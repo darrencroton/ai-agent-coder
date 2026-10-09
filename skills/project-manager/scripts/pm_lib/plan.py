@@ -54,6 +54,8 @@ _LICENSE_SURFACE_PREFIXES = ("license", "copying", "notice", "patents")
 _BROAD_SURFACE_ENTRIES = {"**", "**/*"}
 _TOP_LEVEL_ONLY_SURFACE_ENTRIES = {"*"}
 
+_DIFFICULTIES = frozenset({"easy", "moderate", "hard"})
+_CHECKBOX_RE = re.compile(r"^\s*- \[[ xX]\]", flags=re.MULTILINE)
 _SLICE_HEADING_RE = re.compile(r"^## Slice\s+(?P<number>\d+):\s*(?P<title>.+?)\s*$", flags=re.MULTILINE)
 _SLICE_LIKE_HEADING_RE = re.compile(
     r"^[ ]{0,3}#{1,6}\s+Slice(?:\s|:|\d|$)[^\n]*$",
@@ -129,6 +131,17 @@ class PlanSlice:
         # Unlike approval_needed, this fails closed to *off*: absent, blank,
         # or anything not an exact "yes" leaves the opt-in gate unarmed.
         return self._risk_flag("Independent audit required") == "yes"
+
+    @property
+    def difficulty(self) -> str | None:
+        """The slice's rated difficulty, or None unless exactly easy/moderate/hard."""
+        value = self._risk_flag("Difficulty")
+        return value if value in _DIFFICULTIES else None
+
+    @property
+    def criteria_total(self) -> int:
+        """Count of `- [ ]` / `- [x]` checkbox lines in "Acceptance Criteria"."""
+        return len(_CHECKBOX_RE.findall(self.sections.get("Acceptance Criteria", "")))
 
     @property
     def risky_surfaces_clear(self) -> bool:
@@ -396,6 +409,10 @@ def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
             )
         elif approval:
             approval_gated.append(plan_slice.slice_id)
+        if plan_slice.difficulty is None:
+            errors.append(f"{prefix}: 'Difficulty:' must be exactly one of easy, moderate, hard")
+        if plan_slice.criteria_total == 0:
+            errors.append(f"{prefix}: 'Acceptance Criteria' must contain at least one '- [ ]' checkbox criterion")
 
     if _SLICE_BATCH_HEADING_RE.search(masked_text) or _BATCH_BULLET_RE.search(masked_text):
         warnings.append(

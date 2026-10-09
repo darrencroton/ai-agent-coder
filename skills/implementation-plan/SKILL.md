@@ -61,10 +61,10 @@ Use this shape for every implementation slice:
 - ...
 
 ### Acceptance Criteria
-- Inputs:
-- Outputs:
-- User-visible behaviour:
-- Behaviour that must not change:
+- [ ] <one verifiable assertion>
+- [ ] <another, if needed>
+- Inputs: <optional context>
+- Behaviour that must not change: <optional context>
 
 ### Authorized Surface
 - Files allowed to change:
@@ -77,6 +77,8 @@ Use this shape for every implementation slice:
 ### Risk Flags
 - Risky surfaces touched:
 - Approval needed before implementation:
+- Difficulty: easy | moderate | hard
+- Recommended Developer: <free text, optional>
 
 ### Validation Plan
 - Tests to add/update:
@@ -92,7 +94,7 @@ Use this shape for every implementation slice:
 
 `Acceptance Criteria` is the shared behavioural checklist: it reaches the implementer and a `project-manager`-commissioned reviewer verbatim, as the pinned contract the change must satisfy. Requirements that must bind both seats belong in the slice's own sections — plan text outside them reaches neither.
 
-Write them as an enumerable checklist, one verifiable assertion per line, rather than as paragraphs. Requirements buried mid-paragraph get lost even by strong models, and a checklist is what lets a reviewer or supervisor check completeness at a glance:
+Write them as an enumerable checklist, one verifiable assertion per line, rather than as paragraphs. The `- [ ]` checkbox lines are required, not advice: `project-manager` counts them (the count is the denominator of the Developer judgment's `criteria_met`), and a slice with none fails `check-plan`. `Inputs:` and `Behaviour that must not change:` may remain as plain context bullets, but they are not counted. Requirements buried mid-paragraph get lost even by strong models, and a checklist is what lets a reviewer or supervisor check completeness at a glance:
 
 ```md
 - [ ] Both axes are log-scaled on every path, including the all-unusable empty figure.
@@ -134,8 +136,14 @@ Under Mode B, a single path discovered outside the surface is not a dead end: `p
 - `Files allowed to change:` must list each authorized repository-relative path as an indented sub-bullet. Empty, absolute, `.`/`..`, `./`-prefixed, empty-segment, and backslash-separated paths are invalid, as are paths with unwrapped whitespace — to annotate an entry, backtick-wrap the path itself (`` `src/app.py` `` (new file)) so only the path is matched. Entries are matched segment-aware: a plain path matches exactly and never matches beneath a directory (add a trailing `/` to authorize a subtree), and `*`, `?`, and `[` match within one segment. A lone `*` covers top-level paths only; use `/` separators and `**` for a recursive glob (`docs/**/*.md`).
 - `Approval needed before implementation:` must be an exact `no` to run unattended. Anything else (`yes`, `not yet decided`, `none`, blank) stops the run for a human. An explicit `yes` is satisfied at runtime by a recorded human approval (`project-manager`'s `approve` command) without editing the plan; anything unclear cannot be.
 - `Independent audit required:` is optional and lives in the `Risk Flags` section, a sibling of `Approval needed before implementation:`. It defaults to off: absent, blank, or anything that is not an exact `yes` leaves it off. An exact `yes` makes the slice **elevated risk** under `project-manager` (Mode B): PM must commission independent `drift-audit` and `code-review` reviews of the final diff, both fresh at the exact final commit, before the slice can be accepted. In Mode A it is not mechanically enforced: the human or Developer judges independence directly, and the `orchestrator` skill's fallback rules apply (stop and report rather than self-audit such a slice).
+- `Difficulty:` lives in the `Risk Flags` section and must be exactly one of `easy`, `moderate`, `hard` (case-insensitive, a trailing period is ignored); absent, blank or anything else is a `check-plan` error. `project-manager` stores it as the slice's `difficulty`. Rate the slice, never the model, and set it before any attempt, using these anchors:
+  - **easy**: a tightly specified or mechanical change, typically in one module; follows an existing pattern; no new interfaces; little room for a wrong reading.
+  - **moderate**: new behaviour across a few files within the existing design; some judgement inside the contract; ordinary test work.
+  - **hard**: cross-cutting, or new interfaces or algorithms; subtle state, concurrency, numerics, persistence or schema; a wrong reading is likely or costly.
+- `Recommended Developer:` is optional free text in the `Risk Flags` section (for example a model and effort) for the operator and PM to read. `project-manager` never parses it.
+- Checkbox criteria: the count of `- [ ]` / `- [x]` lines in `### Acceptance Criteria` is stored as the slice's `criteria_total`. Zero is a `check-plan` error.
 - Slice batches (`Batch A: Slices 1-2`) apply to Mode A runs only (either usage). `project-manager` (Mode B) executes atomic slices in plan order and ignores batch groupings, so a plan destined for PM should make each slice independently gateable rather than relying on a batch sharing one review.
-- `project-manager`'s `check-plan` command validates all of the above across every slice before a run begins (and again automatically at `init`), plus lint warnings for dependency/license-shaped authorized files, whole-repo globs, plain entries that name existing directories (when run with repo context), and batch groupings. Running it against a fresh plan is the fast way to confirm the plan is PM-ready.
+- `project-manager`'s `check-plan` command validates all of the above (including `Difficulty:` and the checkbox criteria) across every slice before a run begins (and again automatically at `init`), plus lint warnings for dependency/license-shaped authorized files, whole-repo globs, plain entries that name existing directories (when run with repo context), and batch groupings. Running it against a fresh plan is the fast way to confirm the plan is PM-ready.
 
 ## Execution Modes
 

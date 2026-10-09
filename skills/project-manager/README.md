@@ -147,6 +147,7 @@ cat > ../trial-plan.md <<'PLAN'
 
 ### Acceptance Criteria
 - Outputs: hello.txt with the single word hello
+- [ ] hello.txt contains the single word hello
 
 ### Authorized Surface
 - Files allowed to change:
@@ -158,6 +159,7 @@ cat > ../trial-plan.md <<'PLAN'
 ### Risk Flags
 - Risky surfaces touched: none
 - Approval needed before implementation: no
+- Difficulty: easy
 
 ### Validation Plan
 - Commands to run: cat hello.txt

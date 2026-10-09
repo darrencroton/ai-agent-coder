@@ -343,6 +343,8 @@ def init_run(
             "status": "attested" if plan_slice.slice_id in attested_ids else None,
             "risk": plan_slice.plan_risk,
             "plan_risk": plan_slice.plan_risk,
+            "difficulty": plan_slice.difficulty,
+            "criteria_total": plan_slice.criteria_total,
             "commit": None,
             "attempts": 0,
         }
