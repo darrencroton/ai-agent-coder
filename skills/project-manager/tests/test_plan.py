@@ -216,38 +216,42 @@ class TestApprovalFlag(PlanTestCase):
         self.assertTrue(any("must be exactly 'yes' or 'no'" in e for e in report["errors"]))
 
 
-    def _check_single_slice_report(self, text: str) -> list[str]:
+
+class TestPlanCovariates(PlanTestCase):
+    def _write(self, text: str) -> Path:
         path = self.repo / "plan.md"
         path.write_text("# Plan\n\n" + text, encoding="utf-8")
-        return plan_mod.plan_check_report(path)["errors"]
+        return path
+
+    def _errors(self, text: str) -> list[str]:
+        return plan_mod.plan_check_report(self._write(text))["errors"]
 
     def test_missing_difficulty_is_plan_error_naming_slice(self) -> None:
-        text = render_slice(1).replace("- Difficulty: moderate.\n", "")
-        path = self.repo / "plan.md"
-        path.write_text("# Plan\n\n" + text, encoding="utf-8")
+        path = self._write(render_slice(1).replace("- Difficulty: moderate.\n", ""))
         self.assertIsNone(plan_mod.parse_plan(path)[0].difficulty)
-        errors = self._check_single_slice_report(text)
+        errors = plan_mod.plan_check_report(path)["errors"]
         self.assertTrue(any(e.startswith("Slice 1 (") and "'Difficulty:' must be exactly one of" in e for e in errors))
 
     def test_unrecognised_difficulty_is_plan_error(self) -> None:
-        for value in ("easy | moderate | hard", "", "medium"):
+        for value in ("easy | moderate | hard", "medium"):
             with self.subTest(value=value):
-                text = render_slice(1, difficulty=value)
-                errors = self._check_single_slice_report(text)
+                errors = self._errors(render_slice(1, difficulty=value))
                 self.assertTrue(any("'Difficulty:' must be exactly one of" in e for e in errors))
 
+    def test_blank_difficulty_is_plan_error(self) -> None:
+        errors = self._errors(render_slice(1).replace("- Difficulty: moderate.\n", "- Difficulty:\n"))
+        self.assertTrue(any("'Difficulty:' must be exactly one of" in e for e in errors))
+
     def test_valid_difficulty_and_checkboxes_are_counted(self) -> None:
-        path = self.repo / "plan.md"
         text = render_slice(1, difficulty="Hard", acceptance="- Inputs: none\n- [ ] One.\n  - [x] Two.\n- [X] Three.")
-        path.write_text("# Plan\n\n" + text, encoding="utf-8")
+        path = self._write(text)
         plan_slice = plan_mod.parse_plan(path)[0]
         self.assertEqual(plan_slice.difficulty, "hard")
         self.assertEqual(plan_slice.criteria_total, 3)
         self.assertEqual(plan_mod.plan_check_report(path)["errors"], [])
 
     def test_zero_checkbox_criteria_is_plan_error(self) -> None:
-        text = render_slice(1, acceptance="- Inputs: none\n- Behaviour that must not change: x")
-        errors = self._check_single_slice_report(text)
+        errors = self._errors(render_slice(1, acceptance="- Inputs: none\n- Behaviour that must not change: x"))
         self.assertTrue(any(e.startswith("Slice 1 (") and "at least one '- [ ]' checkbox criterion" in e for e in errors))
 
 
