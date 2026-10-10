@@ -940,6 +940,11 @@ class TestReviewerPidsClearedOnFailure(ReviewCommandTestCase):
         # The failure path must not leave a stale pgid behind for a later
         # `stop` to SIGKILL after PID reuse.
         self.assertEqual(reloaded["current_slice"]["reviewer_pids"], [])
+        # A non-zero exit that no PM decision caused is a recorded failure.
+        events = state_mod.read_events(run_dir)
+        failed = [e for e in events if e["kind"] == "review-failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["data"]["reason"], "exit 1")
 
 
 class TestReviewDirtyWorktreeRefusal(ReviewCommandTestCase):
@@ -1022,10 +1027,22 @@ class TestReviewTimeout(ReviewCommandTestCase):
         self.assertEqual(reloaded["current_slice"]["reviewer_pids"], [])
 
         events = state_mod.read_events(run_dir)
-        timeout_events = [
-            e for e in events if e["kind"] == "review" and "timed out" in (e.get("note") or "")
-        ]
-        self.assertEqual(len(timeout_events), 1)
+        self.assertEqual([e for e in events if e["kind"] == "review"], [])
+        failed = [e for e in events if e["kind"] == "review-failed"]
+        self.assertEqual(len(failed), 1)
+        launch_index = next(i for i, e in enumerate(events) if e["kind"] == "launch")
+        self.assertEqual(
+            failed[0]["data"],
+            {
+                "skill": "code-review",
+                "tool": "faketool",
+                "model": None,
+                "effort": None,
+                "command_override": True,
+                "origin_event_index": launch_index,
+                "reason": "timeout",
+            },
+        )
 
     def test_fast_reviewer_with_generous_timeout_succeeds(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
@@ -1315,6 +1332,71 @@ class TestReviewLaunchVisibilityOrdering(ReviewCommandTestCase):
             thread.join(timeout=10.0)
 
         self.assertNotIn("error", result, result.get("error"))
+
+
+class TestSuccessfulReviewIgnoresReviewerPids(ReviewCommandTestCase):
+    def test_reviewer_exiting_zero_is_recorded_after_its_pgid_was_cleared(self) -> None:
+        """Reaped detection applies only to failed exits: a reviewer that
+        exits 0 is recorded as a review even when its pgid has already left
+        `reviewer_pids` while it ran."""
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=before_head,
+            reviewer_pids=[],
+        )
+        self._advance_head()
+
+        sentinel = self.repo.parent / "release_reviewer"
+        fake = _write_fake_reviewer(
+            self.repo.parent / "fake_reviewer_sentinel.sh",
+            f'while [ ! -f "{sentinel}" ]; do sleep 0.1; done\necho "FAKE REVIEW REPORT"\nexit 0',
+        )
+        result: dict = {}
+
+        def _run() -> None:
+            try:
+                with redirect_stdout(io.StringIO()):
+                    result["outcome"] = review_mod.run_review(
+                        self.repo,
+                        run_dir,
+                        token,
+                        slice_id="Slice 1",
+                        skill="code-review",
+                        tool="faketool",
+                        reviewer_command=str(fake),
+                    )
+            except Exception as exc:  # noqa: BLE001 - surfaced via assertion below
+                result["error"] = exc
+
+        def _recorded_pids() -> list:
+            current = state_mod.load_state(run_dir, token)["current_slice"]
+            return current["reviewer_pids"]
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not _recorded_pids():
+                time.sleep(0.05)
+            with state_mod.locked_update(run_dir, token) as live:
+                pids = live["current_slice"]["reviewer_pids"]
+                self.assertTrue(pids, "reviewer pgid never recorded")
+                live["current_slice"]["reviewer_pids"] = []
+        finally:
+            sentinel.write_text("go\n", encoding="utf-8")
+            thread.join(timeout=10.0)
+
+        self.assertNotIn("error", result, result.get("error"))
+        reloaded = state_mod.load_state(run_dir, token)
+        self.assertEqual(len(reloaded["slices"][0]["reviews"]), 1)
+        events = state_mod.read_events(run_dir)
+        self.assertEqual(len([e for e in events if e["kind"] == "review"]), 1)
+        self.assertEqual([e for e in events if e["kind"] == "review-failed"], [])
 
 
 class TestResolveToolOverride(ReviewCommandTestCase):

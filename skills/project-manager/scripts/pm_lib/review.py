@@ -506,18 +506,51 @@ def run_review(
     # Persisted BEFORE any fallible post-processing (mirror/hash below): if
     # either raises, the cleared pgid must already be on disk so a later
     # `stop` cannot SIGKILL a reused pgid recorded as still-live.
+    failed = timed_out or returncode != 0
+    reaped = False
     with state_mod.locked_update(run_dir, token) as state:
         current = state.get("current_slice")
+        # A failed reviewer whose pgid is no longer recorded was reaped by a
+        # PM decision (`stop`, `finalize --accept`/`--stop`), which clears
+        # `reviewer_pids` before killing the group; that is PM's choice, not
+        # the reviewer's failure. Decided before the filter below removes
+        # the pgid, and only for failed exits: a reviewer that exited 0 is
+        # recorded as a review whatever `reviewer_pids` holds.
+        if failed:
+            reaped = current is None or pgid not in (current.get("reviewer_pids") or [])
         if current is not None and current.get("reviewer_pids"):
             current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
 
-    if timed_out:
+    if reaped:
+        raise PmError(
+            f"reviewer was reaped by a PM decision (process group {pgid}); "
+            "not recorded as a failure"
+        )
+
+    if failed:
+        reason = "timeout" if timed_out else f"exit {returncode}"
+        note = (
+            f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed"
+            if timed_out
+            else f"{skill} via {resolved_tool} exited {returncode}"
+        )
         state_mod.append_event(
             run_dir,
-            "review",
+            "review-failed",
             slice_id=slice_id,
-            note=f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed",
+            note=note,
+            data={
+                "skill": skill,
+                "tool": resolved_tool,
+                "model": resolved_model,
+                "effort": recorded_effort,
+                "command_override": bool(reviewer_command),
+                "origin_event_index": origin_event["index"],
+                "reason": reason,
+            },
         )
+
+    if timed_out:
         raise PmError(
             f"reviewer timed out after {timeout:g}s and was killed (process group {pgid}); "
             "this is not proof of a hang — a slow cold local model may just need a longer --timeout. "

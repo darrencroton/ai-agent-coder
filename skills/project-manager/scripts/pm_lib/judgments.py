@@ -216,11 +216,14 @@ def _active_judgments(entry: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def assessment_of(record: dict[str, Any]) -> str:
-    """Return a new record's explicit kind or the legacy record's meaning."""
+    """Return a stored reviewer judgment's explicit kind; raise if it has none."""
     value = record.get("assessment")
-    if isinstance(value, str) and value in {_RATING, _COMPARISON}:
-        return value
-    return _RATING if record.get("skill") == "drift-audit" else _COMPARISON
+    if value not in {_RATING, _COMPARISON}:
+        raise PmError(
+            f"review judgment {record.get('judgment_id')!r} has no valid assessment "
+            f"(expected {_RATING!r} or {_COMPARISON!r})"
+        )
+    return value
 
 
 def _input_matches(record: dict[str, Any], parsed: dict[str, Any]) -> bool:
@@ -279,7 +282,7 @@ def _context_key(review: dict[str, Any]) -> tuple[Any, ...]:
     context = review.get("review_context")
     if not isinstance(origin, dict) or not isinstance(context, dict):
         raise PmError(
-            f"review {review.get('review_id')!r} lacks commission-time context; it remains historical/unjudged"
+            f"review {review.get('review_id')!r} lacks commission-time context"
         )
     return (
         origin.get("index"),
@@ -397,16 +400,6 @@ def unranked_code_review_ids(state: dict[str, Any]) -> list[tuple[str, str]]:
     )
 
 
-def historical_review_count(state: dict[str, Any]) -> int:
-    """Completed records predating stable review IDs, kept as unjudged evidence."""
-    return sum(
-        1
-        for entry in state.get("slices") or []
-        for review in entry.get("reviews") or []
-        if isinstance(review, dict) and not isinstance(review.get("review_id"), str)
-    )
-
-
 def _parse_developer_input(data: dict[str, Any]) -> dict[str, Any]:
     version = data.get("schema_version")
     if type(version) is not int or version != _VERSION:
@@ -517,9 +510,7 @@ def _origin_from_current(
         )
     developer = current.get("developer")
     if not isinstance(developer, dict):
-        raise PmError(
-            "current developer submission lacks a stable launch identity; it remains historical/unjudged"
-        )
+        raise PmError("current developer submission lacks a stable launch identity")
     origin = _latest_developer_origin(run_dir, parsed["slice"])
     if origin["index"] != parsed["origin_event_index"]:
         raise PmError(

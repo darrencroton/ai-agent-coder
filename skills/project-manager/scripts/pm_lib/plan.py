@@ -21,7 +21,7 @@ REQUIRED_SECTIONS: tuple[str, ...] = (
     "Rollback Path",
 )
 
-# Slice statuses (lite-1) that mark a slice as no longer eligible to run.
+# Slice statuses (lite-2) that mark a slice as no longer eligible to run.
 _COMPLETED_SLICE_STATUSES = {"accepted", "attested"}
 
 # check-plan lint vocabulary. PM's dependency/license/side-effect stop

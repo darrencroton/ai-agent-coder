@@ -214,3 +214,13 @@ def worktree_git_dir(repo: Path) -> Path:
     `worktrees/<name>/`, so PM state rooted here is distinct per worktree.
     """
     return Path(git(repo, "rev-parse", "--absolute-git-dir")).resolve()
+
+
+def git_common_dir_name(repo: Path) -> str:
+    """The main repository's name: the basename of the directory holding the git common dir.
+
+    Unlike `repo.name`, this names the main checkout even when `repo` is a
+    linked worktree, whose own top level is usually named after the worktree.
+    """
+    common_dir = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return Path(common_dir).resolve().parent.name

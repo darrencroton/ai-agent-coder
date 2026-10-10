@@ -129,7 +129,16 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_group = finalize.add_mutually_exclusive_group()
     finalize_group.add_argument("--accept", help="accept the slice; reasoning must be >= 40 characters")
     finalize_group.add_argument("--steer", help="send a written correction into the live session")
-    finalize_group.add_argument("--stop", help="stop the slice, recording the reason")
+    finalize_group.add_argument(
+        "--stop", help="stop the slice, recording the reason (requires --cause)"
+    )
+    # Required with --stop and refused otherwise; argparse cannot express
+    # that inside the mutually exclusive group, so _run_finalize enforces it.
+    finalize.add_argument(
+        "--cause",
+        choices=["plan", "developer", "environment"],
+        help="why the slice stopped (only with --stop): plan, developer, or environment",
+    )
     finalize.add_argument("--risk", help='only "elevated" is accepted; risk can never be lowered')
     finalize.add_argument("--run")
     finalize.add_argument("--token")
@@ -337,9 +346,6 @@ def _run_status(args: argparse.Namespace) -> int:
         print("unjudged reviews: " + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in missing))
     else:
         print("unjudged reviews: none")
-    historical = judgments.historical_review_count(state)
-    if historical:
-        print(f"historical/unjudged reviews without stable IDs: {historical}")
 
     unranked = judgments.unranked_code_review_ids(state)
     if unranked:
@@ -565,6 +571,12 @@ def _print_pane_tail(pane_path: Path) -> None:
 
 
 def _run_finalize(args: argparse.Namespace) -> int:
+    # Checked before anything is read or written, so a refused combination
+    # leaves run.json and events.jsonl untouched.
+    if args.stop is not None and args.cause is None:
+        raise PmError("finalize --stop requires --cause plan|developer|environment")
+    if args.cause is not None and args.stop is None:
+        raise PmError("--cause is only valid with finalize --stop")
     token = _require_token(args)
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
@@ -598,7 +610,9 @@ def _run_finalize(args: argparse.Namespace) -> int:
         return 2
 
     if args.stop is not None:
-        outcome = slice_ops.finalize_stop(repo, run_dir, token, reason=args.stop, risk=args.risk)
+        outcome = slice_ops.finalize_stop(
+            repo, run_dir, token, reason=args.stop, cause=args.cause, risk=args.risk
+        )
         print(f"STOPPED {outcome.slice_id}")
         _print_floor_facts(outcome.report)
         _print_pane_tail(outcome.pane_path)

@@ -1,4 +1,4 @@
-"""Protected behaviours: lite-1 state round-trip, authentication, and the CLI stubs.
+"""Protected behaviours: lite-2 state round-trip, authentication, and the CLI stubs.
 
 The distinction these tests exist to hold: a *wrong* token is a caller
 mistake (`PmError`), while state that fails MAC verification — or is missing
@@ -19,6 +19,7 @@ from unittest import mock
 from pm_test_helpers import PlanTestCase, PmTestCase
 
 from pm_lib import IntegrityError, PmError
+from pm_lib import judgments
 from pm_lib import sessions as sessions_mod
 from pm_lib import state as state_mod
 
@@ -104,7 +105,8 @@ class TestCreateRunRoundTrip(PmTestCase):
         pointer = state_mod.state_root(self.repo) / "current"
         self.assertEqual(pointer.read_text(encoding="utf-8").strip(), state["run_id"])
 
-        self.assertEqual(state["schema"], state_mod.SCHEMA)
+        self.assertEqual(state["schema"], "lite-2")
+        self.assertEqual(state["repo_name"], self.repo.name)
         self.assertEqual(state["status"], "active")
         self.assertEqual(state["plan"]["slice_count"], 1)
         # The token is never written to disk in the clear.
@@ -169,20 +171,23 @@ class TestTamperDetection(PmTestCase):
         # But shape validation still runs: corrupt the schema field directly
         # (bypassing MAC, since no token is supplied) and confirm it's caught.
         raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        raw["schema"] = "lite-2"
+        raw["schema"] = "lite-3"
         (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
         with self.assertRaises(PmError):
             state_mod.load_state(run_dir)
 
-    def test_future_schema_version_is_refused_with_message(self) -> None:
+    def test_other_schema_version_is_refused_with_message(self) -> None:
+        """No migration and no dual-schema path: a `lite-1` run is refused."""
         plan_path = self.write_plan()
         _state, _token, run_dir = self.make_run(plan_path=plan_path)
         raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        raw["schema"] = "lite-2"
+        raw["schema"] = "lite-1"
         (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
         with self.assertRaises(PmError) as ctx:
             state_mod.load_state(run_dir)
-        self.assertIn("lite-2", str(ctx.exception))
+        self.assertIn(
+            "'lite-1' is not supported by this toolkit version", str(ctx.exception)
+        )
 
     def test_malformed_enum_values_rejected(self) -> None:
         plan_path = self.write_plan()
@@ -258,6 +263,22 @@ class TestEventsAndReadback(PmTestCase):
         for event in events:
             self.assertIn("ts", event)
             self.assertEqual(event["slice"], "Slice 1")
+
+    def test_event_data_round_trips_and_is_omitted_when_none(self) -> None:
+        plan_path = self.write_plan()
+        _state, _token, run_dir = self.make_run(plan_path=plan_path)
+        developer = {"tool": "claude", "model": "claude-opus-5-5", "effort": None}
+        payload = {"developer": developer}
+        state_mod.append_event(
+            run_dir, "launch", slice_id="Slice 1", note="attempt 0", data=payload
+        )
+        state_mod.append_event(
+            run_dir, "stop", slice_id="Slice 1", note="operator stop"
+        )
+
+        launch, stop = state_mod.read_events(run_dir)
+        self.assertEqual(launch["data"], payload)
+        self.assertNotIn("data", stop)
 
     def test_read_events_empty_when_no_file(self) -> None:
         plan_path = self.write_plan()
@@ -606,6 +627,18 @@ class TestRunReportSurfaceGrants(PlanTestCase):
 
         empty_text = self._report([{"id": "Slice 1", "title": "T"}])
         self.assertIn("## Surface Grants\n(none)", empty_text)
+
+
+class TestStoredJudgmentAssessmentIsStrict(unittest.TestCase):
+    """The report renderer reads each stored reviewer judgment's kind through
+    `judgments.assessment_of`; a record without one is malformed, not legacy."""
+
+    def test_record_without_assessment_is_refused_by_name(self) -> None:
+        self.assertEqual(judgments.assessment_of({"assessment": "rating"}), "rating")
+        with self.assertRaisesRegex(PmError, "judgment-3"):
+            judgments.assessment_of(
+                {"judgment_id": "judgment-3", "skill": "drift-audit"}
+            )
 
 
 class TestRunElapsed(unittest.TestCase):

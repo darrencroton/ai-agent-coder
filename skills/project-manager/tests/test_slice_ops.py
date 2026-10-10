@@ -29,6 +29,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import shutil
 
 from pm_test_helpers import (
+    PlanTestCase,
     PmTestCase,
     TmuxRunTestCase,
     commit_and_result_script,
@@ -529,7 +530,11 @@ class TestAttemptAccounting(SliceOpsTestCase):
         self.assertEqual(code, 0)
         session0 = self._track_current_session(run_id, token)
         self.assertIsNotNone(session0)
-        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        launched = state_mod.load_state(run_dir, token)["current_slice"]
+        artifact_dir = Path(launched["artifact_dir"])
+        events = state_mod.read_events(run_dir)
+        launches = [e["data"] for e in events if e["kind"] == "launch"]
+        self.assertEqual(launches, [{"developer": launched["developer"]}])
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
         # The fake harness writes no validation.md, so stand in for the
         # Developer-authored evidence the real one leaves behind: it must
@@ -554,6 +559,10 @@ class TestAttemptAccounting(SliceOpsTestCase):
             reloaded["current_slice"]["developer"],
             {"tool": "custom", "model": None, "effort": None},
         )
+        events = state_mod.read_events(run_dir)
+        relaunches = [e["data"] for e in events if e["kind"] == "relaunch"]
+        developer = reloaded["current_slice"]["developer"]
+        self.assertEqual(relaunches, [{"developer": developer}])
         by_id = {entry["id"]: entry for entry in reloaded["slices"]}
         self.assertEqual(by_id["Slice 1"]["attempts"], 1)
         # Attempt 0's result.json was rotated out of the way before the
@@ -576,6 +585,9 @@ class TestAttemptAccounting(SliceOpsTestCase):
         self.assertIn("attempt budget exhausted", err)
         final_state = state_mod.load_state(run_dir, token)
         self.assertEqual(final_state["status"], "needs-human")
+        events = state_mod.read_events(run_dir)
+        budget_stops = [e["data"] for e in events if e["kind"] == "stop"]
+        self.assertEqual(budget_stops, [{"cause": "developer"}])
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -1063,6 +1075,10 @@ class TestStop(SliceOpsTestCase):
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "stopped")
         self.assertEqual(state["stop_reason"], "operator stop")
+        # `pm stop` appends with data=None, so its event carries no data key.
+        stops = [e for e in state_mod.read_events(run_dir) if e["kind"] == "stop"]
+        self.assertEqual(len(stops), 1)
+        self.assertNotIn("data", stops[0])
 
     def test_stop_scavenge_finds_run_prefixed_session_with_state_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
@@ -1086,6 +1102,22 @@ class TestStop(SliceOpsTestCase):
 
 
 # --- all slices complete -----------------------------------------------------
+
+
+class TestReviewFreshnessRequiresGrantsSeen(PlanTestCase):
+    def test_review_without_int_grants_seen_is_stale(self) -> None:
+        artifact = self.repo / "review.md"
+        artifact.write_text("report\n", encoding="utf-8")
+        review = {
+            "head": "abc",
+            "artifact": str(artifact),
+            "sha256": slice_ops.sha256_file(artifact),
+        }
+        fresh = slice_ops.is_review_fresh
+
+        self.assertTrue(fresh({**review, "grants_seen": 0}, "abc", 0))
+        self.assertFalse(fresh(review, "abc", 0))
+        self.assertFalse(fresh({**review, "grants_seen": "0"}, "abc", 0))
 
 
 class TestAllSlicesComplete(SliceOpsTestCase):

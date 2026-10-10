@@ -7,7 +7,9 @@ temporary repository with actual commits rather than string fixtures.
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from pm_test_helpers import PmTestCase
 
@@ -137,6 +139,17 @@ class TestGitFacts(PmTestCase):
 
     def test_commit_is_descendant_none_before_head_is_true(self) -> None:
         self.assertTrue(git_ops.commit_is_descendant(self.repo, None, git_ops.git_head(self.repo)))
+
+
+class TestGitCommonDirName(PmTestCase):
+    def test_linked_worktree_names_the_main_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            linked = Path(tmp) / "linked-worktree"
+            self._git("worktree", "add", "-q", "-b", "linked-branch", str(linked))
+            self.addCleanup(self._git, "worktree", "remove", "--force", str(linked))
+
+            self.assertEqual(git_ops.git_common_dir_name(self.repo), self.repo.name)
+            self.assertEqual(git_ops.git_common_dir_name(linked), self.repo.name)
 
     def test_require_clean_worktree_raises_on_dirty_outside_pm(self) -> None:
         (self.repo / "dirty.txt").write_text("oops\n", encoding="utf-8")

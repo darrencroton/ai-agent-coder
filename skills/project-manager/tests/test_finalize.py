@@ -309,7 +309,10 @@ class TestAcceptRefusedOnShortReasoning(PmTestCase):
 
         for flag in ("--accept", "--steer", "--stop"):
             with self.subTest(flag=flag):
-                code, out, err = self.run_cli_in_repo(["finalize", flag, "", "--token", token])
+                cause = ["--cause", "plan"] if flag == "--stop" else []
+                code, out, err = self.run_cli_in_repo(
+                    ["finalize", flag, "", *cause, "--token", token]
+                )
                 self.assertEqual(code, 2, out)
                 self.assertIn(flag, err)
                 self.assertNotIn("PASS", out, "an empty decision must not degrade to a floor dump")
@@ -1009,10 +1012,24 @@ class TestStopDecision(FinalizeTestCase):
         self.assertEqual(code, 0, out + err)
 
         code, out, err = self.run_cli_in_repo(
-            ["finalize", "--stop", "giving up on this approach", "--token", token]
+            [
+                "finalize",
+                "--stop",
+                "giving up on this approach",
+                "--cause",
+                "environment",
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, out + err)
         self.assertIn("STOPPED", out)
+
+        # The cause lives on the slice-stop event and nowhere else.
+        events = state_mod.read_events(run_dir)
+        slice_stops = [e for e in events if e["kind"] == "slice-stop"]
+        self.assertEqual(len(slice_stops), 1)
+        self.assertEqual(slice_stops[0]["data"], {"cause": "environment"})
 
         self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
 
@@ -1031,6 +1048,43 @@ class TestStopDecision(FinalizeTestCase):
         self.assertIn("See the notes for why.", text)
 
         self.assertTrue((run_dir / "run-report.md").is_file())
+        report_path = run_dir / "run-report.md"
+        for stored in (run_dir / "run.json", assessment_path, report_path):
+            self.assertNotIn("environment", stored.read_text(encoding="utf-8"), stored)
+
+
+class TestFinalizeCauseFlag(PmTestCase):
+    """`--cause` is required with `finalize --stop` and refused with anything
+    else; argparse cannot express that inside the decision group, so the
+    handler enforces it before reading or writing any run state."""
+
+    def test_stop_cause_pairing_is_refused_untouched(self) -> None:
+        plan_path = self.write_plan(
+            self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}]
+        )
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head
+        )
+        run_json = (run_dir / "run.json").read_bytes()
+        events = (run_dir / "events.jsonl").read_bytes()
+
+        cases = {
+            "stop without cause": ["--stop", "human needed"],
+            "cause with accept": ["--accept", _LONG_REASONING, "--cause", "plan"],
+            "cause with steer": ["--steer", "fix it", "--cause", "developer"],
+            "cause alone": ["--cause", "environment"],
+        }
+        for label, argv in cases.items():
+            with self.subTest(label):
+                code, out, err = self.run_cli_in_repo(
+                    ["finalize", *argv, "--token", token]
+                )
+                self.assertEqual(code, 2, out + err)
+                self.assertIn("--cause", err)
+                self.assertEqual((run_dir / "run.json").read_bytes(), run_json)
+                self.assertEqual((run_dir / "events.jsonl").read_bytes(), events)
 
 
 # --- notes.md controller-owned + mirror + tripwire ---------------------------
@@ -1189,6 +1243,10 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "needs-human")
         self.assertEqual(state["stop_reason"], "attempt budget exhausted")
+        events = state_mod.read_events(run_dir)
+        budget_stops = [e for e in events if e["kind"] == "stop"]
+        self.assertEqual(len(budget_stops), 1)
+        self.assertEqual(budget_stops[0]["data"], {"cause": "developer"})
 
         code, _out, err = self.run_cli_in_repo(
             ["send", "--text", "hi", "--reason", "nudge", "--token", token]
@@ -1206,7 +1264,15 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
         # outcome (floor passing or not) is exactly what a mandatory stop
         # still permits.
         code, out, err = self.run_cli_in_repo(
-            ["finalize", "--stop", "human should look at this", "--token", token]
+            [
+                "finalize",
+                "--stop",
+                "human should look at this",
+                "--cause",
+                "developer",
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, out + err)
         self.assertIn("STOPPED", out)
@@ -1282,10 +1348,15 @@ class HungReviewerTestCase(PmTestCase):
 
 class TestStopReapsHungReviewer(HungReviewerTestCase):
     def test_stop_kills_reviewer_process_group(self) -> None:
-        token, _run_dir, proc, pgid = self._start_hung_reviewer()
+        token, run_dir, proc, pgid = self._start_hung_reviewer()
         code, out, err = self.run_cli_in_repo(["stop", "--reason", "reaping test", "--token", token])
         self.assertEqual(code, 0, out + err)
         self._assert_reaped(pgid, proc, by="stop")
+        # A reviewer killed by a PM decision is PM's choice, not the
+        # reviewer's failure: its `review` command refuses and records nothing.
+        self.assertEqual(proc.returncode, 2)
+        events = state_mod.read_events(run_dir)
+        self.assertEqual([e for e in events if e["kind"] == "review-failed"], [])
 
 
 class TestAcceptReapsHungReviewer(FinalizeTestCase):

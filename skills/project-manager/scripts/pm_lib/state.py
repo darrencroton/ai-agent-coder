@@ -24,10 +24,10 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from . import IntegrityError, PmError
-from .git_ops import worktree_git_dir
+from .git_ops import git_common_dir_name, worktree_git_dir
 from .plan import format_grant
 
-SCHEMA = "lite-1"
+SCHEMA = "lite-2"
 RUN_STATUSES = {"active", "needs-human", "complete", "stopped"}
 SLICE_STATUSES = {"accepted", "attested", "stopped"}
 RISK_LEVELS = {"standard", "elevated"}
@@ -193,7 +193,7 @@ def create_run(
     slices: list[dict[str, Any]],
     run_id: str | None = None,
 ) -> tuple[dict[str, Any], str, Path]:
-    """Mint a token, build the lite-1 state dict, create the run dir, write it.
+    """Mint a token, build the lite-2 state dict, create the run dir, write it.
 
     `slices` is the pre-built slice-entry list; the caller derives each
     entry's status (None for pending, "attested" for operator-attested prior
@@ -216,6 +216,7 @@ def create_run(
         "updated_at": now,
         "status": "active",
         "repo": str(repo),
+        "repo_name": git_common_dir_name(repo),
         "branch": branch,
         "plan": {"path": str(plan_path), "sha256": plan_sha256, "slice_count": slice_count},
         "harness": harness,
@@ -370,20 +371,40 @@ def verify_state_mac(run_dir: Path, token: str) -> None:
 
 
 def append_event(
-    run_dir: Path, kind: str, *, slice_id: str | None = None, note: str = "", evidence: str | None = None
+    run_dir: Path,
+    kind: str,
+    *,
+    slice_id: str | None = None,
+    note: str = "",
+    evidence: str | None = None,
+    data: dict[str, Any] | None = None,
 ) -> None:
-    """Append one JSON line to events.jsonl. Never rewrites run.json."""
+    """Append one JSON line to events.jsonl. Never rewrites run.json.
+
+    `data` is a structured payload written verbatim under the `data` key; its
+    values must be JSON-serialisable. Like `evidence`, it is omitted when None.
+    """
     with _advisory_lock(run_dir / ".lock"):
-        _append_event_unlocked(run_dir, kind, slice_id=slice_id, note=note, evidence=evidence)
+        _append_event_unlocked(
+            run_dir, kind, slice_id=slice_id, note=note, evidence=evidence, data=data
+        )
 
 
 def _append_event_unlocked(
-    run_dir: Path, kind: str, *, slice_id: str | None = None, note: str = "", evidence: str | None = None
+    run_dir: Path,
+    kind: str,
+    *,
+    slice_id: str | None = None,
+    note: str = "",
+    evidence: str | None = None,
+    data: dict[str, Any] | None = None,
 ) -> None:
     """Append one event without acquiring the state lock."""
     event: dict[str, Any] = {"ts": utc_now_iso(), "kind": kind, "slice": slice_id, "note": note}
     if evidence is not None:
         event["evidence"] = evidence
+    if data is not None:
+        event["data"] = data
     with open(run_dir / "events.jsonl", "a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, sort_keys=True) + "\n")
 
@@ -721,10 +742,6 @@ def _render_reviewer_judgments(state: dict[str, Any], events: list[dict[str, Any
             "- Outside recorded code panels (informational): "
             + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in unranked)
         )
-    historical = judgments.historical_review_count(state)
-    if historical:
-        any_record = True
-        lines.append(f"- Historical/unjudged: {historical} review record(s) lack stable IDs")
     if not any_record:
         lines.append("(none; no stable review judgments recorded)")
     return lines

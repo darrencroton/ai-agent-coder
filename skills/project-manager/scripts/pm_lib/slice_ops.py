@@ -764,7 +764,11 @@ def start_slice(
             state["stop_reason"] = _BUDGET_EXHAUSTED_REASON
             state_mod.save_state(run_dir, state, token)
             state_mod.append_event(
-                run_dir, "stop", slice_id=plan_slice.slice_id, note=_BUDGET_EXHAUSTED_REASON
+                run_dir,
+                "stop",
+                slice_id=plan_slice.slice_id,
+                note=_BUDGET_EXHAUSTED_REASON,
+                data={"cause": "developer"},
             )
             return StartSliceOutcome(kind="attempts_exhausted", slice_id=plan_slice.slice_id)
     else:
@@ -865,7 +869,7 @@ def start_slice(
         sessions.send_prompt(session_name, prompts.render_launch_pointer(prompt_path))
 
         # `new_current` below discards the outgoing slice's recorded pgids.
-        _reap_reviewers(current if relaunch else None)
+        _reap_reviewers(run_dir, token, current if relaunch else None)
 
         now = state_mod.utc_now_iso()
         launch_kind = "relaunch" if relaunch else "launch"
@@ -926,6 +930,7 @@ def start_slice(
         slice_id=plan_slice.slice_id,
         note=note,
         evidence=str(prompt_path),
+        data={"developer": new_current["developer"]},
     )
 
     return StartSliceOutcome(
@@ -1229,10 +1234,6 @@ def is_review_fresh(review: dict[str, Any], head: str | None, grant_count: int) 
     timestamp: a review's stamp is written when it *completes*, which cannot
     answer whether its prompt showed a given grant.
 
-    A record with no `grants_seen` counts as 0, so a review predating this
-    field stays valid on a slice with no grants and fails closed the moment one
-    is recorded.
-
     `grant_count` is deliberately NOT defaulted: a caller that omitted it would
     silently accept a review the grants should have staled, and this predicate
     gates acceptance.
@@ -1240,7 +1241,7 @@ def is_review_fresh(review: dict[str, Any], head: str | None, grant_count: int) 
     if not isinstance(review, dict) or head is None or review.get("head") != head:
         return False
     seen = review.get("grants_seen")
-    if (seen if isinstance(seen, int) else 0) != grant_count:
+    if type(seen) is not int or seen != grant_count:
         return False
     artifact = review.get("artifact")
     if not artifact or not Path(artifact).is_file():
@@ -1442,7 +1443,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     entry["summary"] = first_line
 
     session = current.get("tmux_session")
-    _reap_reviewers(current)
+    _reap_reviewers(run_dir, token, current)
     state["current_slice"] = None
     if session:
         sessions.force_stop(session)
@@ -1523,7 +1524,13 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
         state["status"] = "needs-human"
         state["stop_reason"] = _BUDGET_EXHAUSTED_REASON
         state_mod.save_state(run_dir, state, token)
-        state_mod.append_event(run_dir, "stop", slice_id=slice_id, note=_BUDGET_EXHAUSTED_REASON)
+        state_mod.append_event(
+            run_dir,
+            "stop",
+            slice_id=slice_id,
+            note=_BUDGET_EXHAUSTED_REASON,
+            data={"cause": "developer"},
+        )
         return SteerOutcome(
             kind="budget_exhausted", slice_id=slice_id, message="attempt budget exhausted; steer refused"
         )
@@ -1615,9 +1622,22 @@ class StopDecisionOutcome:
     pane_path: Path
 
 
-def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: str | None = None) -> StopDecisionOutcome:
-    """`finalize --stop "reason"`: records exactly what happened, floor
-    passing or not — that is the point of a stop record."""
+def finalize_stop(
+    repo: Path,
+    run_dir: Path,
+    token: str,
+    *,
+    reason: str,
+    cause: str,
+    risk: str | None = None,
+) -> StopDecisionOutcome:
+    """`finalize --stop "reason" --cause <cause>`: records exactly what
+    happened, floor passing or not — that is the point of a stop record.
+
+    `cause` (`plan`, `developer` or `environment`, restricted by the CLI's
+    `--cause` choices) is stored only as `data.cause` on the `slice-stop`
+    event, never on the slice entry or in the assessment.
+    """
     # A stop is an accountability record like an acceptance, so a blank
     # reason is refused rather than written into the assessment as an empty
     # decision line. No minimum length: the honest reason for some stops
@@ -1666,14 +1686,21 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
     session = current.get("tmux_session")
     if session:
         sessions.force_stop(session)
-    _reap_reviewers(current)
+    _reap_reviewers(run_dir, token, current)
 
     state["status"] = "needs-human"
     state["stop_reason"] = reason
     state["current_slice"] = None
 
     state_mod.save_state(run_dir, state, token)
-    state_mod.append_event(run_dir, "slice-stop", slice_id=slice_id, note=first_line, evidence=str(assessment_original))
+    state_mod.append_event(
+        run_dir,
+        "slice-stop",
+        slice_id=slice_id,
+        note=first_line,
+        evidence=str(assessment_original),
+        data={"cause": cause},
+    )
     regenerate_report(repo, run_dir, state)
 
     return StopDecisionOutcome(
@@ -1685,16 +1712,29 @@ def finalize_stop(repo: Path, run_dir: Path, token: str, *, reason: str, risk: s
 # --- stop -----------------------------------------------------------------
 
 
-def _reap_reviewers(current: dict[str, Any] | None) -> None:
+def _reap_reviewers(run_dir: Path, token: str, current: dict[str, Any] | None) -> None:
     """Kill the reviewer process groups recorded on `current`, and forget them.
 
     Every path that ends or replaces `current_slice` must call this: dropping
     the pgids without killing them strands a reviewer running against a
     checkout nobody is holding still, with nothing able to find it again.
+
+    The cleared `reviewer_pids` is persisted under the state lock BEFORE any
+    process group is killed. A killed `pm review` wakes at once and decides
+    whether its failed exit was a PM reap by reading the persisted
+    `reviewer_pids`; persisting only with the caller's later `save_state`
+    would let it see its own pgid still recorded and log the reap as a
+    `review-failed` commission.
     """
     if not current:
         return
-    for pgid in list(current.get("reviewer_pids") or []):
+    pgids = list(current.get("reviewer_pids") or [])
+    if pgids:
+        with state_mod.locked_update(run_dir, token) as locked_state:
+            locked_current = locked_state.get("current_slice")
+            if locked_current is not None:
+                locked_current["reviewer_pids"] = []
+    for pgid in pgids:
         _kill_reviewer_pgid(pgid)
     current["reviewer_pids"] = []
 
@@ -1738,7 +1778,7 @@ def stop(
     # Guarded on a recorded pgid so a `current_slice` that never carried the
     # key is left exactly as found, rather than gaining an empty one here.
     if current and current.get("reviewer_pids"):
-        _reap_reviewers(current)
+        _reap_reviewers(run_dir, token, current)
 
     killed: list[str] = []
     for name in sessions.sessions_for_run(run_id):

@@ -1,4 +1,4 @@
-# Run State Reference (`lite-1`)
+# Run State Reference (`lite-2`)
 
 Authoritative run state is a **single copy outside the worktree**: `<worktree-git-dir>/pm/<run-id>/` (found via `git rev-parse --absolute-git-dir`, so each linked worktree gets its own state). `<worktree-git-dir>/pm/current` names the active run; every run-scoped command (all except `check-plan` and `init`) defaults to it and accepts `--run <id>`.
 
@@ -8,7 +8,7 @@ Authoritative run state is a **single copy outside the worktree**: `<worktree-gi
 |---|---|---|
 | `run.json` | toolkit only | the run's authoritative state (schema below) |
 | `run.json.mac` | toolkit only | HMAC-SHA256 of `run.json`, keyed by the run capability token |
-| `events.jsonl` | toolkit only | append-only log: `{ts, kind, slice, note, evidence?}` |
+| `events.jsonl` | toolkit only | append-only log: `{ts, kind, slice, note, evidence?, data?}`; `data` is a structured object, omitted when absent: `launch`/`relaunch` carry `{developer: {tool, model, effort}}` (the session's identity at that launch); a budget-exhaustion `stop` carries `{cause: "developer"}` and `slice-stop` carries `{cause}` from `finalize --stop --cause plan\|developer\|environment`; `review-failed` records a commissioned reviewer that timed out or exited non-zero as `{skill, tool, model, effort, command_override, origin_event_index, reason}` with `reason` `timeout` or `exit <code>` (a reviewer reaped by a PM decision records nothing) |
 | `notes.md` | the PM agent (via `pm notes`) | curated run knowledge fed to each new Developer session (mirrored into `.pm/`) |
 | `run-report.md` | toolkit | human-facing report, regenerated from controller-owned data only |
 | `slices/slice-NNN/assessment.md` | toolkit (PM reasoning embedded) | the accountability record per decided slice |
@@ -28,11 +28,11 @@ A run id is `<UTC timestamp>-<random nonce>`. The nonce is load-bearing, not dec
 
 ```json
 {
-  "schema": "lite-1",
+  "schema": "lite-2",
   "run_id": "20260718T090000Z-3f9a1c",
   "created_at": "…", "updated_at": "…",
   "status": "active | needs-human | complete | stopped",
-  "repo": "/abs/path", "branch": "feature/x",
+  "repo": "/abs/path", "repo_name": "my-repo", "branch": "feature/x",
   "plan": {"path": "/abs/plan.md", "sha256": "…", "slice_count": 5},
   "harness": {"name": "codex", "model": null, "effort": null, "command_override": null},
   "reviewer": {"tools": ["copilot"], "model": null, "effort": null},
@@ -82,7 +82,9 @@ Validation is tolerant: only the fields PM reads are checked; unknown extras pas
 - **Grants:** recorded per slice in `grants` (path, evidence, `at`); each authorizes exactly one file path — never a directory or glob — and they only ever widen a slice's effective authorized surface, never narrow it. The first grant on a slice ratchets `risk` to `elevated` the same way an explicit raise does, and every grant stales every review already recorded for the slice: a review records `grants_seen`, the number of grants its own prompt was rendered from, and counts as fresh only while that equals the slice's current grant count — so both mandatory reviews must be re-commissioned after the last grant, even on a slice that was already elevated. Because grants are append-only, that count is a monotonic authorization revision and no clock is involved: a review still running when a grant lands is staled by what its prompt showed, not by when it happened to finish. The plan digest is untouched — a grant never touches the plan file. Compatibility is one-directional: absent `grants` stays valid state, and an older toolkit that does not know the field ignores it and enforces the narrower original surface, which fails closed rather than open. One honest limit: a grant persists on the slice entry through `finalize --stop` → human review → a later `start-slice` re-run, so the re-run inherits the widening along with a fresh attempt budget — visible in the report and assessment, but never re-confirmed by the human who cleared the stop.
 - **Recovery:** `run.json` + the artifact dir + git are sufficient. `status` reconstructs the situation and checks session liveness. With state deleted or unreadable, `stop --scavenge` still sweeps that run's sessions (or, with no run id, all `pm-*`).
 - **Superseded attempts** live in `attempt-<n>/` subdirectories of the slice's `.pm/` artifact dir and in the event log — never as state rows.
+- **Repo name:** `repo_name`, recorded once at `init`, is the basename of the directory holding the git common dir, so it names the main repository even when the run lives in a linked worktree (where `repo` is the worktree's own top level).
+- **Known limits:** a review commission whose controlling `pm review` process itself dies leaves no record — neither a review nor a `review-failed` event. The event log is unsigned, so a steer-event append that fails right after a delivered steer merges that submission into the previous one, and this is caught, if at all, by the gate's head check.
 
 ## Developer and reviewer judgments (additive)
 
-Successful review records additionally carry stable commission identity and commission-time opportunity context. Each slice may carry `review_judgments`, a versioned list of PM-authored drift/code ratings, independent code-panel tie groups or explicit unavailable judgments. New reviewer judgments name their `assessment` as `rating` or `comparison`; old records retain their established meaning. A slice may also carry `developer_judgments`: PM-authored 0–2 ratings or unavailable assessments with immutable submission and Developer identity snapshots. The originating launch/relaunch/steer event identifies an attempt independently of the budget counter. Current launches record their effective Developer tool/model/effort so later judgment records retain the correct attribution. Individual code ratings and panel comparisons have separate active coverage and supersession. See [review-judgments.md](review-judgments.md) for the exact input/storage contract, corrections and harvest path. Absent new fields remain historical/unjudged in `lite-1`; no migration or automatic backfill occurs. Judgments do not change review freshness or acceptance rules.
+Successful review records additionally carry stable commission identity and commission-time opportunity context. Each slice may carry `review_judgments`, a versioned list of PM-authored drift/code ratings, independent code-panel tie groups or explicit unavailable judgments. Reviewer judgments name their `assessment` as `rating` or `comparison`. A slice may also carry `developer_judgments`: PM-authored 0–2 ratings or unavailable assessments with immutable submission and Developer identity snapshots. The originating launch/relaunch/steer event identifies an attempt independently of the budget counter. Current launches record their effective Developer tool/model/effort so later judgment records retain the correct attribution. Individual code ratings and panel comparisons have separate active coverage and supersession. See [review-judgments.md](review-judgments.md) for the exact input/storage contract, corrections and harvest path. Judgments do not change review freshness or acceptance rules.
