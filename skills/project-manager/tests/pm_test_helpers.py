@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import atexit
 import io
+import json
 import os
 import re
 import stat
@@ -307,6 +308,24 @@ def render_slice(
 {rollback}
 
 """
+
+
+def _judge(test: "PmTestCase", command: str, filename: str, token: str, run_dir: Path, data: dict):
+    path = test.repo.parent / filename
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return test.run_cli_in_repo(
+        [command, "--file", str(path), "--run", run_dir.name, "--token", token]
+    )
+
+
+def judge_reviews(test: "PmTestCase", token: str, run_dir: Path, data: dict) -> tuple[int, str, str]:
+    """Record one `judge-reviews` input through the CLI; returns (code, out, err)."""
+    return _judge(test, "judge-reviews", "judgment.json", token, run_dir, data)
+
+
+def judge_developer(test: "PmTestCase", token: str, run_dir: Path, data: dict) -> tuple[int, str, str]:
+    """Record one `judge-developer` input through the CLI; returns (code, out, err)."""
+    return _judge(test, "judge-developer", "developer-judgment.json", token, run_dir, data)
 
 
 class PlanTestCase(unittest.TestCase):

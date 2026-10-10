@@ -656,7 +656,7 @@ def _judgment_attempt_label(judgment: dict[str, Any], entry: dict[str, Any], eve
     review_ids = (
         judgment.get("review_ids") if judgment.get("status") == "unavailable"
         else [judgment.get("review_id")] if "review_id" in judgment
-        else [review_id for group in judgment.get("rank_groups") or [] for review_id in group]
+        else list(judgment.get("order") or [])
     )
     reviews = {review.get("review_id"): review for review in entry.get("reviews") or [] if isinstance(review, dict)}
     origins = [reviews.get(review_id, {}).get("origin_event") for review_id in review_ids]
@@ -723,13 +723,13 @@ def _render_reviewer_judgments(state: dict[str, Any], events: list[dict[str, Any
                 label_text = "drift" if judgment.get("skill") == "drift-audit" else "code"
                 detail = f"{label_text} {_review_display(review_id, reviews)} score {judgment.get('score')}"
             else:
-                groups = judgment.get("rank_groups") or []
-                order = " > ".join(
-                    " = ".join(_review_display(review_id, reviews) for review_id in group) for group in groups
-                )
+                close = set(judgment.get("close") or [])
+                order = ""
+                for position, review_id in enumerate(judgment.get("order") or []):
+                    if position:
+                        order += " ≈ " if review_id in close else " > "
+                    order += _review_display(review_id, reviews)
                 detail = f"code panel {order}"
-                if len(groups) == 1 and len(groups[0]) == 1:
-                    detail += " (singleton/unranked)"
             lines.append(prefix + detail + f" — {judgment.get('reason', '')}")
     missing = judgments.unjudged_review_ids(state)
     if missing:
@@ -739,7 +739,7 @@ def _render_reviewer_judgments(state: dict[str, Any], events: list[dict[str, Any
     if unranked:
         any_record = True
         lines.append(
-            "- Outside recorded code panels (informational): "
+            "- Code panels without an order: "
             + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in unranked)
         )
     if not any_record:

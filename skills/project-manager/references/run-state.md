@@ -66,8 +66,8 @@ A run id is `<UTC timestamp>-<random nonce>`. The nonce is load-bearing, not dec
      "review_judgments": [{
        "schema_version": 1, "judgment_id": "judgment-1", "at": "…",
        "skill": "code-review", "assessment": "comparison",
-       "rank_groups": [["review-1"]],
-       "reason": "Sound checking; singleton provides no comparative score."
+       "order": ["review-1", "review-2"], "close": ["review-2"],
+       "reason": "Review 1 found the verified defect; review 2 was too close to call against it."
      }],
      "grants": [{"path": "…", "evidence": "…", "at": "…"}],
      "assessment": "<state-dir>/slices/slice-001/assessment.md", "summary": "…"}
@@ -94,4 +94,4 @@ Validation is tolerant: only the fields PM reads are checked; unknown extras pas
 
 ## Developer and reviewer judgments (additive)
 
-Successful review records additionally carry stable commission identity and commission-time opportunity context. Each slice may carry `review_judgments`, a versioned list of PM-authored drift/code ratings, independent code-panel tie groups or explicit unavailable judgments. Reviewer judgments name their `assessment` as `rating` or `comparison`. A slice may also carry `developer_judgments`: PM-authored 0–2 ratings or unavailable assessments with immutable submission and Developer identity snapshots. The originating launch/relaunch/steer event identifies an attempt independently of the budget counter. Current launches record their effective Developer tool/model/effort so later judgment records retain the correct attribution. Individual code ratings and panel comparisons have separate active coverage and supersession. See [review-judgments.md](review-judgments.md) for the exact input/storage contract, corrections and harvest path. Judgments do not change review freshness or acceptance rules.
+Successful review records additionally carry stable commission identity and commission-time opportunity context. Each slice may carry `review_judgments`, a versioned list of PM-authored drift/code ratings, independent code-panel orders (strict best-first, with close calls flagged) or explicit unavailable judgments. Reviewer judgments name their `assessment` as `rating` or `comparison`. A slice may also carry `developer_judgments`: PM-authored 0–2 ratings, each with `criteria_met` and a `defects` count per severity (`P0`–`P3`), or unavailable assessments with immutable submission and Developer identity snapshots. The originating launch/relaunch/steer event identifies an attempt independently of the budget counter. Current launches record their effective Developer tool/model/effort so later judgment records retain the correct attribution. Individual code ratings and panel comparisons have separate active coverage and supersession. See [review-judgments.md](review-judgments.md) for the exact input/storage contract, corrections and harvest path. Judgments do not change review freshness or acceptance rules.

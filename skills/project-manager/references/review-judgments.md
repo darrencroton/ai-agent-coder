@@ -1,6 +1,6 @@
 # Developer and reviewer judgments
 
-Record PM’s assessment of each Developer submission and each reviewer report as a 0–2 rating in signed `run.json`. Code-review panels also retain their independent best-first ordering and ties. These subjective judgments do not determine acceptance, review freshness or model selection.
+Record PM’s assessment of each Developer submission and each reviewer report as a 0–2 rating in signed `run.json`. Code-review panels also retain a strict best-first order with close calls flagged; Developer scores also retain the criteria met and the confirmed defects. These subjective judgments do not determine acceptance, review freshness or model selection.
 
 ## Judgment rubric and timing
 
@@ -13,7 +13,7 @@ Use **0 — unacceptable**, **1 — acceptable**, and **2 — excellent**, with 
 
 Rate the contribution against the instructions and evidence available to PM. A sound, thorough clean review can earn 2; finding a real defect and returning FAIL can also earn 2. Never derive utility mechanically from verdict, finding count/severity or Developer acceptance. Do not invent omissions PM has not established. An accepted Developer submission does not automatically earn 2; an earlier failed submission does not prevent an excellent correction earning 2.
 
-Judge each drift report before deciding on code review. Rate each code report, and separately order the chosen panel’s usefulness best first with ties. Weigh valid in-scope findings, reproducible evidence, actionable advice, false positives/overreach and established material omissions. Two reports can both earn 2 while one ranks higher. A singleton has an absolute rating but no comparative score. Do not commission extra reviews merely to fill a ranking.
+Judge each drift report before deciding on code review. Rate each code report, and separately order every intact code report that shares a commission context, strictly best first. Weigh valid in-scope findings, reproducible evidence, actionable advice, false positives/overreach and established material omissions. Two reports can both earn 2 while one ranks higher. A lone report is rated, never ordered. See [SKILL.md](../SKILL.md) for when each record is due.
 
 Rate an assessed Developer submission before accepting, steering, relaunching or stopping it, including when PM’s own checks needed no commissioned review. Repeated checks or reviewer commissions do not create additional Developer ratings. Preserve earlier attempts instead of replacing their scores with the final outcome. Give one concise reason identifying the evidence behind each rating or comparison. Missing judgments never prevent emergency stopping.
 
@@ -41,21 +41,22 @@ An individual reviewer rating uses the same payload for either review skill:
 }
 ```
 
-For drift, use `"skill": "drift-audit"` and its review ID. Record a code-panel comparison independently:
+For drift, use `"skill": "drift-audit"` and its review ID. Record a code-panel order independently:
 
 ```json
 {
   "schema_version": 1,
   "slice": "Slice 1",
   "skill": "code-review",
-  "rank_groups": [["review-2"], ["review-3", "review-4"]],
-  "reason": "Review 2 found the verified defect; 3 and 4 supplied equally useful checks."
+  "order": ["review-2", "review-3", "review-4"],
+  "close": ["review-4"],
+  "reason": "Review 2 found the verified defect; 3 and 4 both supplied checks, too close to call."
 }
 ```
 
-Use `[["review-2"]]` for a singleton. Each participating successful commission appears exactly once; PM chooses the panel, not every review ever commissioned for the slice. A panel’s order never supplies its members’ absolute ratings.
+`order` lists at least two distinct review IDs, best first, each a successful code-review commission of the slice; the order is strict. `close` lists, possibly as an empty list but always supplied, the IDs that are too close to call against the member immediately above them; each must appear in `order` at position 1 or later. A panel’s order never supplies its members’ absolute ratings, and `rank_groups` is not accepted.
 
-An unavailable individual rating uses `assessment: "rating"`, `status: "unavailable"` and one `review_ids` entry. An unavailable code comparison uses the following form:
+An unavailable rating, for either skill, uses `"assessment": "rating"`, `"status": "unavailable"` and exactly one `review_ids` entry. An unavailable code comparison uses the following form:
 
 ```json
 {
@@ -69,7 +70,7 @@ An unavailable individual rating uses `assessment: "rating"`, `status: "unavaila
 }
 ```
 
-Unavailable judgments have no score or rank. An unavailable comparison does not make its individual reports unrateable. For compatibility, unavailable drift input without `assessment` means a rating; unavailable code input without it means a comparison. Unknown IDs and altered/missing report artifacts remain named errors, not unavailable judgments. A failed subprocess without a successful review record remains outside the reviewer population. Unjudged means the relevant rating or comparison has not been recorded.
+`assessment` is required on every unavailable record; drift-audit supports `"rating"` only. Unavailable judgments have no score, order or close list. An unavailable comparison does not make its individual reports unrateable. Unknown IDs and altered/missing report artifacts remain named errors, not unavailable judgments. A failed subprocess without a successful review record remains outside the reviewer population. Unjudged means the relevant rating or comparison has not been recorded.
 
 ## Developer input and submission identity
 
@@ -81,25 +82,41 @@ Use `judge-developer --file /tmp/developer-judgment.json` with the originating e
   "slice": "Slice 1",
   "origin_event_index": 1,
   "score": 1,
+  "criteria_met": 3,
+  "defects": {"P0": 0, "P1": 0, "P2": 1, "P3": 2},
   "reason": "Implementation meets the slice contract; PM reran validation and verified the diff."
 }
 ```
 
+`criteria_met` counts the slice’s checkbox acceptance criteria this submission met, from 0 up to the slice’s `criteria_total`. `defects` counts the distinct defects PM confirmed in this submission, code or scope, whether PM found them or confirmed a reviewer’s finding, by severity; all four keys `P0`, `P1`, `P2` and `P3` are required, each a non-negative integer.
+
 The index is zero-based in the mapping entries returned by `read_events`, not a human attempt number or PM’s resettable budget counter. It identifies the submission’s launch/relaunch/steer event. A new judgment must reference the current Developer attempt; historical exact retries and corrections resolve an existing judgment. This intentionally avoids guessing historical commits or model identities after a submission has passed without a rating.
 
-For an assessment PM cannot make, replace `score` with `"status": "unavailable"` and explain why. Unavailable is not 0; operational failure without assessable work is not automatically a bad substantive contribution. Historical attempts missed before their decision remain explicitly unjudged.
+For an assessment PM cannot make, replace `score`, `criteria_met` and `defects` with `"status": "unavailable"` and explain why; an unavailable record carrying either of those fields is refused:
+
+```json
+{
+  "schema_version": 1,
+  "slice": "Slice 1",
+  "origin_event_index": 1,
+  "status": "unavailable",
+  "reason": "The session died before producing assessable work."
+}
+```
+
+Unavailable is not 0; operational failure without assessable work is not automatically a bad substantive contribution. Historical attempts missed before their decision remain explicitly unjudged.
 
 Developer judgments retain the originating event, evaluated `head`, `before_head`, authorization revision (`grants_seen`), and the resolved Developer tool/model/effort recorded at launch. Steers inherit the session’s identity. A model given alongside a custom command is recorded, never forced to null; effort omitted on the COMPOSED (non-override) path is recorded as the literal string `"default"` -- a known, repeatable fact, since no effort flag was sent -- while effort omitted under a custom command stays null, since no harness profile verifies what the command actually runs. HEAD identifies the recorded Git revision, not proof that the working tree was clean or that the implementation was correct. The rationale states the evidence PM actually checked.
 
 ## Stored contract and coverage
 
-Reviewer judgments remain in `slices[].review_judgments`. Records carry `assessment: "rating"` or `"comparison"`, `schema_version: 1`, generated `judgment_id: "judgment-N"`, UTC `at`, `skill`, `reason`, and the applicable input payload. Developer judgments live in `slices[].developer_judgments` with generated `developer-judgment-N` IDs, timestamp, reason, score/status and the stored `submission` and `developer` context. Slice identity is inherited from the enclosing entry. No normalized points or model averages are stored.
+Reviewer judgments remain in `slices[].review_judgments`. Records carry `assessment: "rating"` or `"comparison"`, `schema_version: 1`, generated `judgment_id: "judgment-N"`, UTC `at`, `skill`, `reason`, and the applicable input payload. Developer judgments live in `slices[].developer_judgments` with generated `developer-judgment-N` IDs, timestamp, reason, score (with `criteria_met` and `defects`) or status, and the stored `submission` and `developer` context. Slice identity is inherited from the enclosing entry. No normalized points or model averages are stored.
 
 Successful `reviews[]` entries retain stable `review_id: "review-N"`, tool/model/effort, `command_override` (true iff `--reviewer-command` built this commission -- `tool` alone can name a real profile even under an override, so it cannot carry this signal by itself), `origin_event: {index, kind, slice}` and `review_context: {pm_adjudications, drift_review}`. `pm_adjudications` is null or supplied text; `drift_review` is null or `{review_id, artifact, sha256}` identifying the drift report handed to a code reviewer. Join reviewer judgments by `(run_id, slice.id, review_id)` and Developer judgments by `(run_id, slice.id, submission.origin_event.index)`, never by list position, model or artifact content.
 
-A ranked panel must share originating attempt, `head`, `before_head`, `grants_seen` and adjudication/drift-report context. The toolkit resolves these from review records and verifies report hashes. Differing contexts can be marked unavailable instead of forcing a ranking. Independent absolute ratings need no shared panel context.
+An ordered panel must share originating attempt, `head`, `before_head`, `grants_seen` and adjudication/drift-report context. The toolkit resolves these from review records and verifies report hashes. Differing contexts can be marked unavailable instead of forcing an order. Independent absolute ratings need no shared panel context.
 
-`status` and the generated `run-report.md` distinguish missing absolute ratings, code reports outside recorded panels, unavailable, singleton/unranked and superseded records. Reports outside panels are informational comparison coverage, not a requirement to rank every report; a deliberately excluded report needs its individual rating but no invented comparison. Human attempt labels count launch/relaunch/steer events for the slice starting at 1; machine budget counters keep their existing semantics.
+`status` and the generated `run-report.md` distinguish missing absolute ratings, code panels without an order, unavailable and superseded records, and render an order as `a > b ≈ c` (`≈` marks a close call against the member before it). A panel is two or more intact code reports of one submission that share a commission context; a lone report needs only its rating. Human attempt labels count launch/relaunch/steer events for the slice starting at 1; machine budget counters keep their existing semantics.
 
 ## Corrections, recovery and harvesting
 

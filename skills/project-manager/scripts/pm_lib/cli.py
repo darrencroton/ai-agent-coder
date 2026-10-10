@@ -350,11 +350,11 @@ def _run_status(args: argparse.Namespace) -> int:
     unranked = judgments.unranked_code_review_ids(state)
     if unranked:
         print(
-            "code reviews outside recorded panels (informational): "
+            "code panels without an order: "
             + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in unranked)
         )
     else:
-        print("code reviews outside recorded panels (informational): none")
+        print("code panels without an order: none")
 
     events = state_mod.read_events(run_dir)
     missing_developers = judgments.unjudged_developer_origins(state, events)
