@@ -103,21 +103,13 @@ def _require_judged(
 
     try:
         # A malformed event log is a named error (exit 2), never a traceback.
-        gaps = judgments.current_submission_gaps(
-            state, judgments._read_events_or_raise(run_dir), repo, slice_id
-        )
+        gaps = judgments.current_submission_gaps(state, judgments.read_events_or_raise(run_dir), repo, slice_id)
+        if gaps:
+            raise PmError(f"refused: the current submission of {slice_id} is unjudged — " + "; ".join(gaps))
     except PmError:
         if ratcheted:
             state_mod.save_state(run_dir, state, token)
         raise
-    if not gaps:
-        return
-    if ratcheted:
-        state_mod.save_state(run_dir, state, token)
-    raise PmError(
-        f"refused: the current submission of {slice_id} is unjudged — "
-        + "; ".join(gaps)
-    )
 
 
 # --- Path helpers ------------------------------------------------------------
@@ -329,12 +321,15 @@ def init_run(
     reviewer_model: str | None,
     reviewer_effort: str | None,
     harness_command: str | None,
+    model_tag: str | None,
+    run_tag: str | None,
 ) -> InitResult:
     """Preflight, branch setup, and state/artifact creation for `init`.
 
     Callers are expected to have already run `plan.plan_check_report` and
     stopped on errors (this function assumes the plan is clean); it does
-    not re-check the plan.
+    not re-check the plan. `model_tag` (the run's default Developer tag) and
+    `run_tag` are stored as given, already validated by `state.tag_value`.
     """
     if not _executable_exists("tmux"):
         raise PmError("tmux is required to run PM; install it before running init")
@@ -382,7 +377,13 @@ def init_run(
         for plan_slice in slices
     ]
 
-    harness_block = {"name": harness, "model": model, "effort": effort, "command_override": harness_command}
+    harness_block = {
+        "name": harness,
+        "model": model,
+        "effort": effort,
+        "model_tag": model_tag,
+        "command_override": harness_command,
+    }
     reviewer_block = {
         "tools": list(profiles.parse_reviewer_tools(reviewer_tools)),
         "model": reviewer_model,
@@ -400,15 +401,16 @@ def init_run(
         reviewer=reviewer_block,
         policy=policy_block,
         slices=entries,
+        run_tag=run_tag,
     )
 
     write_pm_gitignore(repo)
     (run_artifact_dir(repo, state["run_id"]) / "slices").mkdir(parents=True, exist_ok=True)
-    state_mod.append_event(
-        run_dir, "init", note=f"harness={harness} branch={resolved_branch} slices={len(slices)}"
-    )
+    state_mod.append_event(run_dir, "init", note=f"harness={harness} branch={resolved_branch} slices={len(slices)}")
 
-    return InitResult(run_id=state["run_id"], run_dir=run_dir, token=token, state=state, slices=slices, branch=resolved_branch)
+    return InitResult(
+        run_id=state["run_id"], run_dir=run_dir, token=token, state=state, slices=slices, branch=resolved_branch
+    )
 
 
 def _executable_exists(executable: str) -> bool:
@@ -720,6 +722,7 @@ def start_slice(
     *,
     model: str | None = None,
     effort: str | None = None,
+    model_tag: str | None = None,
     reviewer_tools: str | None = None,
     harness_command: str | None = None,
     risk: str | None = None,
@@ -815,9 +818,7 @@ def start_slice(
             )
             return StartSliceOutcome(kind="attempts_exhausted", slice_id=plan_slice.slice_id)
         # A supplied --risk was ratcheted above: any other value raised there.
-        _require_judged(
-            repo, run_dir, token, state, plan_slice.slice_id, ratcheted=risk is not None
-        )
+        _require_judged(repo, run_dir, token, state, plan_slice.slice_id, ratcheted=risk is not None)
     else:
         attempts = 0
 
@@ -882,6 +883,7 @@ def start_slice(
     effective_override = harness_command or harness_block.get("command_override")
     launch_model = model or harness_block.get("model")
     launch_effort = effort or harness_block.get("effort")
+    launch_model_tag = model_tag or harness_block.get("model_tag")
 
     expected_model_display: str | None = None
     if effective_override:
@@ -941,9 +943,12 @@ def start_slice(
                 # legitimately be unset with no override (no model
                 # configured at all).
                 "effort": launch_effort if effective_override else (launch_effort or "default"),
+                "model_tag": launch_model_tag,
             },
         }
-        launch_overrides: dict[str, Any] = {key: value for key, value in (("model", model), ("effort", effort)) if value}
+        launch_overrides: dict[str, Any] = {
+            key: value for key, value in (("model", model), ("effort", effort)) if value
+        }
         if reviewer_tools:
             # review._resolve_tool prefers this per-slice record over the
             # run-level reviewer configuration.
@@ -957,6 +962,21 @@ def start_slice(
         # stop/needs-human pause; tampered state can never reach here (the MAC
         # check above fails closed before any launch).
         state["status"] = "active"
+        # The origin event is appended BEFORE the state save: a saved
+        # submission whose event append then failed would hide a live session
+        # under the previous origin's judgment, whereas an event whose save
+        # then failed is a visible phantom origin that is judged unavailable.
+        note = f"attempt {attempts}"
+        if reaped:
+            note += f"; reaped stale sessions: {', '.join(reaped)}"
+        state_mod.append_event(
+            run_dir,
+            launch_kind,
+            slice_id=plan_slice.slice_id,
+            note=note,
+            evidence=str(prompt_path),
+            data={"developer": new_current["developer"]},
+        )
         state_mod.save_state(run_dir, state, token)
     except BaseException:
         # Best-effort cleanup that must never replace the failure it is
@@ -968,17 +988,6 @@ def start_slice(
         except BaseException:
             pass
         raise
-    note = f"attempt {attempts}"
-    if reaped:
-        note += f"; reaped stale sessions: {', '.join(reaped)}"
-    state_mod.append_event(
-        run_dir,
-        launch_kind,
-        slice_id=plan_slice.slice_id,
-        note=note,
-        evidence=str(prompt_path),
-        data={"developer": new_current["developer"]},
-    )
 
     return StartSliceOutcome(
         kind="relaunched" if relaunch else "launched",
@@ -1000,9 +1009,7 @@ class ObserveOutcome:
     pane_changed: bool = False
     result_present: bool = False
     result_status: str | None = None
-    dialog_markers: dict[str, Any] = field(
-        default_factory=lambda: {"present": False, "kinds": [], "markers": []}
-    )
+    dialog_markers: dict[str, Any] = field(default_factory=lambda: {"present": False, "kinds": [], "markers": []})
     tail: str = ""
     slice_id: str | None = None
     elapsed_seconds: float = 0.0
@@ -1237,9 +1244,7 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
 
-    state_mod.append_event(
-        run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir)
-    )
+    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
     # updated_at bump (and, when --risk was given, the ratchet) only — no
     # other semantic field changes in bare finalize.
     state_mod.save_state(run_dir, state, token)
@@ -1321,8 +1326,7 @@ def _reviews_consulted_text(
             else " [SUPERSEDED - stale for current HEAD or a later surface grant]"
         )
         lines.append(
-            f"- {review.get('skill')}/{review.get('tool')} @ {review.get('head')} -> "
-            f"{review.get('artifact')}{stale}"
+            f"- {review.get('skill')}/{review.get('tool')} @ {review.get('head')} -> {review.get('artifact')}{stale}"
         )
     return "\n".join(lines)
 
@@ -1440,15 +1444,15 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    state_mod.append_event(
-        run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir)
-    )
+    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
 
     if not report.passed:
         state_mod.save_state(run_dir, state, token)
         failed_names = ", ".join(fact.name for fact in report.facts if not fact.passed)
         return AcceptOutcome(
-            kind="floor_failed", slice_id=slice_id, report=report,
+            kind="floor_failed",
+            slice_id=slice_id,
+            report=report,
             message=f"floor failed for {slice_id}: {failed_names}; nothing accepted",
             pane_path=artifact_dir / "pane.txt",
         )
@@ -1467,7 +1471,9 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         if missing:
             state_mod.save_state(run_dir, state, token)
             return AcceptOutcome(
-                kind="reviews_stale", slice_id=slice_id, report=report,
+                kind="reviews_stale",
+                slice_id=slice_id,
+                report=report,
                 message=(
                     f"acceptance refused: missing or stale review(s) for {', '.join(missing)} "
                     f"against HEAD {head}; re-run review --skill <name> against the current HEAD"
@@ -1485,11 +1491,19 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
     grants_text = _grants_text(plan_mod.slice_grants(state, slice_id))
     assessment_text = _render_assessment(
-        entry, report, reasoning=stripped_reasoning, decision="ACCEPTED", head=head,
-        reviews_text=reviews_text, attempts_summary=attempts_summary, grants_text=grants_text,
+        entry,
+        report,
+        reasoning=stripped_reasoning,
+        decision="ACCEPTED",
+        head=head,
+        reviews_text=reviews_text,
+        attempts_summary=attempts_summary,
+        grants_text=grants_text,
     )
     assessment_relative = f"{slice_relative_dir(slice_id)}/assessment.md"
-    assessment_original = write_controller_artifact(repo, run_dir, state["run_id"], assessment_relative, assessment_text)
+    assessment_original = write_controller_artifact(
+        repo, run_dir, state["run_id"], assessment_relative, assessment_text
+    )
 
     first_line = stripped_reasoning.splitlines()[0][:120]
     entry["status"] = "accepted"
@@ -1519,8 +1533,13 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     regenerate_report(repo, run_dir, state)
 
     return AcceptOutcome(
-        kind="accepted", slice_id=slice_id, report=report, assessment_path=assessment_original,
-        message=f"{slice_id} accepted", pane_path=artifact_dir / "pane.txt", code_warning=code_warning,
+        kind="accepted",
+        slice_id=slice_id,
+        report=report,
+        assessment_path=assessment_original,
+        message=f"{slice_id} accepted",
+        pane_path=artifact_dir / "pane.txt",
+        code_warning=code_warning,
     )
 
 
@@ -1661,7 +1680,9 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     state_mod.append_event(run_dir, "steer", slice_id=slice_id, note=correction)
 
     return SteerOutcome(
-        kind="steered", slice_id=slice_id, attempts=attempts,
+        kind="steered",
+        slice_id=slice_id,
+        attempts=attempts,
         message=f"steered {slice_id} (attempt {attempts})",
         correction_path=correction_path,
     )
@@ -1720,9 +1741,7 @@ def finalize_stop(
     _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    state_mod.append_event(
-        run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir)
-    )
+    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
 
     head = git_ops.git_head(repo)
     reviews = list(entry.get("reviews") or [])
@@ -1731,11 +1750,19 @@ def finalize_stop(
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
     grants_text = _grants_text(plan_mod.slice_grants(state, slice_id))
     assessment_text = _render_assessment(
-        entry, report, reasoning=stripped_reason, decision="STOPPED", head=head,
-        reviews_text=reviews_text, attempts_summary=attempts_summary, grants_text=grants_text,
+        entry,
+        report,
+        reasoning=stripped_reason,
+        decision="STOPPED",
+        head=head,
+        reviews_text=reviews_text,
+        attempts_summary=attempts_summary,
+        grants_text=grants_text,
     )
     assessment_relative = f"{slice_relative_dir(slice_id)}/assessment.md"
-    assessment_original = write_controller_artifact(repo, run_dir, state["run_id"], assessment_relative, assessment_text)
+    assessment_original = write_controller_artifact(
+        repo, run_dir, state["run_id"], assessment_relative, assessment_text
+    )
 
     first_line = stripped_reason.splitlines()[0][:120] if stripped_reason else ""
     entry["status"] = "stopped"
@@ -1764,7 +1791,9 @@ def finalize_stop(
     regenerate_report(repo, run_dir, state)
 
     return StopDecisionOutcome(
-        slice_id=slice_id, assessment_path=assessment_original, report=report,
+        slice_id=slice_id,
+        assessment_path=assessment_original,
+        report=report,
         pane_path=artifact_dir / "pane.txt",
     )
 
@@ -1773,7 +1802,7 @@ def finalize_stop(
 
 
 def _reap_reviewers(run_dir: Path, token: str, current: dict[str, Any] | None) -> None:
-    """Kill the reviewer process groups recorded on `current`, and forget them.
+    """Kill the reviewer process groups persisted for the current slice; forget them.
 
     Every path that ends or replaces `current_slice` must call this: dropping
     the pgids without killing them strands a reviewer running against a
@@ -1786,10 +1815,11 @@ def _reap_reviewers(run_dir: Path, token: str, current: dict[str, Any] | None) -
     would let it see its own pgid still recorded and log the reap as a
     `review-failed` commission.
 
-    The pgids killed are the union of the caller's snapshot and those on disk
-    under the lock: a reviewer that registered after the caller loaded state
-    is cleared from disk too, so it must be killed rather than left running
-    with its eventual failure misread as a reap.
+    Only the pgids on disk under the lock are killed, never the caller's
+    snapshot: a reviewer that registered is there and one that deregistered
+    is gone, so a snapshot pgid absent from disk belongs to a reviewer that
+    has exited, and its pgid may since have been reused by an unrelated
+    process.
 
     The lock can time out (PmError) after a caller's irreversible steps (an
     assessment write, a session kill), leaving a partly applied decision that
@@ -1797,13 +1827,11 @@ def _reap_reviewers(run_dir: Path, token: str, current: dict[str, Any] | None) -
     """
     if not current:
         return
-    pgids = list(current.get("reviewer_pids") or [])
+    pgids: list[int] = []
     with state_mod.locked_update(run_dir, token) as locked_state:
         locked_current = locked_state.get("current_slice")
         if locked_current is not None:
-            for pgid in locked_current.get("reviewer_pids") or []:
-                if pgid not in pgids:
-                    pgids.append(pgid)
+            pgids = list(locked_current.get("reviewer_pids") or [])
             locked_current["reviewer_pids"] = []
     for pgid in pgids:
         _kill_reviewer_pgid(pgid)
@@ -1846,9 +1874,7 @@ def stop(
 
     # Applies whenever state is readable, including the
     # --scavenge-with-readable-state path (cli.py routes that through here).
-    # Guarded on a recorded pgid so a `current_slice` that never carried the
-    # key is left exactly as found, rather than gaining an empty one here.
-    if current and current.get("reviewer_pids"):
+    if current:
         _reap_reviewers(run_dir, token, current)
 
     killed: list[str] = []
@@ -1859,10 +1885,11 @@ def stop(
     if state.get("status") != "complete":
         state["status"] = "stopped"
     state["stop_reason"] = reason
+    applied_status: str | None = None
     if slice_status and current and current.get("id"):
         entry = slice_entry(state, current["id"])
         if entry is not None:
-            entry["status"] = slice_status
+            entry["status"] = applied_status = slice_status
 
     state_mod.save_state(run_dir, state, token)
     state_mod.append_event(
@@ -1871,6 +1898,9 @@ def stop(
         slice_id=current.get("id") if current else None,
         note=reason,
         evidence=", ".join(killed) if killed else None,
+        # The slice status set here is a fact born in this command, so the
+        # ledger reads it from the event, never from the mutable entry.
+        data={"slice_status": applied_status} if applied_status else None,
     )
     regenerate_report(repo, run_dir, state)
     return StopOutcome(run_id=run_id, killed=killed)

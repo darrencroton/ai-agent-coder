@@ -111,12 +111,17 @@ class PlanSlice:
     def _risk_flag(self, label: str) -> str | None:
         """The normalized answer to one "Risk Flags" line, or None if absent.
 
-        Callers compare the answer exactly. A prefix test (startswith("no"))
-        would fail open: "not yet decided", "none", and "not required — ask
-        first" all begin with "no".
+        Only a label that opens its line (after any bullet marker) counts, so
+        a label quoted inside another flag's free text (a `Difficulty:` within
+        `Recommended Developer:`) is never read as that flag. Callers compare
+        the answer exactly. A prefix test (startswith("no")) would fail open:
+        "not yet decided", "none", and "not required — ask first" all begin
+        with "no".
         """
         match = re.search(
-            rf"{label}:\s*(?P<value>[^\n]+)", self.sections.get("Risk Flags", ""), flags=re.IGNORECASE
+            rf"^\s*(?:[-*+]\s*)?{label}\s*:\s*(?P<value>[^\n]+)",
+            self.sections.get("Risk Flags", ""),
+            flags=re.IGNORECASE | re.MULTILINE,
         )
         return match.group("value").strip().lower().rstrip(".") if match else None
 
@@ -140,8 +145,10 @@ class PlanSlice:
 
     @property
     def criteria_total(self) -> int:
-        """Count of `- [ ]` / `- [x]` checkbox lines in "Acceptance Criteria"."""
-        return len(_CHECKBOX_RE.findall(self.sections.get("Acceptance Criteria", "")))
+        """Count of `- [ ]` / `- [x]` checkbox lines in "Acceptance Criteria",
+        outside fenced code blocks (an example checkbox is not a criterion)."""
+        masked, _unclosed = mask_fenced_blocks(self.sections.get("Acceptance Criteria", ""))
+        return len(_CHECKBOX_RE.findall(masked))
 
     @property
     def risky_surfaces_clear(self) -> bool:

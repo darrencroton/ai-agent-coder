@@ -119,12 +119,20 @@ class TestComposeReviewerCommand(unittest.TestCase):
         self.assertEqual(
             command,
             [
-                "codex", "exec", "PROMPT",
-                "-m", "gpt-5",
-                "-c", 'model_reasoning_effort="high"',
-                "-c", 'sandbox_mode="read-only"',
-                "-c", 'approval_policy="never"',
-                "--skip-git-repo-check", "-C", "/repo",
+                "codex",
+                "exec",
+                "PROMPT",
+                "-m",
+                "gpt-5",
+                "-c",
+                'model_reasoning_effort="high"',
+                "-c",
+                'sandbox_mode="read-only"',
+                "-c",
+                'approval_policy="never"',
+                "--skip-git-repo-check",
+                "-C",
+                "/repo",
             ],
         )
 
@@ -133,10 +141,16 @@ class TestComposeReviewerCommand(unittest.TestCase):
         self.assertEqual(
             command,
             [
-                "codex", "exec", "PROMPT",
-                "-c", 'sandbox_mode="read-only"',
-                "-c", 'approval_policy="never"',
-                "--skip-git-repo-check", "-C", "/repo",
+                "codex",
+                "exec",
+                "PROMPT",
+                "-c",
+                'sandbox_mode="read-only"',
+                "-c",
+                'approval_policy="never"',
+                "--skip-git-repo-check",
+                "-C",
+                "/repo",
             ],
         )
 
@@ -147,9 +161,19 @@ class TestComposeReviewerCommand(unittest.TestCase):
         self.assertEqual(
             command,
             [
-                "claude", "-p", "PROMPT",
-                "--model", "opus", "--effort", "high",
-                "--permission-mode", "plan", "--output-format", "text", "--add-dir", "/repo",
+                "claude",
+                "-p",
+                "PROMPT",
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "plan",
+                "--output-format",
+                "text",
+                "--add-dir",
+                "/repo",
             ],
         )
 
@@ -161,15 +185,22 @@ class TestComposeReviewerCommand(unittest.TestCase):
             command,
             [
                 "copilot",
-                "--model", "gpt-5", "--effort", "high",
-                "-p", "PROMPT", "--allow-all", "--autopilot", "--silent", "--add-dir", "/repo",
+                "--model",
+                "gpt-5",
+                "--effort",
+                "high",
+                "-p",
+                "PROMPT",
+                "--allow-all",
+                "--autopilot",
+                "--silent",
+                "--add-dir",
+                "/repo",
             ],
         )
 
     def test_opencode_with_model_no_effort(self) -> None:
-        command = review_mod.compose_reviewer_command(
-            "opencode", "PROMPT", model="my-model", repo=Path("/repo")
-        )
+        command = review_mod.compose_reviewer_command("opencode", "PROMPT", model="my-model", repo=Path("/repo"))
         self.assertEqual(
             command,
             ["opencode", "run", "PROMPT", "-m", "my-model", "--agent", "plan", "--auto", "--dir", "/repo"],
@@ -182,8 +213,18 @@ class TestComposeReviewerCommand(unittest.TestCase):
         self.assertEqual(
             command,
             [
-                "opencode", "run", "PROMPT", "-m", "my-model", "--variant", "high",
-                "--agent", "plan", "--auto", "--dir", "/repo",
+                "opencode",
+                "run",
+                "PROMPT",
+                "-m",
+                "my-model",
+                "--variant",
+                "high",
+                "--agent",
+                "plan",
+                "--auto",
+                "--dir",
+                "/repo",
             ],
         )
 
@@ -408,22 +449,26 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         leave profiles' own tests green and reopen that hole."""
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         # Patch the inventory query, not subprocess: patching a module
         # attribute would also capture this path's git calls.
         identity = {"variants": ("max",)}
-        with mock.patch.object(profiles, "query_model_identity", return_value=identity), mock.patch.object(
-            review_mod, "_build_reviewer_command"
-        ) as build:
+        with (
+            mock.patch.object(profiles, "query_model_identity", return_value=identity),
+            mock.patch.object(review_mod, "_build_reviewer_command") as build,
+        ):
             with self.assertRaises(PmError) as ctx:
                 review_mod.run_review(
-                    self.repo, run_dir, token,
-                    slice_id="Slice 1", skill="code-review", tool="opencode",
-                    model="prov/m", effort="high",
+                    self.repo,
+                    run_dir,
+                    token,
+                    slice_id="Slice 1",
+                    skill="code-review",
+                    tool="opencode",
+                    model="prov/m",
+                    effort="high",
                 )
         self.assertIn("does not offer variant", str(ctx.exception))
         # The point of the test: it refused BEFORE building/spawning anything.
@@ -432,9 +477,7 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
     def test_successful_fake_reviewer_records_review_and_clears_pids(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         fake = _write_fake_reviewer(
@@ -444,13 +487,24 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
 
         code, out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake),
-                "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--model-tag",
+                " hot ",
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
         self.assertIn("Slice 1", out)
+        self.assertIn("review id: review-1  model: None  effort: None  tag: hot\n", out)
 
         reloaded = state_mod.load_state(run_dir, token)
         entry = reloaded["slices"][0]
@@ -462,6 +516,7 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self.assertIsNone(review_record["model"])
         self.assertIsNone(review_record["effort"])
         self.assertTrue(review_record["command_override"])
+        self.assertEqual(review_record["model_tag"], "hot")
         self.assertEqual(review_record["origin_event"]["kind"], "launch")
         self.assertEqual(review_record["origin_event"]["slice"], "Slice 1")
         self.assertEqual(review_record["review_context"], {"pm_adjudications": None, "drift_review": None})
@@ -494,15 +549,14 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
             plan_path=plan_path, reviewer={"tools": ["opencode"], "model": "local/tiny", "effort": "high"}
         )
         before_head = self._git("rev-parse", "HEAD").stdout.strip()
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         fake = _write_fake_reviewer(self.repo.parent / "fake_opencode.sh", 'echo "FAKE REVIEW REPORT"\nexit 0')
-        with mock.patch.object(
-            profiles, "query_model_identity", return_value={"variants": ()}
-        ), mock.patch.object(review_mod, "compose_reviewer_command", return_value=[str(fake)]) as compose:
+        with (
+            mock.patch.object(profiles, "query_model_identity", return_value={"variants": ()}),
+            mock.patch.object(review_mod, "compose_reviewer_command", return_value=[str(fake)]) as compose,
+        ):
             code, _out, err = self.run_cli_in_repo(
                 ["review", "--slice", "Slice 1", "--skill", "code-review", "--token", token]
             )
@@ -519,13 +573,12 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
     def test_reviewer_command_with_a_model_keeps_it_instead_of_recording_null(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         fake = _write_fake_reviewer(
-            self.repo.parent / "fake_reviewer.sh", 'echo "FAKE REVIEW REPORT"\nexit 0',
+            self.repo.parent / "fake_reviewer.sh",
+            'echo "FAKE REVIEW REPORT"\nexit 0',
         )
 
         # --tool names a real profile deliberately: `tool` alone must not
@@ -533,9 +586,19 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         # inventory-verified opencode one sharing the same identity.
         code, out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "opencode", "--reviewer-command", str(fake), "--model", "opencode-go/tiny",
-                "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "opencode",
+                "--reviewer-command",
+                str(fake),
+                "--model",
+                "opencode-go/tiny",
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
@@ -562,8 +625,17 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         )
         code, _, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "drift-audit",
-                "--tool", "faketool", "--reviewer-command", str(drift_fake), "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "drift-audit",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(drift_fake),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
@@ -585,8 +657,17 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         )
         code, _, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(quality_fake), "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(quality_fake),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
@@ -603,14 +684,28 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self.assertNotIn("forged", mirror.read_text(encoding="utf-8"))
         reviews = state_mod.load_state(run_dir, token)["slices"][0]["reviews"]
         self.assertEqual([review["review_id"] for review in reviews[:2]], ["review-1", "review-2"])
-        self.assertEqual(reviews[1]["review_context"]["drift_review"], {
-            "review_id": "review-1", "artifact": reviews[0]["artifact"], "sha256": reviews[0]["sha256"],
-        })
+        self.assertEqual(
+            reviews[1]["review_context"]["drift_review"],
+            {
+                "review_id": "review-1",
+                "artifact": reviews[0]["artifact"],
+                "sha256": reviews[0]["sha256"],
+            },
+        )
         judgment_input = self.repo.parent / "drift-judgment.json"
-        judgment_input.write_text(json.dumps({
-            "schema_version": 1, "slice": "Slice 1", "skill": "drift-audit", "review_id": "review-1",
-            "score": 2, "reason": "The PM verified the audit report.",
-        }), encoding="utf-8")
+        judgment_input.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "slice": "Slice 1",
+                    "skill": "drift-audit",
+                    "review_id": "review-1",
+                    "score": 2,
+                    "reason": "The PM verified the audit report.",
+                }
+            ),
+            encoding="utf-8",
+        )
         code, _, err = self.run_cli_in_repo(["judge-reviews", "--file", str(judgment_input), "--token", token])
         self.assertEqual(code, 0, err)
         self.assertEqual(state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"][0]["score"], 2)
@@ -620,8 +715,17 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         # all, so it would read `none` even with the exclusion removed.
         code, _, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "drift-audit",
-                "--tool", "faketool", "--reviewer-command", str(drift_fake), "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "drift-audit",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(drift_fake),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
@@ -635,8 +739,17 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self._advance_head("b.py")
         code, _, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(quality_fake), "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(quality_fake),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
@@ -658,9 +771,17 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
 
         code, _out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake),
-                "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 2)
@@ -689,9 +810,19 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         def commission(command: Path, adjudication: str) -> int:
             code, _out, _err = self.run_cli_in_repo(
                 [
-                    "review", "--slice", "Slice 1", "--skill", "code-review",
-                    "--tool", "faketool", "--reviewer-command", str(command),
-                    "--adjudicated", adjudication, "--token", token,
+                    "review",
+                    "--slice",
+                    "Slice 1",
+                    "--skill",
+                    "code-review",
+                    "--tool",
+                    "faketool",
+                    "--reviewer-command",
+                    str(command),
+                    "--adjudicated",
+                    adjudication,
+                    "--token",
+                    token,
                 ]
             )
             return code
@@ -729,17 +860,26 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self._advance_head()
 
         adjudications_file = self.repo.parent / "adjudications.txt"
-        adjudications_file.write_text(
-            "first ruling\n\n# a comment, skipped\nsecond ruling\n", encoding="utf-8"
-        )
+        adjudications_file.write_text("first ruling\n\n# a comment, skipped\nsecond ruling\n", encoding="utf-8")
         passing = _write_fake_reviewer(self.repo.parent / "fake_rv_pass.sh", 'echo "## Verdict\n- PASS"')
 
         code, _out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(passing),
-                "--adjudicated-file", str(adjudications_file),
-                "--adjudicated", "third ruling", "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(passing),
+                "--adjudicated-file",
+                str(adjudications_file),
+                "--adjudicated",
+                "third ruling",
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
@@ -753,7 +893,8 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         self.assertNotIn("comment, skipped", prompt)
         # File lines must precede the --adjudicated flag, not just be present.
         self.assertLess(
-            prompt.index("- second ruling"), prompt.index("- third ruling"),
+            prompt.index("- second ruling"),
+            prompt.index("- third ruling"),
             "file-sourced rulings must render before --adjudicated flag rulings",
         )
 
@@ -765,10 +906,19 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
 
         code, _out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", "irrelevant",
-                "--adjudicated-file", str(self.repo.parent / "does-not-exist.txt"),
-                "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                "irrelevant",
+                "--adjudicated-file",
+                str(self.repo.parent / "does-not-exist.txt"),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 2)
@@ -806,13 +956,20 @@ class TestReviewThreadsSurfaceGrants(ReviewCommandTestCase):
         updated["slices"] = updated_slices
         state_mod.save_state(run_dir, updated, token)
 
-        fake = _write_fake_reviewer(
-            self.repo.parent / "fake_reviewer_grant.sh", 'echo "FAKE REVIEW REPORT"\nexit 0'
-        )
+        fake = _write_fake_reviewer(self.repo.parent / "fake_reviewer_grant.sh", 'echo "FAKE REVIEW REPORT"\nexit 0')
         code, _out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake), "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
@@ -870,9 +1027,7 @@ class TestReviewerEnvSanitization(ReviewCommandTestCase):
     def test_reviewer_env_never_contains_run_token(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         fake = _write_fake_reviewer(
@@ -897,9 +1052,17 @@ class TestReviewerEnvSanitization(ReviewCommandTestCase):
         # stray untracked files.
         code, out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake),
-                "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 0, err)
@@ -914,9 +1077,7 @@ class TestReviewerPidsClearedOnFailure(ReviewCommandTestCase):
     def test_failed_reviewer_clears_recorded_process_group(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         fake = _write_fake_reviewer(
@@ -926,9 +1087,17 @@ class TestReviewerPidsClearedOnFailure(ReviewCommandTestCase):
 
         code, _out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake),
-                "--token", token,
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
             ]
         )
         self.assertEqual(code, 2)
@@ -951,9 +1120,7 @@ class TestReviewDirtyWorktreeRefusal(ReviewCommandTestCase):
     def test_dirty_worktree_refuses_review(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         # An uncommitted change to a tracked file: HEAD has legitimately
@@ -984,9 +1151,7 @@ class TestReviewTimeout(ReviewCommandTestCase):
     def test_slow_reviewer_times_out_kills_process_and_fails_closed(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         fake = _write_fake_reviewer(
@@ -996,9 +1161,21 @@ class TestReviewTimeout(ReviewCommandTestCase):
 
         code, out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake),
-                "--token", token, "--timeout", "1",
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--model-tag",
+                "cold",
+                "--token",
+                token,
+                "--timeout",
+                "1",
             ]
         )
         self.assertEqual(code, 2)
@@ -1039,6 +1216,7 @@ class TestReviewTimeout(ReviewCommandTestCase):
                 "model": None,
                 "effort": None,
                 "command_override": True,
+                "model_tag": "cold",
                 "origin_event_index": launch_index,
                 "reason": "timeout",
             },
@@ -1047,9 +1225,7 @@ class TestReviewTimeout(ReviewCommandTestCase):
     def test_fast_reviewer_with_generous_timeout_succeeds(self) -> None:
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         fake = _write_fake_reviewer(
@@ -1059,9 +1235,19 @@ class TestReviewTimeout(ReviewCommandTestCase):
 
         code, out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake),
-                "--token", token, "--timeout", "30",
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
+                "--timeout",
+                "30",
             ]
         )
         self.assertEqual(code, 0, err)
@@ -1104,16 +1290,14 @@ class TestReviewTimeout(ReviewCommandTestCase):
         descendant."""
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         child_marker = self.repo.parent / "child_alive_marker"
         child_pid_file = self.repo.parent / "child_pid"
         fake = _write_fake_reviewer(
             self.repo.parent / "fake_reviewer_term_ignoring_child.sh",
-            f'sh -c "trap \'\' TERM; echo alive > \'{child_marker}\'; sleep 30" &\n'
+            f"sh -c \"trap '' TERM; echo alive > '{child_marker}'; sleep 30\" &\n"
             "child_pid=$!\n"
             f'echo "$child_pid" > "{child_pid_file}"\n'
             f'while [ ! -f "{child_marker}" ]; do sleep 0.05; done\n'
@@ -1122,9 +1306,19 @@ class TestReviewTimeout(ReviewCommandTestCase):
 
         code, out, err = self.run_cli_in_repo(
             [
-                "review", "--slice", "Slice 1", "--skill", "code-review",
-                "--tool", "faketool", "--reviewer-command", str(fake),
-                "--token", token, "--timeout", "3",
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
+                "--timeout",
+                "3",
             ]
         )
         self.assertEqual(code, 2)
@@ -1198,9 +1392,7 @@ class TestReviewDefaultTimeout(ReviewCommandTestCase):
         can match that substring."""
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         fake = _write_fake_reviewer(
@@ -1222,9 +1414,17 @@ class TestReviewDefaultTimeout(ReviewCommandTestCase):
         with mock.patch.object(subprocess.Popen, "wait", _spy_wait):
             code, _out, err = self.run_cli_in_repo(
                 [
-                    "review", "--slice", "Slice 1", "--skill", "code-review",
-                    "--tool", "faketool", "--reviewer-command", str(fake),
-                    "--token", token,
+                    "review",
+                    "--slice",
+                    "Slice 1",
+                    "--skill",
+                    "code-review",
+                    "--tool",
+                    "faketool",
+                    "--reviewer-command",
+                    str(fake),
+                    "--token",
+                    token,
                     # Deliberately no --timeout.
                 ]
             )
@@ -1246,9 +1446,7 @@ class TestReviewLaunchVisibilityOrdering(ReviewCommandTestCase):
         exception, once the thread completes."""
         token, before_head, run_dir = self._init_and_advance()
         state = state_mod.load_state(run_dir, token)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         self._advance_head()
 
         sentinel = self.repo.parent / "release_reviewer"
@@ -1264,8 +1462,12 @@ class TestReviewLaunchVisibilityOrdering(ReviewCommandTestCase):
             try:
                 with redirect_stdout(captured):
                     result["outcome"] = review_mod.run_review(
-                        self.repo, run_dir, token,
-                        slice_id="Slice 1", skill="code-review", tool="faketool",
+                        self.repo,
+                        run_dir,
+                        token,
+                        slice_id="Slice 1",
+                        skill="code-review",
+                        tool="faketool",
                         reviewer_command=str(fake),
                     )
             except Exception as exc:  # noqa: BLE001 - surfaced via assertion below
@@ -1407,7 +1609,11 @@ class TestResolveToolOverride(ReviewCommandTestCase):
         )
         before_head = self._git("rev-parse", "HEAD").stdout.strip()
         self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head,
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=before_head,
             launch={"reviewer_tools": ["opencode"]},
         )
         reloaded = state_mod.load_state(run_dir, token)

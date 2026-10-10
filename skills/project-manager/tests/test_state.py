@@ -19,7 +19,6 @@ from unittest import mock
 from pm_test_helpers import PlanTestCase, PmTestCase
 
 from pm_lib import IntegrityError, PmError
-from pm_lib import judgments
 from pm_lib import sessions as sessions_mod
 from pm_lib import state as state_mod
 
@@ -121,9 +120,7 @@ class TestCreateRunRoundTrip(PmTestCase):
 
     def test_slice_entries_accept_attested_status_at_creation(self) -> None:
         plan_path = self.write_plan(slices=[{}, {}])
-        state, _token, _run_dir = self.make_run(
-            plan_path=plan_path, slice_statuses={"Slice 1": "attested"}
-        )
+        state, _token, _run_dir = self.make_run(plan_path=plan_path, slice_statuses={"Slice 1": "attested"})
         by_id = {entry["id"]: entry for entry in state["slices"]}
         self.assertEqual(by_id["Slice 1"]["status"], "attested")
         self.assertIsNone(by_id["Slice 2"]["status"])
@@ -185,9 +182,7 @@ class TestTamperDetection(PmTestCase):
         (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
         with self.assertRaises(PmError) as ctx:
             state_mod.load_state(run_dir)
-        self.assertIn(
-            "'lite-1' is not supported by this toolkit version", str(ctx.exception)
-        )
+        self.assertIn("'lite-1' is not supported by this toolkit version", str(ctx.exception))
 
     def test_malformed_enum_values_rejected(self) -> None:
         plan_path = self.write_plan()
@@ -269,12 +264,8 @@ class TestEventsAndReadback(PmTestCase):
         _state, _token, run_dir = self.make_run(plan_path=plan_path)
         developer = {"tool": "claude", "model": "claude-opus-5-5", "effort": None}
         payload = {"developer": developer}
-        state_mod.append_event(
-            run_dir, "launch", slice_id="Slice 1", note="attempt 0", data=payload
-        )
-        state_mod.append_event(
-            run_dir, "stop", slice_id="Slice 1", note="operator stop"
-        )
+        state_mod.append_event(run_dir, "launch", slice_id="Slice 1", note="attempt 0", data=payload)
+        state_mod.append_event(run_dir, "stop", slice_id="Slice 1", note="operator stop")
 
         launch, stop = state_mod.read_events(run_dir)
         self.assertEqual(launch["data"], payload)
@@ -356,8 +347,15 @@ class TestLinkedWorktreeIsolation(PmTestCase):
                 reviewer={"tools": [], "model": None, "effort": None},
                 policy={"max_attempts": 3},
                 slices=[
-                    {"id": s.slice_id, "title": s.title, "status": None, "risk": s.plan_risk,
-                     "plan_risk": s.plan_risk, "commit": None, "attempts": 0}
+                    {
+                        "id": s.slice_id,
+                        "title": s.title,
+                        "status": None,
+                        "risk": s.plan_risk,
+                        "plan_risk": s.plan_risk,
+                        "commit": None,
+                        "attempts": 0,
+                    }
                     for s in linked_slices
                 ],
             )
@@ -423,9 +421,7 @@ class TestAtomicSaveAndLocking(PmTestCase):
         # the resulting json/mac mismatch and fail closed.
         raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
         raw["stop_reason"] = "tampered-without-resigning"
-        (run_dir / "run.json").write_text(
-            json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        (run_dir / "run.json").write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         with self.assertRaises(IntegrityError):
             state_mod.load_state(run_dir, token)
 
@@ -491,17 +487,16 @@ class TestNewRunId(unittest.TestCase):
                 second = state_mod.new_run_id()
 
         self.assertNotEqual(first, second)
-        self.assertNotEqual(
-            sessions_mod.session_name(first, 1, 0), sessions_mod.session_name(second, 1, 0)
-        )
+        self.assertNotEqual(sessions_mod.session_name(first, 1, 0), sessions_mod.session_name(second, 1, 0))
 
     def test_appends_suffix_on_collision(self) -> None:
         """Clock AND nonce frozen, so `base` is exactly predictable. Deriving
         the expected base from a live `datetime.now()` beside production's own
         independent `now()` call made this flake whenever the two landed either
         side of a UTC-second boundary."""
-        with mock.patch.object(state_mod, "datetime", _FrozenClock), mock.patch.object(
-            state_mod.secrets, "token_hex", return_value="abcdef"
+        with (
+            mock.patch.object(state_mod, "datetime", _FrozenClock),
+            mock.patch.object(state_mod.secrets, "token_hex", return_value="abcdef"),
         ):
             base = "20260730T122423Z-abcdef"
             self.assertEqual(state_mod.new_run_id(), base)
@@ -520,12 +515,16 @@ class TestRunReportHeader(PlanTestCase):
     def _header(self, **overrides) -> str:
         state = {
             "run_id": "20260729T000000Z",
-            "repo": "/repo", "branch": "feature/x", "status": "active",
+            "repo": "/repo",
+            "branch": "feature/x",
+            "status": "active",
             "plan": {"path": "/plan.md", "sha256": "a" * 64, "slice_count": 1},
             "harness": {"name": "opencode", "model": "qwen3.6-27b-bf16", "effort": None},
             "reviewer": {"tools": ["codex"], "model": "gpt-5.6-sol", "effort": "high"},
             "policy": {"max_attempts": 10},
-            "slices": [], "approvals": {}, "stop_reason": None,
+            "slices": [],
+            "approvals": {},
+            "stop_reason": None,
         }
         state.update(overrides)
         return state_mod.render_run_report(state, [], Path(self.repo))
@@ -533,39 +532,52 @@ class TestRunReportHeader(PlanTestCase):
     def test_header_records_harness_reviewer_and_budget(self) -> None:
         text = self._header()
         self.assertIn("- Harness: opencode model=qwen3.6-27b-bf16", text)
-        self.assertIn(
-            "- Reviewers (run default, none completed): codex model=gpt-5.6-sol effort=high", text
-        )
+        self.assertIn("- Reviewers (run default, none completed): codex model=gpt-5.6-sol effort=high", text)
         self.assertIn("- Attempt budget: 10 per slice", text)
+
+    def test_header_names_the_run_tag_only_when_set(self) -> None:
+        self.assertIn("- Branch: feature/x\n- Run tag: bench-a\n", self._header(run_tag="bench-a"))
+        self.assertNotIn("Run tag", self._header())
 
     def test_header_names_the_reviewers_that_actually_reviewed(self) -> None:
         """The recorded reviews replace the init default outright — a stale
         default alongside them would be exactly the claim this line drops."""
         text = self._header(
             slices=[
-                {"id": "Slice 1", "reviews": [
-                    {"skill": "drift-audit", "tool": "opencode", "model": "minimax-m3"},
-                    {"skill": "code-review", "tool": "qwen", "model": "qwen3.6-27b-bf16"},
-                ]},
-                {"id": "Slice 2", "reviews": [
-                    # A repeat of a pair already named, plus a mid-run swap.
-                    {"skill": "drift-audit", "tool": "opencode", "model": "minimax-m3"},
-                    {"skill": "code-review", "tool": "copilot", "model": None},
-                ]},
+                {
+                    "id": "Slice 1",
+                    "reviews": [
+                        {"skill": "drift-audit", "tool": "opencode", "model": "minimax-m3"},
+                        {"skill": "code-review", "tool": "qwen", "model": "qwen3.6-27b-bf16"},
+                    ],
+                },
+                {
+                    "id": "Slice 2",
+                    "reviews": [
+                        # A repeat of a pair already named, plus a mid-run swap.
+                        {"skill": "drift-audit", "tool": "opencode", "model": "minimax-m3"},
+                        {"skill": "code-review", "tool": "copilot", "model": None},
+                    ],
+                },
             ]
         )
-        self.assertIn(
-            "- Reviewers (completed): opencode/minimax-m3, qwen/qwen3.6-27b-bf16, copilot", text
-        )
+        self.assertIn("- Reviewers (completed): opencode/minimax-m3, qwen/qwen3.6-27b-bf16, copilot", text)
         self.assertNotIn("run default", text)
 
     def test_header_reports_total_run_time_with_its_endpoints(self) -> None:
         """The report is the single source for run time so PM never hand-parses
         events.jsonl; the endpoints ship with it so the figure is checkable."""
         state = {
-            "run_id": "r", "repo": "/repo", "branch": "b", "status": "complete",
-            "plan": {"path": "/plan.md", "sha256": "a" * 64}, "harness": {},
-            "reviewer": {}, "policy": {}, "slices": [], "approvals": {},
+            "run_id": "r",
+            "repo": "/repo",
+            "branch": "b",
+            "status": "complete",
+            "plan": {"path": "/plan.md", "sha256": "a" * 64},
+            "harness": {},
+            "reviewer": {},
+            "policy": {},
+            "slices": [],
+            "approvals": {},
             "stop_reason": None,
         }
         events = [
@@ -574,8 +586,7 @@ class TestRunReportHeader(PlanTestCase):
         ]
         text = state_mod.render_run_report(state, events, Path(self.repo))
         self.assertIn(
-            "- Total run time: 53m 14s (2026-07-30T02:17:16Z → 2026-07-30T03:10:30Z, "
-            "first to last recorded event)",
+            "- Total run time: 53m 14s (2026-07-30T02:17:16Z → 2026-07-30T03:10:30Z, first to last recorded event)",
             text,
         )
 
@@ -590,9 +601,7 @@ class TestRunReportHeader(PlanTestCase):
         """`--reviewer-model` alone still applies to a `review --tool …`, so it
         is a configured default, not an unconfigured run."""
         text = self._header(reviewer={"tools": [], "model": "gpt-5.6-sol", "effort": None})
-        self.assertIn(
-            "- Reviewers (run default, none completed): no tool model=gpt-5.6-sol effort=None", text
-        )
+        self.assertIn("- Reviewers (run default, none completed): no tool model=gpt-5.6-sol effort=None", text)
 
     def test_absent_policy_renders_the_budget_the_toolkit_actually_enforces(self) -> None:
         """`max_attempts` is absent-tolerant in enforcement (`cli.py`,
@@ -605,9 +614,16 @@ class TestRunReportHeader(PlanTestCase):
 class TestRunReportSurfaceGrants(PlanTestCase):
     def _report(self, slices: list[dict]) -> str:
         state = {
-            "run_id": "r", "repo": "/repo", "branch": "b", "status": "active",
-            "plan": {"path": "/plan.md", "sha256": "a" * 64}, "harness": {},
-            "reviewer": {}, "policy": {}, "slices": slices, "approvals": {},
+            "run_id": "r",
+            "repo": "/repo",
+            "branch": "b",
+            "status": "active",
+            "plan": {"path": "/plan.md", "sha256": "a" * 64},
+            "harness": {},
+            "reviewer": {},
+            "policy": {},
+            "slices": slices,
+            "approvals": {},
             "stop_reason": None,
         }
         return state_mod.render_run_report(state, [], Path(self.repo))
@@ -616,29 +632,16 @@ class TestRunReportSurfaceGrants(PlanTestCase):
         text = self._report(
             [
                 {
-                    "id": "Slice 1", "title": "T",
+                    "id": "Slice 1",
+                    "title": "T",
                     "grants": [{"path": "b.py", "evidence": "needed for the fix", "at": "2026-01-01T00:00:00Z"}],
                 },
             ]
         )
-        self.assertIn(
-            "## Surface Grants\n- Slice 1: b.py — granted 2026-01-01T00:00:00Z: needed for the fix", text
-        )
+        self.assertIn("## Surface Grants\n- Slice 1: b.py — granted 2026-01-01T00:00:00Z: needed for the fix", text)
 
         empty_text = self._report([{"id": "Slice 1", "title": "T"}])
         self.assertIn("## Surface Grants\n(none)", empty_text)
-
-
-class TestStoredJudgmentAssessmentIsStrict(unittest.TestCase):
-    """The report renderer reads each stored reviewer judgment's kind through
-    `judgments.assessment_of`; a record without one is malformed, not legacy."""
-
-    def test_record_without_assessment_is_refused_by_name(self) -> None:
-        self.assertEqual(judgments.assessment_of({"assessment": "rating"}), "rating")
-        with self.assertRaisesRegex(PmError, "judgment-3"):
-            judgments.assessment_of(
-                {"judgment_id": "judgment-3", "skill": "drift-audit"}
-            )
 
 
 class TestRunElapsed(unittest.TestCase):
@@ -655,22 +658,26 @@ class TestRunElapsed(unittest.TestCase):
     def test_spans_min_to_max_not_first_to_last_line(self) -> None:
         """Events are appended, but an out-of-order line must not yield a
         negative or truncated span."""
-        elapsed = state_mod.run_elapsed([
-            {"ts": "2026-07-30T01:00:00Z"},
-            {"ts": "2026-07-30T00:30:00Z"},
-            {"ts": "2026-07-30T00:45:00Z"},
-        ])
+        elapsed = state_mod.run_elapsed(
+            [
+                {"ts": "2026-07-30T01:00:00Z"},
+                {"ts": "2026-07-30T00:30:00Z"},
+                {"ts": "2026-07-30T00:45:00Z"},
+            ]
+        )
         assert elapsed is not None
         self.assertEqual(elapsed, ("2026-07-30T00:30:00Z", "2026-07-30T01:00:00Z", "30m 0s"))
 
     def test_ignores_malformed_and_missing_timestamps(self) -> None:
-        elapsed = state_mod.run_elapsed([
-            {"kind": "init"},
-            {"ts": "not-a-timestamp"},
-            {"ts": 12345},
-            {"ts": "2026-07-30T00:00:00Z"},
-            {"ts": "2026-07-30T00:01:00Z"},
-        ])
+        elapsed = state_mod.run_elapsed(
+            [
+                {"kind": "init"},
+                {"ts": "not-a-timestamp"},
+                {"ts": 12345},
+                {"ts": "2026-07-30T00:00:00Z"},
+                {"ts": "2026-07-30T00:01:00Z"},
+            ]
+        )
         assert elapsed is not None
         self.assertEqual(elapsed[2], "1m 0s")
 
@@ -681,11 +688,13 @@ class TestRunElapsed(unittest.TestCase):
     def test_offset_naive_timestamps_are_skipped_not_mixed(self) -> None:
         """A naive stamp beside the aware ones `append_event` writes would make
         min/max raise TypeError; alone it would adopt the host's local zone."""
-        elapsed = state_mod.run_elapsed([
-            {"ts": "2026-07-30T00:00:00Z"},
-            {"ts": "2026-07-30T09:00:00"},
-            {"ts": "2026-07-30T00:02:00Z"},
-        ])
+        elapsed = state_mod.run_elapsed(
+            [
+                {"ts": "2026-07-30T00:00:00Z"},
+                {"ts": "2026-07-30T09:00:00"},
+                {"ts": "2026-07-30T00:02:00Z"},
+            ]
+        )
         assert elapsed is not None
         self.assertEqual(elapsed[2], "2m 0s")
         self.assertIsNone(state_mod.run_elapsed([{"ts": "2026-07-30T09:00:00"}]))

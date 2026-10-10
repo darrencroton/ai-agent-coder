@@ -18,7 +18,7 @@ from pathlib import Path
 from . import IntegrityError, PmError
 from . import git_ops
 from . import judgments
-from . import ledger
+from . import leaderboard, ledger
 from . import plan as plan_mod
 from . import review as review_mod
 from . import sessions
@@ -61,6 +61,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument("--model")
     init.add_argument("--effort")
+    init.add_argument(
+        "--model-tag",
+        help="the run's default Developer tag: a label that tells apart two configurations the tool, model "
+        "and effort strings cannot (a local model at two temperatures, say); the ledger groups by it",
+    )
+    init.add_argument("--run-tag", help="a label for the whole run; `ledger render --run-tag` filters by it")
     branch_group = init.add_mutually_exclusive_group()
     branch_group.add_argument("--branch")
     branch_group.add_argument("--create-branch")
@@ -109,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     start_slice = subparsers.add_parser("start-slice", help="Run the next eligible slice")
     start_slice.add_argument("--model")
     start_slice.add_argument("--effort")
+    start_slice.add_argument("--model-tag", help="this launch's Developer tag, overriding init's --model-tag")
     start_slice.add_argument("--reviewer-tools")
     start_slice.add_argument("--harness-command")
     start_slice.add_argument("--risk", help='only "elevated" is accepted; risk can never be lowered')
@@ -130,9 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_group = finalize.add_mutually_exclusive_group()
     finalize_group.add_argument("--accept", help="accept the slice; reasoning must be >= 40 characters")
     finalize_group.add_argument("--steer", help="send a written correction into the live session")
-    finalize_group.add_argument(
-        "--stop", help="stop the slice, recording the reason (requires --cause)"
-    )
+    finalize_group.add_argument("--stop", help="stop the slice, recording the reason (requires --cause)")
     # Required with --stop and refused otherwise; argparse cannot express
     # that inside the mutually exclusive group, so _run_finalize enforces it.
     finalize.add_argument(
@@ -154,14 +159,18 @@ def build_parser() -> argparse.ArgumentParser:
         "e.g. an opencode-namespaced model is --tool opencode --model opencode-go/<model>",
     )
     review.add_argument("--effort")
+    review.add_argument("--model-tag", help="this commission's Reviewer tag; the ledger groups by it")
     review.add_argument(
-        "--adjudicated", action="append", metavar="TEXT",
+        "--adjudicated",
+        action="append",
+        metavar="TEXT",
         help="one ruling PM has already settled in this run, so the reviewer stops re-raising it; "
         "repeatable. Bounds reviewer attention only — it can never widen the authorized surface "
         "or weaken a criterion, and a reviewer that disagrees still files a full finding",
     )
     review.add_argument(
-        "--adjudicated-file", metavar="PATH",
+        "--adjudicated-file",
+        metavar="PATH",
         help="one ruling per line (blank lines and lines starting with # are skipped) from a file "
         "PM reuses byte-for-byte across every commission in a panel, instead of retyping the same "
         "ruling per --adjudicated call with a risk of wording drift — a judge-reviews panel "
@@ -170,7 +179,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review.add_argument("--reviewer-command", help="override the whole reviewer command (tests/unsupported tools)")
     review.add_argument(
-        "--timeout", type=_positive_seconds, default=_REVIEW_DEFAULT_TIMEOUT_SECONDS,
+        "--timeout",
+        type=_positive_seconds,
+        default=_REVIEW_DEFAULT_TIMEOUT_SECONDS,
         help="kill the reviewer process group and fail closed after N seconds "
         f"(default {_REVIEW_DEFAULT_TIMEOUT_SECONDS:g}). The default is a hang backstop, not a "
         "cadence: it is set well beyond any healthy review so it only ever fires on a stuck "
@@ -192,9 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     developer_judge.add_argument("--run")
     developer_judge.add_argument("--token")
 
-    notes = subparsers.add_parser(
-        "notes", help="Update the run notes safely (authoritative original, then mirror)"
-    )
+    notes = subparsers.add_parser("notes", help="Update the run notes safely (authoritative original, then mirror)")
     notes_group = notes.add_mutually_exclusive_group(required=True)
     notes_group.add_argument("--append", help="append this text as a new trailing block")
     notes_group.add_argument("--set", dest="set_text", help="replace the whole notes file with this text")
@@ -214,6 +223,12 @@ def build_parser() -> argparse.ArgumentParser:
     ledger_commands = ledger_parser.add_subparsers(dest="ledger_command", required=True)
     render = ledger_commands.add_parser("render", help="Render every per-run ledger file into one leaderboard")
     render.add_argument("--out", help="output path (default: <ledger dir>/leaderboard.md)")
+    render.add_argument(
+        "--run-tag",
+        action="append",
+        metavar="TEXT",
+        help="render only runs with this run tag; repeatable, and untagged runs are then left out",
+    )
 
     return parser
 
@@ -253,6 +268,8 @@ def _run_check_plan(args: argparse.Namespace) -> int:
 
 
 def _run_init(args: argparse.Namespace) -> int:
+    model_tag = state_mod.tag_value(args.model_tag, flag="--model-tag")
+    run_tag = state_mod.tag_value(args.run_tag, flag="--run-tag")
     repo = git_ops.resolve_repo(Path(args.repo))
     plan_path = git_ops.resolve_plan(Path(args.plan))
 
@@ -278,6 +295,8 @@ def _run_init(args: argparse.Namespace) -> int:
         reviewer_model=args.reviewer_model,
         reviewer_effort=args.reviewer_effort,
         harness_command=args.harness_command,
+        model_tag=model_tag,
+        run_tag=run_tag,
     )
 
     print(f"run id: {result.run_id}")
@@ -286,8 +305,7 @@ def _run_init(args: argparse.Namespace) -> int:
     print("slices:")
     for entry, plan_slice in zip(result.state["slices"], result.slices, strict=True):
         print(
-            f"  {entry['id']:<10} {plan_slice.title:<40} risk={entry['risk']:<9} "
-            f"status={entry['status'] or 'pending'}"
+            f"  {entry['id']:<10} {plan_slice.title:<40} risk={entry['risk']:<9} status={entry['status'] or 'pending'}"
         )
     print(f"PM_RUN_TOKEN={result.token}")
     print(
@@ -358,8 +376,7 @@ def _run_status(args: argparse.Namespace) -> int:
     unranked = judgments.unranked_code_review_ids(state)
     if unranked:
         print(
-            "code panels without an order: "
-            + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in unranked)
+            "code panels without an order: " + ", ".join(f"{slice_id}/{review_id}" for slice_id, review_id in unranked)
         )
     else:
         print("code panels without an order: none")
@@ -447,6 +464,7 @@ def _run_grant(args: argparse.Namespace) -> int:
 
 
 def _run_start_slice(args: argparse.Namespace) -> int:
+    model_tag = state_mod.tag_value(args.model_tag, flag="--model-tag")
     token = _require_token(args)
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
@@ -456,6 +474,7 @@ def _run_start_slice(args: argparse.Namespace) -> int:
         token,
         model=args.model,
         effort=args.effort,
+        model_tag=model_tag,
         reviewer_tools=args.reviewer_tools,
         harness_command=args.harness_command,
         risk=args.risk,
@@ -620,9 +639,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         return 2
 
     if args.stop is not None:
-        outcome = slice_ops.finalize_stop(
-            repo, run_dir, token, reason=args.stop, cause=args.cause, risk=args.risk
-        )
+        outcome = slice_ops.finalize_stop(repo, run_dir, token, reason=args.stop, cause=args.cause, risk=args.risk)
         print(f"STOPPED {outcome.slice_id}")
         _print_floor_facts(outcome.report)
         _print_pane_tail(outcome.pane_path)
@@ -664,6 +681,7 @@ def _load_adjudications(args: argparse.Namespace) -> list[str]:
 
 
 def _run_review(args: argparse.Namespace) -> int:
+    model_tag = state_mod.tag_value(args.model_tag, flag="--model-tag")
     token = _require_token(args)
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
@@ -677,6 +695,7 @@ def _run_review(args: argparse.Namespace) -> int:
         tool=args.tool,
         model=args.model,
         effort=args.effort,
+        model_tag=model_tag,
         reviewer_command=args.reviewer_command,
         timeout=args.timeout,
         # Rendered one-per-line so the reviewer reads a list, not a run-on
@@ -685,14 +704,13 @@ def _run_review(args: argparse.Namespace) -> int:
         # contract in the prompt, so a multi-line item could otherwise imitate a
         # later prompt section rather than read as one ruling.
         pm_adjudications=(
-            "\n".join(f"- {' '.join(item.split())}" for item in adjudications)
-            if adjudications
-            else None
+            "\n".join(f"- {' '.join(item.split())}" for item in adjudications) if adjudications else None
         ),
     )
     print(f"slice: {outcome.slice_id}")
     print(f"skill: {outcome.skill}  tool: {outcome.tool}")
-    print(f"review id: {outcome.review_id}  model: {outcome.model}  effort: {outcome.effort}")
+    tag = f"  tag: {outcome.model_tag}" if outcome.model_tag is not None else ""
+    print(f"review id: {outcome.review_id}  model: {outcome.model}  effort: {outcome.effort}{tag}")
     print(f"reviewed head: {outcome.head}  before_head: {outcome.before_head}")
     print(f"diff: {outcome.diff_path}")
     print(f"changed files: {len(outcome.changed_files)}")
@@ -701,18 +719,14 @@ def _run_review(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_judgment(
-    args: argparse.Namespace, *, recorder, event_kind: str, label: str
-) -> int:
+def _run_judgment(args: argparse.Namespace, *, recorder, event_kind: str, label: str) -> int:
     repo = _repo_from_cwd()
     token = _require_token(args)
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     data = judgments.load_input(Path(args.file))
     outcome = recorder(run_dir, token, data)
     try:
-        judgments.publish_event(
-            run_dir, token, outcome.judgment_id, outcome.slice_id, kind=event_kind
-        )
+        judgments.publish_event(run_dir, token, outcome.judgment_id, outcome.slice_id, kind=event_kind)
     except IntegrityError:
         raise
     except (OSError, PmError) as exc:
@@ -798,14 +812,18 @@ def _run_notes(args: argparse.Namespace) -> int:
 
 
 def _run_ledger_render(args: argparse.Namespace) -> int:
+    run_tags = frozenset(state_mod.tag_value(tag, flag="--run-tag") for tag in args.run_tag or [])
     root = ledger.ledger_dir()
-    files = ledger.load_run_files(root)
+    files = leaderboard.load_run_files(root)
     if not files:
         raise PmError(f"no per-run ledger files found under {root}")
     out = Path(args.out) if args.out else root / "leaderboard.md"
     # The write replaces `out` itself, never a symlink's target, so the
     # History link is relative to the directory `out` is named in.
-    text, errors = ledger.render_leaderboard(files, out_dir=out.parent.resolve())
+    try:
+        text, errors = leaderboard.render_leaderboard(files, out_dir=out.parent.resolve(), run_tags=run_tags)
+    except PmError as exc:
+        raise PmError(f"{exc} under {root}") from exc
     try:
         state_mod._atomic_write_bytes(out, text.encode("utf-8"))
     except OSError as exc:

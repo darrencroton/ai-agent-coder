@@ -68,9 +68,7 @@ def _parse_input(data: dict[str, Any]) -> dict[str, Any]:
 
     common = {"schema_version", "slice", "skill", "reason", "supersedes", "assessment"}
     assessment = data.get("assessment")
-    if assessment is not None and (
-        not isinstance(assessment, str) or assessment not in {_RATING, _COMPARISON}
-    ):
+    if assessment is not None and (not isinstance(assessment, str) or assessment not in {_RATING, _COMPARISON}):
         raise PmError("judgment assessment must be 'rating' or 'comparison'")
     status = data.get("status")
     if status is not None:
@@ -79,22 +77,18 @@ def _parse_input(data: dict[str, Any]) -> dict[str, Any]:
         allowed = common | {"status", "review_ids"}
         unknown = set(data) - allowed
         if unknown:
-            raise PmError(
-                f"unavailable judgment has unsupported fields: {', '.join(sorted(unknown))}"
-            )
+            raise PmError(f"unavailable judgment has unsupported fields: {', '.join(sorted(unknown))}")
         ids = _review_ids(data.get("review_ids"), "review_ids")
         if skill == "drift-audit" and len(ids) != 1:
-            raise PmError(
-                "an unavailable drift-audit judgment must reference exactly one review ID"
-            )
+            raise PmError("an unavailable drift-audit judgment must reference exactly one review ID")
         if assessment is None:
-            raise PmError(
-                "an unavailable judgment must state assessment 'rating' or 'comparison'"
-            )
+            raise PmError("an unavailable judgment must state assessment 'rating' or 'comparison'")
         if skill == "drift-audit" and assessment != _RATING:
             raise PmError("drift-audit judgments support ratings only")
         if assessment == _RATING and len(ids) != 1:
             raise PmError("an unavailable rating must reference exactly one review ID")
+        if assessment == _COMPARISON and len(ids) < 2:
+            raise PmError("an unavailable comparison must reference at least two review IDs")
         return {
             "schema_version": _VERSION,
             "slice": slice_id,
@@ -111,9 +105,7 @@ def _parse_input(data: dict[str, Any]) -> dict[str, Any]:
         unknown = set(data) - allowed
         if unknown:
             label = "drift judgment" if skill == "drift-audit" else "code rating"
-            raise PmError(
-                f"{label} has unsupported fields: {', '.join(sorted(unknown))}"
-            )
+            raise PmError(f"{label} has unsupported fields: {', '.join(sorted(unknown))}")
         score = data.get("score")
         if type(score) is not int or score not in (0, 1, 2):
             label = "drift judgment" if skill == "drift-audit" else "code rating"
@@ -134,15 +126,11 @@ def _parse_input(data: dict[str, Any]) -> dict[str, Any]:
         }
 
     if "rank_groups" in data:
-        raise PmError(
-            "code-review rank_groups is no longer supported; supply order and close"
-        )
+        raise PmError("code-review rank_groups is no longer supported; supply order and close")
     allowed = common | {"order", "close"}
     unknown = set(data) - allowed
     if unknown:
-        raise PmError(
-            f"code-review judgment has unsupported fields: {', '.join(sorted(unknown))}"
-        )
+        raise PmError(f"code-review judgment has unsupported fields: {', '.join(sorted(unknown))}")
     order = _review_ids(data.get("order"), "order")
     if len(order) < 2:
         raise PmError("code-review order must name at least two review IDs")
@@ -156,10 +144,7 @@ def _parse_input(data: dict[str, Any]) -> dict[str, Any]:
         if review_id not in order:
             raise PmError(f"code-review close member {review_id} is not in order")
         if order.index(review_id) == 0:
-            raise PmError(
-                f"code-review close member {review_id} is first in order and has no "
-                "member above it"
-            )
+            raise PmError(f"code-review close member {review_id} is first in order and has no member above it")
     if assessment not in (None, _COMPARISON):
         raise PmError("code-review order must use assessment 'comparison'")
     return {
@@ -193,18 +178,15 @@ def _review_map(entry: dict[str, Any], skill: str) -> dict[str, dict[str, Any]]:
         review_id = review.get("review_id")
         if isinstance(review_id, str) and review_id:
             if review_id in records:
-                raise PmError(
-                    f"duplicate {skill} review ID in signed state: {review_id}"
-                )
+                raise PmError(f"duplicate {skill} review ID in signed state: {review_id}")
             records[review_id] = review
     return records
 
 
-def _referenced_ids(judgment: dict[str, Any]) -> set[str]:
+def referenced_ids(judgment: dict[str, Any]) -> set[str]:
+    """The review IDs one reviewer judgment (or parsed input) covers."""
     if judgment.get("status") == "unavailable":
-        return {
-            item for item in judgment.get("review_ids") or [] if isinstance(item, str)
-        }
+        return {item for item in judgment.get("review_ids") or [] if isinstance(item, str)}
     if judgment.get("skill") == "drift-audit" or "review_id" in judgment:
         review_id = judgment.get("review_id")
         return {review_id} if isinstance(review_id, str) else set()
@@ -213,24 +195,19 @@ def _referenced_ids(judgment: dict[str, Any]) -> set[str]:
 
 def _active_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Exclude records superseded by a later immutable correction."""
-    superseded = {
-        item.get("supersedes")
-        for item in records
-        if isinstance(item.get("supersedes"), str)
-    }
+    superseded = {item.get("supersedes") for item in records if isinstance(item.get("supersedes"), str)}
     return [item for item in records if item.get("judgment_id") not in superseded]
 
 
-def _active_judgments(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    return _active_records([
-        item for item in entry.get("review_judgments") or [] if isinstance(item, dict)
-    ])
+def active_judgments(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """A slice entry's reviewer judgments that no later record supersedes."""
+    return _active_records([item for item in entry.get("review_judgments") or [] if isinstance(item, dict)])
 
 
 def assessment_of(record: dict[str, Any]) -> str:
     """Return a stored reviewer judgment's explicit kind; raise if it has none."""
     value = record.get("assessment")
-    if value not in {_RATING, _COMPARISON}:
+    if not isinstance(value, str) or value not in {_RATING, _COMPARISON}:
         raise PmError(
             f"review judgment {record.get('judgment_id')!r} has no valid assessment "
             f"(expected {_RATING!r} or {_COMPARISON!r})"
@@ -273,11 +250,9 @@ def _next_judgment_id(records: list[dict[str, Any]], prefix: str) -> str:
     return f"{prefix}{highest + 1}"
 
 
-def _validate_reviews(
-    parsed: dict[str, Any], entry: dict[str, Any]
-) -> list[dict[str, Any]]:
+def _validate_reviews(parsed: dict[str, Any], entry: dict[str, Any]) -> list[dict[str, Any]]:
     skill = parsed["skill"]
-    ids = _referenced_ids(parsed)
+    ids = referenced_ids(parsed)
     records = _review_map(entry, skill)
     resolved: list[dict[str, Any]] = []
     for review_id in ids:
@@ -294,9 +269,7 @@ def _context_key(review: dict[str, Any]) -> tuple[Any, ...]:
     origin = review.get("origin_event")
     context = review.get("review_context")
     if not isinstance(origin, dict) or not isinstance(context, dict):
-        raise PmError(
-            f"review {review.get('review_id')!r} lacks commission-time context"
-        )
+        raise PmError(f"review {review.get('review_id')!r} lacks commission-time context")
     return (
         origin.get("index"),
         origin.get("kind"),
@@ -308,16 +281,12 @@ def _context_key(review: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _validate_comparable_panel(
-    parsed: dict[str, Any], reviews: list[dict[str, Any]]
-) -> None:
+def _validate_comparable_panel(parsed: dict[str, Any], reviews: list[dict[str, Any]]) -> None:
     if parsed.get("status") == "unavailable" or len(reviews) <= 1:
         return
     keys = {_context_key(review) for review in reviews}
     if len(keys) != 1:
-        raise PmError(
-            "code-review panel mixes commission contexts; record it as unavailable instead"
-        )
+        raise PmError("code-review panel mixes commission contexts; record it as unavailable instead")
 
 
 def record_judgment(run_dir: Path, token: str, data: dict[str, Any]) -> JudgmentOutcome:
@@ -327,73 +296,50 @@ def record_judgment(run_dir: Path, token: str, data: dict[str, Any]) -> Judgment
         entry = slice_ops.slice_entry(state, parsed["slice"])
         if entry is None:
             raise PmError(f"{parsed['slice']} is not present in this run")
-        records = [
-            item
-            for item in entry.get("review_judgments") or []
-            if isinstance(item, dict)
-        ]
+        records = [item for item in entry.get("review_judgments") or [] if isinstance(item, dict)]
         reviews = _validate_reviews(parsed, entry)
         _validate_comparable_panel(parsed, reviews)
         for record in records:
             if _input_matches(record, parsed):
-                return JudgmentOutcome(
-                    str(record.get("judgment_id")), parsed["slice"], created=False
-                )
+                return JudgmentOutcome(str(record.get("judgment_id")), parsed["slice"], created=False)
 
-        active = _active_judgments(entry)
+        active = active_judgments(entry)
         supersedes = parsed.get("supersedes")
-        target = next(
-            (item for item in active if item.get("judgment_id") == supersedes), None
-        )
+        target = next((item for item in active if item.get("judgment_id") == supersedes), None)
         if supersedes is not None:
             if target is None:
-                raise PmError(
-                    f"supersedes must name an active judgment in this slice: {supersedes}"
-                )
+                raise PmError(f"supersedes must name an active judgment in this slice: {supersedes}")
             if target.get("skill") != parsed["skill"] or assessment_of(target) != parsed["assessment"]:
-                raise PmError(
-                    "supersedes must name a judgment for the same review skill and assessment"
-                )
+                raise PmError("supersedes must name a judgment for the same review skill and assessment")
 
-        new_ids = _referenced_ids(parsed)
+        new_ids = referenced_ids(parsed)
         for earlier in active:
             if earlier is target:
                 continue
             if assessment_of(earlier) != parsed["assessment"]:
                 continue
-            overlap = new_ids & _referenced_ids(earlier)
+            overlap = new_ids & referenced_ids(earlier)
             if overlap:
-                raise PmError(
-                    "review IDs already have an active judgment: "
-                    + ", ".join(sorted(overlap))
-                )
+                raise PmError("review IDs already have an active judgment: " + ", ".join(sorted(overlap)))
 
-        judgment = {
-            key: value
-            for key, value in parsed.items()
-            if value is not None and key != "slice"
-        }
+        judgment = {key: value for key, value in parsed.items() if value is not None and key != "slice"}
         judgment["judgment_id"] = _next_judgment_id(records, "judgment-")
         judgment["at"] = state_mod.utc_now_iso()
         entry["review_judgments"] = [*records, judgment]
         return JudgmentOutcome(judgment["judgment_id"], parsed["slice"], created=True)
 
 
-def _review_ids_without_coverage(
-    state: dict[str, Any], *, assessment: str, skill: str | None = None
-) -> list[tuple[str, str]]:
+def _review_ids_without_coverage(state: dict[str, Any], *, assessment: str) -> list[tuple[str, str]]:
     """Return successful review IDs missing one independent assessment kind."""
     missing: list[tuple[str, str]] = []
     for entry in state.get("slices") or []:
         if not isinstance(entry, dict):
             continue
-        covered = set().union(*(
-            _referenced_ids(item)
-            for item in _active_judgments(entry)
-            if assessment_of(item) == assessment
-        ))
+        covered = set().union(
+            *(referenced_ids(item) for item in active_judgments(entry) if assessment_of(item) == assessment)
+        )
         for review in entry.get("reviews") or []:
-            if not isinstance(review, dict) or (skill is not None and review.get("skill") != skill):
+            if not isinstance(review, dict):
                 continue
             review_id = review.get("review_id")
             if isinstance(review_id, str) and review_id and review_id not in covered:
@@ -416,9 +362,9 @@ def panel_groups(entry: dict[str, Any], origin_index: int) -> list[list[str]]:
     """
     unavailable = {
         review_id
-        for judgment in _active_judgments(entry)
+        for judgment in active_judgments(entry)
         if judgment.get("status") == "unavailable" and assessment_of(judgment) == _RATING
-        for review_id in _referenced_ids(judgment)
+        for review_id in referenced_ids(judgment)
     }
     groups: dict[tuple[Any, ...], list[str]] = {}
     for review in entry.get("reviews") or []:
@@ -439,28 +385,38 @@ def panel_groups(entry: dict[str, Any], origin_index: int) -> list[list[str]]:
     return [group for group in groups.values() if len(group) >= 2]
 
 
+def panel_is_covered(group: list[str], entry: dict[str, Any]) -> bool:
+    """Whether an active comparison-kind record of `entry` covers the whole panel.
+
+    The record is an ``order`` or an unavailable comparison; it covers the
+    panel when its referenced IDs include every member of `group`. Under
+    Decision 14 the record may also name reviews outside the panel, so this
+    is an "includes" test, not equality.
+    """
+    return any(
+        set(group) <= referenced_ids(item) for item in active_judgments(entry) if assessment_of(item) == _COMPARISON
+    )
+
+
 def unranked_code_review_ids(state: dict[str, Any]) -> list[tuple[str, str]]:
     """Members of code panels no active order or unavailable comparison covers."""
     missing: list[tuple[str, str]] = []
     for entry in state.get("slices") or []:
         if not isinstance(entry, dict):
             continue
-        covers = [
-            _referenced_ids(item)
-            for item in _active_judgments(entry)
-            if assessment_of(item) == _COMPARISON
-        ]
-        origins = sorted({
-            review["origin_event"]["index"]
-            for review in entry.get("reviews") or []
-            if isinstance(review, dict)
-            and review.get("skill") == "code-review"
-            and isinstance(review.get("origin_event"), dict)
-            and type(review["origin_event"].get("index")) is int
-        })
+        origins = sorted(
+            {
+                review["origin_event"]["index"]
+                for review in entry.get("reviews") or []
+                if isinstance(review, dict)
+                and review.get("skill") == "code-review"
+                and isinstance(review.get("origin_event"), dict)
+                and type(review["origin_event"].get("index")) is int
+            }
+        )
         for origin_index in origins:
             for group in panel_groups(entry, origin_index):
-                if not any(set(group) <= covered for covered in covers):
+                if not panel_is_covered(group, entry):
                     missing.extend((str(entry.get("id")), review_id) for review_id in group)
     return missing
 
@@ -484,9 +440,7 @@ def _parse_developer_input(data: dict[str, Any]) -> dict[str, Any]:
             raise PmError("developer judgment status must be 'unavailable' when supplied")
         unknown = set(data) - (common | {"status"})
         if unknown:
-            raise PmError(
-                f"unavailable developer judgment has unsupported fields: {', '.join(sorted(unknown))}"
-            )
+            raise PmError(f"unavailable developer judgment has unsupported fields: {', '.join(sorted(unknown))}")
         return {
             "schema_version": _VERSION,
             "slice": slice_id,
@@ -498,9 +452,7 @@ def _parse_developer_input(data: dict[str, Any]) -> dict[str, Any]:
 
     unknown = set(data) - (common | {"score", "criteria_met", "defects"})
     if unknown:
-        raise PmError(
-            f"developer judgment has unsupported fields: {', '.join(sorted(unknown))}"
-        )
+        raise PmError(f"developer judgment has unsupported fields: {', '.join(sorted(unknown))}")
     score = data.get("score")
     if type(score) is not int or score not in (0, 1, 2):
         raise PmError("developer judgment score must be integer 0, 1, or 2")
@@ -509,23 +461,11 @@ def _parse_developer_input(data: dict[str, Any]) -> dict[str, Any]:
         raise PmError("developer judgment criteria_met must be a non-negative integer")
     defects = data.get("defects")
     if not isinstance(defects, dict):
+        raise PmError("developer judgment defects must be an object with the keys " + ", ".join(_DEFECT_KEYS))
+    if set(defects) != set(_DEFECT_KEYS):
         raise PmError(
-            "developer judgment defects must be an object with the keys "
-            + ", ".join(_DEFECT_KEYS)
-        )
-    missing = [key for key in _DEFECT_KEYS if key not in defects]
-    extra = sorted(str(key) for key in defects if key not in _DEFECT_KEYS)
-    if missing or extra:
-        detail = "; ".join(
-            part
-            for part in (
-                f"missing {', '.join(missing)}" if missing else "",
-                f"unexpected {', '.join(extra)}" if extra else "",
-            )
-            if part
-        )
-        raise PmError(
-            f"developer judgment defects must have exactly the keys {', '.join(_DEFECT_KEYS)} ({detail})"
+            f"developer judgment defects must have exactly the keys {', '.join(_DEFECT_KEYS)} "
+            f"(got {', '.join(sorted(map(str, defects))) or 'none'})"
         )
     for key in _DEFECT_KEYS:
         if type(defects[key]) is not int or defects[key] < 0:
@@ -542,41 +482,50 @@ def _parse_developer_input(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _active_developer_judgments(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    return _active_records([
-        item for item in entry.get("developer_judgments") or [] if isinstance(item, dict)
-    ])
+def active_developer_judgments(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """A slice entry's Developer judgments that no later record supersedes."""
+    return _active_records([item for item in entry.get("developer_judgments") or [] if isinstance(item, dict)])
 
 
-def _developer_origin_index(record: dict[str, Any]) -> int | None:
+def developer_origin_index(record: dict[str, Any]) -> int | None:
+    """The origin event index a Developer judgment assesses, or None if it has none."""
     origin = (record.get("submission") or {}).get("origin_event")
     index = origin.get("index") if isinstance(origin, dict) else None
     return index if type(index) is int else None
 
 
+def active_developer_judgment(entry: dict[str, Any], origin_index: int) -> dict[str, Any] | None:
+    """The active Developer judgment of the submission opened at `origin_index`, or None."""
+    return next(
+        (
+            judgment
+            for judgment in active_developer_judgments(entry)
+            if developer_origin_index(judgment) == origin_index
+        ),
+        None,
+    )
+
+
 def _developer_input_matches(record: dict[str, Any], parsed: dict[str, Any]) -> bool:
-    wanted = {
-        key: value
-        for key, value in parsed.items()
-        if key not in {"slice", "supersedes"} and value is not None
-    }
+    wanted = {key: value for key, value in parsed.items() if key not in {"slice", "supersedes"} and value is not None}
     wanted["origin_event_index"] = parsed["origin_event_index"]
     actual = {key: record.get(key) for key in wanted if key != "origin_event_index"}
-    return actual == {key: value for key, value in wanted.items() if key != "origin_event_index"} and (
-        _developer_origin_index(record) == wanted["origin_event_index"]
-    ) and record.get("supersedes") == parsed.get("supersedes")
+    return (
+        actual == {key: value for key, value in wanted.items() if key != "origin_event_index"}
+        and (developer_origin_index(record) == wanted["origin_event_index"])
+        and record.get("supersedes") == parsed.get("supersedes")
+    )
 
 
-def _read_events_or_raise(run_dir: Path) -> list[dict[str, Any]]:
+def read_events_or_raise(run_dir: Path) -> list[dict[str, Any]]:
+    """Read the run's event log, turning an unreadable or malformed log into ``PmError``."""
     try:
         return state_mod.read_events(run_dir)
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
         raise PmError(f"could not read PM event log {run_dir / 'events.jsonl'}: {exc}") from exc
 
 
-def _scan_latest_developer_origin(
-    events: list[dict[str, Any]], slice_id: str
-) -> dict[str, Any] | None:
+def _scan_latest_developer_origin(events: list[dict[str, Any]], slice_id: str) -> dict[str, Any] | None:
     for index in range(len(events) - 1, -1, -1):
         event = events[index]
         if event.get("slice") == slice_id and event.get("kind") in {"launch", "relaunch", "steer"}:
@@ -585,11 +534,9 @@ def _scan_latest_developer_origin(
 
 
 def _latest_developer_origin(run_dir: Path, slice_id: str) -> dict[str, Any]:
-    origin = _scan_latest_developer_origin(_read_events_or_raise(run_dir), slice_id)
+    origin = _scan_latest_developer_origin(read_events_or_raise(run_dir), slice_id)
     if origin is None:
-        raise PmError(
-            f"current developer submission for {slice_id} has no launch, relaunch, or steer event"
-        )
+        raise PmError(f"current developer submission for {slice_id} has no launch, relaunch, or steer event")
     return origin
 
 
@@ -606,9 +553,7 @@ def _origin_from_current(
         raise PmError("current developer submission lacks a stable launch identity")
     origin = _latest_developer_origin(run_dir, parsed["slice"])
     if origin["index"] != parsed["origin_event_index"]:
-        raise PmError(
-            "developer judgment origin_event_index does not match the current developer submission"
-        )
+        raise PmError("developer judgment origin_event_index does not match the current developer submission")
     submission = {
         "origin_event": origin,
         "head": git_ops.git_head(Path(str(state.get("repo") or ""))),
@@ -619,6 +564,7 @@ def _origin_from_current(
         "tool": developer.get("tool"),
         "model": developer.get("model"),
         "effort": developer.get("effort"),
+        "model_tag": developer.get("model_tag"),
     }
     return submission, identity
 
@@ -634,49 +580,34 @@ def record_developer_judgment(run_dir: Path, token: str, data: dict[str, Any]) -
             criteria_total = entry.get("criteria_total")
             if type(criteria_total) is not int or criteria_total < 0:
                 raise PmError(
-                    f"{parsed['slice']} has no valid criteria_total in signed state; "
-                    "criteria_met cannot be checked"
+                    f"{parsed['slice']} has no valid criteria_total in signed state; criteria_met cannot be checked"
                 )
             if parsed["criteria_met"] > criteria_total:
                 raise PmError(
                     f"developer judgment criteria_met {parsed['criteria_met']} exceeds "
                     f"{parsed['slice']} criteria_total {criteria_total}"
                 )
-        records = [
-            item for item in entry.get("developer_judgments") or [] if isinstance(item, dict)
-        ]
+        records = [item for item in entry.get("developer_judgments") or [] if isinstance(item, dict)]
         current_submission: dict[str, Any] | None = None
         current_identity: dict[str, Any] | None = None
         current = state.get("current_slice")
         if isinstance(current, dict) and current.get("id") == parsed["slice"]:
-            origin = _scan_latest_developer_origin(
-                _read_events_or_raise(run_dir), parsed["slice"]
-            )
+            origin = _scan_latest_developer_origin(read_events_or_raise(run_dir), parsed["slice"])
             if origin is not None and origin["index"] == parsed["origin_event_index"]:
-                current_submission, current_identity = _origin_from_current(
-                    state, parsed, run_dir
-                )
+                current_submission, current_identity = _origin_from_current(state, parsed, run_dir)
         for record in records:
             if _developer_input_matches(record, parsed):
                 if current_submission is not None and record.get("submission") != current_submission:
-                    raise PmError(
-                        "developer submission changed since this judgment; use supersedes to correct it"
-                    )
-                return JudgmentOutcome(
-                    str(record.get("judgment_id")), parsed["slice"], created=False
-                )
+                    raise PmError("developer submission changed since this judgment; use supersedes to correct it")
+                return JudgmentOutcome(str(record.get("judgment_id")), parsed["slice"], created=False)
 
-        active = _active_developer_judgments(entry)
+        active = active_developer_judgments(entry)
         supersedes = parsed.get("supersedes")
-        target = next(
-            (item for item in active if item.get("judgment_id") == supersedes), None
-        )
+        target = next((item for item in active if item.get("judgment_id") == supersedes), None)
         if supersedes is not None:
             if target is None:
-                raise PmError(
-                    f"supersedes must name an active developer judgment in this slice: {supersedes}"
-                )
-            if _developer_origin_index(target) != parsed["origin_event_index"]:
+                raise PmError(f"supersedes must name an active developer judgment in this slice: {supersedes}")
+            if developer_origin_index(target) != parsed["origin_event_index"]:
                 raise PmError("supersedes must name the same developer submission origin")
             if current_submission is not None:
                 submission, identity = current_submission, current_identity or {}
@@ -692,10 +623,8 @@ def record_developer_judgment(run_dir: Path, token: str, data: dict[str, Any]) -
         for earlier in active:
             if earlier is target:
                 continue
-            if _developer_origin_index(earlier) == parsed["origin_event_index"]:
-                raise PmError(
-                    "developer submission already has an active judgment; use supersedes to correct it"
-                )
+            if developer_origin_index(earlier) == parsed["origin_event_index"]:
+                raise PmError("developer submission already has an active judgment; use supersedes to correct it")
 
         judgment = {
             key: value
@@ -710,16 +639,14 @@ def record_developer_judgment(run_dir: Path, token: str, data: dict[str, Any]) -
         return JudgmentOutcome(judgment["judgment_id"], parsed["slice"], created=True)
 
 
-def unjudged_developer_origins(
-    state: dict[str, Any], events: list[dict[str, Any]]
-) -> list[tuple[str, int, str]]:
+def unjudged_developer_origins(state: dict[str, Any], events: list[dict[str, Any]]) -> list[tuple[str, int, str]]:
     """Launch, relaunch, and steer origins without active developer coverage."""
     covered = {
-        (str(entry.get("id")), _developer_origin_index(judgment))
+        (str(entry.get("id")), developer_origin_index(judgment))
         for entry in state.get("slices") or []
         if isinstance(entry, dict)
-        for judgment in _active_developer_judgments(entry)
-        if _developer_origin_index(judgment) is not None
+        for judgment in active_developer_judgments(entry)
+        if developer_origin_index(judgment) is not None
     }
     return [
         (str(event.get("slice")), index, str(event.get("kind")))
@@ -731,7 +658,10 @@ def unjudged_developer_origins(
 
 
 def current_submission_gaps(
-    state: dict[str, Any], events: list[dict[str, Any]], repo: Path, slice_id: str
+    state: dict[str, Any],
+    events: list[dict[str, Any]],
+    repo: Path,
+    slice_id: str,
 ) -> list[str]:
     """Name every judgment the current submission of `slice_id` still lacks.
 
@@ -750,30 +680,20 @@ def current_submission_gaps(
     entry = slice_ops.slice_entry(state, slice_id) or {}
     gaps: list[str] = []
 
-    developer = next(
-        (
-            judgment
-            for judgment in _active_developer_judgments(entry)
-            if _developer_origin_index(judgment) == index
-        ),
-        None,
-    )
+    developer = active_developer_judgment(entry, index)
     if developer is None:
         gaps.append(f"Developer judgment for event {index} (judge-developer)")
     else:
         submission = developer.get("submission") or {}
-        if submission.get("head") != git_ops.git_head(repo) or submission.get(
-            "grants_seen"
-        ) != len(plan_mod.slice_grants(state, slice_id)):
+        if submission.get("head") != git_ops.git_head(repo) or submission.get("grants_seen") != len(
+            plan_mod.slice_grants(state, slice_id)
+        ):
             gaps.append(
-                f"Developer judgment for event {index} is stale (head or grants changed); "
-                "record a superseding judgment"
+                f"Developer judgment for event {index} is stale (head or grants changed); record a superseding judgment"
             )
 
-    active = _active_judgments(entry)
-    rated = set().union(
-        *(_referenced_ids(item) for item in active if assessment_of(item) == _RATING)
-    )
+    active = active_judgments(entry)
+    rated = set().union(*(referenced_ids(item) for item in active if assessment_of(item) == _RATING))
     for review in entry.get("reviews") or []:
         if not isinstance(review, dict):
             continue
@@ -786,11 +706,8 @@ def current_submission_gaps(
         if review_id not in rated:
             gaps.append(f"rating for {review_id} ({review.get('skill')})")
 
-    covers = [
-        _referenced_ids(item) for item in active if assessment_of(item) == _COMPARISON
-    ]
     for group in panel_groups(entry, index):
-        if not any(set(group) <= covered for covered in covers):
+        if not panel_is_covered(group, entry):
             gaps.append(
                 f"panel order for {', '.join(group)} (judge-reviews order, or one "
                 "unavailable comparison covering all of them)"
@@ -798,25 +715,17 @@ def current_submission_gaps(
     return gaps
 
 
-def publish_event(
-    run_dir: Path, token: str, judgment_id: str, slice_id: str, *, kind: str = "review-judgment"
-) -> None:
+def publish_event(run_dir: Path, token: str, judgment_id: str, slice_id: str, *, kind: str = "review-judgment") -> None:
     """Publish one judgment event, atomically checking for an exact retry first."""
     with state_mod._advisory_lock(run_dir / ".lock"):
         state_mod._load_state_unlocked(run_dir, token)
         try:
             events = state_mod.read_events(run_dir)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise PmError(
-                f"could not read PM event log {run_dir / 'events.jsonl'}: {exc}"
-            ) from exc
+            raise PmError(f"could not read PM event log {run_dir / 'events.jsonl'}: {exc}") from exc
         if any(
-            event.get("kind") == kind
-            and event.get("note") == judgment_id
-            and event.get("slice") == slice_id
+            event.get("kind") == kind and event.get("note") == judgment_id and event.get("slice") == slice_id
             for event in events
         ):
             return
-        state_mod._append_event_unlocked(
-            run_dir, kind, slice_id=slice_id, note=judgment_id
-        )
+        state_mod._append_event_unlocked(run_dir, kind, slice_id=slice_id, note=judgment_id)

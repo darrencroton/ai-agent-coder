@@ -96,6 +96,27 @@ class TestInitHappyPath(SliceOpsTestCase):
         events = state_mod.read_events(run_dir)
         self.assertTrue(any(event["kind"] == "init" for event in events))
 
+    def test_init_stores_stripped_tags_and_refuses_a_blank_one(self) -> None:
+        plan_path = self.write_plan(self._plan_path())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+
+        code, out, err = self._init(plan_path, harness, extra=["--model-tag", " temp-0.2 ", "--run-tag", "bench-a"])
+        self.assertEqual(code, 0, err)
+        run_id, token = parse_init_output(out)
+        state = state_mod.load_state(state_mod.resolve_run_dir(self.repo, run_id), token)
+        self.assertEqual((state["harness"]["model_tag"], state["run_tag"]), ("temp-0.2", "bench-a"))
+
+        for bad, message in (
+            ("  ", "must be one non-blank line"),
+            ("a\nb", "must be one non-blank line"),
+            ("untagged", "cannot be 'untagged'"),
+        ):
+            with self.subTest(bad):
+                code, _out, err = self._init(plan_path, harness, extra=["--run-tag", bad])
+                self.assertEqual(code, 2)
+                self.assertIn(f"--run-tag {message}", err)
+        self.assertEqual(state_mod.resolve_run_dir(self.repo).name, run_id)
+
     def test_reinit_creates_second_run_and_repoints_current(self) -> None:
         plan_path = self.write_plan(self._plan_path())
         harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
@@ -452,7 +473,17 @@ class TestGrant(SliceOpsTestCase):
         for grant_path in ("src/query/", "*.toml", "**/**", "src/query"):
             with self.subTest(path=grant_path):
                 code, _out, err = self.run_cli_in_repo(
-                    ["grant", "--slice", "Slice 1", "--path", grant_path, "--evidence", _LONG_EVIDENCE, "--token", token]
+                    [
+                        "grant",
+                        "--slice",
+                        "Slice 1",
+                        "--path",
+                        grant_path,
+                        "--evidence",
+                        _LONG_EVIDENCE,
+                        "--token",
+                        token,
+                    ]
                 )
                 self.assertEqual(code, 2, err)
                 self.assertIn("grant refused", err)
@@ -482,6 +513,25 @@ class TestGrant(SliceOpsTestCase):
         self.assertIn("b.py", plan_mod.effective_authorized_files(plan_slice, reloaded))
 
 
+# --- review freshness --------------------------------------------------------
+
+
+class TestReviewFreshnessRequiresGrantsSeen(PlanTestCase):
+    def test_review_without_int_grants_seen_is_stale(self) -> None:
+        artifact = self.repo / "review.md"
+        artifact.write_text("report\n", encoding="utf-8")
+        review = {
+            "head": "abc",
+            "artifact": str(artifact),
+            "sha256": slice_ops.sha256_file(artifact),
+        }
+        fresh = slice_ops.is_review_fresh
+
+        self.assertTrue(fresh({**review, "grants_seen": 0}, "abc", 0))
+        self.assertFalse(fresh(review, "abc", 0))
+        self.assertFalse(fresh({**review, "grants_seen": "0"}, "abc", 0))
+
+
 # --- tmux-gated flows --------------------------------------------------------
 
 
@@ -504,7 +554,9 @@ class TestFinalizeFloorFailure(SliceOpsTestCase):
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
         self.assertTrue(
             self._wait_for(
-                lambda: (Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]) / "result.json").is_file(),
+                lambda: (
+                    Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]) / "result.json"
+                ).is_file(),
                 timeout=15.0,
             )
         )
@@ -522,18 +574,19 @@ class TestAttemptAccounting(SliceOpsTestCase):
     def test_relaunch_persists_attempts_rotates_prior_result_and_exhausts_budget(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(self.repo.parent / "fake.sh", result_only_script(delay=0.5, tail_sleep=30.0))
-        code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "1"])
+        code, out, _err = self._init(plan_path, harness, extra=["--max-attempts", "1", "--model-tag", "run-default"])
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
 
         # Attempt 0: launch, let it write a (stale, to-be-superseded) result.
-        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--model-tag", "this-launch", "--token", token])
         self.assertEqual(code, 0)
         session0 = self._track_current_session(run_id, token)
         self.assertIsNotNone(session0)
         launched = state_mod.load_state(run_dir, token)["current_slice"]
         artifact_dir = Path(launched["artifact_dir"])
+        self.assertEqual(launched["developer"]["model_tag"], "this-launch")
         events = state_mod.read_events(run_dir)
         launches = [e["data"] for e in events if e["kind"] == "launch"]
         self.assertEqual(launches, [{"developer": launched["developer"]}])
@@ -553,6 +606,7 @@ class TestAttemptAccounting(SliceOpsTestCase):
         judge_current_developer(self, token, run_dir, **UNAVAILABLE_DEVELOPER)
 
         # Relaunch: attempts becomes 1 (within budget 1), prior result rotated.
+        # Without --model-tag it falls back to the run's default tag.
         code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0, out)
         self.assertIn("relaunched", out)
@@ -563,7 +617,7 @@ class TestAttemptAccounting(SliceOpsTestCase):
         self.assertEqual(reloaded["current_slice"]["attempts"], 1)
         self.assertEqual(
             reloaded["current_slice"]["developer"],
-            {"tool": "custom", "model": None, "effort": None},
+            {"tool": "custom", "model": None, "effort": None, "model_tag": "run-default"},
         )
         events = state_mod.read_events(run_dir)
         relaunches = [e["data"] for e in events if e["kind"] == "relaunch"]
@@ -571,6 +625,9 @@ class TestAttemptAccounting(SliceOpsTestCase):
         self.assertEqual(relaunches, [{"developer": developer}])
         by_id = {entry["id"]: entry for entry in reloaded["slices"]}
         self.assertEqual(by_id["Slice 1"]["attempts"], 1)
+        # The judgment snapshotted attempt 0's identity, tag included.
+        [judged] = by_id["Slice 1"]["developer_judgments"]
+        self.assertEqual(judged["developer"], launched["developer"])
         # Attempt 0's result.json was rotated out of the way before the
         # relaunch — a stale completion signal can never be mistaken for
         # the new attempt's. (Attempt 1's own script may have already
@@ -625,8 +682,9 @@ class TestLaunchPersistenceWindow(SliceOpsTestCase):
             started.append(session_name)
             return real_start_session(session_name, *args, **kwargs)
 
-        with mock.patch.object(sessions, "start_session", _recording_start_session), mock.patch.object(
-            state_mod, "save_state", side_effect=OSError("no space left on device")
+        with (
+            mock.patch.object(sessions, "start_session", _recording_start_session),
+            mock.patch.object(state_mod, "save_state", side_effect=OSError("no space left on device")),
         ):
             with self.assertRaises(OSError) as caught:
                 self.run_cli_in_repo(["start-slice", "--token", token])
@@ -840,9 +898,7 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
 
         self._launch(idle_script(sleep_seconds=120.0))
-        code, out, _err = self.run_cli_in_repo(
-            ["observe", "--wait", str(2 * _OBSERVE_POLL_SECONDS)]
-        )
+        code, out, _err = self.run_cli_in_repo(["observe", "--wait", str(2 * _OBSERVE_POLL_SECONDS)])
         self.assertEqual(code, 0, "the note is advisory and must never change the exit code")
         self.assertIn("note: this wait returned no signal", out)
 
@@ -893,16 +949,20 @@ class TestObserveEventAppendFailure(PmTestCase):
         artifact_dir.mkdir()
         (artifact_dir / "pane-live.txt").write_text(previous, encoding="utf-8")
         self.set_current_slice(
-            state, token, run_dir,
-            slice_id="Slice 1", before_head=None, artifact_dir=artifact_dir,
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=None,
+            artifact_dir=artifact_dir,
             tmux_session="pm-fake-session",
         )
         activity = {"running": True, "capture": capture}
-        with mock.patch.object(sessions, "session_exists", return_value=True), \
-             mock.patch.object(sessions, "detect_activity", return_value=activity), \
-             mock.patch.object(
-                 slice_ops.state_mod, "append_event", side_effect=OSError("events.jsonl unwritable")
-             ):
+        with (
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "detect_activity", return_value=activity),
+            mock.patch.object(slice_ops.state_mod, "append_event", side_effect=OSError("events.jsonl unwritable")),
+        ):
             return slice_ops.observe(self.repo, run_dir, wait=wait, token=token)
 
     def test_a_real_change_propagates_an_append_failure(self) -> None:
@@ -930,9 +990,7 @@ class TestSendNudge(SliceOpsTestCase):
         """
         trigger = self.repo.parent / "credential_trigger"
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", trigger_gated_credential_prompt_script(trigger)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", trigger_gated_credential_prompt_script(trigger))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -990,27 +1048,41 @@ class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
         artifact_dir.mkdir(parents=True, exist_ok=True)
         (artifact_dir / "pane-live.txt").write_text("earlier screen\n", encoding="utf-8")
         self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=None,
-            artifact_dir=artifact_dir, tmux_session="pm-not-a-real-session",
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=None,
+            artifact_dir=artifact_dir,
+            tmux_session="pm-not-a-real-session",
         )
 
         marker_screen = "working...\nEnter API key to continue\n"
         dialog = sessions.scan_dialog_markers(marker_screen)
-        with mock.patch.object(
-            slice_ops.sessions, "detect_activity",
-            # The pre-marker screen: the loop reads this BEFORE the dialog draws,
-            # so a tail taken from it would not contain the marker.
-            return_value={"running": True, "capture": "working...\n"},
-        ), mock.patch.object(
-            slice_ops.sessions, "scan_visible_pane",
-            return_value=sessions.PaneObservation(capture=marker_screen, dialog_markers=dialog),
-        ), mock.patch.object(
-            # Alive when the wait began, dead by the time liveness is re-read.
-            slice_ops.sessions, "session_exists", side_effect=[True, False],
-        ), mock.patch.object(
-            slice_ops.sessions,
-            "pane_text",
-            side_effect=AssertionError("marker evidence must not be reconstructed by a second read"),
+        with (
+            mock.patch.object(
+                slice_ops.sessions,
+                "detect_activity",
+                # The pre-marker screen: the loop reads this BEFORE the dialog draws,
+                # so a tail taken from it would not contain the marker.
+                return_value={"running": True, "capture": "working...\n"},
+            ),
+            mock.patch.object(
+                slice_ops.sessions,
+                "scan_visible_pane",
+                return_value=sessions.PaneObservation(capture=marker_screen, dialog_markers=dialog),
+            ),
+            mock.patch.object(
+                # Alive when the wait began, dead by the time liveness is re-read.
+                slice_ops.sessions,
+                "session_exists",
+                side_effect=[True, False],
+            ),
+            mock.patch.object(
+                slice_ops.sessions,
+                "pane_text",
+                side_effect=AssertionError("marker evidence must not be reconstructed by a second read"),
+            ),
         ):
             outcome = slice_ops.observe(self.repo, run_dir, wait=30.0, token=token)
 
@@ -1018,11 +1090,13 @@ class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
         self.assertIn("credential_prompt", outcome.dialog_markers["kinds"])
         self.assertFalse(outcome.running, "liveness must be re-read after a marker break")
         self.assertIn(
-            "Enter API key", outcome.tail,
+            "Enter API key",
+            outcome.tail,
             "the tail must be the screen that showed the marker, not the poll before it",
         )
         self.assertIn(
-            "Enter API key", (artifact_dir / "pane-live.txt").read_text(encoding="utf-8"),
+            "Enter API key",
+            (artifact_dir / "pane-live.txt").read_text(encoding="utf-8"),
             "finalize falls back to this file, so it must hold the marker screen too",
         )
         self.assertFalse(outcome.no_signal, "a marker is a signal, not a no-signal wait")
@@ -1036,20 +1110,23 @@ class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
         pane_live = artifact_dir / "pane-live.txt"
         pane_live.write_text("last good screen\n", encoding="utf-8")
         self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=None,
-            artifact_dir=artifact_dir, tmux_session="pm-not-a-real-session",
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=None,
+            artifact_dir=artifact_dir,
+            tmux_session="pm-not-a-real-session",
         )
         clear = sessions.PaneObservation(
             capture=None,
             dialog_markers={"present": False, "kinds": [], "markers": []},
         )
 
-        with mock.patch.object(
-            slice_ops.sessions, "detect_activity", return_value={"running": False, "capture": None}
-        ), mock.patch.object(
-            slice_ops.sessions, "scan_visible_pane", return_value=clear
-        ), mock.patch.object(
-            slice_ops.sessions, "session_exists", side_effect=[True, False]
+        with (
+            mock.patch.object(slice_ops.sessions, "detect_activity", return_value={"running": False, "capture": None}),
+            mock.patch.object(slice_ops.sessions, "scan_visible_pane", return_value=clear),
+            mock.patch.object(slice_ops.sessions, "session_exists", side_effect=[True, False]),
         ):
             outcome = slice_ops.observe(self.repo, run_dir, wait=30.0, token=token)
 
@@ -1083,10 +1160,18 @@ class TestStop(SliceOpsTestCase):
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "stopped")
         self.assertEqual(state["stop_reason"], "operator stop")
-        # `pm stop` appends with data=None, so its event carries no data key.
+        # `pm stop` appends with data=None, so its event carries no data key;
+        # only `--slice-status stopped` records that status on the event.
         stops = [e for e in state_mod.read_events(run_dir) if e["kind"] == "stop"]
         self.assertEqual(len(stops), 1)
         self.assertNotIn("data", stops[0])
+        code, out, _err = self.run_cli_in_repo(
+            ["stop", "--reason", "give up", "--slice-status", "stopped", "--token", token]
+        )
+        self.assertEqual(code, 0, out)
+        stops = [e for e in state_mod.read_events(run_dir) if e["kind"] == "stop"]
+        self.assertEqual(stops[-1]["data"], {"slice_status": "stopped"})
+        self.assertEqual(state_mod.load_state(run_dir, token)["slices"][0]["status"], "stopped")
 
     def test_stop_scavenge_finds_run_prefixed_session_with_state_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
@@ -1109,16 +1194,40 @@ class TestStop(SliceOpsTestCase):
         self.assertIn(session, out)
 
 
-# --- all slices complete -----------------------------------------------------
+# --- the origin event precedes the state save --------------------------------
 
 
-class TestReapReviewersUnionsPersistedPids(PmTestCase):
-    def test_reviewer_registered_after_snapshot_is_killed_and_cleared(self) -> None:
-        """A reviewer that registers its pgid after the caller loaded state
-        is cleared from disk with the rest, so it must be killed as well."""
-        plan_path = self.write_plan(
-            self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}]
-        )
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestLaunchEventPrecedesStateSave(SliceOpsTestCase):
+    def test_a_failed_state_save_leaves_the_launch_event_and_no_current_slice(self) -> None:
+        """A saved submission whose event append then failed would hide a live session under the
+        previous origin's judgment; the reverse failure leaves a visible phantom origin instead."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=30.0))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        with mock.patch.object(state_mod, "save_state", side_effect=PmError("disk full")):
+            with self.assertRaisesRegex(PmError, "disk full"):
+                slice_ops.start_slice(self.repo, run_dir, token)
+
+        launches = [e for e in state_mod.read_events(run_dir) if e["kind"] == "launch"]
+        self.assertEqual([e["slice"] for e in launches], ["Slice 1"])
+        self.assertIn("developer", launches[0]["data"])
+        self.assertIsNone(state_mod.load_state(run_dir, token)["current_slice"])
+        self.assertTrue(self._wait_for(lambda: not sessions.sessions_for_run(run_id), timeout=10.0))
+
+
+# --- reaping kills only the persisted reviewer set ---------------------------
+
+
+class TestReapReviewersKillsPersistedPids(PmTestCase):
+    def _reap(self, plan_path: Path, on_disk: list[int]) -> tuple[list[int], list[list[int]], dict]:
+        """Reap with a snapshot of `[111]` while disk holds `on_disk`; return
+        the pgids killed, the persisted `reviewer_pids` each kill observed,
+        and the caller's snapshot afterwards."""
         state, token, run_dir = self.make_run(plan_path=plan_path)
         self.set_current_slice(
             state,
@@ -1130,32 +1239,36 @@ class TestReapReviewersUnionsPersistedPids(PmTestCase):
         )
         current = state_mod.load_state(run_dir, token)["current_slice"]
         with state_mod.locked_update(run_dir, token) as live:
-            live["current_slice"]["reviewer_pids"].append(222)
+            live["current_slice"]["reviewer_pids"] = list(on_disk)
 
         killed: list[int] = []
-        with mock.patch.object(slice_ops, "_kill_reviewer_pgid", killed.append):
+        persisted_at_kill: list[list[int]] = []
+
+        def kill(pgid: int) -> None:
+            persisted = state_mod.load_state(run_dir, token)["current_slice"]
+            persisted_at_kill.append(persisted["reviewer_pids"])
+            killed.append(pgid)
+
+        with mock.patch.object(slice_ops, "_kill_reviewer_pgid", kill):
             slice_ops._reap_reviewers(run_dir, token, current)
+        self.assertEqual(state_mod.load_state(run_dir, token)["current_slice"]["reviewer_pids"], [])
+        return killed, persisted_at_kill, current
 
-        self.assertEqual(killed, [111, 222])
-        self.assertEqual(current["reviewer_pids"], [])
-        persisted = state_mod.load_state(run_dir, token)["current_slice"]
-        self.assertEqual(persisted["reviewer_pids"], [])
+    def test_only_persisted_pgids_are_killed_after_the_clear_is_persisted(self) -> None:
+        """The on-disk `reviewer_pids` under the lock is authoritative: a pgid
+        registered after the caller's snapshot is killed, one only in the
+        snapshot (a reviewer that has deregistered) is not, and every kill
+        happens after the cleared set is persisted."""
+        plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
+        for on_disk, expected in (([111, 222], [111, 222]), ([], [])):
+            with self.subTest(on_disk=on_disk):
+                killed, persisted_at_kill, current = self._reap(plan_path, on_disk)
+                self.assertEqual(killed, expected)
+                self.assertEqual(persisted_at_kill, [[] for _ in expected])
+                self.assertEqual(current["reviewer_pids"], [])
 
 
-class TestReviewFreshnessRequiresGrantsSeen(PlanTestCase):
-    def test_review_without_int_grants_seen_is_stale(self) -> None:
-        artifact = self.repo / "review.md"
-        artifact.write_text("report\n", encoding="utf-8")
-        review = {
-            "head": "abc",
-            "artifact": str(artifact),
-            "sha256": slice_ops.sha256_file(artifact),
-        }
-        fresh = slice_ops.is_review_fresh
-
-        self.assertTrue(fresh({**review, "grants_seen": 0}, "abc", 0))
-        self.assertFalse(fresh(review, "abc", 0))
-        self.assertFalse(fresh({**review, "grants_seen": "0"}, "abc", 0))
+# --- all slices complete -----------------------------------------------------
 
 
 class TestAllSlicesComplete(SliceOpsTestCase):
@@ -1261,8 +1374,9 @@ class TestRealHarnessComposition(SliceOpsTestCase):
         self.assertEqual(code, 0, out)
         run_id, token = parse_init_output(out)
 
-        with mock.patch.object(sessions, "start_session", capture), mock.patch.object(
-            sessions, "wait_until_ready", lambda *args, **kwargs: None
+        with (
+            mock.patch.object(sessions, "start_session", capture),
+            mock.patch.object(sessions, "wait_until_ready", lambda *args, **kwargs: None),
         ):
             code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
         self._track_current_session(run_id, token)
@@ -1274,7 +1388,7 @@ class TestRealHarnessComposition(SliceOpsTestCase):
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
         self.assertEqual(
             state_mod.load_state(run_dir, token)["current_slice"]["developer"],
-            {"tool": "codex", "model": None, "effort": "default"},
+            {"tool": "codex", "model": None, "effort": "default", "model_tag": None},
         )
 
     def test_harness_command_override_with_a_model_keeps_it_instead_of_recording_null(self) -> None:
@@ -1294,7 +1408,7 @@ class TestRealHarnessComposition(SliceOpsTestCase):
         # null, not an invented "default".
         self.assertEqual(
             state_mod.load_state(run_dir, token)["current_slice"]["developer"],
-            {"tool": "custom", "model": "opencode-go/tiny", "effort": None},
+            {"tool": "custom", "model": "opencode-go/tiny", "effort": None, "model_tag": None},
         )
 
 

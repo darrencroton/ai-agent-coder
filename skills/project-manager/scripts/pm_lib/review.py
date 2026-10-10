@@ -117,8 +117,7 @@ def compose_reviewer_command(
         return command
 
     raise PmError(
-        f"no reviewer command profile is defined for {tool!r}; supported tools: "
-        "codex, claude, copilot, opencode, qwen"
+        f"no reviewer command profile is defined for {tool!r}; supported tools: codex, claude, copilot, opencode, qwen"
     )
 
 
@@ -190,9 +189,7 @@ def _commission_origin(run_dir: Path, slice_id: str) -> dict[str, Any]:
         event = events[index]
         if event.get("slice") == slice_id and event.get("kind") in {"launch", "relaunch", "steer"}:
             return {"index": index, "kind": event["kind"], "slice": slice_id}
-    raise PmError(
-        f"cannot commission {slice_id}: no launch, relaunch, or steer event records its current attempt"
-    )
+    raise PmError(f"cannot commission {slice_id}: no launch, relaunch, or steer event records its current attempt")
 
 
 def _tail(path: Path, max_chars: int = _STDERR_TAIL_CHARS) -> str:
@@ -267,6 +264,7 @@ class ReviewOutcome:
     tool: str
     model: str | None
     effort: str | None
+    model_tag: str | None
     review_id: str
     head: str
     before_head: str | None
@@ -292,6 +290,7 @@ def run_review(
     tool: str | None = None,
     model: str | None = None,
     effort: str | None = None,
+    model_tag: str | None = None,
     reviewer_command: str | None = None,
     timeout: float | None = None,
     pm_adjudications: str | None = None,
@@ -360,9 +359,7 @@ def run_review(
         raise PmError(f"{slice_id} is not present in the run's slice entries")
     # Failed commissions also reserve their artifact sequence: they record no
     # review, so numbering from `len(reviews)` alone would overwrite them.
-    seq, stderr_path = _claim_commission_seq(
-        original_slice_dir, len(entry.get("reviews") or []), skill, resolved_tool
-    )
+    seq, stderr_path = _claim_commission_seq(original_slice_dir, len(entry.get("reviews") or []), skill, resolved_tool)
 
     # Per-commission, so a later commission cannot replace the pinned diff a
     # running reviewer has not opened yet.
@@ -390,8 +387,12 @@ def run_review(
     # happened to finish.
     commissioned_grants = plan_mod.slice_grants(state, slice_id)
 
-    drift_record = None if skill == "drift-audit" else _fresh_drift_audit_report(
-        repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head, len(commissioned_grants)
+    drift_record = (
+        None
+        if skill == "drift-audit"
+        else _fresh_drift_audit_report(
+            repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head, len(commissioned_grants)
+        )
     )
     origin_event = _commission_origin(run_dir, slice_id)
     prompt_text = prompts.render_reviewer_prompt(
@@ -431,7 +432,11 @@ def run_review(
     recorded_effort = resolved_effort if reviewer_command else (resolved_effort or "default")
 
     command = _build_reviewer_command(
-        resolved_tool, prompt_text, model=resolved_model, effort=resolved_effort, repo=repo,
+        resolved_tool,
+        prompt_text,
+        model=resolved_model,
+        effort=resolved_effort,
+        repo=repo,
         reviewer_command_override=reviewer_command,
     )
 
@@ -456,8 +461,13 @@ def run_review(
         process = subprocess.Popen(
             # stdin=DEVNULL: `codex exec` blocks on inherited stdin ("Reading
             # additional input from stdin...") and the hang looks like a slow model.
-            command, cwd=str(repo), stdout=stdout_handle, stderr=stderr_handle,
-            stdin=subprocess.DEVNULL, start_new_session=True, env=reviewer_env,
+            command,
+            cwd=str(repo),
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=reviewer_env,
         )
         # start_new_session=True makes the child its own process-group
         # leader, so its pgid equals its pid at creation time — no
@@ -522,10 +532,7 @@ def run_review(
             current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
 
     if reaped:
-        raise PmError(
-            f"reviewer was reaped by a PM decision (process group {pgid}); "
-            "not recorded as a failure"
-        )
+        raise PmError(f"reviewer was reaped by a PM decision (process group {pgid}); not recorded as a failure")
 
     if failed:
         reason = "timeout" if timed_out else f"exit {returncode}"
@@ -545,6 +552,7 @@ def run_review(
                 "model": resolved_model,
                 "effort": recorded_effort,
                 "command_override": bool(reviewer_command),
+                "model_tag": model_tag,
                 "origin_event_index": origin_event["index"],
                 "reason": reason,
             },
@@ -576,6 +584,7 @@ def run_review(
                     "model": resolved_model,
                     "effort": recorded_effort,
                     "command_override": bool(reviewer_command),
+                    "model_tag": model_tag,
                     "review_id": f"review-{seq}",
                     "head": reviewed_head,
                     "before_head": before_head,
@@ -596,7 +605,8 @@ def run_review(
                                 "artifact": drift_record[0].get("artifact"),
                                 "sha256": drift_record[0].get("sha256"),
                             }
-                            if drift_record else None
+                            if drift_record
+                            else None
                         ),
                     },
                 },
@@ -611,6 +621,7 @@ def run_review(
         tool=resolved_tool,
         model=resolved_model,
         effort=recorded_effort,
+        model_tag=model_tag,
         command_override=bool(reviewer_command),
         review_id=f"review-{seq}",
         head=reviewed_head,

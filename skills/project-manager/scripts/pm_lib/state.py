@@ -134,6 +134,28 @@ def _advisory_lock(lock_path: Path) -> Iterator[None]:
             handle.close()
 
 
+# How the leaderboard labels an identity with no model tag; reserved so a
+# supplied tag can never read as the absence of one.
+UNTAGGED = "untagged"
+
+
+def tag_value(raw: str | None, *, flag: str) -> str | None:
+    """A model or run tag as given to `flag`, stripped; None when the flag is absent.
+
+    A tag is a one-line label the ledger groups and filters by, so an empty,
+    whitespace-only or multi-line value is refused rather than stored, as is
+    the reserved `UNTAGGED` label.
+    """
+    if raw is None:
+        return None
+    tag = raw.strip()
+    if not tag or "\n" in tag or "\r" in tag:
+        raise PmError(f"{flag} must be one non-blank line of text (got {raw!r})")
+    if tag == UNTAGGED:
+        raise PmError(f"{flag} cannot be {UNTAGGED!r}: the leaderboard uses it for an absent tag")
+    return tag
+
+
 def _validate_shape(state: dict[str, Any]) -> None:
     """Validate only the fields PM reads; unknown extra fields are tolerated untouched."""
     schema = state.get("schema")
@@ -192,6 +214,7 @@ def create_run(
     policy: dict[str, Any],
     slices: list[dict[str, Any]],
     run_id: str | None = None,
+    run_tag: str | None = None,
 ) -> tuple[dict[str, Any], str, Path]:
     """Mint a token, build the lite-2 state dict, create the run dir, write it.
 
@@ -218,6 +241,7 @@ def create_run(
         "repo": str(repo),
         "repo_name": git_common_dir_name(repo),
         "branch": branch,
+        "run_tag": run_tag,
         "plan": {"path": str(plan_path), "sha256": plan_sha256, "slice_count": slice_count},
         "harness": harness,
         "reviewer": reviewer,
@@ -385,9 +409,7 @@ def append_event(
     values must be JSON-serialisable. Like `evidence`, it is omitted when None.
     """
     with _advisory_lock(run_dir / ".lock"):
-        _append_event_unlocked(
-            run_dir, kind, slice_id=slice_id, note=note, evidence=evidence, data=data
-        )
+        _append_event_unlocked(run_dir, kind, slice_id=slice_id, note=note, evidence=evidence, data=data)
 
 
 def _append_event_unlocked(
@@ -433,9 +455,7 @@ def resolve_run_dir(repo: Path, run_id: str | None = None) -> Path:
     if run_id is None:
         pointer = root / "current"
         if not pointer.exists():
-            raise PmError(
-                f"no current PM run recorded under {root}; pass --run explicitly or start a run with init"
-            )
+            raise PmError(f"no current PM run recorded under {root}; pass --run explicitly or start a run with init")
         run_id = pointer.read_text(encoding="utf-8").strip()
         if not run_id:
             raise PmError(f"current run pointer at {pointer} is empty; pass --run explicitly")
@@ -484,11 +504,7 @@ def run_elapsed(events: list[dict[str, Any]]) -> tuple[str, str, str] | None:
     parseable timestamp, so a malformed log degrades to an honest "unknown"
     instead of a fabricated figure.
     """
-    stamps = [
-        parsed
-        for parsed in (parse_event_ts(event.get("ts")) for event in events)
-        if parsed is not None
-    ]
+    stamps = [parsed for parsed in (parse_event_ts(event.get("ts")) for event in events) if parsed is not None]
     if not stamps:
         return None
     first, last = min(stamps), max(stamps)
@@ -563,10 +579,11 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     lines.append("")
     lines.append(f"- Repo: {state.get('repo')}")
     lines.append(f"- Branch: {state.get('branch')}")
+    if state.get("run_tag") is not None:
+        lines.append(f"- Run tag: {state['run_tag']}")
     lines.append(f"- Plan: {plan_info.get('path')} (sha256 {plan_sha}…)")
     lines.append(
-        f"- Harness: {harness_info.get('name')} model={harness_info.get('model')} "
-        f"effort={harness_info.get('effort')}"
+        f"- Harness: {harness_info.get('name')} model={harness_info.get('model')} effort={harness_info.get('effort')}"
     )
     # Reviewer and budget are the run's other two comparability controls. The
     # budget mirrors the enforcement default so the report cannot state one the
@@ -665,8 +682,10 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
 def _judgment_attempt_label(judgment: dict[str, Any], entry: dict[str, Any], events: list[dict[str, Any]]) -> str:
     """Best-effort human attempt label from a stored commission origin."""
     review_ids = (
-        judgment.get("review_ids") if judgment.get("status") == "unavailable"
-        else [judgment.get("review_id")] if "review_id" in judgment
+        judgment.get("review_ids")
+        if judgment.get("status") == "unavailable"
+        else [judgment.get("review_id")]
+        if "review_id" in judgment
         else list(judgment.get("order") or [])
     )
     reviews = {review.get("review_id"): review for review in entry.get("reviews") or [] if isinstance(review, dict)}
@@ -685,10 +704,13 @@ def _origin_attempt_label(origin: Any, entry: dict[str, Any], events: list[dict[
     event = events[index]
     if event.get("slice") != entry.get("id") or event.get("kind") != origin.get("kind"):
         return "unknown"
-    return str(sum(
-        event.get("slice") == entry.get("id") and event.get("kind") in {"launch", "relaunch", "steer"}
-        for event in events[: index + 1]
-    ) or "unknown")
+    return str(
+        sum(
+            event.get("slice") == entry.get("id") and event.get("kind") in {"launch", "relaunch", "steer"}
+            for event in events[: index + 1]
+        )
+        or "unknown"
+    )
 
 
 def _review_display(review_id: Any, reviews: dict[str, dict[str, Any]]) -> str:
@@ -701,7 +723,9 @@ def _review_display(review_id: Any, reviews: dict[str, dict[str, Any]]) -> str:
     return f"{review_id} ({review.get('tool')}{suffix})"
 
 
-def _render_reviewer_judgments(state: dict[str, Any], events: list[dict[str, Any]], slices: list[dict[str, Any]]) -> list[str]:
+def _render_reviewer_judgments(
+    state: dict[str, Any], events: list[dict[str, Any]], slices: list[dict[str, Any]]
+) -> list[str]:
     """Compact report section derived only from signed structured records."""
     from . import judgments
 
@@ -709,11 +733,13 @@ def _render_reviewer_judgments(state: dict[str, Any], events: list[dict[str, Any
     any_record = False
     for entry in slices:
         reviews = {
-            review.get("review_id"): review for review in entry.get("reviews") or []
+            review.get("review_id"): review
+            for review in entry.get("reviews") or []
             if isinstance(review, dict) and isinstance(review.get("review_id"), str)
         }
         superseded = {
-            item.get("supersedes") for item in entry.get("review_judgments") or []
+            item.get("supersedes")
+            for item in entry.get("review_judgments") or []
             if isinstance(item, dict) and isinstance(item.get("supersedes"), str)
         }
         for judgment in entry.get("review_judgments") or []:
@@ -762,22 +788,35 @@ def _developer_display(developer: dict[str, Any]) -> str:
     tool = developer.get("tool") or "unknown tool"
     model = developer.get("model") or "unknown model"
     effort = developer.get("effort") if developer.get("effort") is not None else "unknown"
-    return f"{tool}/{model} effort={effort}"
+    tag = f" tag={developer['model_tag']}" if developer.get("model_tag") is not None else ""
+    return f"{tool}/{model} effort={effort}{tag}"
 
 
-def _render_developer_judgments(state: dict[str, Any], events: list[dict[str, Any]], slices: list[dict[str, Any]]) -> list[str]:
+def _developer_counts(judgment: dict[str, Any], entry: dict[str, Any]) -> str:
+    """`criteria M/T, defects P0 n P1 n P2 n P3 n` for a scored Developer judgment.
+
+    `T` is the slice entry's `criteria_total`; any missing value renders as `?`.
+    """
+
+    def shown(value: Any) -> str:
+        return "?" if value is None else str(value)
+
+    defects = judgment.get("defects") if isinstance(judgment.get("defects"), dict) else {}
+    counts = " ".join(f"{key} {shown(defects.get(key))}" for key in ("P0", "P1", "P2", "P3"))
+    return f"criteria {shown(judgment.get('criteria_met'))}/{shown(entry.get('criteria_total'))}, defects {counts}"
+
+
+def _render_developer_judgments(
+    state: dict[str, Any], events: list[dict[str, Any]], slices: list[dict[str, Any]]
+) -> list[str]:
     """Compact report section derived only from signed structured records."""
     from . import judgments
 
     lines: list[str] = []
     any_record = False
     for entry in slices:
-        records = [
-            item for item in entry.get("developer_judgments") or [] if isinstance(item, dict)
-        ]
-        superseded = {
-            item.get("supersedes") for item in records if isinstance(item.get("supersedes"), str)
-        }
+        records = [item for item in entry.get("developer_judgments") or [] if isinstance(item, dict)]
+        superseded = {item.get("supersedes") for item in records if isinstance(item.get("supersedes"), str)}
         for judgment in records:
             any_record = True
             label = judgment.get("judgment_id", "unknown")
@@ -790,14 +829,16 @@ def _render_developer_judgments(state: dict[str, Any], events: list[dict[str, An
             if judgment.get("status") == "unavailable":
                 detail = f"developer {_developer_display(developer)} unavailable"
             else:
-                detail = f"developer {_developer_display(developer)} score {judgment.get('score')}"
+                detail = (
+                    f"developer {_developer_display(developer)} score {judgment.get('score')}, "
+                    + _developer_counts(judgment, entry)
+                )
             lines.append(prefix + detail + f" — {judgment.get('reason', '')}")
     missing = judgments.unjudged_developer_origins(state, events)
     if missing:
         any_record = True
         lines.append(
-            "- Unjudged: "
-            + ", ".join(f"{slice_id}/event-{index} ({kind})" for slice_id, index, kind in missing)
+            "- Unjudged: " + ", ".join(f"{slice_id}/event-{index} ({kind})" for slice_id, index, kind in missing)
         )
     if not any_record:
         lines.append("(none; no developer judgments recorded)")

@@ -36,7 +36,9 @@ class TestCheckPlanCleanAndMultiDefect(PlanTestCase):
             "### Intended Change\nDo it.\n\n"
             "### Authorized Surface\n"
             "- Files allowed to change:\n  - a.py\n\n"
-            "## Slice 2: Duplicate\n\n" + render_slice(2, files=None) + "## Slice 2: Duplicate again\n\n"
+            "## Slice 2: Duplicate\n\n"
+            + render_slice(2, files=None)
+            + "## Slice 2: Duplicate again\n\n"
             + render_slice(2)
         )
         path = self.repo / "plan.md"
@@ -65,11 +67,7 @@ class TestHeadingDefects(PlanTestCase):
         self.assertTrue(any("malformed slice heading" in error for error in report["errors"]))
 
     def test_slice_like_heading_in_fence_rejected(self) -> None:
-        text = (
-            "# Plan\n\n"
-            + render_slice(1)
-            + "```markdown\n## Slice 2: Example inside a fence\n```\n\n"
-        )
+        text = "# Plan\n\n" + render_slice(1) + "```markdown\n## Slice 2: Example inside a fence\n```\n\n"
         path = self.repo / "plan.md"
         path.write_text(text, encoding="utf-8")
         report = plan_mod.plan_check_report(path)
@@ -216,7 +214,6 @@ class TestApprovalFlag(PlanTestCase):
         self.assertTrue(any("must be exactly 'yes' or 'no'" in e for e in report["errors"]))
 
 
-
 class TestPlanCovariates(PlanTestCase):
     def _write(self, text: str) -> Path:
         path = self.repo / "plan.md"
@@ -252,7 +249,21 @@ class TestPlanCovariates(PlanTestCase):
 
     def test_zero_checkbox_criteria_is_plan_error(self) -> None:
         errors = self._errors(render_slice(1, acceptance="- Inputs: none\n- Behaviour that must not change: x"))
-        self.assertTrue(any(e.startswith("Slice 1 (") and "at least one '- [ ]' checkbox criterion" in e for e in errors))
+        self.assertTrue(
+            any(e.startswith("Slice 1 (") and "at least one '- [ ]' checkbox criterion" in e for e in errors)
+        )
+
+    def test_difficulty_quoted_in_another_flag_is_not_read_as_the_difficulty(self) -> None:
+        text = render_slice(1, difficulty="easy").replace(
+            "- Difficulty: easy.\n",
+            "- Recommended Developer: a strong model (Difficulty: hard) at high effort.\n- Difficulty: easy.\n",
+        )
+        self.assertEqual(plan_mod.parse_plan(self._write(text))[0].difficulty, "easy")
+
+    def test_checkbox_inside_a_fenced_block_is_not_counted(self) -> None:
+        acceptance = "- Inputs: none\n- [ ] One.\n\n```markdown\n- [ ] An example, not a criterion.\n```"
+        plan_slice = plan_mod.parse_plan(self._write(render_slice(1, acceptance=acceptance)))[0]
+        self.assertEqual(plan_slice.criteria_total, 1)
 
 
 class TestIndependentAudit(PlanTestCase):
@@ -270,6 +281,18 @@ class TestIndependentAudit(PlanTestCase):
         path.write_text("# Plan\n\n" + text, encoding="utf-8")
         plan_slice = plan_mod.parse_plan(path)[0]
         self.assertFalse(plan_slice.independent_audit_required)
+
+    def test_independent_audit_line_counts_without_a_dash_bullet(self) -> None:
+        """The label is read at the start of its line whatever the bullet marker, so a hand-written
+        `Independent audit required: yes` (the template has no such line) still arms the gate."""
+        for prefix in ("", "* "):
+            with self.subTest(prefix=prefix or "none"):
+                text = render_slice(1).replace(
+                    "- Independent audit required: no.\n", f"{prefix}Independent audit required: yes\n"
+                )
+                path = self.repo / "plan.md"
+                path.write_text("# Plan\n\n" + text, encoding="utf-8")
+                self.assertTrue(plan_mod.parse_plan(path)[0].independent_audit_required)
 
     def test_independent_audit_unclear_defaults_off(self) -> None:
         plan_slice = plan_mod.parse_plan(self.write_plan(slices=[{"audit": "maybe"}]))[0]
@@ -308,15 +331,15 @@ class TestRiskySurfacesAndPlanRisk(PlanTestCase):
         self.assertEqual(plan_slice.plan_risk, "elevated")
 
     def test_plan_risk_elevated_via_approval(self) -> None:
-        plan_slice = plan_mod.parse_plan(
-            self.write_plan(slices=[{"approval": "yes", "audit": "no", "risky": "none"}])
-        )[0]
+        plan_slice = plan_mod.parse_plan(self.write_plan(slices=[{"approval": "yes", "audit": "no", "risky": "none"}]))[
+            0
+        ]
         self.assertEqual(plan_slice.plan_risk, "elevated")
 
     def test_plan_risk_elevated_via_independent_audit(self) -> None:
-        plan_slice = plan_mod.parse_plan(
-            self.write_plan(slices=[{"approval": "no", "audit": "yes", "risky": "none"}])
-        )[0]
+        plan_slice = plan_mod.parse_plan(self.write_plan(slices=[{"approval": "no", "audit": "yes", "risky": "none"}]))[
+            0
+        ]
         self.assertEqual(plan_slice.plan_risk, "elevated")
 
     def test_plan_risk_elevated_via_risky_surfaces(self) -> None:
@@ -326,9 +349,9 @@ class TestRiskySurfacesAndPlanRisk(PlanTestCase):
         self.assertEqual(plan_slice.plan_risk, "elevated")
 
     def test_plan_risk_standard_when_all_clear(self) -> None:
-        plan_slice = plan_mod.parse_plan(
-            self.write_plan(slices=[{"approval": "no", "audit": "no", "risky": "none"}])
-        )[0]
+        plan_slice = plan_mod.parse_plan(self.write_plan(slices=[{"approval": "no", "audit": "no", "risky": "none"}]))[
+            0
+        ]
         self.assertEqual(plan_slice.plan_risk, "standard")
 
 

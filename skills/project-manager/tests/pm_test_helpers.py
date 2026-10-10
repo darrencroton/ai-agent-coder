@@ -25,6 +25,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -213,22 +214,12 @@ def trigger_gated_credential_prompt_script(trigger_path: Path) -> str:
     both drained and echoed: a `send_line` steer shows up in the pane and never
     accumulates unread.
     """
-    return (
-        f"{_READY}\n"
-        f"( {trigger_wait(trigger_path)}; echo 'Enter API key to continue' ) &\n"
-        "exec cat -"
-    )
+    return f"{_READY}\n( {trigger_wait(trigger_path)}; echo 'Enter API key to continue' ) &\nexec cat -"
 
 
 def trigger_gated_result_script(trigger_path: Path, *, tail_sleep: float = 10.0) -> str:
     """Writes result.json once `trigger_path` exists, then idles."""
-    return (
-        f"{_READY}\n"
-        "cat - >/dev/null &\n"
-        f"{trigger_wait(trigger_path)}\n"
-        f"{result_heredoc()}\n"
-        f"sleep {tail_sleep}"
-    )
+    return f"{_READY}\ncat - >/dev/null &\n{trigger_wait(trigger_path)}\n{result_heredoc()}\nsleep {tail_sleep}"
 
 
 def trigger_gated_exit_script(trigger_path: Path) -> str:
@@ -324,9 +315,7 @@ def render_slice(
 def _judge(test: "PmTestCase", command: str, filename: str, token: str, run_dir: Path, data: dict):
     path = test.repo.parent / filename
     path.write_text(json.dumps(data), encoding="utf-8")
-    return test.run_cli_in_repo(
-        [command, "--file", str(path), "--run", run_dir.name, "--token", token]
-    )
+    return test.run_cli_in_repo([command, "--file", str(path), "--run", run_dir.name, "--token", token])
 
 
 def judge_reviews(test: "PmTestCase", token: str, run_dir: Path, data: dict) -> tuple[int, str, str]:
@@ -345,8 +334,7 @@ def current_origin_index(run_dir: Path, slice_id: str = "Slice 1") -> int:
     return max(
         index
         for index, event in enumerate(events)
-        if event.get("slice") == slice_id
-        and event.get("kind") in {"launch", "relaunch", "steer"}
+        if event.get("slice") == slice_id and event.get("kind") in {"launch", "relaunch", "steer"}
     )
 
 
@@ -393,15 +381,9 @@ def judge_current_developer(
     return out.strip().rsplit(": ", 1)[1]
 
 
-def rate_reviews(
-    test: "PmTestCase", token: str, run_dir: Path, *, slice_id: str = "Slice 1"
-) -> None:
+def rate_reviews(test: "PmTestCase", token: str, run_dir: Path, *, slice_id: str = "Slice 1") -> None:
     """Give every not-yet-rated review of `slice_id` a score of 1, asserting success."""
-    entry = next(
-        item
-        for item in state_mod.load_state(run_dir, token)["slices"]
-        if item["id"] == slice_id
-    )
+    entry = next(item for item in state_mod.load_state(run_dir, token)["slices"] if item["id"] == slice_id)
     rated = {
         review_id
         for judgment in entry.get("review_judgments") or []
@@ -428,6 +410,21 @@ def rate_reviews(
             },
         )
         test.assertEqual(code, 0, err)
+
+
+# --- ledger fixtures -----------------------------------------------------------
+#
+# Shared by test_ledger (rows) and test_leaderboard (rendering), so a row
+# built from these events and a hand-built row name the same identities.
+
+_LEDGER_T0 = datetime(2026, 10, 10, tzinfo=timezone.utc)
+OPUS = {"tool": "claude", "model": "claude-opus-5-5", "effort": "high", "model_tag": None}
+SONNET = {"tool": "claude", "model": "claude-sonnet-5-5", "effort": "medium", "model_tag": None}
+
+
+def ledger_ts(seconds: int) -> str:
+    """The event timestamp `seconds` after a fixed instant."""
+    return (_LEDGER_T0 + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class PlanTestCase(unittest.TestCase):
@@ -607,9 +604,7 @@ class PmTestCase(PlanTestCase):
         be judged and then decided through the judgment gate. Returns the
         freshly loaded, persisted state.
         """
-        overrides.setdefault(
-            "developer", {"tool": "fake", "model": None, "effort": None}
-        )
+        overrides.setdefault("developer", {"tool": "fake", "model": None, "effort": None})
         updated = self.set_current_slice(
             state,
             token,
@@ -682,10 +677,14 @@ class TmuxRunTestCase(PmTestCase):
     def _init(self, plan_path: Path, harness_script: Path, *, extra: list[str] | None = None) -> tuple[int, str, str]:
         argv = [
             "init",
-            "--repo", str(self.repo),
-            "--plan", str(plan_path),
-            "--harness", "fake",
-            "--harness-command", str(harness_script),
+            "--repo",
+            str(self.repo),
+            "--plan",
+            str(plan_path),
+            "--harness",
+            "fake",
+            "--harness-command",
+            str(harness_script),
         ]
         if extra:
             argv += extra

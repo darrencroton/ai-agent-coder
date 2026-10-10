@@ -74,4 +74,4 @@ Structural evidence feeds review, never a mechanical gate. In Mode A the Develop
 
 Read [references/methodology.md](references/methodology.md) before interpreting a report. It defines the built-in measures, differential attribution, coverage tiers, and known limits. Read [references/tooling.md](references/tooling.md) only when evaluating or adding an external collector.
 
-Tests: `python3 -m unittest discover -s <skill-dir>/tests -p 'test_*.py'`.
+Tests: `python3 -m unittest discover -s <skill-dir>/tests -p 'test_*.py'`. `project-manager`'s `code_metrics` imports `health.py` by path and depends on `SourceFile`, `language_for`, `category_for`, `line_counts` and `python_structure`, so run the project-manager suite after changing any of them.

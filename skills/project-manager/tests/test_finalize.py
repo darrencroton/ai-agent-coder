@@ -352,9 +352,7 @@ class TestAcceptRefusedOnShortReasoning(PmTestCase):
         for flag in ("--accept", "--steer", "--stop"):
             with self.subTest(flag=flag):
                 cause = ["--cause", "plan"] if flag == "--stop" else []
-                code, out, err = self.run_cli_in_repo(
-                    ["finalize", flag, "", *cause, "--token", token]
-                )
+                code, out, err = self.run_cli_in_repo(["finalize", flag, "", *cause, "--token", token])
                 self.assertEqual(code, 2, out)
                 self.assertIn(flag, err)
                 self.assertNotIn("PASS", out, "an empty decision must not degrade to a floor dump")
@@ -367,9 +365,7 @@ class TestAcceptRefusedOnShortReasoning(PmTestCase):
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestElevatedReviewFreshness(FinalizeTestCase):
     def test_missing_then_stale_then_fresh_reviews(self) -> None:
-        plan_path = self.write_plan(
-            self._plan_path(), slices=[{"files": ["a.py"], "risky": "touches auth"}]
-        )
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"], "risky": "touches auth"}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
         )
@@ -393,13 +389,35 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
         fake_drift = _fake_reviewer_ok(self.repo.parent / "fake_drift.sh", "drift-1")
         fake_code = _fake_reviewer_ok(self.repo.parent / "fake_code.sh", "code-1")
         code, _out, err = self.run_cli_in_repo(
-            ["review", "--slice", "Slice 1", "--skill", "drift-audit", "--tool", "t1",
-             "--reviewer-command", str(fake_drift), "--token", token]
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "drift-audit",
+                "--tool",
+                "t1",
+                "--reviewer-command",
+                str(fake_drift),
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, err)
         code, _out, err = self.run_cli_in_repo(
-            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "t1",
-             "--reviewer-command", str(fake_code), "--token", token]
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "t1",
+                "--reviewer-command",
+                str(fake_code),
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, err)
 
@@ -421,13 +439,35 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
         fake_drift2 = _fake_reviewer_ok(self.repo.parent / "fake_drift2.sh", "drift-2")
         fake_code2 = _fake_reviewer_ok(self.repo.parent / "fake_code2.sh", "code-2")
         code, _out, err = self.run_cli_in_repo(
-            ["review", "--slice", "Slice 1", "--skill", "drift-audit", "--tool", "t1",
-             "--reviewer-command", str(fake_drift2), "--token", token]
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "drift-audit",
+                "--tool",
+                "t1",
+                "--reviewer-command",
+                str(fake_drift2),
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, err)
         code, _out, err = self.run_cli_in_repo(
-            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "t1",
-             "--reviewer-command", str(fake_code2), "--token", token]
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "t1",
+                "--reviewer-command",
+                str(fake_code2),
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, err)
         rate_reviews(self, token, run_dir)
@@ -542,13 +582,35 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
         fake_drift = _fake_reviewer_ok(self.repo.parent / "fake_drift.sh", "drift-1")
         fake_code = _fake_reviewer_ok(self.repo.parent / "fake_code.sh", "code-1")
         code, _out, err = self.run_cli_in_repo(
-            ["review", "--slice", "Slice 1", "--skill", "drift-audit", "--tool", "t1",
-             "--reviewer-command", str(fake_drift), "--token", token]
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "drift-audit",
+                "--tool",
+                "t1",
+                "--reviewer-command",
+                str(fake_drift),
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, err)
         code, _out, err = self.run_cli_in_repo(
-            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "t1",
-             "--reviewer-command", str(fake_code), "--token", token]
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "t1",
+                "--reviewer-command",
+                str(fake_code),
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, err)
         judge_current_developer(self, token, run_dir)
@@ -603,10 +665,15 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
         entry = state["slices"][0]
         entry["reviews"] = [
             {
-                "skill": skill, "tool": "t1", "model": None, "head": head,
+                "skill": skill,
+                "tool": "t1",
+                "model": None,
+                "head": head,
                 "before_head": state["current_slice"]["before_head"],
-                "artifact": str(report), "sha256": slice_ops.sha256_file(report),
-                "at": "2099-01-01T00:00:00Z", "grants_seen": 0,
+                "artifact": str(report),
+                "sha256": slice_ops.sha256_file(report),
+                "at": "2099-01-01T00:00:00Z",
+                "grants_seen": 0,
             }
             for skill in ("drift-audit", "code-review")
         ]
@@ -652,13 +719,35 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
         fake_drift = _fake_reviewer_ok(self.repo.parent / "fake_drift.sh", "drift-1")
         fake_code = _fake_reviewer_ok(self.repo.parent / "fake_code.sh", "code-1")
         code, _out, err = self.run_cli_in_repo(
-            ["review", "--slice", "Slice 1", "--skill", "drift-audit", "--tool", "t1",
-             "--reviewer-command", str(fake_drift), "--token", token]
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "drift-audit",
+                "--tool",
+                "t1",
+                "--reviewer-command",
+                str(fake_drift),
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, err)
         code, _out, err = self.run_cli_in_repo(
-            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "t1",
-             "--reviewer-command", str(fake_code), "--token", token]
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "t1",
+                "--reviewer-command",
+                str(fake_code),
+                "--token",
+                token,
+            ]
         )
         self.assertEqual(code, 0, err)
 
@@ -704,12 +793,14 @@ class TestSteerTypedStateCleanup(PmTestCase):
         )
         judge_current_developer(self, token, run_dir)
 
-        with mock.patch.object(slice_ops.sessions, "session_exists", return_value=True), \
-             mock.patch.object(
-                 slice_ops.sessions,
-                 "send_line",
-                 side_effect=TypedNotSubmitted("typed, not sent"),
-             ):
+        with (
+            mock.patch.object(slice_ops.sessions, "session_exists", return_value=True),
+            mock.patch.object(
+                slice_ops.sessions,
+                "send_line",
+                side_effect=TypedNotSubmitted("typed, not sent"),
+            ),
+        ):
             with self.assertRaises(TypedNotSubmitted):
                 slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the thing")
 
@@ -776,9 +867,7 @@ class TestSteer(FinalizeTestCase):
         # Budget (max_attempts=1) is now exhausted: the next steer is refused,
         # although the steered submission is unjudged — the budget check
         # precedes the judgment gate.
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "One more nudge.", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "One more nudge.", "--token", token])
         self.assertEqual(code, 2, err)
         self.assertIn("attempt budget exhausted", err)
         state = state_mod.load_state(run_dir, token)
@@ -848,9 +937,7 @@ class TestSteer(FinalizeTestCase):
         # `start-slice` itself), and a fixed post-launch delay to achieve that
         # was racing the launch it was trying to follow.
         trigger = self.repo.parent / "credential_trigger"
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", trigger_gated_credential_prompt_script(trigger)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", trigger_gated_credential_prompt_script(trigger))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -860,14 +947,10 @@ class TestSteer(FinalizeTestCase):
         self.assertEqual(code, 0)
         session = self._track_current_session(run_id, token)
         trigger.write_text("go\n", encoding="utf-8")
-        self.assertTrue(
-            self._wait_for(lambda: "Enter API key" in sessions.pane_text(session), timeout=10.0)
-        )
+        self.assertTrue(self._wait_for(lambda: "Enter API key" in sessions.pane_text(session), timeout=10.0))
 
         judge_current_developer(self, token, run_dir)
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "please continue", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "please continue", "--token", token])
         self.assertEqual(code, 2, err)
         self.assertIn("credential_prompt", err)
 
@@ -890,9 +973,7 @@ class TestSteer(FinalizeTestCase):
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         self._track_current_session(run_id, token)
-        artifact_dir = Path(
-            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
-        )
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
 
         judge_current_developer(self, token, run_dir)
         with mock.patch.object(
@@ -921,15 +1002,11 @@ class TestSteer(FinalizeTestCase):
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         self._track_current_session(run_id, token)
-        artifact_dir = Path(
-            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
-        )
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
         judge_current_developer(self, token, run_dir)
 
-        with mock.patch.object(
-            slice_ops.sessions, "send_line", side_effect=PmError("never reached the pane")
-        ):
+        with mock.patch.object(slice_ops.sessions, "send_line", side_effect=PmError("never reached the pane")):
             with self.assertRaises(PmError):
                 slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the other thing")
 
@@ -953,9 +1030,7 @@ class TestSteer(FinalizeTestCase):
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         self._track_current_session(run_id, token)
-        artifact_dir = Path(
-            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
-        )
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
 
         def _race_a_fresh_result(*_args, **_kwargs):
@@ -967,9 +1042,7 @@ class TestSteer(FinalizeTestCase):
             with self.assertRaises(PmError):
                 slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the other thing")
 
-        self.assertEqual(
-            (artifact_dir / "result.json").read_text(encoding="utf-8"), '{"status": "fresh"}'
-        )
+        self.assertEqual((artifact_dir / "result.json").read_text(encoding="utf-8"), '{"status": "fresh"}')
         self.assertTrue((artifact_dir / "attempt-0" / "result.json").is_file())
 
     def test_steer_leaves_rotation_in_place_when_send_might_still_deliver(self) -> None:
@@ -987,15 +1060,11 @@ class TestSteer(FinalizeTestCase):
         code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         self._track_current_session(run_id, token)
-        artifact_dir = Path(
-            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
-        )
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
         judge_current_developer(self, token, run_dir)
 
-        with mock.patch.object(
-            slice_ops.sessions, "send_line", side_effect=TypedNotSubmitted("typed but unconfirmed")
-        ):
+        with mock.patch.object(slice_ops.sessions, "send_line", side_effect=TypedNotSubmitted("typed but unconfirmed")):
             with self.assertRaises(TypedNotSubmitted):
                 slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the other thing")
 
@@ -1004,9 +1073,7 @@ class TestSteer(FinalizeTestCase):
 
     def test_accepted_assessment_retains_full_correction_narrative(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", _steer_then_complete_script(self.repo)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", _steer_then_complete_script(self.repo))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -1046,9 +1113,7 @@ class TestSteer(FinalizeTestCase):
         sessions.force_stop(session)
         self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
 
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "nudge into the void", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "nudge into the void", "--token", token])
         self.assertEqual(code, 2)
         self.assertIn("relaunch", err)
 
@@ -1134,14 +1199,10 @@ class TestFinalizeCauseFlag(PmTestCase):
     handler enforces it before reading or writing any run state."""
 
     def test_stop_cause_pairing_is_refused_untouched(self) -> None:
-        plan_path = self.write_plan(
-            self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}]
-        )
+        plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
         before_head = self._git("rev-parse", "HEAD").stdout.strip()
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head)
         run_json = (run_dir / "run.json").read_bytes()
         events = (run_dir / "events.jsonl").read_bytes()
 
@@ -1153,9 +1214,7 @@ class TestFinalizeCauseFlag(PmTestCase):
         }
         for label, argv in cases.items():
             with self.subTest(label):
-                code, out, err = self.run_cli_in_repo(
-                    ["finalize", *argv, "--token", token]
-                )
+                code, out, err = self.run_cli_in_repo(["finalize", *argv, "--token", token])
                 self.assertEqual(code, 2, out + err)
                 self.assertIn("--cause", err)
                 self.assertEqual((run_dir / "run.json").read_bytes(), run_json)
@@ -1309,9 +1368,7 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
         # The steer itself would be attempt 1, over the budget of 0: refused,
         # and the exhaustion is a mandatory stop that force-kills the session.
         # The submission is unjudged: the budget check precedes the gate.
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "fix it please", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "fix it please", "--token", token])
         self.assertEqual(code, 2, err)
         self.assertIn("attempt budget exhausted", err)
 
@@ -1325,15 +1382,11 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
         self.assertEqual(len(budget_stops), 1)
         self.assertEqual(budget_stops[0]["data"], {"cause": "developer"})
 
-        code, _out, err = self.run_cli_in_repo(
-            ["send", "--text", "hi", "--reason", "nudge", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["send", "--text", "hi", "--reason", "nudge", "--token", token])
         self.assertEqual(code, 2)
         self.assertIn("attempt budget exhausted", err)
 
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--accept", _LONG_REASONING, "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 2)
         self.assertIn("attempt budget exhausted", err)
 
@@ -1375,26 +1428,40 @@ class HungReviewerTestCase(PmTestCase):
         plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
         before_head = self._git("rev-parse", "HEAD").stdout.strip()
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[]
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
         state_mod.append_event(run_dir, "launch", slice_id="Slice 1", note="test launch")
         (self.repo / "a.py").write_text("changed\n", encoding="utf-8")
         self._git("add", "a.py")
         self._git("commit", "-q", "-m", "advance head")
+        proc, pgid = self._spawn_hung_review(token, run_dir)
+        return token, run_dir, proc, pgid
 
+    def _spawn_hung_review(self, token: str, run_dir: Path) -> tuple[subprocess.Popen, int]:
+        """Run a real `pm review` child whose reviewer sleeps, and return it
+        once its process group is recorded in `reviewer_pids`."""
         fake_sleep = _fake_reviewer_sleep(self.repo.parent / "fake_sleep_reviewer.sh", seconds=300)
 
         env = dict(os.environ)
         env["PM_RUN_TOKEN"] = token
         proc = subprocess.Popen(
             [
-                sys.executable, str(_PM_PY), "review",
-                "--slice", "Slice 1", "--skill", "code-review", "--tool", "sleepy",
-                "--reviewer-command", str(fake_sleep),
+                sys.executable,
+                str(_PM_PY),
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "sleepy",
+                "--reviewer-command",
+                str(fake_sleep),
             ],
-            cwd=str(self.repo), env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            cwd=str(self.repo),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         self.addCleanup(proc.stderr.close)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
@@ -1415,14 +1482,21 @@ class HungReviewerTestCase(PmTestCase):
             time.sleep(0.2)
         self.assertTrue(found, "reviewer pgid never appeared in state")
         self.assertTrue(_pgid_alive(pgid))
-        return token, run_dir, proc, pgid
+        return proc, pgid
 
-    def _assert_reaped(self, pgid: int, proc: subprocess.Popen, *, by: str) -> None:
+    def _assert_reaped(self, run_dir: Path, pgid: int, proc: subprocess.Popen, *, by: str) -> None:
+        """The reviewer's process group is gone, and its `review` command saw
+        a PM decision rather than a reviewer failure: it refuses (exit 2) and
+        records no `review-failed` event."""
         self.assertTrue(
             self._wait_for(lambda: not _pgid_alive(pgid), timeout=10.0),
             f"reviewer process group survived {by}",
         )
         proc.wait(timeout=10)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("reaped by a PM decision", proc.stderr.read())
+        events = state_mod.read_events(run_dir)
+        self.assertEqual([e for e in events if e["kind"] == "review-failed"], [])
 
 
 class TestStopReapsHungReviewer(HungReviewerTestCase):
@@ -1430,22 +1504,15 @@ class TestStopReapsHungReviewer(HungReviewerTestCase):
         token, run_dir, proc, pgid = self._start_hung_reviewer()
         code, out, err = self.run_cli_in_repo(["stop", "--reason", "reaping test", "--token", token])
         self.assertEqual(code, 0, out + err)
-        self._assert_reaped(pgid, proc, by="stop")
-        # A reviewer killed by a PM decision is PM's choice, not the
-        # reviewer's failure: its `review` command refuses and records nothing.
-        self.assertEqual(proc.returncode, 2)
-        self.assertIn("reaped by a PM decision", proc.stderr.read())
-        events = state_mod.read_events(run_dir)
-        self.assertEqual([e for e in events if e["kind"] == "review-failed"], [])
+        self._assert_reaped(run_dir, pgid, proc, by="stop")
 
 
-class TestAcceptReapsHungReviewer(FinalizeTestCase):
+class TestAcceptReapsHungReviewer(FinalizeTestCase, HungReviewerTestCase):
     """Acceptance clears `current_slice`, discarding the recorded pgids. Without
     an explicit kill the reviewer runs on with nothing able to find it again.
 
     Acceptance needs a passing floor, so this drives the real launch-to-result
-    flow and records a genuinely running process group as the reviewer —
-    `review` itself is not needed to pin "recorded pgids get killed"."""
+    flow, then commissions a real `pm review` whose reviewer hangs."""
 
     def test_accept_kills_reviewer_process_group(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
@@ -1462,24 +1529,17 @@ class TestAcceptReapsHungReviewer(FinalizeTestCase):
         self._track_current_session(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
-        proc = subprocess.Popen(["sleep", "300"], start_new_session=True)
-        self.addCleanup(lambda: proc.poll() is None and proc.kill())
-        pgid = os.getpgid(proc.pid)
-        with state_mod.locked_update(run_dir, token) as state:
-            state["current_slice"]["reviewer_pids"] = [pgid]
-        self.assertTrue(_pgid_alive(pgid))
+        proc, pgid = self._spawn_hung_review(token, run_dir)
+        # The hung review has recorded nothing yet, so the gate needs only the
+        # Developer judgment; `rate_reviews` covers any review that has.
         judge_current_developer(self, token, run_dir)
+        rate_reviews(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(
             ["finalize", "--accept", "Diff and validation evidence check out; accepting.", "--token", token]
         )
         self.assertEqual(code, 0, out + err)
-        # `proc.poll()` rather than `_pgid_alive`: the sleeper is this test's
-        # own child, so a killed one lingers as a zombie until it is waited.
-        self.assertTrue(
-            self._wait_for(lambda: proc.poll() is not None, timeout=10.0),
-            "reviewer process group survived finalize --accept",
-        )
+        self._assert_reaped(run_dir, pgid, proc, by="finalize --accept")
         self.assertIsNone(state_mod.load_state(run_dir, token).get("current_slice"))
 
 
@@ -1519,9 +1579,7 @@ class TestCurrentSubmissionGaps(PmTestCase):
     refusals are `TestJudgmentGate`'s."""
 
     def _launched(self) -> tuple[str, Path]:
-        plan_path = self.write_plan(
-            self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}]
-        )
+        plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
         head = self._git("rev-parse", "HEAD").stdout.strip()
         artifact_dir = run_dir / "slices" / "slice-001"
@@ -1591,32 +1649,15 @@ class TestCurrentSubmissionGaps(PmTestCase):
         self.assertEqual(code, 0, err)
         return out.strip().rsplit(": ", 1)[1]
 
-    def test_a_submission_without_an_origin_event_is_refused(self) -> None:
-        plan_path = self.write_plan(
-            self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}]
-        )
+    def test_a_submission_without_an_origin_event_is_a_gap(self) -> None:
+        plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
-        self.set_current_slice(
-            state, token, run_dir, slice_id="Slice 1", before_head=None
-        )
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=None)
 
         self.assertEqual(
             self._gaps(token, run_dir),
             ["no launch, relaunch or steer event for Slice 1"],
         )
-        code, _out, err = self.run_cli_in_repo(
-            [
-                "finalize",
-                "--stop",
-                "cannot continue",
-                "--cause",
-                "plan",
-                "--token",
-                token,
-            ]
-        )
-        self.assertEqual(code, 2)
-        self.assertIn("no launch, relaunch or steer event for Slice 1", err)
 
     def test_an_unreadable_event_log_refuses_by_name_and_writes_nothing(self) -> None:
         token, run_dir = self._launched()
@@ -1645,9 +1686,7 @@ class TestCurrentSubmissionGaps(PmTestCase):
         """The gate cannot be evaluated, but the `--risk elevated` this command
         applied (and logged as a risk-raise) must not be lost with it."""
         token, run_dir = self._launched()
-        self.assertEqual(
-            state_mod.load_state(run_dir, token)["slices"][0]["risk"], "standard"
-        )
+        self.assertEqual(state_mod.load_state(run_dir, token)["slices"][0]["risk"], "standard")
         with (run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
             handle.write("{truncated\n")
 
@@ -1685,8 +1724,7 @@ class TestCurrentSubmissionGaps(PmTestCase):
         self._git("add", "a.py")
         self._git("commit", "-q", "-m", "work after the judgment")
         stale = (
-            f"Developer judgment for event {origin} is stale (head or grants changed); "
-            "record a superseding judgment"
+            f"Developer judgment for event {origin} is stale (head or grants changed); record a superseding judgment"
         )
         self.assertEqual(self._gaps(token, run_dir), [stale])
         code, _out, err = self.run_cli_in_repo(
@@ -1728,10 +1766,7 @@ class TestCurrentSubmissionGaps(PmTestCase):
         self.assertEqual(code, 0, out + err)
         self.assertEqual(
             self._gaps(token, run_dir),
-            [
-                f"Developer judgment for event {origin} is stale (head or grants changed); "
-                "record a superseding judgment"
-            ],
+            [f"Developer judgment for event {origin} is stale (head or grants changed); record a superseding judgment"],
         )
 
         judge_current_developer(self, token, run_dir, supersedes=first)
@@ -1744,17 +1779,11 @@ class TestCurrentSubmissionGaps(PmTestCase):
         missing = self._add_review(token, run_dir)
         altered = self._add_review(token, run_dir)
         entry = state_mod.load_state(run_dir, token)["slices"][0]
-        artifacts = {
-            review["review_id"]: Path(review["artifact"]) for review in entry["reviews"]
-        }
+        artifacts = {review["review_id"]: Path(review["artifact"]) for review in entry["reviews"]}
         artifacts[missing].unlink()
-        artifacts[altered].write_text(
-            "rewritten after the commission\n", encoding="utf-8"
-        )
+        artifacts[altered].write_text("rewritten after the commission\n", encoding="utf-8")
 
-        self.assertEqual(
-            self._gaps(token, run_dir), ["rating for review-1 (drift-audit)"]
-        )
+        self.assertEqual(self._gaps(token, run_dir), ["rating for review-1 (drift-audit)"])
 
     def test_gaps_on_an_earlier_origin_never_refuse(self) -> None:
         token, run_dir = self._launched()
@@ -1826,10 +1855,7 @@ class TestCurrentSubmissionGaps(PmTestCase):
         token, run_dir = self._launched()
         judge_current_developer(self, token, run_dir)
         ids = [self._add_review(token, run_dir) for _ in range(3)]
-        ratings = {
-            review_id: self._judge(token, run_dir, _score(review_id))
-            for review_id in ids
-        }
+        ratings = {review_id: self._judge(token, run_dir, _score(review_id)) for review_id in ids}
         self.assertEqual(
             self._gaps(token, run_dir),
             [f"panel order for {', '.join(ids)} {_PANEL_GAP}"],
@@ -1870,15 +1896,11 @@ class TestJudgmentGate(FinalizeTestCase):
         code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0, err)
         session = self._track_current_session(run_id, token)
-        self.assertTrue(
-            self._wait_for(lambda: sessions.session_exists(session), timeout=10.0)
-        )
+        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
         return token, state_mod.resolve_run_dir(self.repo, run_id), session
 
     def _review(self, token: str, skill: str, tool: str) -> None:
-        fake = _fake_reviewer_ok(
-            self.repo.parent / f"fake-{skill}-{tool}.sh", f"{skill} {tool}"
-        )
+        fake = _fake_reviewer_ok(self.repo.parent / f"fake-{skill}-{tool}.sh", f"{skill} {tool}")
         code, _out, err = self.run_cli_in_repo(
             [
                 "review",
@@ -1910,26 +1932,16 @@ class TestJudgmentGate(FinalizeTestCase):
     def test_accept_names_every_gap_writes_nothing_and_proceeds_once_judged(
         self,
     ) -> None:
-        token, run_dir, _session = self._launch(
-            commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0)
-        )
-        artifact_dir = Path(
-            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
-        )
-        self.assertTrue(
-            self._wait_for(
-                lambda: (artifact_dir / "result.json").is_file(), timeout=15.0
-            )
-        )
+        token, run_dir, _session = self._launch(commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0))
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=15.0))
         self._review(token, "drift-audit", "t1")
         self._review(token, "code-review", "t1")
         self._review(token, "code-review", "t2")
         origin = current_origin_index(run_dir)
         before = self._snapshot(run_dir)
 
-        code, out, err = self.run_cli_in_repo(
-            ["finalize", "--accept", _LONG_REASONING, "--token", token]
-        )
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 2, out + err)
         for gap in (
             f"Developer judgment for event {origin} (judge-developer)",
@@ -1945,27 +1957,19 @@ class TestJudgmentGate(FinalizeTestCase):
 
         judge_current_developer(self, token, run_dir)
         rate_reviews(self, token, run_dir)
-        code, out, err = self.run_cli_in_repo(
-            ["finalize", "--accept", _LONG_REASONING, "--token", token]
-        )
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 2, out + err)
         self.assertIn(f"panel order for review-2, review-3 {_PANEL_GAP}", err)
         self.assertNotIn("rating for", err)
 
-        code, _out, err = judge_reviews(
-            self, token, run_dir, _order("review-3", "review-2")
-        )
+        code, _out, err = judge_reviews(self, token, run_dir, _order("review-3", "review-2"))
         self.assertEqual(code, 0, err)
-        code, out, err = self.run_cli_in_repo(
-            ["finalize", "--accept", _LONG_REASONING, "--token", token]
-        )
+        code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, out + err)
         self.assertIn("ACCEPTED", out)
 
     def test_a_refusal_after_a_risk_raise_persists_only_the_ratchet(self) -> None:
-        token, run_dir, _session = self._launch(
-            commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0)
-        )
+        token, run_dir, _session = self._launch(commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0))
 
         code, out, err = self.run_cli_in_repo(
             [
@@ -1989,19 +1993,11 @@ class TestJudgmentGate(FinalizeTestCase):
 
     def test_steer_refused_unjudged_leaves_attempts_session_and_result(self) -> None:
         token, run_dir, session = self._launch(_result_then_drain_script())
-        artifact_dir = Path(
-            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
-        )
-        self.assertTrue(
-            self._wait_for(
-                lambda: (artifact_dir / "result.json").is_file(), timeout=10.0
-            )
-        )
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
         before = self._snapshot(run_dir)
 
-        code, _out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "Remove the dead import.", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "Remove the dead import.", "--token", token])
         self.assertEqual(code, 2, err)
         self.assertIn("is unjudged", err)
         self.assertEqual(self._snapshot(run_dir), before)
@@ -2011,13 +2007,9 @@ class TestJudgmentGate(FinalizeTestCase):
         self.assertFalse((artifact_dir / "steer-attempt-1.md").exists())
 
         judge_current_developer(self, token, run_dir)
-        code, out, err = self.run_cli_in_repo(
-            ["finalize", "--steer", "Remove the dead import.", "--token", token]
-        )
+        code, out, err = self.run_cli_in_repo(["finalize", "--steer", "Remove the dead import.", "--token", token])
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(
-            state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 1
-        )
+        self.assertEqual(state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 1)
 
     def test_stop_refused_unjudged_then_a_fresh_launch_is_ungated(self) -> None:
         token, run_dir, session = self._launch(stdin_draining_idle_script())
@@ -2063,13 +2055,9 @@ class TestJudgmentGate(FinalizeTestCase):
 
     def test_a_refused_relaunch_with_a_risk_raise_persists_the_ratchet(self) -> None:
         token, run_dir, session = self._launch(stdin_draining_idle_script())
-        self.assertEqual(
-            state_mod.load_state(run_dir, token)["slices"][0]["risk"], "standard"
-        )
+        self.assertEqual(state_mod.load_state(run_dir, token)["slices"][0]["risk"], "standard")
 
-        code, _out, err = self.run_cli_in_repo(
-            ["start-slice", "--risk", "elevated", "--token", token]
-        )
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--risk", "elevated", "--token", token])
         self.assertEqual(code, 2, err)
         self.assertIn("is unjudged", err)
         # The entry is the risk every decision reads (`entry["risk"]`).
@@ -2085,17 +2073,9 @@ class TestJudgmentGate(FinalizeTestCase):
     def test_relaunch_is_gated_including_a_resume_after_pm_stop_which_is_not(
         self,
     ) -> None:
-        token, run_dir, session = self._launch(
-            result_only_script(delay=0.5, tail_sleep=30.0)
-        )
-        artifact_dir = Path(
-            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
-        )
-        self.assertTrue(
-            self._wait_for(
-                lambda: (artifact_dir / "result.json").is_file(), timeout=10.0
-            )
-        )
+        token, run_dir, session = self._launch(result_only_script(delay=0.5, tail_sleep=30.0))
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
         before = self._snapshot(run_dir)
 
         # A relaunch of the live slice: refused before rotating or killing.
@@ -2108,9 +2088,7 @@ class TestJudgmentGate(FinalizeTestCase):
         self.assertFalse((artifact_dir / "attempt-0").exists())
 
         # `pm stop` is the ungated emergency exit; resuming after it is gated.
-        code, out, err = self.run_cli_in_repo(
-            ["stop", "--reason", "pause for a human", "--token", token]
-        )
+        code, out, err = self.run_cli_in_repo(["stop", "--reason", "pause for a human", "--token", token])
         self.assertEqual(code, 0, out + err)
         code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 2, err)
@@ -2121,9 +2099,7 @@ class TestJudgmentGate(FinalizeTestCase):
         self.assertEqual(code, 0, out + err)
         self.assertIn("relaunched", out)
         self._track_current_session(run_dir.name, token)
-        self.assertEqual(
-            state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 1
-        )
+        self.assertEqual(state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 1)
 
 
 # --- _attempts_summary: exact multiline formatting, no tmux required --------
@@ -2172,9 +2148,7 @@ class TestAttemptsSummaryFormatting(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
-            state_mod.append_event(
-                run_dir, "steer", slice_id="Slice 1", note="line one\nline two"
-            )
+            state_mod.append_event(run_dir, "steer", slice_id="Slice 1", note="line one\nline two")
             summary = slice_ops._attempts_summary(run_dir, "Slice 1", attempts=1)
 
             events = state_mod.read_events(run_dir)

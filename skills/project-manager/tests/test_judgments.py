@@ -6,13 +6,14 @@ import hashlib
 import json
 import sys
 import threading
+import unittest
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from pm_lib import judgments
+from pm_lib import PmError, judgments
 from pm_lib import state as state_mod
 from pm_test_helpers import PmTestCase, judge_developer, judge_reviews
 
@@ -117,9 +118,7 @@ class TestReviewerJudgments(_JudgmentFixtures):
         self.assertEqual(judgment["close"], ["review-4"])
         self.assertEqual(judgment["assessment"], "comparison")
         self.assertNotIn("rank_groups", judgment)
-        report = state_mod.render_run_report(
-            state, state_mod.read_events(run_dir), run_dir
-        )
+        report = state_mod.render_run_report(state, state_mod.read_events(run_dir), run_dir)
         self.assertIn(
             "code panel review-2 (codex/test-model effort=medium)"
             " > review-3 (codex/test-model effort=medium)"
@@ -153,13 +152,9 @@ class TestReviewerJudgments(_JudgmentFixtures):
             [("Slice 1", "review-2"), ("Slice 1", "review-3")],
         )
         self.assertEqual(judgments.unjudged_review_ids(state), [("Slice 1", "review-1"), ("Slice 1", "review-3")])
-        report = state_mod.render_run_report(
-            state, state_mod.read_events(run_dir), run_dir
-        )
+        report = state_mod.render_run_report(state, state_mod.read_events(run_dir), run_dir)
         self.assertIn("Slice 1 attempt 1 judgment-1: code review-2", report)
-        self.assertIn(
-            "Code panels without an order: Slice 1/review-2, Slice 1/review-3", report
-        )
+        self.assertIn("Code panels without an order: Slice 1/review-2, Slice 1/review-3", report)
 
         self.assertEqual(judge_reviews(self, token, run_dir, order)[0], 0)
         stored = state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"]
@@ -264,10 +259,7 @@ class TestReviewerJudgments(_JudgmentFixtures):
         self.assertEqual(judge_developer(self, token, run_dir, data)[0], 0)
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(len(state["slices"][0]["developer_judgments"]), 1)
-        events = [
-            event for event in state_mod.read_events(run_dir)
-            if event["kind"] == "developer-judgment"
-        ]
+        events = [event for event in state_mod.read_events(run_dir) if event["kind"] == "developer-judgment"]
         self.assertEqual(len(events), 1)
         report = state_mod.render_run_report(state, state_mod.read_events(run_dir), run_dir)
         self.assertIn("developer codex/first-model effort=medium unavailable", report)
@@ -292,9 +284,7 @@ class TestReviewerJudgments(_JudgmentFixtures):
         }
         from unittest import mock
 
-        with mock.patch.object(
-            judgments.state_mod, "read_events", side_effect=OSError("disk full")
-        ):
+        with mock.patch.object(judgments.state_mod, "read_events", side_effect=OSError("disk full")):
             code, _out, err = judge_developer(self, token, run_dir, correction)
         self.assertEqual(code, 2)
         self.assertIn("could not read PM event log", err)
@@ -315,9 +305,7 @@ class TestReviewerJudgments(_JudgmentFixtures):
         self.assertEqual(code, 0, err)
 
         state = state_mod.load_state(run_dir, token)
-        state["slices"][0]["reviews"][2]["review_context"]["pm_adjudications"] = (
-            "different"
-        )
+        state["slices"][0]["reviews"][2]["review_context"]["pm_adjudications"] = "different"
         state_mod.save_state(run_dir, state, token)
         invalid = {
             **ordered,
@@ -360,9 +348,7 @@ class TestReviewerJudgments(_JudgmentFixtures):
         self.assertIn("unknown drift-audit review ID", err)
         self.assertEqual((run_dir / "run.json").read_bytes(), before)
 
-        Path(state["slices"][0]["reviews"][0]["artifact"]).write_text(
-            "altered\n", encoding="utf-8"
-        )
+        Path(state["slices"][0]["reviews"][0]["artifact"]).write_text("altered\n", encoding="utf-8")
         data["review_id"] = "review-1"
         code, _out, err = judge_reviews(self, token, run_dir, data)
         self.assertEqual(code, 2)
@@ -387,9 +373,7 @@ class TestReviewerJudgments(_JudgmentFixtures):
             "_append_event_unlocked",
             side_effect=OSError("disk full"),
         ):
-            code, _out, err = self.run_cli_in_repo(
-                ["judge-reviews", "--file", str(path), "--token", token]
-            )
+            code, _out, err = self.run_cli_in_repo(["judge-reviews", "--file", str(path), "--token", token])
         self.assertEqual(code, 2)
         self.assertIn("was stored but event publication failed", err)
         self.assertEqual(
@@ -397,11 +381,7 @@ class TestReviewerJudgments(_JudgmentFixtures):
             1,
         )
         self.assertEqual(judge_reviews(self, token, run_dir, data)[0], 0)
-        events = [
-            event
-            for event in state_mod.read_events(run_dir)
-            if event["kind"] == "review-judgment"
-        ]
+        events = [event for event in state_mod.read_events(run_dir) if event["kind"] == "review-judgment"]
         self.assertEqual(len(events), 1)
 
     def test_context_mismatches_refuse_a_panel_without_changing_state(self) -> None:
@@ -457,11 +437,7 @@ class TestReviewerJudgments(_JudgmentFixtures):
             thread.start()
         for thread in threads:
             thread.join()
-        events = [
-            event
-            for event in state_mod.read_events(run_dir)
-            if event["kind"] == "review-judgment"
-        ]
+        events = [event for event in state_mod.read_events(run_dir) if event["kind"] == "review-judgment"]
         self.assertEqual(len(events), 1)
 
     def test_event_publication_preserves_an_integrity_stop(self) -> None:
@@ -487,12 +463,8 @@ class TestReviewerJudgments(_JudgmentFixtures):
             (run_dir / "run.json").write_text(json.dumps(tampered), encoding="utf-8")
             return outcome
 
-        with mock.patch.object(
-            judgments, "record_judgment", side_effect=record_then_tamper
-        ):
-            code, _out, err = self.run_cli_in_repo(
-                ["judge-reviews", "--file", str(path), "--token", token]
-            )
+        with mock.patch.object(judgments, "record_judgment", side_effect=record_then_tamper):
+            code, _out, err = self.run_cli_in_repo(["judge-reviews", "--file", str(path), "--token", token])
         self.assertEqual(code, 2)
         self.assertIn("INTEGRITY", err)
         self.assertNotIn("retry the same input", err)
@@ -555,10 +527,9 @@ class TestReviewerJudgments(_JudgmentFixtures):
         self.assertEqual(judge_reviews(self, token, run_dir, first)[0], 0)
         self.assertEqual(judge_reviews(self, token, run_dir, second)[0], 0)
         stored = state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"]
-        self.assertEqual(
-            [item["judgment_id"] for item in stored], ["judgment-1", "judgment-2"]
-        )
+        self.assertEqual([item["judgment_id"] for item in stored], ["judgment-1", "judgment-2"])
         self.assertEqual(stored[1]["supersedes"], "judgment-1")
+
 
 class TestDeveloperJudgmentFields(_JudgmentFixtures):
     def _score(self, **overrides) -> dict:
@@ -586,9 +557,16 @@ class TestDeveloperJudgmentFields(_JudgmentFixtures):
         data = self._score()
         code, _out, err = judge_developer(self, token, run_dir, data)
         self.assertEqual(code, 0, err)
-        [stored] = state_mod.load_state(run_dir, token)["slices"][0]["developer_judgments"]
+        state = state_mod.load_state(run_dir, token)
+        [stored] = state["slices"][0]["developer_judgments"]
         self.assertEqual(stored["criteria_met"], 1)
         self.assertEqual(stored["defects"], {"P0": 0, "P1": 1, "P2": 2, "P3": 3})
+        report = state_mod.render_run_report(state, state_mod.read_events(run_dir), run_dir)
+        self.assertIn("score 1, criteria 1/1, defects P0 0 P1 1 P2 2 P3 3", report)
+        # A value the report cannot find renders as `?`, never a crash.
+        del state["slices"][0]["criteria_total"]
+        report = state_mod.render_run_report(state, state_mod.read_events(run_dir), run_dir)
+        self.assertIn("score 1, criteria 1/?, defects P0 0", report)
 
     def test_score_refuses_missing_or_out_of_range_criteria_met(self) -> None:
         cases = {
@@ -601,17 +579,15 @@ class TestDeveloperJudgmentFields(_JudgmentFixtures):
         for name, (value, fragment) in cases.items():
             with self.subTest(case=name):
                 token, run_dir = self._run_with_developer()
-                self._assert_refused(
-                    token, run_dir, self._score(criteria_met=value), fragment
-                )
+                self._assert_refused(token, run_dir, self._score(criteria_met=value), fragment)
 
     def test_score_refuses_missing_or_malformed_defects(self) -> None:
         full = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
         cases = {
             "missing": (_MISSING, "defects must be an object"),
             "not an object": ([0, 0, 0, 0], "defects must be an object"),
-            "missing key": ({"P0": 0, "P1": 0, "P2": 0}, "missing P3"),
-            "extra key": ({**full, "P4": 0}, "unexpected P4"),
+            "missing key": ({"P0": 0, "P1": 0, "P2": 0}, "exactly the keys P0, P1, P2, P3 (got P0, P1, P2)"),
+            "extra key": ({**full, "P4": 0}, "exactly the keys P0, P1, P2, P3 (got P0, P1, P2, P3, P4)"),
             "negative": ({**full, "P2": -1}, "P2 must be a non-negative integer"),
             "boolean": ({**full, "P0": True}, "P0 must be a non-negative integer"),
         }
@@ -638,9 +614,7 @@ class TestDeveloperJudgmentFields(_JudgmentFixtures):
         state = state_mod.load_state(run_dir, token)
         del state["slices"][0]["criteria_total"]
         state_mod.save_state(run_dir, state, token)
-        self._assert_refused(
-            token, run_dir, self._score(), "has no valid criteria_total in signed state"
-        )
+        self._assert_refused(token, run_dir, self._score(), "has no valid criteria_total in signed state")
 
     def test_changed_defects_is_not_an_exact_retry(self) -> None:
         token, run_dir = self._run_with_developer()
@@ -679,13 +653,9 @@ class TestPanelOrderInput(_JudgmentFixtures):
         for close in ([], ["review-3"], ["review-3", "review-4"]):
             with self.subTest(close=close):
                 _state, token, run_dir = self._run_with_reviews(count=4)
-                code, _out, err = judge_reviews(
-                    self, token, run_dir, self._order(close=list(reversed(close)))
-                )
+                code, _out, err = judge_reviews(self, token, run_dir, self._order(close=list(reversed(close))))
                 self.assertEqual(code, 0, err)
-                [stored] = state_mod.load_state(run_dir, token)["slices"][0][
-                    "review_judgments"
-                ]
+                [stored] = state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"]
                 self.assertEqual(stored["order"], ["review-2", "review-3", "review-4"])
                 self.assertEqual(stored["close"], close)
 
@@ -708,7 +678,7 @@ class TestPanelOrderInput(_JudgmentFixtures):
             ),
             "close missing": ({"close": _MISSING}, "close must be a list"),
             "close not a list": ({"close": "review-3"}, "close must be a list"),
-            "unknown id": ({"order": ["review-2", "review-9"], "close": []},"unknown code-review review ID"),
+            "unknown id": ({"order": ["review-2", "review-9"], "close": []}, "unknown code-review review ID"),
         }
         for name, (overrides, fragment) in cases.items():
             with self.subTest(case=name):
@@ -723,16 +693,14 @@ class TestPanelOrderInput(_JudgmentFixtures):
         self.assertEqual(code, 0, err)
         self.assertIn("already recorded", out)
         reversed_order = self._order(order=["review-4", "review-3", "review-2"], close=[])
+        self._assert_refused(token, run_dir, reversed_order, "review IDs already have an active judgment")
         self._assert_refused(
-            token, run_dir, reversed_order, "review IDs already have an active judgment"
-        )
-        self._assert_refused(
-            token, run_dir, self._order(close=["review-4"]),
+            token,
+            run_dir,
+            self._order(close=["review-4"]),
             "review IDs already have an active judgment",
         )
-        self.assertEqual(
-            len(state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"]), 1
-        )
+        self.assertEqual(len(state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"]), 1)
 
     def test_unavailable_record_requires_assessment_for_both_skills(self) -> None:
         cases = {
@@ -750,14 +718,27 @@ class TestPanelOrderInput(_JudgmentFixtures):
                     "review_ids": ids,
                     "reason": "PM could not assess this report.",
                 }
-                self._assert_refused(
-                    token, run_dir, data, "must state assessment 'rating' or 'comparison'"
-                )
+                self._assert_refused(token, run_dir, data, "must state assessment 'rating' or 'comparison'")
                 code, _out, err = judge_reviews(
-                    self, token, run_dir,
+                    self,
+                    token,
+                    run_dir,
                     {**data, "assessment": "rating" if skill == "drift-audit" else "comparison"},
                 )
                 self.assertEqual(code, 0, err)
+
+    def test_unavailable_comparison_refuses_a_single_review_id(self) -> None:
+        _state, token, run_dir = self._run_with_reviews(count=3)
+        data = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "skill": "code-review",
+            "assessment": "comparison",
+            "status": "unavailable",
+            "review_ids": ["review-2"],
+            "reason": "PM could not compare this report.",
+        }
+        self._assert_refused(token, run_dir, data, "an unavailable comparison must reference at least two review IDs")
 
     def test_order_supersession_replaces_active_coverage(self) -> None:
         _state, token, run_dir = self._run_with_reviews(count=4)
@@ -773,6 +754,20 @@ class TestPanelOrderInput(_JudgmentFixtures):
         self.assertEqual(judgments.unranked_code_review_ids(state), [])
         report = state_mod.render_run_report(state, state_mod.read_events(run_dir), run_dir)
         self.assertIn("judgment-1: superseded code panel", report)
+
+
+class TestStoredJudgmentAssessmentIsStrict(unittest.TestCase):
+    """The report renderer reads each stored reviewer judgment's kind through
+    `judgments.assessment_of`; a record without one is malformed, not legacy."""
+
+    def test_record_without_assessment_is_refused_by_name(self) -> None:
+        self.assertEqual(judgments.assessment_of({"assessment": "rating"}), "rating")
+        with self.assertRaisesRegex(PmError, "judgment-3"):
+            judgments.assessment_of({"judgment_id": "judgment-3", "skill": "drift-audit"})
+
+    def test_unhashable_assessment_is_refused_by_name(self) -> None:
+        with self.assertRaisesRegex(PmError, "judgment-4"):
+            judgments.assessment_of({"judgment_id": "judgment-4", "assessment": ["rating"]})
 
 
 class TestPanelGroups(_JudgmentFixtures):
@@ -814,9 +809,7 @@ class TestPanelGroups(_JudgmentFixtures):
         self.assertEqual(judgments.panel_groups(self._entry(token, run_dir), 0), [["review-2", "review-3"]])
         self._rate_unavailable(token, run_dir, "review-3")
         self.assertEqual(judgments.panel_groups(self._entry(token, run_dir), 0), [])
-        self.assertEqual(
-            judgments.unranked_code_review_ids(state_mod.load_state(run_dir, token)), []
-        )
+        self.assertEqual(judgments.unranked_code_review_ids(state_mod.load_state(run_dir, token)), [])
 
     def test_order_covers_a_panel_by_inclusion_and_unavailable_comparison_covers_too(self) -> None:
         _state, token, run_dir = self._run_with_reviews(count=4)
@@ -850,9 +843,7 @@ class TestPanelGroups(_JudgmentFixtures):
             "review_ids": ["review-2", "review-3"],
             "reason": "Instructions differed.",
         }
-        self.assertEqual(
-            len(judgments.unranked_code_review_ids(state_mod.load_state(run_dir, token))), 2
-        )
+        self.assertEqual(len(judgments.unranked_code_review_ids(state_mod.load_state(run_dir, token))), 2)
         self.assertEqual(judge_reviews(self, token, run_dir, unavailable)[0], 0)
         self.assertEqual(judgments.unranked_code_review_ids(state_mod.load_state(run_dir, token)), [])
 
