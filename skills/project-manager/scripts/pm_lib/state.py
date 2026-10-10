@@ -144,7 +144,8 @@ def tag_value(raw: str | None, *, flag: str) -> str | None:
 
     A tag is a one-line label the ledger groups and filters by, so an empty,
     whitespace-only or multi-line value is refused rather than stored, as is
-    the reserved `UNTAGGED` label.
+    the reserved `UNTAGGED` label and a value containing `=` (the rename
+    separator of `ledger tag`).
     """
     if raw is None:
         return None
@@ -153,6 +154,8 @@ def tag_value(raw: str | None, *, flag: str) -> str | None:
         raise PmError(f"{flag} must be one non-blank line of text (got {raw!r})")
     if tag == UNTAGGED:
         raise PmError(f"{flag} cannot be {UNTAGGED!r}: the leaderboard uses it for an absent tag")
+    if "=" in tag:
+        raise PmError(f"{flag} cannot contain '=': it separates OLD=NEW in `ledger tag`")
     return tag
 
 

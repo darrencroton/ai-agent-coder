@@ -110,6 +110,7 @@ class TestInitHappyPath(SliceOpsTestCase):
             ("  ", "must be one non-blank line"),
             ("a\nb", "must be one non-blank line"),
             ("untagged", "cannot be 'untagged'"),
+            ("a=b", "cannot contain '='"),
         ):
             with self.subTest(bad):
                 code, _out, err = self._init(plan_path, harness, extra=["--run-tag", bad])

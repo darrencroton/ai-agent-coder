@@ -27,6 +27,7 @@ from pm_test_helpers import OPUS, SONNET, ledger_ts  # noqa: E402
 
 from pm_lib import cli  # noqa: E402
 from pm_lib import leaderboard  # noqa: E402
+from pm_lib import state as state_mod  # noqa: E402
 
 _CODEX = ("codex", "gpt-6.1-sol", "high", False)
 _CLAUDE = ("claude", "claude-opus-5-5", "high", False)
@@ -958,6 +959,122 @@ class TestLedgerRenderCommand(unittest.TestCase):
 
         self.assertEqual(code, 0, err)
         self.assertIn("(skill/ledger/historical-pre-ledger.md)", out.read_text(encoding="utf-8"))
+
+
+class TestLedgerTagCommand(unittest.TestCase):
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name).resolve() / "ledger"
+        patcher = mock.patch.dict(os.environ, {"PM_LEDGER_DIR": str(self.root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _main(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def _seed(self) -> dict[str, bytes]:
+        """Two host copies of run-1 (an untagged Developer, a `cold` review) and an unrelated run-2."""
+        run_1 = _file(
+            "run-1",
+            [_row([_sub(OPUS)], decided_at=ledger_ts(5), reviews=[_rev("r1", _CODEX, {"score": 2}, model_tag="cold")])],
+        )
+        run_2 = _file("run-2", [_row([_sub(SONNET)], decided_at=ledger_ts(6))])
+        files = {"mac/run-1.json": run_1, "studio/run-1.json": run_1, "mac/run-2.json": run_2}
+        for name, data in files.items():
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        return files
+
+    def test_retag_rewrites_every_copy_identically_and_the_copies_still_collapse(self) -> None:
+        files = self._seed()
+
+        code, stdout, err = self._main(
+            ["ledger", "tag", "run-1", "--run-tag", "bench", "--model-tag", "untagged=hot", "--model-tag", "cold=warm"]
+        )
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            stdout.splitlines(),
+            [f"retagged: {self.root / 'mac' / 'run-1.json'}", f"retagged: {self.root / 'studio' / 'run-1.json'}"],
+        )
+        mac = (self.root / "mac" / "run-1.json").read_bytes()
+        self.assertEqual(mac, (self.root / "studio" / "run-1.json").read_bytes())
+        self.assertNotEqual(mac, files["mac/run-1.json"])
+        payload = json.loads(mac)
+        self.assertEqual(payload["run_tag"], "bench")
+        row = payload["rows"][0]
+        self.assertEqual(row["submissions"][0]["developer"]["model_tag"], "hot")
+        self.assertEqual(row["reviews"][0]["model_tag"], "warm")
+        self.assertEqual((self.root / "mac" / "run-2.json").read_bytes(), files["mac/run-2.json"])
+
+        code, _stdout, err = self._main(["ledger", "render", "--run-tag", "bench"])
+
+        self.assertEqual(code, 0, err)
+        text = (self.root / "leaderboard.md").read_text(encoding="utf-8")
+        self.assertIn("Runs: 1; slice windows: 1.", text)
+        self.assertIn("None.", _section(text, "## Errors"))
+        self.assertIn(" / hot |", text)
+        self.assertIn(" / warm |", text)
+
+    def test_retag_refusals_exit_two_and_rewrite_nothing(self) -> None:
+        files = self._seed()
+        cases = {
+            "unknown run id": (
+                ["nowhere", "--run-tag", "x"],
+                f"no per-run ledger file for run nowhere under {self.root}",
+            ),
+            "OLD matches nothing": (["run-1", "--model-tag", "typo=x"], "--model-tag typo"),
+            "malformed form": (["run-1", "--model-tag", "cold"], "OLD=NEW"),
+            "reserved NEW": (["run-1", "--model-tag", "cold=untagged"], "cannot be 'untagged'"),
+            "tag containing the separator": (["run-1", "--run-tag", "a=b"], "cannot contain '='"),
+            "no tag given": (["run-1"], "needs --run-tag"),
+        }
+        for name, (argv, expected) in cases.items():
+            with self.subTest(name):
+                code, stdout, err = self._main(["ledger", "tag", *argv])
+
+                self.assertEqual(code, 2)
+                self.assertIn(expected, err)
+                self.assertEqual(stdout, "")
+                for relative, data in files.items():
+                    self.assertEqual((self.root / relative).read_bytes(), data)
+
+    def test_retag_refuses_while_a_host_folder_cannot_be_listed(self) -> None:
+        """A copy in an unlistable folder would later conflict with the retagged ones, so nothing is written."""
+        files = self._seed()
+        listed = leaderboard.load_run_files(self.root)
+        with mock.patch.object(leaderboard, "load_run_files", return_value=[("locked/", None), *listed]):
+            code, _stdout, err = self._main(["ledger", "tag", "run-1", "--run-tag", "bench"])
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"host folder {self.root / 'locked/'} cannot be listed", err)
+        for relative, data in files.items():
+            self.assertEqual((self.root / relative).read_bytes(), data)
+
+    def test_a_write_failure_restores_the_copies_already_rewritten(self) -> None:
+        files = self._seed()
+        real_write = state_mod._atomic_write_bytes
+
+        def fail_second(path: Path, data: bytes) -> None:
+            if path.parent.name == "studio":
+                raise OSError("disk full")
+            real_write(path, data)
+
+        with mock.patch.object(state_mod, "_atomic_write_bytes", side_effect=fail_second):
+            code, _stdout, err = self._main(["ledger", "tag", "run-1", "--run-tag", "bench"])
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"cannot rewrite {self.root / 'studio' / 'run-1.json'}: disk full", err)
+        self.assertIn("were restored, so nothing changed", err)
+        self.assertNotIn("Traceback", err)
+        # Both copies hold their original bytes, so they still collapse at render.
+        for relative, data in files.items():
+            self.assertEqual((self.root / relative).read_bytes(), data)
 
 
 if __name__ == "__main__":

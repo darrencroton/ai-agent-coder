@@ -6,6 +6,8 @@ writes: Developer tables overall and per difficulty, Reviewer tables per
 skill. The leaderboard is a pure function of the files' names and bytes:
 duplicates across hosts collapse, every statistic is exact (`Fraction`, then
 half-up `Decimal` rounding for display), and nothing in it reads the clock.
+`retag_run_files` is the one writer here: it edits a finished run's tags in
+the per-run files themselves.
 """
 
 from __future__ import annotations
@@ -80,6 +82,85 @@ def load_run_files(root: Path) -> list[tuple[str, bytes | None]]:
             except OSError:
                 files.append((label, None))
     return files
+
+
+def retag_run_files(root: Path, run_id: str, *, run_tag: str | None, model_tags: dict[str, str]) -> list[Path]:
+    """Retag every host copy of one run's per-run file in place; return the rewritten paths, sorted.
+
+    `run_tag` replaces the file's `run_tag` (None leaves it). `model_tags`
+    maps OLD to NEW model tags, applied in one pass to every submission's
+    Developer and every review (recorded or failed), so a swap is well
+    defined; OLD may be `state.UNTAGGED` to select identities with no tag.
+    Every copy is rewritten with `write_run_file`'s serialisation, so copies
+    that were identical stay identical.
+
+    Raises `PmError` before anything is written for an invalid tag, an OLD
+    that matches no identity in any copy, no copy of `run_id` under `root`,
+    a malformed copy, or a host folder that cannot be listed (a copy there
+    would later conflict with the retagged ones); a file belongs to the run
+    by its parsed `run_id`, or by its name `<run_id>.json` when it cannot be
+    parsed. Copies are replaced one at a time; if one write fails, the copies
+    already rewritten are restored from their original bytes, so a failure
+    never leaves the run's copies disagreeing, and the error says so.
+    """
+    new_run_tag = state_mod.tag_value(run_tag, flag="--run-tag")
+    mapping = {old: state_mod.tag_value(new, flag="--model-tag") for old, new in model_tags.items()}
+
+    copies: list[tuple[Path, bytes, dict[str, Any]]] = []
+    for label, raw in load_run_files(root):
+        payload, error = _parse_run_file(label, raw)
+        if payload is None:
+            if label.endswith("/"):
+                raise PmError(f"cannot retag while the host folder {root / label} cannot be listed")
+            if Path(label).stem == run_id:
+                raise PmError(f"cannot retag {root / label}: {error}")
+        elif payload["run_id"] == run_id:
+            copies.append((root / label, raw or b"", payload))
+    if not copies:
+        raise PmError(f"no per-run ledger file for run {run_id} under {root}")
+
+    matched = {old: 0 for old in mapping}
+    for _path, _raw, payload in copies:
+        for identity in _identities(payload):
+            key = state_mod.UNTAGGED if identity.get("model_tag") is None else identity.get("model_tag")
+            if key in mapping:
+                identity["model_tag"] = mapping[key]
+                matched[key] += 1
+    for old, count in matched.items():
+        if not count:
+            raise PmError(f"--model-tag {old}: no identity in run {run_id} carries that tag under {root}")
+
+    rewritten: list[tuple[Path, bytes]] = []
+    for path, raw, payload in copies:
+        if new_run_tag is not None:
+            payload["run_tag"] = new_run_tag
+        data = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        try:
+            state_mod._atomic_write_bytes(path, data)
+        except OSError as exc:
+            unrestored = []
+            for done, original in rewritten:
+                try:
+                    state_mod._atomic_write_bytes(done, original)
+                except OSError:
+                    unrestored.append(str(done))
+            outcome = (
+                "the copies already rewritten were restored, so nothing changed"
+                if not unrestored
+                else f"and these rewritten copies could not be restored: {', '.join(unrestored)}"
+            )
+            raise PmError(f"cannot rewrite {path}: {exc}; {outcome}") from exc
+        rewritten.append((path, raw))
+    return sorted(path for path, _original in rewritten)
+
+
+def _identities(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every dict in a parsed per-run file that carries a `model_tag`: Developers and reviews."""
+    found: list[dict[str, Any]] = []
+    for row in payload["rows"]:
+        found += [s["developer"] for s in row.get("submissions") or [] if s.get("developer") is not None]
+        found += row.get("reviews") or []
+    return found
 
 
 def _parse_run_file(label: str, raw: bytes | None) -> tuple[dict[str, Any] | None, str | None]:

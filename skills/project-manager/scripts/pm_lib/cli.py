@@ -229,6 +229,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         help="render only runs with this run tag; repeatable, and untagged runs are then left out",
     )
+    tag = ledger_commands.add_parser("tag", help="Retag a finished run's per-run ledger files in place")
+    tag.add_argument("run_id", metavar="RUN_ID")
+    tag.add_argument("--run-tag", metavar="TEXT", help="set the run tag")
+    tag.add_argument(
+        "--model-tag",
+        action="append",
+        metavar="OLD=NEW",
+        help="rename a model tag on every Developer and review (OLD `untagged` selects those with no tag); "
+        "repeatable, and all renames apply at once, so a swap is allowed",
+    )
 
     return parser
 
@@ -808,7 +818,7 @@ def _run_notes(args: argparse.Namespace) -> int:
     return 0
 
 
-# --- ledger render --------------------------------------------------------
+# --- ledger render and tag ------------------------------------------------
 
 
 def _run_ledger_render(args: argparse.Namespace) -> int:
@@ -834,6 +844,28 @@ def _run_ledger_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_ledger_tag(args: argparse.Namespace) -> int:
+    model_tags: dict[str, str] = {}
+    for form in args.model_tag or []:
+        old, sep, new = form.partition("=")
+        if not sep or not old or "=" in new:
+            raise PmError(f"--model-tag must be OLD=NEW with a non-empty OLD and one '=' (got {form!r})")
+        if old in model_tags:
+            raise PmError(f"--model-tag {old!r} is given twice")
+        model_tags[old] = new
+    if args.run_tag is None and not model_tags:
+        raise PmError("ledger tag needs --run-tag, --model-tag, or both")
+    for path in leaderboard.retag_run_files(
+        ledger.ledger_dir(), args.run_id, run_tag=args.run_tag, model_tags=model_tags
+    ):
+        print(f"retagged: {path}")
+    return 0
+
+
+def _run_ledger(args: argparse.Namespace) -> int:
+    return {"render": _run_ledger_render, "tag": _run_ledger_tag}[args.ledger_command](args)
+
+
 _HANDLERS = {
     "check-plan": _run_check_plan,
     "init": _run_init,
@@ -849,8 +881,7 @@ _HANDLERS = {
     "judge-developer": _run_judge_developer,
     "notes": _run_notes,
     "stop": _run_stop,
-    # `render` is the ledger's only, required subcommand.
-    "ledger": _run_ledger_render,
+    "ledger": _run_ledger,
 }
 
 
