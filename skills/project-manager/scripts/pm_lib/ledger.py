@@ -10,6 +10,11 @@ timestamps on events), so a row is a projection, never a second copy.
 ``<ledger_dir>/<host>/<run_id>.json``, from MAC-verified state under the
 run's existing lock. `cli.main` calls it after every token-bearing command;
 the file is derived output and is never edited by hand.
+
+`load_run_files` and `render_leaderboard` turn every host's per-run files
+into one markdown leaderboard (`pm ledger render`). The leaderboard is a pure
+function of the files' names and bytes: duplicates across hosts collapse,
+and nothing in it reads the clock.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -351,3 +357,646 @@ def write_run_file(run_dir: Path, token: str) -> Path:
             path, (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
         )
     return path
+
+
+# --- the leaderboard -----------------------------------------------------------
+
+# Groups with fewer windows (Developers) or commissions (Reviewers) than this
+# are listed under "Insufficient data", unranked.
+MIN_WINDOWS = 3
+MIN_COMMISSIONS = 3
+
+# The frozen pre-ledger table lives beside the skill's own ledger data, never
+# under `PM_LEDGER_DIR`, so an override cannot hide it.
+_HISTORY_PATH = (
+    Path(__file__).resolve().parents[2] / "ledger" / "historical-pre-ledger.md"
+)
+
+_DIFFICULTIES = ("easy", "moderate", "hard")
+# code-health's six file categories and three line kinds, in display order.
+_CODE_CATEGORIES = (
+    "production",
+    "test",
+    "documentation",
+    "configuration",
+    "data",
+    "other",
+)
+_LINE_KINDS = ("code", "comment", "blank")
+
+
+def load_run_files(root: Path) -> list[tuple[str, bytes | None]]:
+    """Every ``<root>/*/*.json`` as ``(host/name, bytes)``, in sorted path order.
+
+    An unreadable file carries None in place of its bytes, so the renderer can
+    list it under Errors instead of failing the whole render.
+    """
+    files: list[tuple[str, bytes | None]] = []
+    for path in sorted(root.glob("*/*.json")):
+        if not path.is_file():
+            continue
+        label = path.relative_to(root).as_posix()
+        try:
+            files.append((label, path.read_bytes()))
+        except OSError:
+            files.append((label, None))
+    return files
+
+
+def _parse_run_file(
+    label: str, raw: bytes | None
+) -> tuple[dict[str, Any] | None, str | None]:
+    """`(payload, None)` for a well-formed per-run file, else `(None, error)`."""
+    if raw is None:
+        return None, f"{label}: unreadable"
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"{label}: not valid JSON ({exc})"
+    if not (
+        isinstance(payload, dict)
+        and isinstance(payload.get("run_id"), str)
+        and type(payload.get("events")) is int
+        and isinstance(payload.get("rows"), list)
+        and all(isinstance(row, dict) for row in payload["rows"])
+    ):
+        return None, f"{label}: missing or invalid run_id, events or rows"
+    return payload, None
+
+
+def _select_runs(
+    files: list[tuple[str, bytes | None]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """One copy per run (the most events wins; identical copies collapse).
+
+    Copies of a run that tie on the largest `events` but differ in bytes are
+    all excluded and named, as is every malformed file. Independent of the
+    order the files arrive in.
+    """
+    errors: list[tuple[str, str]] = []
+    copies: dict[str, list[tuple[str, bytes, dict[str, Any]]]] = {}
+    for label, raw in sorted(files, key=lambda item: item[0]):
+        payload, error = _parse_run_file(label, raw)
+        if payload is None:
+            errors.append((label, error or label))
+            continue
+        copies.setdefault(payload["run_id"], []).append((label, raw or b"", payload))
+    runs: list[dict[str, Any]] = []
+    for run_id in sorted(copies):
+        most = max(payload["events"] for _label, _raw, payload in copies[run_id])
+        best = [copy for copy in copies[run_id] if copy[2]["events"] == most]
+        if len({raw for _label, raw, _payload in best}) == 1:
+            runs.append(best[0][2])
+            continue
+        for label, _raw, _payload in best:
+            errors.append(
+                (
+                    label,
+                    f"{label}: run {run_id} has another copy with {most} events and different contents",
+                )
+            )
+    return runs, [message for _label, message in sorted(errors)]
+
+
+# --- statistics and cells --------------------------------------------------------
+
+
+def _number(value: Fraction) -> str:
+    """An exact value as an integer, else to one decimal (medians end in .5)."""
+    if value.denominator == 1:
+        return str(value.numerator)
+    return f"{float(value):.1f}"
+
+
+def _mean(values: list[int]) -> Fraction | None:
+    return Fraction(sum(values), len(values)) if values else None
+
+
+def _median(values: list[int]) -> Fraction | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return Fraction(ordered[middle])
+    return Fraction(ordered[middle - 1] + ordered[middle], 2)
+
+
+def _share(hits: int, total: int) -> Fraction | None:
+    return Fraction(hits, total) if total else None
+
+
+def _mean_cell(values: list[int]) -> str:
+    mean = _mean(values)
+    return "n/a" if mean is None else f"{float(mean):.2f} (n={len(values)})"
+
+
+def _median_cell(values: list[int]) -> str:
+    median = _median(values)
+    return "n/a" if median is None else f"{_number(median)} (n={len(values)})"
+
+
+def _share_cell(hits: int, total: int) -> str:
+    if not total:
+        return "n/a"
+    percent = Fraction(100 * hits, total)
+    return f"{hits}/{total} ({int(percent + Fraction(1, 2))}%)"
+
+
+def _ratio_cell(met: int, total: int, count: int) -> str:
+    return "n/a" if not count else f"{met}/{total} (n={count})"
+
+
+def _key_part(value: Any) -> tuple[int, str]:
+    """Sortable form of one group-key field: None sorts after every value."""
+    return (1, "") if value is None else (0, str(value))
+
+
+def _group_sort_key(group: tuple[Any, ...]) -> tuple[tuple[int, str], ...]:
+    return tuple(_key_part(value) for value in group)
+
+
+def _descending(value: Fraction | None) -> tuple[int, Fraction]:
+    """Sort key for a descending statistic with None last."""
+    return (1, Fraction(0)) if value is None else (0, -value)
+
+
+def _label(value: Any) -> str:
+    return "unknown" if value is None else str(value)
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    """A markdown table; pipes inside cells are escaped."""
+
+    def line(cells: list[str]) -> str:
+        return "| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |"
+
+    return [line(headers), line(["---"] * len(headers)), *(line(row) for row in rows)]
+
+
+def _ranked_sections(
+    headers: list[str],
+    ranked: list[list[str]],
+    insufficient: list[list[str]],
+    threshold: str,
+) -> list[str]:
+    lines: list[str] = []
+    if ranked:
+        lines += _table(
+            ["Rank", *headers],
+            [[str(rank), *row] for rank, row in enumerate(ranked, 1)],
+        )
+    else:
+        lines.append("No group has enough data to rank.")
+    if insufficient:
+        lines += ["", f"Insufficient data ({threshold}), unranked:", ""]
+        lines += _table(headers, insufficient)
+    return lines
+
+
+# --- Developer tables -------------------------------------------------------------
+
+
+def _counts_for_developer(row: dict[str, Any]) -> bool:
+    outcome = row.get("outcome")
+    return outcome in {"accepted", "exhausted"} or (
+        outcome == "stopped" and row.get("cause") == "developer"
+    )
+
+
+def _identity_key(developer: Any) -> tuple[Any, Any, Any]:
+    if not isinstance(developer, dict):
+        return (None, None, None)
+    return (developer.get("tool"), developer.get("model"), developer.get("effort"))
+
+
+def _scored(row: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        submission
+        for submission in row.get("submissions") or []
+        if isinstance(submission, dict)
+        and isinstance(submission.get("judgment"), dict)
+        and "score" in submission["judgment"]
+    ]
+
+
+def _int(value: Any) -> int | None:
+    return value if type(value) is int else None
+
+
+def _code_lines(row: dict[str, Any], category: str) -> tuple[int, int, int] | None:
+    code = row.get("code")
+    if (
+        not isinstance(code, dict)
+        or "error" in code
+        or not isinstance(code.get("lines"), dict)
+    ):
+        return None
+    counts = code["lines"].get(category)
+    if not isinstance(counts, dict):
+        return None
+    code_n, comment_n, blank_n = (_int(counts.get(kind)) for kind in _LINE_KINDS)
+    if code_n is None or comment_n is None or blank_n is None:
+        return None
+    return code_n, comment_n, blank_n
+
+
+def _complexity_delta(row: dict[str, Any]) -> int | None:
+    code = row.get("code")
+    if (
+        not isinstance(code, dict)
+        or "error" in code
+        or not isinstance(code.get("complexity"), dict)
+    ):
+        return None
+    before, after = code["complexity"].get("before"), code["complexity"].get("after")
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    before_sum, after_sum = _int(before.get("sum")), _int(after.get("sum"))
+    if before_sum is None or after_sum is None:
+        return None
+    return after_sum - before_sum
+
+
+def _new_developer_group() -> dict[str, Any]:
+    return {
+        "scores": [],
+        "criteria": [],
+        "major": [],
+        "minor": [],
+        "developer_s": [],
+        "windows": 0,
+        "accepted": 0,
+        "first_accepted": 0,
+        "submissions": [],
+        "steers_nudges": [],
+        "elapsed_s": [],
+        "lines": {category: [] for category in _CODE_CATEGORIES},
+        "complexity": [],
+    }
+
+
+def _developer_groups(
+    rows: list[dict[str, Any]],
+) -> tuple[dict[tuple[Any, ...], dict[str, Any]], int, int]:
+    """Per-identity figures over the Developer-counted windows of `rows`.
+
+    Returns the groups and the counts of windows left out of window-level
+    columns: mixed identities, and no scored submission.
+    """
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    mixed = unscored = 0
+    for row in rows:
+        if not _counts_for_developer(row):
+            continue
+        scored = _scored(row)
+        for submission in scored:
+            group = groups.setdefault(
+                _identity_key(submission.get("developer")), _new_developer_group()
+            )
+            score = _int(submission["judgment"].get("score"))
+            if score is not None:
+                group["scores"].append(score)
+            seconds = _int(submission.get("developer_s"))
+            if seconds is not None:
+                group["developer_s"].append(seconds)
+        if scored:
+            first = scored[0]
+            group = groups[_identity_key(first.get("developer"))]
+            judgment = first["judgment"]
+            met, total = (
+                _int(judgment.get("criteria_met")),
+                _int(row.get("criteria_total")),
+            )
+            if met is not None and total is not None:
+                group["criteria"].append((met, total))
+            defects = judgment.get("defects")
+            if isinstance(defects, dict):
+                levels = [
+                    _int(defects.get(level)) for level in ("P0", "P1", "P2", "P3")
+                ]
+                if None not in levels:
+                    group["major"].append(levels[0] + levels[1])
+                    group["minor"].append(levels[2] + levels[3])
+        identities = {
+            _identity_key(submission.get("developer")) for submission in scored
+        }
+        if not identities:
+            unscored += 1
+            continue
+        if len(identities) > 1:
+            mixed += 1
+            continue
+        group = groups[identities.pop()]
+        group["windows"] += 1
+        if row.get("outcome") == "accepted":
+            group["accepted"] += 1
+            if len(scored) == 1:
+                group["first_accepted"] += 1
+        group["submissions"].append(len(scored))
+        steers, nudges = _int(row.get("steers")), _int(row.get("nudges"))
+        if steers is not None and nudges is not None:
+            group["steers_nudges"].append(steers + nudges)
+        elapsed = _int(row.get("elapsed_s"))
+        if elapsed is not None:
+            group["elapsed_s"].append(elapsed)
+        for category in _CODE_CATEGORIES:
+            lines = _code_lines(row, category)
+            if lines is not None:
+                group["lines"][category].append(lines)
+        delta = _complexity_delta(row)
+        if delta is not None:
+            group["complexity"].append(delta)
+    return groups, mixed, unscored
+
+
+_DEVELOPER_HEADERS = [
+    "Developer (tool / model / effort)",
+    "Score (PM), mean 0–2",
+    "First-submission criteria met (PM), Σk/Σn",
+    "First-submission P0+P1 defects (PM), mean",
+    "First-submission P2+P3 defects (PM), mean",
+    "Developer time per submission, median s",
+    "Windows, n",
+    "Accepted, share",
+    "Accepted on first submission, share",
+    "Scored submissions per window, mean",
+    "Steers+nudges per window, mean",
+    "Wall time per window, median s",
+    *(
+        f"Δ {category} lines code/comment/blank, median"
+        for category in _CODE_CATEGORIES
+    ),
+    "Δ complexity sum, median",
+]
+
+
+def _lines_cell(values: list[tuple[int, int, int]]) -> str:
+    if not values:
+        return "n/a"
+    medians = []
+    for kind in range(len(_LINE_KINDS)):
+        median = _median([value[kind] for value in values])
+        medians.append("n/a" if median is None else _number(median))
+    return f"{'/'.join(medians)} (n={len(values)})"
+
+
+def _developer_cells(key: tuple[Any, ...], group: dict[str, Any]) -> list[str]:
+    criteria = group["criteria"]
+    return [
+        " / ".join(_label(value) for value in key),
+        _mean_cell(group["scores"]),
+        _ratio_cell(
+            sum(met for met, _ in criteria),
+            sum(total for _, total in criteria),
+            len(criteria),
+        ),
+        _mean_cell(group["major"]),
+        _mean_cell(group["minor"]),
+        _median_cell(group["developer_s"]),
+        str(group["windows"]),
+        _share_cell(group["accepted"], group["windows"]),
+        _share_cell(group["first_accepted"], group["windows"]),
+        _mean_cell(group["submissions"]),
+        _mean_cell(group["steers_nudges"]),
+        _median_cell(group["elapsed_s"]),
+        *(_lines_cell(group["lines"][category]) for category in _CODE_CATEGORIES),
+        _median_cell(group["complexity"]),
+    ]
+
+
+def _developer_table(rows: list[dict[str, Any]]) -> list[str]:
+    groups, mixed, unscored = _developer_groups(rows)
+    if not groups and not mixed and not unscored:
+        return ["No Developer-counted windows."]
+    keys = sorted(groups, key=_group_sort_key)
+    ranked = [key for key in keys if groups[key]["windows"] >= MIN_WINDOWS]
+    ranked.sort(
+        key=lambda key: (
+            _descending(_mean(groups[key]["scores"])),
+            _descending(_share(groups[key]["first_accepted"], groups[key]["windows"])),
+            _group_sort_key(key),
+        )
+    )
+    insufficient = [key for key in keys if groups[key]["windows"] < MIN_WINDOWS]
+    lines = _ranked_sections(
+        _DEVELOPER_HEADERS,
+        [_developer_cells(key, groups[key]) for key in ranked],
+        [_developer_cells(key, groups[key]) for key in insufficient],
+        f"fewer than {MIN_WINDOWS} windows",
+    )
+    lines += [
+        "",
+        f"Window-level columns leave out {mixed} window(s) with mixed Developer identities"
+        f" and {unscored} window(s) with no scored submission.",
+    ]
+    return lines
+
+
+# --- Reviewer tables --------------------------------------------------------------
+
+
+def _new_reviewer_group() -> dict[str, Any]:
+    return {
+        "commissions": 0,
+        "rated": 0,
+        "unusable": 0,
+        "scores": [],
+        "panels": 0,
+        "wins": 0,
+        "losses": 0,
+        "close_wins": 0,
+        "close_losses": 0,
+    }
+
+
+def _reviewer_groups(
+    runs: list[dict[str, Any]],
+) -> dict[str, dict[tuple[Any, ...], dict[str, Any]]]:
+    """Per-skill, per-identity reviewer figures over every window, any outcome."""
+    by_skill: dict[str, dict[tuple[Any, ...], dict[str, Any]]] = {}
+    for run in runs:
+        for row in run["rows"]:
+            members: dict[Any, tuple[str, tuple[Any, ...]]] = {}
+            for review in row.get("reviews") or []:
+                if not isinstance(review, dict):
+                    continue
+                skill = _label(review.get("skill"))
+                key = (
+                    review.get("tool"),
+                    review.get("model"),
+                    review.get("effort"),
+                    review.get("command_override"),
+                )
+                group = by_skill.setdefault(skill, {}).setdefault(
+                    key, _new_reviewer_group()
+                )
+                group["commissions"] += 1
+                rating = review.get("rating")
+                if review.get("failed"):
+                    group["unusable"] += 1
+                    continue
+                members[review.get("review_id")] = (skill, key)
+                if isinstance(rating, dict) and "score" in rating:
+                    group["rated"] += 1
+                    score = _int(rating.get("score"))
+                    if score is not None:
+                        group["scores"].append(score)
+                elif isinstance(rating, dict) and rating.get("status") == "unavailable":
+                    group["unusable"] += 1
+            for comparison in row.get("comparisons") or []:
+                if isinstance(comparison, dict) and isinstance(
+                    comparison.get("order"), list
+                ):
+                    _credit_order(by_skill, members, comparison)
+    return by_skill
+
+
+def _credit_order(
+    by_skill: dict[str, dict[tuple[Any, ...], dict[str, Any]]],
+    members: dict[Any, tuple[str, tuple[Any, ...]]],
+    comparison: dict[str, Any],
+) -> None:
+    """Credit one panel order: panels, every implied pair, and close calls."""
+    ids = comparison["order"]
+    close = set(comparison.get("close") or [])
+    known = [members.get(review_id) for review_id in ids]
+    groups = [
+        None if member is None else by_skill[member[0]][member[1]] for member in known
+    ]
+    for skill, key in {member for member in known if member is not None}:
+        by_skill[skill][key]["panels"] += 1
+    for position, upper in enumerate(groups):
+        for lower in groups[position + 1 :]:
+            if upper is not None:
+                upper["wins"] += 1
+            if lower is not None:
+                lower["losses"] += 1
+    for position in range(1, len(ids)):
+        if ids[position] not in close:
+            continue
+        upper, lower = groups[position - 1], groups[position]
+        if upper is not None:
+            upper["close_wins"] += 1
+        if lower is not None:
+            lower["close_losses"] += 1
+
+
+_REVIEWER_HEADERS = [
+    "Reviewer (tool / model / effort / override)",
+    "Commissions, n",
+    "Usable (PM), share rated/(rated+unavailable+failed)",
+    "Score (PM), mean 0–2",
+    "Panels (PM), n",
+    "Pairwise wins (PM), share",
+    "Close-call wins (PM), share",
+]
+
+
+def _reviewer_cells(key: tuple[Any, ...], group: dict[str, Any]) -> list[str]:
+    tool, model, effort, override = key
+    override_label = (
+        "unknown" if override is None else ("override" if override else "no override")
+    )
+    return [
+        " / ".join([_label(tool), _label(model), _label(effort), override_label]),
+        str(group["commissions"]),
+        _share_cell(group["rated"], group["rated"] + group["unusable"]),
+        _mean_cell(group["scores"]),
+        str(group["panels"]),
+        _share_cell(group["wins"], group["wins"] + group["losses"]),
+        _share_cell(group["close_wins"], group["close_wins"] + group["close_losses"]),
+    ]
+
+
+def _reviewer_table(
+    skill: str, groups: dict[tuple[Any, ...], dict[str, Any]]
+) -> list[str]:
+    def statistic(group: dict[str, Any]) -> Fraction | None:
+        if skill == "code-review":
+            return _share(group["wins"], group["wins"] + group["losses"])
+        return _mean(group["scores"])
+
+    keys = sorted(groups, key=_group_sort_key)
+    ranked = [key for key in keys if groups[key]["commissions"] >= MIN_COMMISSIONS]
+    ranked.sort(
+        key=lambda key: (_descending(statistic(groups[key])), _group_sort_key(key))
+    )
+    insufficient = [key for key in keys if groups[key]["commissions"] < MIN_COMMISSIONS]
+    return _ranked_sections(
+        _REVIEWER_HEADERS,
+        [_reviewer_cells(key, groups[key]) for key in ranked],
+        [_reviewer_cells(key, groups[key]) for key in insufficient],
+        f"fewer than {MIN_COMMISSIONS} commissions",
+    )
+
+
+# --- the document -----------------------------------------------------------------
+
+
+def _as_of(rows: list[dict[str, Any]]) -> str:
+    latest: tuple[Any, str] | None = None
+    for row in rows:
+        parsed = state_mod.parse_event_ts(row.get("decided_at"))
+        if parsed is not None and (latest is None or parsed > latest[0]):
+            latest = (parsed, row["decided_at"])
+    return "unknown" if latest is None else latest[1]
+
+
+def render_leaderboard(
+    runs: list[tuple[str, bytes | None]], out_dir: Path | None = None
+) -> tuple[str, list[str]]:
+    """The leaderboard as markdown, and the files excluded from it.
+
+    `runs` is `load_run_files` output in any order; the result depends only
+    on the files' contents and names, never on their order or the clock. A
+    History link to the frozen pre-ledger table is written relative to
+    `out_dir` when that table exists.
+    """
+    kept, errors = _select_runs(runs)
+    rows = [row for run in kept for row in run["rows"]]
+    lines = ["# PM model leaderboard", "", f"As of: {_as_of(rows)}", ""]
+    if _HISTORY_PATH.is_file():
+        target = (
+            os.path.relpath(_HISTORY_PATH, out_dir)
+            if out_dir is not None
+            else str(_HISTORY_PATH)
+        )
+        lines += [f"History: [{_HISTORY_PATH.name}]({Path(target).as_posix()})", ""]
+    lines += [
+        f"Runs: {len(kept)}; slice windows: {len(rows)}.",
+        "",
+        "Every cell states its statistic and its own n; `n/a` means no values. Columns marked (PM) are"
+        " PM judgment, never blended into a measured figure. There is no composite score.",
+        "",
+        "## Developers",
+        "",
+        "Counted windows: `accepted`, `exhausted`, and `stopped` with cause `developer`. Only scored"
+        " submissions count. Submission-level columns credit each submission's own identity;"
+        " window-level columns (from Windows on) credit a window only when all its scored submissions"
+        " share one identity.",
+        "",
+        "### All difficulties",
+        "",
+        *_developer_table(rows),
+    ]
+    bands = sorted(
+        {row.get("difficulty") for row in rows} - set(_DIFFICULTIES),
+        key=_key_part,
+    )
+    for band in [*_DIFFICULTIES, *bands]:
+        lines += ["", f"### Difficulty: {_label(band)}", ""]
+        lines += _developer_table(
+            [row for row in rows if row.get("difficulty") == band]
+        )
+    lines += ["", "## Reviewers"]
+    reviewer_groups = _reviewer_groups(kept)
+    if not reviewer_groups:
+        lines += ["", "No reviews recorded."]
+    for skill in sorted(reviewer_groups):
+        order = "pairwise wins" if skill == "code-review" else "mean score"
+        lines += ["", f"### {skill}", "", f"Ranked by {order}.", ""]
+        lines += _reviewer_table(skill, reviewer_groups[skill])
+    lines += ["", "## Errors", ""]
+    lines += [f"- {error}" for error in errors] if errors else ["None."]
+    return "\n".join(lines) + "\n", errors

@@ -9,10 +9,13 @@ runs driven by a fake harness, with `PM_LEDGER_DIR` pinned by
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +35,7 @@ from pm_test_helpers import (  # noqa: E402
     write_fake_harness,
 )
 
+from pm_lib import cli  # noqa: E402
 from pm_lib import ledger  # noqa: E402
 from pm_lib import state as state_mod  # noqa: E402
 
@@ -611,6 +615,593 @@ class TestLedgerSilentWithoutRunState(PmTestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("state unavailable", out)
         self.assertNotIn("pm: ledger", out + err)
+
+
+# --- pm ledger render ------------------------------------------------------------
+
+_CODEX = ("codex", "gpt-6.1-sol", "high", False)
+_CLAUDE = ("claude", "claude-opus-5-5", "high", False)
+_QWEN = ("qwen", "qwen-4", None, True)
+_ZERO_DEFECTS = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
+
+
+def _sub(
+    developer: dict,
+    score: int | None = 2,
+    *,
+    criteria_met: int = 3,
+    defects: dict | None = None,
+    developer_s: int | None = 60,
+) -> dict:
+    """One submission; `score=None` makes it an `unavailable` one."""
+    if score is None:
+        judgment: dict = {"status": "unavailable"}
+    else:
+        judgment = {
+            "score": score,
+            "criteria_met": criteria_met,
+            "defects": defects or _ZERO_DEFECTS,
+        }
+    return {
+        "origin": 0,
+        "kind": "launch",
+        "developer": developer,
+        "judgment": judgment,
+        "developer_s": developer_s,
+    }
+
+
+def _rev(
+    review_id: str, key: tuple, rating: dict | None, skill: str = "code-review"
+) -> dict:
+    tool, model, effort, override = key
+    return {
+        "review_id": review_id,
+        "skill": skill,
+        "tool": tool,
+        "model": model,
+        "effort": effort,
+        "command_override": override,
+        "origin": 0,
+        "rating": rating,
+    }
+
+
+def _failed(key: tuple, skill: str = "code-review") -> dict:
+    tool, model, effort, override = key
+    return {
+        "review_id": None,
+        "failed": True,
+        "skill": skill,
+        "tool": tool,
+        "model": model,
+        "effort": effort,
+        "command_override": override,
+        "origin": 0,
+        "reason": "timeout",
+    }
+
+
+def _code(production: tuple[int, int, int], before: int, after: int) -> dict:
+    lines = {
+        category: {"code": 0, "comment": 0, "blank": 0}
+        for category in (
+            "production",
+            "test",
+            "documentation",
+            "configuration",
+            "data",
+            "other",
+        )
+    }
+    lines["production"] = dict(
+        zip(("code", "comment", "blank"), production, strict=True)
+    )
+    return {
+        "lines": lines,
+        "complexity": {
+            "before": {"sum": before, "max": before},
+            "after": {"sum": after, "max": after},
+        },
+        "complexity_reason": None,
+    }
+
+
+def _row(
+    submissions: list[dict],
+    *,
+    outcome: str = "accepted",
+    cause: str | None = None,
+    slice_id: str = "Slice 1",
+    difficulty: str | None = "moderate",
+    decided_at: str | None = None,
+    elapsed_s: int | None = 600,
+    steers: int = 0,
+    nudges: int = 0,
+    code: dict | None = None,
+    reviews: list[dict] | None = None,
+    comparisons: list[dict] | None = None,
+) -> dict:
+    return {
+        "repo_name": "repo",
+        "run_id": "run-1",
+        "slice_id": slice_id,
+        "window_open": 0,
+        "difficulty": difficulty,
+        "criteria_total": 3,
+        "outcome": outcome,
+        "cause": cause,
+        "decided_at": decided_at if outcome != "open" else None,
+        "elapsed_s": elapsed_s,
+        "steers": steers,
+        "relaunches": 0,
+        "nudges": nudges,
+        "code": code,
+        "submissions": submissions,
+        "reviews": reviews or [],
+        "comparisons": comparisons or [],
+    }
+
+
+def _file(run_id: str, rows: list[dict], events: int = 10) -> bytes:
+    payload = {"run_id": run_id, "events": events, "rows": rows}
+    return (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def _render(*files: tuple[str, bytes]) -> str:
+    text, _errors = ledger.render_leaderboard(list(files))
+    return text
+
+
+def _section(text: str, heading: str) -> str:
+    """The body under `heading` up to the next heading of the same or higher level."""
+    level = heading.split(" ", 1)[0]
+    lines = text.splitlines()
+    start = lines.index(heading) + 1
+    end = next(
+        (
+            index
+            for index in range(start, len(lines))
+            if lines[index].startswith("#")
+            and len(lines[index].split(" ", 1)[0]) <= len(level)
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
+def _tables(section: str) -> list[list[dict[str, str]]]:
+    """Every markdown table in `section`, each as a list of header→cell rows."""
+    tables: list[list[dict[str, str]]] = []
+    block: list[list[str]] = []
+    for line in [*section.splitlines(), ""]:
+        if line.startswith("|"):
+            block.append([cell.strip() for cell in line.strip("|").split(" | ")])
+            continue
+        if block:
+            headers = block[0]
+            tables.append(
+                [dict(zip(headers, cells, strict=True)) for cells in block[2:]]
+            )
+            block = []
+    return tables
+
+
+def _by_name(table: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    """Index a Developer table by its identity column."""
+    return {row["Developer (tool / model / effort)"]: row for row in table}
+
+
+_OPUS_LABEL = "claude / claude-opus-5-5 / high"
+_SONNET_LABEL = "claude / claude-sonnet-5-5 / medium"
+
+
+class TestLeaderboardColumns(unittest.TestCase):
+    """Every column on a fixture whose values are worked out by hand."""
+
+    def _text(self) -> str:
+        rows = [
+            # Two scored submissions: only the first is "first", both count.
+            _row(
+                [
+                    _sub(
+                        _OPUS,
+                        1,
+                        criteria_met=2,
+                        defects={"P0": 0, "P1": 1, "P2": 1, "P3": 1},
+                        developer_s=100,
+                    ),
+                    _sub(_OPUS, 2, developer_s=200),
+                ],
+                elapsed_s=600,
+                steers=1,
+                nudges=1,
+                code=_code((10, 2, 1), 4, 7),
+                reviews=[
+                    _rev("review-1", _CODEX, {"score": 2}),
+                    _rev("review-2", _CLAUDE, {"score": 1}),
+                    _rev("review-3", _QWEN, {"score": 1}),
+                ],
+                comparisons=[
+                    {
+                        "origin": 0,
+                        "order": ["review-1", "review-2", "review-3"],
+                        "close": ["review-2"],
+                    }
+                ],
+            ),
+            _row(
+                [_sub(_OPUS, 2, developer_s=300)],
+                slice_id="Slice 2",
+                elapsed_s=300,
+                code=_code((20, 0, 3), 0, 1),
+                reviews=[
+                    _rev("review-1", _CODEX, {"score": 1}),
+                    _rev("review-2", _CLAUDE, {"score": 2}),
+                ],
+                comparisons=[
+                    {
+                        "origin": 0,
+                        "order": ["review-2", "review-1"],
+                        "close": ["review-1"],
+                    }
+                ],
+            ),
+            # Exhausted: the unavailable first submission is skipped, so the
+            # steer is the first scored one.
+            _row(
+                [
+                    _sub(_OPUS, None),
+                    _sub(
+                        _OPUS,
+                        0,
+                        criteria_met=1,
+                        defects={"P0": 1, "P1": 1, "P2": 0, "P3": 2},
+                        developer_s=None,
+                    ),
+                ],
+                outcome="exhausted",
+                cause="developer",
+                slice_id="Slice 3",
+                elapsed_s=900,
+                steers=2,
+                nudges=1,
+                reviews=[_rev("review-1", _CODEX, {"score": 2}), _failed(_QWEN)],
+            ),
+            # Accepted with a failed code block and no wall time.
+            _row(
+                [_sub(_OPUS, 2, developer_s=50)],
+                slice_id="Slice 4",
+                elapsed_s=None,
+                code={"error": "OSError: boom"},
+                reviews=[_rev("review-1", _CLAUDE, None)],
+            ),
+        ]
+        return _render(("host/run-1.json", _file("run-1", rows)))
+
+    def test_developer_columns_match_hand_computed_values(self) -> None:
+        tables = _tables(_section(self._text(), "### All difficulties"))
+        self.assertEqual(len(tables), 1)
+        row = _by_name(tables[0])[_OPUS_LABEL]
+        expected = {
+            "Rank": "1",
+            "Score (PM), mean 0–2": "1.40 (n=5)",
+            "First-submission criteria met (PM), Σk/Σn": "9/12 (n=4)",
+            "First-submission P0+P1 defects (PM), mean": "0.75 (n=4)",
+            "First-submission P2+P3 defects (PM), mean": "1.00 (n=4)",
+            "Developer time per submission, median s": "150 (n=4)",
+            "Windows, n": "4",
+            "Accepted, share": "3/4 (75%)",
+            "Accepted on first submission, share": "2/4 (50%)",
+            "Scored submissions per window, mean": "1.25 (n=4)",
+            "Steers+nudges per window, mean": "1.25 (n=4)",
+            "Wall time per window, median s": "600 (n=3)",
+            "Δ production lines code/comment/blank, median": "15/1/2 (n=2)",
+            "Δ test lines code/comment/blank, median": "0/0/0 (n=2)",
+            "Δ complexity sum, median": "2 (n=2)",
+        }
+        self.assertEqual({key: row[key] for key in expected}, expected)
+
+    def test_difficulty_bands_without_counted_windows_say_so(self) -> None:
+        text = self._text()
+        self.assertEqual(
+            _section(text, "### Difficulty: easy").strip(),
+            "No Developer-counted windows.",
+        )
+        self.assertIn(_OPUS_LABEL, _section(text, "### Difficulty: moderate"))
+
+    def test_reviewer_columns_match_hand_computed_values(self) -> None:
+        tables = _tables(_section(self._text(), "### code-review"))
+        ranked, insufficient = tables
+        # Codex and Claude tie on pairwise share, so group-key order decides.
+        self.assertEqual(
+            [row["Reviewer (tool / model / effort / override)"] for row in ranked],
+            [
+                "claude / claude-opus-5-5 / high / no override",
+                "codex / gpt-6.1-sol / high / no override",
+            ],
+        )
+        claude, codex = ranked
+        self.assertEqual(
+            [
+                claude[h]
+                for h in (
+                    "Rank",
+                    "Commissions, n",
+                    "Score (PM), mean 0–2",
+                    "Panels (PM), n",
+                )
+            ],
+            ["1", "3", "1.50 (n=2)", "2"],
+        )
+        self.assertEqual(
+            claude["Usable (PM), share rated/(rated+unavailable+failed)"], "2/2 (100%)"
+        )
+        self.assertEqual(claude["Pairwise wins (PM), share"], "2/3 (67%)")
+        self.assertEqual(claude["Close-call wins (PM), share"], "1/2 (50%)")
+        self.assertEqual(codex["Score (PM), mean 0–2"], "1.67 (n=3)")
+        self.assertEqual(codex["Pairwise wins (PM), share"], "2/3 (67%)")
+        self.assertEqual(codex["Close-call wins (PM), share"], "1/2 (50%)")
+        (qwen,) = insufficient
+        self.assertNotIn("Rank", qwen)
+        self.assertEqual(
+            qwen["Reviewer (tool / model / effort / override)"],
+            "qwen / qwen-4 / unknown / override",
+        )
+        self.assertEqual(qwen["Commissions, n"], "2")
+        self.assertEqual(
+            qwen["Usable (PM), share rated/(rated+unavailable+failed)"], "1/2 (50%)"
+        )
+        self.assertEqual(qwen["Pairwise wins (PM), share"], "0/2 (0%)")
+        self.assertEqual(qwen["Close-call wins (PM), share"], "n/a")
+
+    def test_presentation_carries_no_wall_clock_or_composite_score(self) -> None:
+        text = self._text()
+        self.assertIn("## Errors\n\nNone.\n", text)
+        self.assertNotIn("composite", text.replace("There is no composite score.", ""))
+        self.assertNotIn(datetime.now(timezone.utc).strftime("%Y-%m-%d"), text)
+
+
+class TestLeaderboardWindowSelection(unittest.TestCase):
+    def test_open_and_plan_or_environment_stops_count_only_for_reviewers(self) -> None:
+        drift = ("codex", "gpt-6.1-sol", "high", False)
+        rows = [
+            _row(
+                [_sub(_SONNET)],
+                outcome="open",
+                reviews=[_rev("review-1", drift, {"score": 2}, "drift-audit")],
+            ),
+            _row(
+                [_sub(_SONNET)],
+                outcome="stopped",
+                cause="plan",
+                reviews=[_rev("review-1", drift, {"score": 1}, "drift-audit")],
+            ),
+            _row(
+                [_sub(_SONNET)],
+                outcome="stopped",
+                cause="environment",
+                reviews=[_rev("review-1", drift, {"score": 0}, "drift-audit")],
+            ),
+        ]
+        text = _render(("host/run-1.json", _file("run-1", rows)))
+
+        self.assertEqual(
+            _section(text, "### All difficulties").strip(),
+            "No Developer-counted windows.",
+        )
+        (ranked,) = _tables(_section(text, "### drift-audit"))
+        self.assertEqual(ranked[0]["Commissions, n"], "3")
+        self.assertEqual(ranked[0]["Score (PM), mean 0–2"], "1.00 (n=3)")
+
+    def test_mixed_and_unscored_windows_are_footnoted_but_submissions_still_count(
+        self,
+    ) -> None:
+        rows = [
+            _row(
+                [
+                    _sub(_OPUS, 1, criteria_met=1, developer_s=10),
+                    _sub(_SONNET, 2, developer_s=None),
+                ]
+            ),
+            _row([_sub(_OPUS, None)], slice_id="Slice 2"),
+        ]
+        section = _section(
+            _render(("host/run-1.json", _file("run-1", rows))), "### All difficulties"
+        )
+
+        self.assertIn(
+            "leave out 1 window(s) with mixed Developer identities and 1 window(s) with no scored submission",
+            section,
+        )
+        (insufficient,) = _tables(section)
+        opus, sonnet = (
+            _by_name(insufficient)[_OPUS_LABEL],
+            _by_name(insufficient)[_SONNET_LABEL],
+        )
+        self.assertEqual(opus["Score (PM), mean 0–2"], "1.00 (n=1)")
+        self.assertEqual(opus["First-submission criteria met (PM), Σk/Σn"], "1/3 (n=1)")
+        self.assertEqual(opus["Developer time per submission, median s"], "10 (n=1)")
+        self.assertEqual(sonnet["Score (PM), mean 0–2"], "2.00 (n=1)")
+        self.assertEqual(sonnet["First-submission criteria met (PM), Σk/Σn"], "n/a")
+        self.assertEqual(sonnet["Developer time per submission, median s"], "n/a")
+        for group in (opus, sonnet):
+            self.assertEqual(group["Windows, n"], "0")
+            self.assertEqual(group["Accepted, share"], "n/a")
+            self.assertEqual(group["Wall time per window, median s"], "n/a")
+
+    def test_small_groups_are_unranked_and_full_ties_keep_group_key_order(self) -> None:
+        def identity(model: str) -> dict:
+            return {"tool": "claude", "model": model, "effort": "high"}
+
+        rows = [
+            *(
+                _row([_sub(identity(model), 1)], slice_id=f"{model} {n}")
+                for model in ("beta", "alpha")
+                for n in range(3)
+            ),
+            *(
+                _row([_sub(identity("zeta"), 2)], slice_id=f"zeta {n}")
+                for n in range(3)
+            ),
+            *(_row([_sub(identity("aaa"), 2)], slice_id=f"aaa {n}") for n in range(2)),
+        ]
+        section = _section(
+            _render(("host/run-1.json", _file("run-1", rows))), "### All difficulties"
+        )
+        ranked, insufficient = _tables(section)
+
+        self.assertEqual(
+            [(row["Rank"], row["Developer (tool / model / effort)"]) for row in ranked],
+            [
+                ("1", "claude / zeta / high"),
+                ("2", "claude / alpha / high"),
+                ("3", "claude / beta / high"),
+            ],
+        )
+        self.assertIn("Insufficient data (fewer than 3 windows), unranked:", section)
+        self.assertEqual(
+            [row["Developer (tool / model / effort)"] for row in insufficient],
+            ["claude / aaa / high"],
+        )
+        self.assertNotIn("Rank", insufficient[0])
+
+    def test_usable_share_leaves_unrated_reviews_out_of_both_sides(self) -> None:
+        drift = ("codex", "gpt-6.1-sol", "high", False)
+        reviews = [
+            _rev("review-1", drift, {"score": 2}, "drift-audit"),
+            _rev("review-2", drift, {"status": "unavailable"}, "drift-audit"),
+            _rev("review-3", drift, None, "drift-audit"),
+            _failed(drift, "drift-audit"),
+        ]
+        text = _render(
+            ("host/run-1.json", _file("run-1", [_row([_sub(_OPUS)], reviews=reviews)]))
+        )
+        (ranked,) = _tables(_section(text, "### drift-audit"))
+
+        self.assertEqual(ranked[0]["Commissions, n"], "4")
+        self.assertEqual(
+            ranked[0]["Usable (PM), share rated/(rated+unavailable+failed)"],
+            "1/3 (33%)",
+        )
+
+
+class TestLeaderboardFiles(unittest.TestCase):
+    def _rows(self, decided_at: str, score: int = 2) -> list[dict]:
+        return [_row([_sub(_OPUS, score)], decided_at=decided_at)]
+
+    def test_output_ignores_repetition_host_copies_and_file_order(self) -> None:
+        one = ("mac/run-1.json", _file("run-1", self._rows(_ts(10))))
+        two = ("mac/run-2.json", _file("run-2", self._rows(_ts(20), 1)))
+        first = _render(one, two)
+
+        self.assertEqual(_render(one, two), first)
+        self.assertEqual(_render(two, one), first)
+        copied = [("studio/run-1.json", one[1]), ("studio/run-2.json", two[1])]
+        self.assertEqual(_render(two, *copied, one), first)
+
+    def test_more_events_win_and_equal_events_with_different_bytes_are_errors(
+        self,
+    ) -> None:
+        files = [
+            ("a/run-1.json", _file("run-1", self._rows(_ts(500)), events=5)),
+            ("b/run-1.json", _file("run-1", self._rows(_ts(100)), events=7)),
+            ("a/run-2.json", _file("run-2", self._rows(_ts(10)), events=3)),
+            ("b/run-2.json", _file("run-2", self._rows(_ts(20)), events=3)),
+            ("b/broken.json", b"{not json"),
+            ("b/partial.json", b'{"run_id": "run-3", "events": 1}'),
+        ]
+        text, errors = ledger.render_leaderboard(files)
+
+        self.assertIn("Runs: 1; slice windows: 1.", text)
+        # The 5-event copy of run-1 (decided later) lost to the 7-event copy.
+        self.assertIn(f"As of: {_ts(100)}", text)
+        self.assertEqual(
+            [error.split(":", 1)[0] for error in errors],
+            ["a/run-2.json", "b/broken.json", "b/partial.json", "b/run-2.json"],
+        )
+        self.assertIn("different contents", errors[0])
+        self.assertIn("not valid JSON", errors[1])
+        self.assertIn("missing or invalid run_id, events or rows", errors[2])
+        for error in errors:
+            self.assertIn(f"- {error}", _section(text, "## Errors"))
+
+    def test_as_of_is_the_latest_decision_or_unknown(self) -> None:
+        files = [
+            ("h/run-1.json", _file("run-1", self._rows(_ts(30)))),
+            (
+                "h/run-2.json",
+                _file(
+                    "run-2", [*self._rows(_ts(90)), _row([_sub(_OPUS)], outcome="open")]
+                ),
+            ),
+        ]
+        self.assertIn(f"As of: {_ts(90)}\n", _render(*files))
+        undecided = _file("run-3", [_row([_sub(_OPUS)], outcome="open")])
+        self.assertIn("As of: unknown\n", _render(("h/run-3.json", undecided)))
+
+    def test_history_link_is_relative_to_the_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            history = Path(scratch) / "skill" / "ledger" / "historical-pre-ledger.md"
+            history.parent.mkdir(parents=True)
+            history.write_text("frozen\n", encoding="utf-8")
+            files = [("h/run-1.json", _file("run-1", self._rows(_ts(1))))]
+            with mock.patch.object(ledger, "_HISTORY_PATH", history):
+                text, _ = ledger.render_leaderboard(
+                    files, out_dir=Path(scratch) / "out"
+                )
+            with mock.patch.object(
+                ledger, "_HISTORY_PATH", history.with_name("absent.md")
+            ):
+                plain, _ = ledger.render_leaderboard(
+                    files, out_dir=Path(scratch) / "out"
+                )
+
+        self.assertIn(
+            "History: [historical-pre-ledger.md](../skill/ledger/historical-pre-ledger.md)",
+            text,
+        )
+        self.assertNotIn("History:", plain)
+
+
+class TestLedgerRenderCommand(unittest.TestCase):
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name) / "ledger"
+        patcher = mock.patch.dict(os.environ, {"PM_LEDGER_DIR": str(self.root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _main(self, argv: list[str]) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_out_path_receives_the_leaderboard(self) -> None:
+        host = self.root / "mac"
+        host.mkdir(parents=True)
+        (host / "run-1.json").write_bytes(
+            _file("run-1", [_row([_sub(_OPUS)], decided_at=_ts(5))])
+        )
+        out = self.root.parent / "elsewhere" / "board.md"
+
+        code, stdout, err = self._main(["ledger", "render", "--out", str(out)])
+
+        self.assertEqual(code, 0, err)
+        self.assertIn(str(out), stdout)
+        self.assertTrue(
+            out.read_text(encoding="utf-8").startswith("# PM model leaderboard\n")
+        )
+        self.assertFalse((self.root / "leaderboard.md").exists())
+
+    def test_no_files_exits_two_naming_the_directory(self) -> None:
+        code, _stdout, err = self._main(["ledger", "render"])
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"no per-run ledger files found under {self.root}", err)
+        self.assertNotIn("pm: ledger: not written", err)
 
 
 if __name__ == "__main__":

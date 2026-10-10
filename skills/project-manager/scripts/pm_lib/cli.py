@@ -208,6 +208,13 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--run")
     stop.add_argument("--token")
 
+    # Reads only the ledger directory: no run, no token, so the post-command
+    # ledger hook never fires for it.
+    ledger_parser = subparsers.add_parser("ledger", help="Work with the cross-run model ledger")
+    ledger_commands = ledger_parser.add_subparsers(dest="ledger_command", required=True)
+    render = ledger_commands.add_parser("render", help="Render every per-run ledger file into one leaderboard")
+    render.add_argument("--out", help="output path (default: <ledger dir>/leaderboard.md)")
+
     return parser
 
 
@@ -787,6 +794,23 @@ def _run_notes(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- ledger render --------------------------------------------------------
+
+
+def _run_ledger_render(args: argparse.Namespace) -> int:
+    root = ledger.ledger_dir()
+    files = ledger.load_run_files(root)
+    if not files:
+        raise PmError(f"no per-run ledger files found under {root}")
+    out = Path(args.out) if args.out else root / "leaderboard.md"
+    text, errors = ledger.render_leaderboard(files, out_dir=out.resolve().parent)
+    state_mod._atomic_write_bytes(out, text.encode("utf-8"))
+    print(f"leaderboard: {out}")
+    for error in errors:
+        print(f"WARNING: excluded {error}")
+    return 0
+
+
 _HANDLERS = {
     "check-plan": _run_check_plan,
     "init": _run_init,
@@ -802,6 +826,8 @@ _HANDLERS = {
     "judge-developer": _run_judge_developer,
     "notes": _run_notes,
     "stop": _run_stop,
+    # `render` is the ledger's only, required subcommand.
+    "ledger": _run_ledger_render,
 }
 
 
