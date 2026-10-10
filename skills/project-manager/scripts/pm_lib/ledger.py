@@ -20,8 +20,10 @@ and nothing in it reads the clock.
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
+import urllib.parse
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -411,7 +413,8 @@ def _parse_run_file(
         return None, f"{label}: unreadable"
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except ValueError as exc:
+        # Also covers bad UTF-8 and an integer too long to convert.
         return None, f"{label}: not valid JSON ({exc})"
     if not (
         isinstance(payload, dict)
@@ -421,7 +424,68 @@ def _parse_run_file(
         and all(isinstance(row, dict) for row in payload["rows"])
     ):
         return None, f"{label}: missing or invalid run_id, events or rows"
+    for index, row in enumerate(payload["rows"]):
+        problem = _row_shape_error(row)
+        if problem is not None:
+            return None, f"{label}: malformed row {index}: {problem}"
     return payload, None
+
+
+def _is_scalar(value: Any) -> bool:
+    """A value usable as a group-key field or an id: str, int, bool or None."""
+    return value is None or isinstance(value, (str, int, bool))
+
+
+def _dict_or_none(value: Any) -> bool:
+    return value is None or isinstance(value, dict)
+
+
+def _list_or_none(value: Any) -> bool:
+    return value is None or isinstance(value, list)
+
+
+def _row_shape_error(row: dict[str, Any]) -> str | None:
+    """What in one row the renderer cannot consume, or None.
+
+    Every field the renderer hashes, compares or iterates is checked here, so
+    a file whose interior is malformed is excluded with a named reason instead
+    of failing the whole render.
+    """
+    for field in ("outcome", "cause", "difficulty"):
+        if not _is_scalar(row.get(field)):
+            return f"{field} is not a scalar"
+    if not _dict_or_none(row.get("code")):
+        return "code is not an object"
+    for field in ("submissions", "reviews", "comparisons"):
+        items = row.get(field)
+        if not _list_or_none(items) or not all(
+            isinstance(item, dict) for item in items or []
+        ):
+            return f"{field} is not a list of objects"
+    for submission in row.get("submissions") or []:
+        developer = submission.get("developer")
+        if not _dict_or_none(developer) or not _dict_or_none(
+            submission.get("judgment")
+        ):
+            return "a submission's developer or judgment is not an object"
+        if developer is not None and not all(
+            _is_scalar(developer.get(key)) for key in ("tool", "model", "effort")
+        ):
+            return "a submission's developer identity is not scalar"
+    for review in row.get("reviews") or []:
+        keys = ("review_id", "skill", "tool", "model", "effort", "command_override")
+        if not all(_is_scalar(review.get(key)) for key in keys):
+            return "a review's id, skill or identity is not scalar"
+        if not _dict_or_none(review.get("rating")):
+            return "a review's rating is not an object"
+    for comparison in row.get("comparisons") or []:
+        for field in ("order", "close"):
+            members = comparison.get(field)
+            if not _list_or_none(members) or not all(
+                _is_scalar(member) for member in members or []
+            ):
+                return f"a comparison's {field} is not a list of scalar ids"
+    return None
 
 
 def _select_runs(
@@ -486,9 +550,16 @@ def _share(hits: int, total: int) -> Fraction | None:
     return Fraction(hits, total) if total else None
 
 
+def _two_decimals(value: Fraction) -> str:
+    """An exact value rounded half-up (away from zero) to two decimals."""
+    hundredths = math.floor(abs(value) * 100 + Fraction(1, 2))
+    sign = "-" if value < 0 and hundredths else ""
+    return f"{sign}{hundredths // 100}.{hundredths % 100:02d}"
+
+
 def _mean_cell(values: list[int]) -> str:
     mean = _mean(values)
-    return "n/a" if mean is None else f"{float(mean):.2f} (n={len(values)})"
+    return "n/a" if mean is None else f"{_two_decimals(mean)} (n={len(values)})"
 
 
 def _median_cell(values: list[int]) -> str:
@@ -962,7 +1033,9 @@ def render_leaderboard(
             if out_dir is not None
             else str(_HISTORY_PATH)
         )
-        lines += [f"History: [{_HISTORY_PATH.name}]({Path(target).as_posix()})", ""]
+        # Percent-encoded so spaces, '#' and parentheses keep the link valid.
+        link = urllib.parse.quote(Path(target).as_posix(), safe="/")
+        lines += [f"History: [{_HISTORY_PATH.name}]({link})", ""]
     lines += [
         f"Runs: {len(kept)}; slice windows: {len(rows)}.",
         "",

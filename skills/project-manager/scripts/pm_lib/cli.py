@@ -803,8 +803,13 @@ def _run_ledger_render(args: argparse.Namespace) -> int:
     if not files:
         raise PmError(f"no per-run ledger files found under {root}")
     out = Path(args.out) if args.out else root / "leaderboard.md"
-    text, errors = ledger.render_leaderboard(files, out_dir=out.resolve().parent)
-    state_mod._atomic_write_bytes(out, text.encode("utf-8"))
+    # The write replaces `out` itself, never a symlink's target, so the
+    # History link is relative to the directory `out` is named in.
+    text, errors = ledger.render_leaderboard(files, out_dir=out.parent.resolve())
+    try:
+        state_mod._atomic_write_bytes(out, text.encode("utf-8"))
+    except OSError as exc:
+        raise PmError(f"cannot write the leaderboard to {out}: {exc}") from exc
     print(f"leaderboard: {out}")
     for error in errors:
         print(f"WARNING: excluded {error}")

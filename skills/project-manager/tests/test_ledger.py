@@ -1163,6 +1163,62 @@ class TestLeaderboardFiles(unittest.TestCase):
         )
         self.assertNotIn("History:", plain)
 
+    def test_history_link_is_percent_encoded(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            history = Path(scratch) / "my hist#1 (old)" / "historical-pre-ledger.md"
+            history.parent.mkdir()
+            history.write_text("frozen\n", encoding="utf-8")
+            files = [("h/run-1.json", _file("run-1", self._rows(_ts(1))))]
+            with mock.patch.object(ledger, "_HISTORY_PATH", history):
+                text, _ = ledger.render_leaderboard(
+                    files, out_dir=Path(scratch) / "out"
+                )
+
+        self.assertIn("(../my%20hist%231%20%28old%29/historical-pre-ledger.md)", text)
+
+    def test_malformed_row_interiors_are_errors_not_crashes(self) -> None:
+        good = ("h/good.json", _file("good", self._rows(_ts(1))))
+
+        def with_row(**fields) -> bytes:
+            return _file("bad", [{**_row([_sub(_OPUS)]), **fields}])
+
+        reviewer = _rev("review-1", _CODEX, {"score": 2})
+        cases = {
+            "submissions": with_row(submissions=5),
+            "difficulty": with_row(difficulty=["x"]),
+            "review_id": with_row(reviews=[{**reviewer, "review_id": ["a"]}]),
+            "tool": with_row(reviews=[{**reviewer, "tool": {"x": 1}}]),
+            "developer": with_row(
+                submissions=[{**_sub(_OPUS), "developer": {"tool": ["x"]}}]
+            ),
+            "order": with_row(
+                comparisons=[{"origin": 0, "order": [["a"]], "close": []}]
+            ),
+            "events": b'{"run_id": "bad", "events": ' + b"9" * 5000 + b', "rows": []}',
+        }
+        for name, raw in cases.items():
+            with self.subTest(name):
+                text, errors = ledger.render_leaderboard([good, ("h/bad.json", raw)])
+
+                self.assertIn("Runs: 1; slice windows: 1.", text)
+                self.assertEqual(len(errors), 1)
+                self.assertTrue(errors[0].startswith("h/bad.json: "), errors[0])
+                self.assertIn(f"- {errors[0]}", _section(text, "## Errors"))
+
+    def test_means_round_half_up_from_the_exact_value(self) -> None:
+        # Scores 1×7 and 2 → 9/8 = 1.125 exactly; binary float formatting gives 1.12.
+        scores = [1] * 7 + [2]
+        rows = [
+            _row([_sub(_OPUS, score)], slice_id=f"Slice {n}")
+            for n, score in enumerate(scores)
+        ]
+        section = _section(
+            _render(("h/run-1.json", _file("run-1", rows))), "### All difficulties"
+        )
+        (ranked,) = _tables(section)
+
+        self.assertEqual(ranked[0]["Score (PM), mean 0–2"], "1.13 (n=8)")
+
 
 class TestLedgerRenderCommand(unittest.TestCase):
     def setUp(self) -> None:
@@ -1202,6 +1258,43 @@ class TestLedgerRenderCommand(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f"no per-run ledger files found under {self.root}", err)
         self.assertNotIn("pm: ledger: not written", err)
+
+    def _seed(self) -> None:
+        host = self.root / "mac"
+        host.mkdir(parents=True)
+        (host / "run-1.json").write_bytes(
+            _file("run-1", [_row([_sub(_OPUS)], decided_at=_ts(5))])
+        )
+
+    def test_an_unwritable_out_path_is_an_error_naming_it(self) -> None:
+        self._seed()
+        out = self.root.parent / "a-directory"
+        out.mkdir()
+
+        code, _stdout, err = self._main(["ledger", "render", "--out", str(out)])
+
+        self.assertEqual(code, 2)
+        self.assertIn(f"pm: error: cannot write the leaderboard to {out}", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_history_link_is_relative_to_an_output_symlinks_own_directory(self) -> None:
+        self._seed()
+        history = self.root.parent / "skill" / "ledger" / "historical-pre-ledger.md"
+        history.parent.mkdir(parents=True)
+        history.write_text("frozen\n", encoding="utf-8")
+        target = self.root.parent / "deep" / "er" / "real.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("old\n", encoding="utf-8")
+        out = self.root.parent / "board.md"
+        out.symlink_to(target)
+
+        with mock.patch.object(ledger, "_HISTORY_PATH", history):
+            code, _stdout, err = self._main(["ledger", "render", "--out", str(out)])
+
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            "(skill/ledger/historical-pre-ledger.md)", out.read_text(encoding="utf-8")
+        )
 
 
 if __name__ == "__main__":
