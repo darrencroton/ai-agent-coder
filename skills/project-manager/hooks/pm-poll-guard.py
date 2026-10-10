@@ -208,9 +208,7 @@ def main() -> None:
         # guessing between two candidate shapes could deny a call the hook
         # cannot even identify.
         candidates = [name for name in ("command", "file_path") if name in tool_input]
-        tool = {"command": "Bash", "file_path": "Read"}.get(
-            candidates[0] if len(candidates) == 1 else ""
-        )
+        tool = {"command": "Bash", "file_path": "Read"}.get(candidates[0] if len(candidates) == 1 else "")
 
     # Each branch applies the PM-run gate itself, once it knows the call is a
     # candidate — an unrelated call must not pay for a filesystem stat.

@@ -232,8 +232,7 @@ def compile_skill_bundle(skill_name: str, *, skills_root: Path | None = None) ->
             path.relative_to(skill_dir)
         except ValueError:
             raise PmError(
-                f"skill resource referenced by {skill_name!r} escapes its own skill directory "
-                f"{skill_dir}: {path}"
+                f"skill resource referenced by {skill_name!r} escapes its own skill directory {skill_dir}: {path}"
             ) from None
         if not path.is_file():
             raise PmError(f"skill resource referenced by {skill_name!r} is missing: {path}")
@@ -312,6 +311,4 @@ def render_reviewer_prompt(
         "risk_flags": risk_flags,
         "skill_bundle": skill_bundle,
     }
-    return _render(
-        template, reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH, "reviewer prompt", **fields
-    )
+    return _render(template, reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH, "reviewer prompt", **fields)

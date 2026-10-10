@@ -140,16 +140,14 @@ class TestQueryModelIdentityOpencode(unittest.TestCase):
         self.assertEqual(called_command, ["opencode", "models", "local", "--verbose"])
 
     def test_missing_model_fails_closed(self) -> None:
-        stdout = "local/other-model\n{\"name\": \"Other\"}\n"
+        stdout = 'local/other-model\n{"name": "Other"}\n'
         with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(0, stdout)):
             with self.assertRaises(PmError) as ctx:
                 profiles.query_model_identity("opencode", "local/qwen3.6-35b")
         self.assertIn("qwen3.6-35b", str(ctx.exception))
 
     def test_query_failure_fails_closed(self) -> None:
-        with mock.patch.object(
-            profiles.subprocess, "run", return_value=self._mock_result(1, "", "no such provider")
-        ):
+        with mock.patch.object(profiles.subprocess, "run", return_value=self._mock_result(1, "", "no such provider")):
             with self.assertRaises(PmError) as ctx:
                 profiles.query_model_identity("opencode", "local/qwen3.6-35b")
         self.assertIn("no such provider", str(ctx.exception))

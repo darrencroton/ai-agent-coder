@@ -101,9 +101,7 @@ def status_changed_files(status_text: str) -> set[str]:
     return {status_path(line) for line in meaningful_status_lines(status_text)}
 
 
-def changed_files_between(
-    repo: Path, before_head: str | None, after_head: str | None, after_status: str
-) -> set[str]:
+def changed_files_between(repo: Path, before_head: str | None, after_head: str | None, after_status: str) -> set[str]:
     """Union of committed changes (before_head..after_head) and dirty-tree changes."""
     files: set[str] = set()
     if before_head and after_head and before_head != after_head:

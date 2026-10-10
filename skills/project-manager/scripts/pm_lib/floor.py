@@ -79,7 +79,11 @@ def _fact_plan_digest(state: dict[str, Any]) -> FloorFact:
         current = compute_plan_digest(path)
     except OSError as exc:
         return FloorFact(
-            1, "plan-digest", False, f"plan file could not be read: {exc}", {"path": str(path), "recorded_sha256": recorded}
+            1,
+            "plan-digest",
+            False,
+            f"plan file could not be read: {exc}",
+            {"path": str(path), "recorded_sha256": recorded},
         )
     passed = bool(recorded) and current == recorded
     detail = (
@@ -92,7 +96,11 @@ def _fact_plan_digest(state: dict[str, Any]) -> FloorFact:
 
 
 def _fact_identity_branch(repo: Path, state: dict[str, Any]) -> FloorFact:
-    evidence: dict[str, Any] = {"repo": str(repo), "recorded_repo": state.get("repo"), "recorded_branch": state.get("branch")}
+    evidence: dict[str, Any] = {
+        "repo": str(repo),
+        "recorded_repo": state.get("repo"),
+        "recorded_branch": state.get("branch"),
+    }
     try:
         resolved_repo = git_ops.resolve_repo(repo)
     except PmError as exc:
@@ -174,7 +182,9 @@ def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | Non
     before_head = current_slice.get("before_head")
     evidence: dict[str, Any] = {"before_head": before_head}
     if plan_slice is None:
-        return FloorFact(5, "surface", False, "slice not found in the parsed plan; authorized surface is unknown", evidence)
+        return FloorFact(
+            5, "surface", False, "slice not found in the parsed plan; authorized surface is unknown", evidence
+        )
 
     try:
         after_head = git_ops.git_head(repo)

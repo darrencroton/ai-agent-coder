@@ -234,8 +234,7 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
 
         without_grant = prompts.render_developer_prompt(plan_slice, **kwargs)
         self.assertIn(
-            "additions (paths PM authorized mid-run on recorded repository evidence; `none` if there "
-            "are none):\nnone",
+            "additions (paths PM authorized mid-run on recorded repository evidence; `none` if there are none):\nnone",
             without_grant,
         )
 

@@ -336,7 +336,9 @@ def force_stop(session: str) -> None:
 def _raise_on_trust_prompt(executable: str, capture: str) -> None:
     result = scan_dialog_markers(capture)
     if "trust_prompt" in result["kinds"]:
-        raise PmError(f"{executable} directory trust prompt blocked unattended launch; trust the repo before running PM")
+        raise PmError(
+            f"{executable} directory trust prompt blocked unattended launch; trust the repo before running PM"
+        )
 
 
 def _wait_stable_pane_ready(session: str, executable: str, deadline: float) -> None:
@@ -411,7 +413,9 @@ def wait_until_ready(
     executable = Path(harness_executable).name if harness_executable else ""
     banner_deadline = time.monotonic() + deadline_seconds
     if executable == "codex":
-        _wait_banner_ready(session, "codex", lambda capture: "OpenAI Codex" in capture and "›" in capture, banner_deadline)
+        _wait_banner_ready(
+            session, "codex", lambda capture: "OpenAI Codex" in capture and "›" in capture, banner_deadline
+        )
     elif executable == "opencode":
         _wait_banner_ready(session, "opencode", lambda capture: "Ask anything" in capture, banner_deadline)
         if expected_model_display:

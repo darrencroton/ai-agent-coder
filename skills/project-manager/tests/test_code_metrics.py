@@ -30,13 +30,7 @@ _CATEGORIES = ("production", "test", "documentation", "configuration", "data", "
 
 _MODULE = "# header comment\ndef f(x):\n    if x:\n        return 1\n\n    return 2\n"
 _TEST_MODULE = (
-    "import unittest\n"
-    "\n"
-    "\n"
-    "class T(unittest.TestCase):\n"
-    "    def test_a(self):\n"
-    "        if 1 and 2:\n"
-    "            pass\n"
+    "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        if 1 and 2:\n            pass\n"
 )
 
 
@@ -122,9 +116,7 @@ class TestLinesAndComplexity(CodeMetricsTestCase):
 
         self.assertIsNone(block["complexity"])
         self.assertRegex(block["complexity_reason"], r"^bad\.py:1: ")
-        self.assertEqual(
-            block["lines"]["production"], {"code": 2, "comment": 0, "blank": 0}
-        )
+        self.assertEqual(block["lines"]["production"], {"code": 2, "comment": 0, "blank": 0})
 
     def test_python_that_stops_parsing_on_the_before_side_is_named_too(self) -> None:
         before = self.commit({"was_bad.py": "def (:\n"})
@@ -142,12 +134,8 @@ class TestLinesAndComplexity(CodeMetricsTestCase):
         block = code_metrics.code_block(self.repo, None, head)
 
         # README.md ("hello") is part of the diff against the empty tree.
-        self.assertEqual(
-            block["lines"]["documentation"], {"code": 1, "comment": 0, "blank": 0}
-        )
-        self.assertEqual(
-            block["lines"]["production"], {"code": 4, "comment": 1, "blank": 1}
-        )
+        self.assertEqual(block["lines"]["documentation"], {"code": 1, "comment": 0, "blank": 0})
+        self.assertEqual(block["lines"]["production"], {"code": 4, "comment": 1, "blank": 1})
         self.assertEqual(
             block["complexity"],
             {"before": {"sum": 0, "max": 0}, "after": {"sum": 2, "max": 2}},
@@ -156,9 +144,7 @@ class TestLinesAndComplexity(CodeMetricsTestCase):
 
 class TestObjectTypeAtPath(CodeMetricsTestCase):
     def test_directory_replaced_by_file_counts_only_real_file_text(self) -> None:
-        before = self.commit(
-            {"thing.py/inner.py": "def g(x):\n    if x:\n        return 1\n"}
-        )
+        before = self.commit({"thing.py/inner.py": "def g(x):\n    if x:\n        return 1\n"})
         head = self.commit({"thing.py/inner.py": None, "thing.py": "a = 1\nb = 2\n"})
 
         block = code_metrics.code_block(self.repo, before, head)
@@ -197,9 +183,7 @@ class TestObjectTypeAtPath(CodeMetricsTestCase):
 
         def failing_cat_file(repo, *args):
             if args[0] == "cat-file":
-                return subprocess.CompletedProcess(
-                    args, 128, b"", b"fatal: unable to read object"
-                )
+                return subprocess.CompletedProcess(args, 128, b"", b"fatal: unable to read object")
             return real_git(repo, *args)
 
         with mock.patch.object(code_metrics, "_git", side_effect=failing_cat_file):
@@ -210,9 +194,7 @@ class TestObjectTypeAtPath(CodeMetricsTestCase):
 
     def test_bom_prefixed_python_is_measured_not_a_parse_error(self) -> None:
         before = self._git("rev-parse", "HEAD").stdout.strip()
-        (self.repo / "bom.py").write_bytes(
-            b"\xef\xbb\xbfdef f(x):\n    if x:\n        return 1\n"
-        )
+        (self.repo / "bom.py").write_bytes(b"\xef\xbb\xbfdef f(x):\n    if x:\n        return 1\n")
         self._git("add", "-A")
         self._git("commit", "-q", "-m", "bom file")
         head = self._git("rev-parse", "HEAD").stdout.strip()
@@ -253,9 +235,7 @@ class TestObjectTypeAtPath(CodeMetricsTestCase):
 
         block = code_metrics.code_block(self.repo, before, head)
 
-        self.assertEqual(
-            block["lines"]["production"], {"code": 3, "comment": 0, "blank": 0}
-        )
+        self.assertEqual(block["lines"]["production"], {"code": 3, "comment": 0, "blank": 0})
         self.assertEqual(block["complexity"]["after"], {"sum": 2, "max": 2})
 
     def test_symlink_contributes_nothing_and_does_not_null_complexity(self) -> None:

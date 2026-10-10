@@ -74,7 +74,7 @@ class TestScanDialogMarkersPositiveFixtures(unittest.TestCase):
         self.assertIn("credential_prompt", result["kinds"])
 
     def test_hyphenated_marker_matches_flush_against_other_characters(self) -> None:
-        """"two-factor" is a hyphenated phrase, not a bare word, so it keeps
+        """ "two-factor" is a hyphenated phrase, not a bare word, so it keeps
         substring matching. Bounding it would lose a prompt a pane renders
         flush against padding — the same mid-token wrap case `-J` protects."""
         result = sessions.scan_dialog_markers("xxxTwo-factor authentication required")
@@ -174,29 +174,35 @@ class TestPostTypingRefusalWithholdsTheEnter(unittest.TestCase):
             sessions.PaneObservation(capture="clear pane", dialog_markers=clear),
             sessions.PaneObservation(capture="Enter API key to continue", dialog_markers=dialog),
         ]
-        with mock.patch.object(sessions, "scan_visible_pane", side_effect=observations), \
-             mock.patch.object(sessions, "session_exists", return_value=True), \
-             mock.patch.object(sessions, "_tmux_or_raise", side_effect=record), \
-             mock.patch.object(sessions, "_run_tmux", side_effect=record), \
-             mock.patch.object(sessions.time, "sleep"):
+        with (
+            mock.patch.object(sessions, "scan_visible_pane", side_effect=observations),
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "_tmux_or_raise", side_effect=record),
+            mock.patch.object(sessions, "_run_tmux", side_effect=record),
+            mock.patch.object(sessions.time, "sleep"),
+        ):
             with self.assertRaises(TypedNotSubmitted) as ctx:
                 call()
         return sent, str(ctx.exception)
 
     def test_send_line_types_but_never_presses_enter(self) -> None:
         sent, message = self._run(lambda: sessions.send_line("pm-mocked", "please continue"))
-        self.assertTrue(any("please continue" in part for argv in sent for part in argv),
-                        "the line should have been typed before the dialog was noticed")
-        self.assertFalse([argv for argv in sent if "C-m" in argv],
-                         f"no Enter may be sent once a dialog is visible; got {sent!r}")
+        self.assertTrue(
+            any("please continue" in part for argv in sent for part in argv),
+            "the line should have been typed before the dialog was noticed",
+        )
+        self.assertFalse(
+            [argv for argv in sent if "C-m" in argv], f"no Enter may be sent once a dialog is visible; got {sent!r}"
+        )
         self.assertIn("credential_prompt", message)
         self.assertIn("typed but unsubmitted", message)
         self.assertIn("do not retry", message)
 
     def test_send_prompt_types_but_never_presses_enter(self) -> None:
         sent, message = self._run(lambda: sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md"))
-        self.assertFalse([argv for argv in sent if "C-m" in argv],
-                         f"no Enter may be sent once a dialog is visible; got {sent!r}")
+        self.assertFalse(
+            [argv for argv in sent if "C-m" in argv], f"no Enter may be sent once a dialog is visible; got {sent!r}"
+        )
         self.assertIn("credential_prompt", message)
 
 
@@ -216,9 +222,11 @@ class TestGuardCaptureFailureWithholdsTheEnter(unittest.TestCase):
             sent.append(tuple(args))
             return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux), \
-             mock.patch.object(sessions, "session_exists", return_value=True), \
-             mock.patch.object(sessions.time, "sleep"):
+        with (
+            mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux),
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions.time, "sleep"),
+        ):
             with self.assertRaises(PmError) as ctx:
                 call()
         self.assertIn("safety capture failed", str(ctx.exception))
@@ -266,9 +274,11 @@ class TestGuardCaptureFailureWithholdsTheEnter(unittest.TestCase):
                     _sent.append(tuple(args))
                     return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
 
-                with mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux), \
-                     mock.patch.object(sessions, "session_exists", return_value=True), \
-                     mock.patch.object(sessions.time, "sleep"):
+                with (
+                    mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux),
+                    mock.patch.object(sessions, "session_exists", return_value=True),
+                    mock.patch.object(sessions.time, "sleep"),
+                ):
                     call()
 
                 self.assertEqual(sum("C-m" in argv for argv in sent), 1, sent)
@@ -291,23 +301,30 @@ class TestSendPromptToleratesFastFinishBeforePresubmitScan(unittest.TestCase):
             if args[0] == "capture-pane":
                 code = next(codes)
                 return subprocess.CompletedProcess(
-                    args=list(args), returncode=code, stdout="clear pane" if code == 0 else "", stderr="no server running"
+                    args=list(args),
+                    returncode=code,
+                    stdout="clear pane" if code == 0 else "",
+                    stderr="no server running",
                 )
             sent.append(tuple(args))
             return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux), \
-             mock.patch.object(sessions, "session_exists", return_value=False), \
-             mock.patch.object(sessions.time, "sleep"):
+        with (
+            mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux),
+            mock.patch.object(sessions, "session_exists", return_value=False),
+            mock.patch.object(sessions.time, "sleep"),
+        ):
             sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md")
 
         self.assertFalse([argv for argv in sent if "C-m" in argv], sent)
         self.assertTrue(any("-l" in argv for argv in sent), sent)
 
     def test_send_line_refuses_outright_when_session_is_gone(self) -> None:
-        with mock.patch.object(sessions, "_run_tmux") as fake, \
-             mock.patch.object(sessions, "session_exists", return_value=False), \
-             mock.patch.object(sessions.time, "sleep"):
+        with (
+            mock.patch.object(sessions, "_run_tmux") as fake,
+            mock.patch.object(sessions, "session_exists", return_value=False),
+            mock.patch.object(sessions.time, "sleep"),
+        ):
             with self.assertRaises(PmError) as ctx:
                 sessions.send_line("pm-mocked", "please continue")
 
@@ -328,10 +345,12 @@ class TestSubmitFailurePreservesTypedState(unittest.TestCase):
             if "C-m" in args:
                 raise PmError(message)
 
-        with mock.patch.object(sessions, "scan_visible_pane", return_value=clear), \
-             mock.patch.object(sessions, "session_exists", return_value=True), \
-             mock.patch.object(sessions, "_tmux_or_raise", side_effect=fake_send), \
-             mock.patch.object(sessions.time, "sleep"):
+        with (
+            mock.patch.object(sessions, "scan_visible_pane", return_value=clear),
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "_tmux_or_raise", side_effect=fake_send),
+            mock.patch.object(sessions.time, "sleep"),
+        ):
             with self.assertRaises(TypedNotSubmitted) as ctx:
                 sessions.send_line("pm-mocked", "please continue")
 
@@ -363,14 +382,25 @@ class TestVisiblePaneExcludesScrollback(unittest.TestCase):
     def test_marker_scrolled_off_screen_is_absent_from_the_visible_pane(self) -> None:
         session = "pm-test-visible-s01a0"
         subprocess.run(
-            tmux_argv("new-session", "-d", "-s", session, "-x", "80", "-y", "5",
-                      "sh -c 'echo Enter API key to continue; "
-                      "for i in 1 2 3 4 5 6 7 8 9 10; do echo filler-$i; done; sleep 30'"),
-            check=True, capture_output=True,
+            tmux_argv(
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "80",
+                "-y",
+                "5",
+                "sh -c 'echo Enter API key to continue; "
+                "for i in 1 2 3 4 5 6 7 8 9 10; do echo filler-$i; done; sleep 30'",
+            ),
+            check=True,
+            capture_output=True,
         )
         self.addCleanup(sessions.force_stop, session)
-        subprocess.run(tmux_argv("set-option", "-t", session, "window-size", "manual"),
-                       check=False, capture_output=True)
+        subprocess.run(
+            tmux_argv("set-option", "-t", session, "window-size", "manual"), check=False, capture_output=True
+        )
 
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline and "filler-10" not in sessions.pane_text(session):
@@ -395,9 +425,19 @@ class TestPaneTextRejoinsHardWraps(unittest.TestCase):
         session = "pm-test-hardwrap-s01a0"
         padding = "x" * 19  # pushes the wrap boundary inside "Enter"
         subprocess.run(
-            tmux_argv("new-session", "-d", "-s", session, "-x", "20", "-y", "10",
-                      f"sh -c 'printf \"{padding}Enter API key to continue\\n\"; sleep 30'"),
-            check=True, capture_output=True,
+            tmux_argv(
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "20",
+                "-y",
+                "10",
+                f"sh -c 'printf \"{padding}Enter API key to continue\\n\"; sleep 30'",
+            ),
+            check=True,
+            capture_output=True,
         )
         self.addCleanup(sessions.force_stop, session)
         # The default `window-size` option is "latest", which resizes a
@@ -408,11 +448,13 @@ class TestPaneTextRejoinsHardWraps(unittest.TestCase):
         # on actually holds.
         subprocess.run(
             tmux_argv("set-window-option", "-t", session, "window-size", "manual"),
-            check=True, capture_output=True,
+            check=True,
+            capture_output=True,
         )
         subprocess.run(
             tmux_argv("resize-window", "-t", session, "-x", "20", "-y", "10"),
-            check=True, capture_output=True,
+            check=True,
+            capture_output=True,
         )
 
         deadline = time.monotonic() + 10.0
@@ -452,9 +494,7 @@ class TestSessionName(unittest.TestCase):
 class TestStartSessionEnvTokenAssertion(unittest.TestCase):
     def test_pm_run_token_in_env_raises(self) -> None:
         with self.assertRaises(PmError):
-            sessions.start_session(
-                "pm-test-s01a0", Path("/tmp"), "echo hi", {"PM_RUN_TOKEN": "should-never-be-here"}
-            )
+            sessions.start_session("pm-test-s01a0", Path("/tmp"), "echo hi", {"PM_RUN_TOKEN": "should-never-be-here"})
 
 
 # --- tmux-gated behaviour ------------------------------------------------
@@ -675,28 +715,31 @@ class TestStartSessionStripsInheritedToken(TmuxSessionTestCase):
         # silently delete a value the suite did not set.
         previous_server_env = subprocess.run(
             tmux_argv("show-environment", "-g", "PM_RUN_TOKEN"),
-            check=False, capture_output=True, text=True,
+            check=False,
+            capture_output=True,
+            text=True,
         )
         had_server_env = previous_server_env.returncode == 0 and "=" in previous_server_env.stdout
-        previous_server_value = (
-            previous_server_env.stdout.strip().split("=", 1)[1] if had_server_env else None
-        )
+        previous_server_value = previous_server_env.stdout.strip().split("=", 1)[1] if had_server_env else None
 
         def _restore_server_env() -> None:
             if previous_server_value is None:
                 subprocess.run(
                     tmux_argv("set-environment", "-gu", "PM_RUN_TOKEN"),
-                    check=False, capture_output=True,
+                    check=False,
+                    capture_output=True,
                 )
             else:
                 subprocess.run(
                     tmux_argv("set-environment", "-g", "PM_RUN_TOKEN", previous_server_value),
-                    check=False, capture_output=True,
+                    check=False,
+                    capture_output=True,
                 )
 
         subprocess.run(
             tmux_argv("set-environment", "-g", "PM_RUN_TOKEN", "secret-inherit-test"),
-            check=False, capture_output=True,
+            check=False,
+            capture_output=True,
         )
         self.addCleanup(_restore_server_env)
 

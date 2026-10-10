@@ -21,9 +21,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-_HEALTH_PATH = (
-    Path(__file__).resolve().parents[3] / "code-health" / "scripts" / "health.py"
-)
+_HEALTH_PATH = Path(__file__).resolve().parents[3] / "code-health" / "scripts" / "health.py"
 
 # health.py uses `from __future__ import annotations` with @dataclass, which
 # looks its own module up in sys.modules while the class body executes, so the
@@ -64,18 +62,14 @@ def _load_health() -> ModuleType:
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=False, check=False
-    )
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=False, check=False)
 
 
 def _git_ok(repo: Path, *args: str) -> bytes:
     result = _git(repo, *args)
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"git {' '.join(args)} failed ({result.returncode}): {stderr}"
-        )
+        raise RuntimeError(f"git {' '.join(args)} failed ({result.returncode}): {stderr}")
     return result.stdout
 
 
@@ -91,9 +85,7 @@ def _text_at(repo: Path, rev: str | None, path: str) -> str:
     """
     if rev is None:
         return ""
-    listing = _git_ok(
-        repo, "--literal-pathspecs", "ls-tree", "--full-tree", "-z", rev, "--", path
-    )
+    listing = _git_ok(repo, "--literal-pathspecs", "ls-tree", "--full-tree", "-z", rev, "--", path)
     entry = listing.split(b"\0", 1)[0]
     if not entry:
         return ""
@@ -114,14 +106,8 @@ def _changed_paths(repo: Path, base: str, commit: str) -> list[tuple[str, str]]:
     classification and reports; the git name round-trips arbitrary bytes
     (surrogateescape) so git commands still find a non-UTF-8 file.
     """
-    out = _git_ok(
-        repo, "diff", "--no-renames", "-z", "--name-only", f"{base}..{commit}"
-    )
-    names = [
-        (raw.decode("utf-8", errors="replace"), os.fsdecode(raw))
-        for raw in out.split(b"\0")
-        if raw
-    ]
+    out = _git_ok(repo, "diff", "--no-renames", "-z", "--name-only", f"{base}..{commit}")
+    names = [(raw.decode("utf-8", errors="replace"), os.fsdecode(raw)) for raw in out.split(b"\0") if raw]
     return sorted(names)
 
 
@@ -135,11 +121,7 @@ def _build_block(repo: Path, before_head: str | None, commit: str) -> dict:
     # With no launch-time HEAD the slice built the whole history; the empty
     # tree is the hash-agnostic base, and the "before" side holds no files.
     if before_head is None:
-        base = (
-            _git_ok(repo, "hash-object", "-t", "tree", "/dev/null")
-            .decode("ascii")
-            .strip()
-        )
+        base = _git_ok(repo, "hash-object", "-t", "tree", "/dev/null").decode("ascii").strip()
         before_rev = None
     else:
         base = before_rev = before_head
@@ -153,9 +135,7 @@ def _build_block(repo: Path, before_head: str | None, commit: str) -> dict:
             "before": _text_at(repo, before_rev, git_path),
             "after": _text_at(repo, commit, git_path),
         }
-        counts = {
-            side: health.line_counts(text, language) for side, text in texts.items()
-        }
+        counts = {side: health.line_counts(text, language) for side, text in texts.items()}
         for kind in _KINDS:
             lines[category][kind] += counts["after"][kind] - counts["before"][kind]
         if language == "Python":
@@ -182,10 +162,7 @@ def _build_block(repo: Path, before_head: str | None, commit: str) -> dict:
         }
     return {
         "lines": lines,
-        "complexity": {
-            side: _complexity(structure[side]["functions"])
-            for side in ("before", "after")
-        },
+        "complexity": {side: _complexity(structure[side]["functions"]) for side in ("before", "after")},
         "complexity_reason": None,
     }
 

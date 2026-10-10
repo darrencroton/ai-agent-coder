@@ -1,0 +1,6 @@
+# Project ruff configuration: the `lint` skill's defect-only rule set, at the
+# width this repository's Python is written to. The skill's config applies by
+# itself only where a project has none; naming it here keeps one rule set and
+# lets `ruff format --check` measure these files against their actual width.
+extend = "skills/lint/config/ruff.toml"
+line-length = 120

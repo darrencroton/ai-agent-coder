@@ -104,9 +104,15 @@ class PollGuardTestCase(unittest.TestCase):
         content has to be controllable to distinguish "unchanged" from
         "changed".
         """
-        target = self.home / "scratch" / "claude-654982451" / "proj" / (
-            "caf72e97-e44f-4125-88ee-18353dc23bbc"
-        ) / "tasks" / "b91idsq93.output"
+        target = (
+            self.home
+            / "scratch"
+            / "claude-654982451"
+            / "proj"
+            / ("caf72e97-e44f-4125-88ee-18353dc23bbc")
+            / "tasks"
+            / "b91idsq93.output"
+        )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return str(target)
@@ -147,9 +153,7 @@ class TestReadBranchUnchanged(PollGuardTestCase):
         self.addCleanup(lambda: non_pm.rmdir() if not any(non_pm.iterdir()) else None)
         path = self.task_output("same\n")
         self.assertAllowed(self.read_payload(path, cwd=non_pm))
-        self.assertAllowed(
-            self.read_payload(path, cwd=non_pm), "the PM-run gate must hold even on a repeat"
-        )
+        self.assertAllowed(self.read_payload(path, cwd=non_pm), "the PM-run gate must hold even on a repeat")
 
     def test_an_ordinary_repository_file_is_allowed(self) -> None:
         ordinary = self.cwd / "tasks" / "abc.output"
@@ -237,15 +241,11 @@ class TestBashBranch(PollGuardTestCase):
     def test_a_collision_suffixed_run_id_is_still_matched(self) -> None:
         # new_run_id appends -2, -3, ... when two runs mint the same id.
         self.assertDenied(
-            self.bash_payload(
-                f"sleep 300; cat .git/pm/{_RUN_ID}-2/slices/slice-001/review-1-code-review-codex.md"
-            )
+            self.bash_payload(f"sleep 300; cat .git/pm/{_RUN_ID}-2/slices/slice-001/review-1-code-review-codex.md")
         )
 
     def test_a_four_digit_slice_directory_is_still_matched(self) -> None:
-        self.assertDenied(
-            self.bash_payload(f"sleep 300; cat .git/pm/{_RUN_ID}/slices/slice-1000/review-1-x.md")
-        )
+        self.assertDenied(self.bash_payload(f"sleep 300; cat .git/pm/{_RUN_ID}/slices/slice-1000/review-1-x.md"))
 
     # --- must stay allowed ---------------------------------------------------
 
@@ -257,9 +257,7 @@ class TestBashBranch(PollGuardTestCase):
         right tool when no notification is genuinely coming, e.g. after a
         session resume.
         """
-        self.assertAllowed(
-            self.bash_payload(f"sleep 900; tail -4 {_TASK_OUTPUT}", background=False)
-        )
+        self.assertAllowed(self.bash_payload(f"sleep 900; tail -4 {_TASK_OUTPUT}", background=False))
 
     def test_inspecting_without_waiting_is_allowed(self) -> None:
         self.assertAllowed(self.bash_payload(f"tail -4 {_TASK_OUTPUT}"))
@@ -333,9 +331,7 @@ class TestBashBranch(PollGuardTestCase):
         """Matching a bare `/pm/<run-id>/` would deny background work on
         somebody else's data that happens to be laid out that way. The anchor is
         the directory structure the toolkit actually creates."""
-        self.assertAllowed(
-            self.bash_payload(f"sleep 30; cat /srv/customer/pm/{_RUN_ID}/input.json")
-        )
+        self.assertAllowed(self.bash_payload(f"sleep 30; cat /srv/customer/pm/{_RUN_ID}/input.json"))
 
     def test_a_suffix_alike_directory_is_allowed(self) -> None:
         """`archive.pm/runs/...` is not the `.pm/` mirror; the match needs a real
@@ -343,11 +339,7 @@ class TestBashBranch(PollGuardTestCase):
         enough — a `-`, `~` or `+` prefix walked straight through."""
         for prefix in ("archive.pm", "archive-.pm", "old~.pm", "a+.pm", "archive=.pm"):
             with self.subTest(prefix=prefix):
-                self.assertAllowed(
-                    self.bash_payload(
-                        f"sleep 30; cat {prefix}/runs/{_RUN_ID}/slices/slice-001/x.md"
-                    )
-                )
+                self.assertAllowed(self.bash_payload(f"sleep 30; cat {prefix}/runs/{_RUN_ID}/slices/slice-001/x.md"))
 
     def test_the_real_mirror_is_still_matched_after_a_separator(self) -> None:
         """The boundary must not be so strict that it stops matching the actual
@@ -365,17 +357,13 @@ class TestBashBranch(PollGuardTestCase):
         `.git/worktrees/<name>/pm/<run-id>/`, so polling there is the same waste
         as polling the ordinary location."""
         self.assertDenied(
-            self.bash_payload(
-                f"sleep 60; cat .git/worktrees/wt-a/pm/{_RUN_ID}/slices/slice-001/review-1-x.md"
-            )
+            self.bash_payload(f"sleep 60; cat .git/worktrees/wt-a/pm/{_RUN_ID}/slices/slice-001/review-1-x.md")
         )
 
     def test_outside_a_pm_run_bash_is_untouched(self) -> None:
         non_pm = Path(tempfile.mkdtemp(prefix="not-a-pm-run-"))
         self.addCleanup(lambda: non_pm.rmdir() if not any(non_pm.iterdir()) else None)
-        self.assertAllowed(
-            self.bash_payload(f"until [ -s {_TASK_OUTPUT} ]; do sleep 30; done", cwd=non_pm)
-        )
+        self.assertAllowed(self.bash_payload(f"until [ -s {_TASK_OUTPUT} ]; do sleep 30; done", cwd=non_pm))
 
     def test_an_ordinary_backgrounded_command_is_allowed(self) -> None:
         self.assertAllowed(self.bash_payload("pytest -q tests/"))
@@ -396,20 +384,31 @@ class TestFailsOpen(PollGuardTestCase):
 
     def test_missing_cwd_allows(self) -> None:
         self.assertAllowed(
-            {"session_id": "s", "tool_name": "Bash",
-             "tool_input": {"command": f"sleep 9; cat {_TASK_OUTPUT}", "run_in_background": True}}
+            {
+                "session_id": "s",
+                "tool_name": "Bash",
+                "tool_input": {"command": f"sleep 9; cat {_TASK_OUTPUT}", "run_in_background": True},
+            }
         )
 
     def test_a_non_string_command_allows(self) -> None:
         self.assertAllowed(
-            {"session_id": "s", "cwd": str(self.cwd), "tool_name": "Bash",
-             "tool_input": {"command": ["sleep", "900"], "run_in_background": True}}
+            {
+                "session_id": "s",
+                "cwd": str(self.cwd),
+                "tool_name": "Bash",
+                "tool_input": {"command": ["sleep", "900"], "run_in_background": True},
+            }
         )
 
     def test_an_unrelated_tool_allows(self) -> None:
         self.assertAllowed(
-            {"session_id": "s", "cwd": str(self.cwd), "tool_name": "Write",
-             "tool_input": {"file_path": _TASK_OUTPUT, "content": "x"}}
+            {
+                "session_id": "s",
+                "cwd": str(self.cwd),
+                "tool_name": "Write",
+                "tool_input": {"file_path": _TASK_OUTPUT, "content": "x"},
+            }
         )
 
     def test_a_payload_without_tool_name_still_dispatches_by_shape(self) -> None:
@@ -417,9 +416,11 @@ class TestFailsOpen(PollGuardTestCase):
         that omits `tool_name` must behave as it did before the Bash branch
         existed rather than silently stop guarding."""
         self.assertDenied(
-            {"session_id": "s", "cwd": str(self.cwd),
-             "tool_input": {"command": f"sleep 900; tail -4 {_TASK_OUTPUT}",
-                            "run_in_background": True}}
+            {
+                "session_id": "s",
+                "cwd": str(self.cwd),
+                "tool_input": {"command": f"sleep 900; tail -4 {_TASK_OUTPUT}", "run_in_background": True},
+            }
         )
 
     def test_an_ambiguous_shape_without_tool_name_allows(self) -> None:
@@ -429,19 +430,22 @@ class TestFailsOpen(PollGuardTestCase):
         path = self.task_output("same\n")
         self.assertAllowed(self.read_payload(path))  # prime the digest stamp
         self.assertAllowed(
-            {"session_id": "session-a", "cwd": str(self.cwd),
-             "tool_input": {"file_path": path,
-                            "command": f"sleep 900; tail -4 {_TASK_OUTPUT}",
-                            "run_in_background": True}}
+            {
+                "session_id": "session-a",
+                "cwd": str(self.cwd),
+                "tool_input": {
+                    "file_path": path,
+                    "command": f"sleep 900; tail -4 {_TASK_OUTPUT}",
+                    "run_in_background": True,
+                },
+            }
         )
 
     def test_a_very_large_command_terminates(self) -> None:
         """Guards against a matcher that degrades badly on pathological input;
         the assertion is really the subprocess timeout in `invoke`."""
         self.assertAllowed(self.bash_payload("echo " + ("a" * 200_000)))
-        self.assertDenied(
-            self.bash_payload(f"sleep 60; cat {_REVIEW_MIRROR} # " + ("b" * 200_000))
-        )
+        self.assertDenied(self.bash_payload(f"sleep 60; cat {_REVIEW_MIRROR} # " + ("b" * 200_000)))
 
 
 if __name__ == "__main__":
