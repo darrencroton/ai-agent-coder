@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from . import IntegrityError, PmError, TypedNotSubmitted
+from . import code_metrics
 from . import git_ops
 from . import plan as plan_mod
 from . import profiles
@@ -1359,6 +1360,7 @@ class AcceptOutcome:
     pane_path: Path
     assessment_path: Path | None = None
     message: str = ""
+    code_warning: str | None = None
 
 
 def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, risk: str | None = None) -> AcceptOutcome:
@@ -1425,6 +1427,12 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
                 pane_path=artifact_dir / "pane.txt",
             )
 
+    # Git is read here, once per accepted slice, and never again by the ledger.
+    code = entry["code"] = code_metrics.code_block(repo, current.get("before_head"), head)
+    code_warning = code.get("error") or (
+        None if code.get("complexity") is not None else f"complexity not measured: {code.get('complexity_reason')}"
+    )
+
     reviews_text = _reviews_consulted_text(reviews, head, effective_risk, grant_count)
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
     grants_text = _grants_text(plan_mod.slice_grants(state, slice_id))
@@ -1464,7 +1472,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
 
     return AcceptOutcome(
         kind="accepted", slice_id=slice_id, report=report, assessment_path=assessment_original,
-        message=f"{slice_id} accepted", pane_path=artifact_dir / "pane.txt",
+        message=f"{slice_id} accepted", pane_path=artifact_dir / "pane.txt", code_warning=code_warning,
     )
 
 

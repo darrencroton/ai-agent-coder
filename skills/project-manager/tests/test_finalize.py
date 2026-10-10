@@ -46,6 +46,7 @@ from pm_test_helpers import (
 
 from pm_lib import PmError
 from pm_lib import cli
+from pm_lib import code_metrics
 from pm_lib import TypedNotSubmitted
 from pm_lib import sessions
 from pm_lib import slice_ops
@@ -215,6 +216,8 @@ class TestFullAcceptance(FinalizeTestCase):
         entry = state["slices"][0]
         self.assertEqual(entry["status"], "accepted")
         self.assertEqual(entry["commit"], head)
+        self.assertIsInstance(entry["code"], dict)
+        self.assertIn("lines", entry["code"])
         self.assertIsNone(state["current_slice"])
         # Accepting the LAST undecided slice completes the run there and then —
         # a different production branch from `start_slice` finding nothing left
@@ -250,6 +253,34 @@ class TestFullAcceptance(FinalizeTestCase):
         code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0)
         self.assertIn("all slices complete", out)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestAcceptWithFailingCodeMetrics(FinalizeTestCase):
+    def test_metrics_failure_is_stored_and_reported_but_never_blocks_accept(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
+        )
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for_result(run_id, token))
+
+        health = code_metrics._load_health()
+        with mock.patch.object(health, "python_structure", side_effect=RuntimeError("boom")):
+            code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("ACCEPTED", out)
+        self.assertIn("pm: code metrics: RuntimeError: boom", err)
+        entry = state_mod.load_state(run_dir, token)["slices"][0]
+        self.assertEqual(entry["status"], "accepted")
+        self.assertEqual(entry["code"], {"error": "RuntimeError: boom"})
 
 
 # --- floor failure refuses acceptance ----------------------------------------

@@ -594,6 +594,8 @@ def _run_finalize(args: argparse.Namespace) -> int:
         _print_floor_facts(outcome.report)
         _print_pane_tail(outcome.pane_path)
         if outcome.kind == "accepted":
+            if outcome.code_warning:
+                print(f"pm: code metrics: {outcome.code_warning}", file=sys.stderr)
             print(f"ACCEPTED {outcome.slice_id}")
             print(f"assessment: {outcome.assessment_path}")
             return 0
