@@ -1623,7 +1623,8 @@ class TestCurrentSubmissionGaps(PmTestCase):
         judge_current_developer(self, token, run_dir)
         with (run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
             handle.write("{truncated\n")
-        run_json = (run_dir / "run.json").read_bytes()
+        run_json = run_dir / "run.json"
+        before = (run_json.read_bytes(), run_json.stat().st_ino)
 
         code, _out, err = self.run_cli_in_repo(
             [
@@ -1638,7 +1639,37 @@ class TestCurrentSubmissionGaps(PmTestCase):
         )
         self.assertEqual(code, 2, err)
         self.assertIn("could not read PM event log", err)
-        self.assertEqual((run_dir / "run.json").read_bytes(), run_json)
+        self.assertEqual((run_json.read_bytes(), run_json.stat().st_ino), before)
+
+    def test_an_unreadable_event_log_still_persists_a_risk_raise(self) -> None:
+        """The gate cannot be evaluated, but the `--risk elevated` this command
+        applied (and logged as a risk-raise) must not be lost with it."""
+        token, run_dir = self._launched()
+        self.assertEqual(
+            state_mod.load_state(run_dir, token)["slices"][0]["risk"], "standard"
+        )
+        with (run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write("{truncated\n")
+
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "finalize",
+                "--stop",
+                "cannot continue",
+                "--cause",
+                "plan",
+                "--risk",
+                "elevated",
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertIn("could not read PM event log", err)
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["slices"][0]["risk"], "elevated")
+        self.assertEqual(state["current_slice"]["risk"], "elevated")
+        self.assertIsNone(state["slices"][0].get("status"))
 
     def test_a_judgment_at_an_older_head_is_stale_until_superseded(self) -> None:
         token, run_dir = self._launched()
@@ -1671,6 +1702,37 @@ class TestCurrentSubmissionGaps(PmTestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn(stale, err)
+
+        judge_current_developer(self, token, run_dir, supersedes=first)
+        self.assertEqual(self._gaps(token, run_dir), [])
+
+    def test_a_grant_after_the_judgment_makes_it_stale_until_superseded(self) -> None:
+        token, run_dir = self._launched()
+        origin = current_origin_index(run_dir)
+        first = judge_current_developer(self, token, run_dir)
+        self.assertEqual(self._gaps(token, run_dir), [])
+
+        code, out, err = self.run_cli_in_repo(
+            [
+                "grant",
+                "--slice",
+                "Slice 1",
+                "--path",
+                "b.py",
+                "--evidence",
+                _LONG_GRANT_EVIDENCE,
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(
+            self._gaps(token, run_dir),
+            [
+                f"Developer judgment for event {origin} is stale (head or grants changed); "
+                "record a superseding judgment"
+            ],
+        )
 
         judge_current_developer(self, token, run_dir, supersedes=first)
         self.assertEqual(self._gaps(token, run_dir), [])
@@ -1998,6 +2060,27 @@ class TestJudgmentGate(FinalizeTestCase):
         self.assertIn("launched", out)
         self.assertNotIn("relaunched", out)
         self._track_current_session(run_dir.name, token)
+
+    def test_a_refused_relaunch_with_a_risk_raise_persists_the_ratchet(self) -> None:
+        token, run_dir, session = self._launch(stdin_draining_idle_script())
+        self.assertEqual(
+            state_mod.load_state(run_dir, token)["slices"][0]["risk"], "standard"
+        )
+
+        code, _out, err = self.run_cli_in_repo(
+            ["start-slice", "--risk", "elevated", "--token", token]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertIn("is unjudged", err)
+        # The entry is the risk every decision reads (`entry["risk"]`).
+        # start_slice's ratchet raises only the entry, never the in-flight
+        # current_slice copy, which a relaunch rebuilds from the entry.
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["slices"][0]["risk"], "elevated")
+        kinds = [event["kind"] for event in state_mod.read_events(run_dir)]
+        self.assertIn("risk-raise", kinds)
+        self.assertNotIn("relaunch", kinds)
+        self.assertTrue(sessions.session_exists(session))
 
     def test_relaunch_is_gated_including_a_resume_after_pm_stop_which_is_not(
         self,

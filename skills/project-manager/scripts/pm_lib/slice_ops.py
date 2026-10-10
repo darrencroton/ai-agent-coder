@@ -95,14 +95,21 @@ def _require_judged(
     evidence, rotation or session change. A refusal persists state only when
     this command applied a `--risk elevated` ratchet, so the ratchet and its
     `risk-raise` event stay consistent; otherwise it writes nothing, and can
-    never overwrite a judgment or review recorded concurrently.
+    never overwrite a judgment or review recorded concurrently. The same
+    holds when the gate cannot be evaluated at all (a `PmError` such as a
+    malformed event log): the ratchet is persisted, then the error re-raised.
     """
     from . import judgments
 
-    # A malformed event log is a named error (exit 2), never a traceback.
-    gaps = judgments.current_submission_gaps(
-        state, judgments._read_events_or_raise(run_dir), repo, slice_id
-    )
+    try:
+        # A malformed event log is a named error (exit 2), never a traceback.
+        gaps = judgments.current_submission_gaps(
+            state, judgments._read_events_or_raise(run_dir), repo, slice_id
+        )
+    except PmError:
+        if ratcheted:
+            state_mod.save_state(run_dir, state, token)
+        raise
     if not gaps:
         return
     if ratcheted:
