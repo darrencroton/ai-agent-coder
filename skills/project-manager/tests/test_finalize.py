@@ -1316,8 +1316,9 @@ class HungReviewerTestCase(PmTestCase):
                 "--reviewer-command", str(fake_sleep),
             ],
             cwd=str(self.repo), env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
+        self.addCleanup(proc.stderr.close)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
 
         def _reviewer_pgid() -> int | None:
@@ -1355,6 +1356,7 @@ class TestStopReapsHungReviewer(HungReviewerTestCase):
         # A reviewer killed by a PM decision is PM's choice, not the
         # reviewer's failure: its `review` command refuses and records nothing.
         self.assertEqual(proc.returncode, 2)
+        self.assertIn("reaped by a PM decision", proc.stderr.read())
         events = state_mod.read_events(run_dir)
         self.assertEqual([e for e in events if e["kind"] == "review-failed"], [])
 

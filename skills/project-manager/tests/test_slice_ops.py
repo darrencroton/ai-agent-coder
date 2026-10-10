@@ -1104,6 +1104,36 @@ class TestStop(SliceOpsTestCase):
 # --- all slices complete -----------------------------------------------------
 
 
+class TestReapReviewersUnionsPersistedPids(PmTestCase):
+    def test_reviewer_registered_after_snapshot_is_killed_and_cleared(self) -> None:
+        """A reviewer that registers its pgid after the caller loaded state
+        is cleared from disk with the rest, so it must be killed as well."""
+        plan_path = self.write_plan(
+            self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}]
+        )
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        self.set_current_slice(
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=None,
+            reviewer_pids=[111],
+        )
+        current = state_mod.load_state(run_dir, token)["current_slice"]
+        with state_mod.locked_update(run_dir, token) as live:
+            live["current_slice"]["reviewer_pids"].append(222)
+
+        killed: list[int] = []
+        with mock.patch.object(slice_ops, "_kill_reviewer_pgid", killed.append):
+            slice_ops._reap_reviewers(run_dir, token, current)
+
+        self.assertEqual(killed, [111, 222])
+        self.assertEqual(current["reviewer_pids"], [])
+        persisted = state_mod.load_state(run_dir, token)["current_slice"]
+        self.assertEqual(persisted["reviewer_pids"], [])
+
+
 class TestReviewFreshnessRequiresGrantsSeen(PlanTestCase):
     def test_review_without_int_grants_seen_is_stale(self) -> None:
         artifact = self.repo / "review.md"

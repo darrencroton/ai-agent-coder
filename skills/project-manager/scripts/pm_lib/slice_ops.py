@@ -1725,15 +1725,26 @@ def _reap_reviewers(run_dir: Path, token: str, current: dict[str, Any] | None) -
     `reviewer_pids`; persisting only with the caller's later `save_state`
     would let it see its own pgid still recorded and log the reap as a
     `review-failed` commission.
+
+    The pgids killed are the union of the caller's snapshot and those on disk
+    under the lock: a reviewer that registered after the caller loaded state
+    is cleared from disk too, so it must be killed rather than left running
+    with its eventual failure misread as a reap.
+
+    The lock can time out (PmError) after a caller's irreversible steps (an
+    assessment write, a session kill), leaving a partly applied decision that
+    a retried finalize completes.
     """
     if not current:
         return
     pgids = list(current.get("reviewer_pids") or [])
-    if pgids:
-        with state_mod.locked_update(run_dir, token) as locked_state:
-            locked_current = locked_state.get("current_slice")
-            if locked_current is not None:
-                locked_current["reviewer_pids"] = []
+    with state_mod.locked_update(run_dir, token) as locked_state:
+        locked_current = locked_state.get("current_slice")
+        if locked_current is not None:
+            for pgid in locked_current.get("reviewer_pids") or []:
+                if pgid not in pgids:
+                    pgids.append(pgid)
+            locked_current["reviewer_pids"] = []
     for pgid in pgids:
         _kill_reviewer_pgid(pgid)
     current["reviewer_pids"] = []
