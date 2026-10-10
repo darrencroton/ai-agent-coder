@@ -74,7 +74,7 @@ def _git_ok(repo: Path, *args: str) -> bytes:
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(
-            f"git {' '.join(args[:2])} failed ({result.returncode}): {stderr}"
+            f"git {' '.join(args)} failed ({result.returncode}): {stderr}"
         )
     return result.stdout
 
@@ -83,12 +83,17 @@ def _text_at(repo: Path, rev: str | None, path: str) -> str:
     """The file's text at `rev`; empty when no file exists at `path` on that side.
 
     Absence is established only by a successful `ls-tree` lookup that finds no
-    entry, or finds a directory (or submodule) where a file would be. A failed
-    lookup or an unreadable blob raises, so it can never read as "empty".
+    entry, or finds a directory, submodule or symlink where a file would be
+    (code-health skips symlinks, so their target text is not file content). A
+    failed lookup or an unreadable blob raises, so it can never read as "empty".
+    The path is looked up literally from the repository root, never as a
+    pathspec, so a name such as ``:foo.py`` is found rather than read as absent.
     """
     if rev is None:
         return ""
-    listing = _git_ok(repo, "ls-tree", "-z", rev, "--", path)
+    listing = _git_ok(
+        repo, "--literal-pathspecs", "ls-tree", "--full-tree", "-z", rev, "--", path
+    )
     entry = listing.split(b"\0", 1)[0]
     if not entry:
         return ""
@@ -96,7 +101,7 @@ def _text_at(repo: Path, rev: str | None, path: str) -> str:
     meta = entry.split(b"\t", 1)[0].split()
     if len(meta) != 3:
         raise RuntimeError(f"unexpected git ls-tree entry for {rev}:{path}")
-    if meta[1] != b"blob":
+    if meta[1] != b"blob" or meta[0] == b"120000":
         return ""
     blob = _git_ok(repo, "cat-file", "blob", meta[2].decode("ascii"))
     return blob.decode("utf-8-sig", errors="replace")

@@ -222,20 +222,54 @@ class TestObjectTypeAtPath(CodeMetricsTestCase):
         self.assertIsNone(block["complexity_reason"])
         self.assertEqual(block["complexity"]["after"], {"sum": 2, "max": 2})
 
+    def stage_blob(self, name: bytes, text: str, mode: str = "100644") -> None:
+        """Commit a blob under a raw byte name straight into the index, with no file on disk."""
+        oid = subprocess.run(
+            ["git", "-C", str(self.repo), "hash-object", "-w", "--stdin"],
+            input=text.encode("utf-8"),
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            [b"git", b"-C", os.fsencode(self.repo), b"update-index", b"--add"]
+            + [b"--cacheinfo", f"{mode},".encode() + oid + b"," + name],
+            check=True,
+        )
+        self._git("commit", "-q", "-m", "staged blob")
+
     def test_non_utf8_file_name_is_still_read(self) -> None:
         before = self._git("rev-parse", "HEAD").stdout.strip()
-        name = os.fsdecode(b"bad\xff.py")
-        try:
-            (self.repo / name).write_text("x = 1\n", encoding="utf-8")
-        except OSError:
-            self.skipTest("filesystem rejects non-UTF-8 file names")
-        self._git("add", "-A")
-        self._git("commit", "-q", "-m", "odd name")
+        self.stage_blob(b"bad\xff.py", "x = 1\n")
         head = self._git("rev-parse", "HEAD").stdout.strip()
 
         block = code_metrics.code_block(self.repo, before, head)
 
         self.assertEqual(block["lines"]["production"]["code"], 1)
+        self.assertIsNone(block["complexity_reason"])
+
+    def test_pathspec_looking_file_name_is_read_literally(self) -> None:
+        before = self._git("rev-parse", "HEAD").stdout.strip()
+        head = self.commit({":foo.py": "def f(x):\n    if x:\n        return 1\n"})
+
+        block = code_metrics.code_block(self.repo, before, head)
+
+        self.assertEqual(
+            block["lines"]["production"], {"code": 3, "comment": 0, "blank": 0}
+        )
+        self.assertEqual(block["complexity"]["after"], {"sum": 2, "max": 2})
+
+    def test_symlink_contributes_nothing_and_does_not_null_complexity(self) -> None:
+        before = self._git("rev-parse", "HEAD").stdout.strip()
+        self.stage_blob(b"link.py", "../target dir/x.py", mode="120000")
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+
+        block = code_metrics.code_block(self.repo, before, head)
+
+        self.assertEqual(block["lines"], _zero_lines())
+        self.assertEqual(
+            block["complexity"],
+            {"before": {"sum": 0, "max": 0}, "after": {"sum": 0, "max": 0}},
+        )
         self.assertIsNone(block["complexity_reason"])
 
 
