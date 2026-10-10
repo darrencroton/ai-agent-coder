@@ -9,7 +9,11 @@ stderr warning) is tested in `test_finalize.py`.
 
 from __future__ import annotations
 
+import os
 import sys
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -47,6 +51,12 @@ class CodeMetricsTestCase(PmTestCase):
             path = self.repo / name
             if text is None:
                 path.unlink()
+                # Git does not track directories; clear the emptied ones so a
+                # file can later take the directory's place.
+                for parent in path.parents:
+                    if parent == self.repo or any(parent.iterdir()):
+                        break
+                    parent.rmdir()
                 continue
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
@@ -144,6 +154,91 @@ class TestLinesAndComplexity(CodeMetricsTestCase):
         )
 
 
+class TestObjectTypeAtPath(CodeMetricsTestCase):
+    def test_directory_replaced_by_file_counts_only_real_file_text(self) -> None:
+        before = self.commit(
+            {"thing.py/inner.py": "def g(x):\n    if x:\n        return 1\n"}
+        )
+        head = self.commit({"thing.py/inner.py": None, "thing.py": "a = 1\nb = 2\n"})
+
+        block = code_metrics.code_block(self.repo, before, head)
+
+        expected = _zero_lines()
+        expected["production"]["code"] = 2 - 3
+        self.assertEqual(block["lines"], expected)
+        self.assertEqual(
+            block["complexity"],
+            {"before": {"sum": 2, "max": 2}, "after": {"sum": 0, "max": 0}},
+        )
+
+    def test_file_replaced_by_directory_counts_only_real_file_text(self) -> None:
+        before = self.commit({"thing.py": "a = 1\nb = 2\n"})
+        head = self.commit(
+            {
+                "thing.py": None,
+                "thing.py/inner.py": "def g(x):\n    if x:\n        return 1\n",
+            }
+        )
+
+        block = code_metrics.code_block(self.repo, before, head)
+
+        expected = _zero_lines()
+        expected["production"]["code"] = 3 - 2
+        self.assertEqual(block["lines"], expected)
+        self.assertEqual(
+            block["complexity"],
+            {"before": {"sum": 0, "max": 0}, "after": {"sum": 2, "max": 2}},
+        )
+
+    def test_unreadable_object_is_an_error_block_not_an_empty_side(self) -> None:
+        before = self._git("rev-parse", "HEAD").stdout.strip()
+        head = self.commit({"src/mod.py": _MODULE})
+        real_git = code_metrics._git
+
+        def failing_cat_file(repo, *args):
+            if args[0] == "cat-file":
+                return subprocess.CompletedProcess(
+                    args, 128, b"", b"fatal: unable to read object"
+                )
+            return real_git(repo, *args)
+
+        with mock.patch.object(code_metrics, "_git", side_effect=failing_cat_file):
+            block = code_metrics.code_block(self.repo, before, head)
+
+        self.assertEqual(list(block), ["error"])
+        self.assertIn("unable to read object", block["error"])
+
+    def test_bom_prefixed_python_is_measured_not_a_parse_error(self) -> None:
+        before = self._git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "bom.py").write_bytes(
+            b"\xef\xbb\xbfdef f(x):\n    if x:\n        return 1\n"
+        )
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "bom file")
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+
+        block = code_metrics.code_block(self.repo, before, head)
+
+        self.assertIsNone(block["complexity_reason"])
+        self.assertEqual(block["complexity"]["after"], {"sum": 2, "max": 2})
+
+    def test_non_utf8_file_name_is_still_read(self) -> None:
+        before = self._git("rev-parse", "HEAD").stdout.strip()
+        name = os.fsdecode(b"bad\xff.py")
+        try:
+            (self.repo / name).write_text("x = 1\n", encoding="utf-8")
+        except OSError:
+            self.skipTest("filesystem rejects non-UTF-8 file names")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "odd name")
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+
+        block = code_metrics.code_block(self.repo, before, head)
+
+        self.assertEqual(block["lines"]["production"]["code"], 1)
+        self.assertIsNone(block["complexity_reason"])
+
+
 class TestNeverRaises(CodeMetricsTestCase):
     def test_missing_health_file_returns_error_block(self) -> None:
         head = self._git("rev-parse", "HEAD").stdout.strip()
@@ -162,6 +257,19 @@ class TestNeverRaises(CodeMetricsTestCase):
 
     def test_health_module_is_loaded_once_per_path(self) -> None:
         self.assertIs(code_metrics._load_health(), code_metrics._load_health())
+
+    def test_failed_load_at_another_path_keeps_the_registered_module(self) -> None:
+        good = code_metrics._load_health()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        broken = Path(tmp) / "health.py"
+        broken.write_text("raise RuntimeError('broken health')\n", encoding="utf-8")
+
+        with mock.patch.object(code_metrics, "_HEALTH_PATH", broken):
+            with self.assertRaises(RuntimeError):
+                code_metrics._load_health()
+
+        self.assertIs(sys.modules[code_metrics._MODULE_NAME], good)
 
 
 if __name__ == "__main__":

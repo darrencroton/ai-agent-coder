@@ -15,6 +15,7 @@ so a measurement problem can be loud but never blocks an acceptance.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -45,11 +46,18 @@ def _load_health() -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load code-health from {path}")
     module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(_MODULE_NAME)
     sys.modules[_MODULE_NAME] = module
     try:
         spec.loader.exec_module(module)
     except BaseException:
-        sys.modules.pop(_MODULE_NAME, None)
+        # Put back whatever was registered before (a cached good module for
+        # another path); only drop the entry when it is still our half-built one.
+        if sys.modules.get(_MODULE_NAME) is module:
+            if previous is None:
+                del sys.modules[_MODULE_NAME]
+            else:
+                sys.modules[_MODULE_NAME] = previous
         raise
     _loaded = (path, module)
     return module
@@ -72,28 +80,43 @@ def _git_ok(repo: Path, *args: str) -> bytes:
 
 
 def _text_at(repo: Path, rev: str | None, path: str) -> str:
-    """The file's text at `rev`; empty when the file is absent on that side."""
+    """The file's text at `rev`; empty when no file exists at `path` on that side.
+
+    Absence is established only by a successful `ls-tree` lookup that finds no
+    entry, or finds a directory (or submodule) where a file would be. A failed
+    lookup or an unreadable blob raises, so it can never read as "empty".
+    """
     if rev is None:
         return ""
-    spec = f"{rev}:{path}"
-    result = _git(repo, "show", spec)
-    if result.returncode != 0:
-        # Absent is a legitimate side of an added or deleted file; any other
-        # failure (unreadable object, bad revision) must not read as "empty".
-        if _git(repo, "cat-file", "-e", spec).returncode != 0:
-            return ""
-        stderr = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"git show {spec} failed ({result.returncode}): {stderr}")
-    return result.stdout.decode("utf-8", errors="replace")
+    listing = _git_ok(repo, "ls-tree", "-z", rev, "--", path)
+    entry = listing.split(b"\0", 1)[0]
+    if not entry:
+        return ""
+    # "<mode> SP <type> SP <oid> TAB <path>"
+    meta = entry.split(b"\t", 1)[0].split()
+    if len(meta) != 3:
+        raise RuntimeError(f"unexpected git ls-tree entry for {rev}:{path}")
+    if meta[1] != b"blob":
+        return ""
+    blob = _git_ok(repo, "cat-file", "blob", meta[2].decode("ascii"))
+    return blob.decode("utf-8-sig", errors="replace")
 
 
-def _changed_paths(repo: Path, base: str, commit: str) -> list[str]:
+def _changed_paths(repo: Path, base: str, commit: str) -> list[tuple[str, str]]:
+    """Touched files as ``(display name, git name)``, sorted by display name.
+
+    The display name is UTF-8 decoded with replacement and is only for
+    classification and reports; the git name round-trips arbitrary bytes
+    (surrogateescape) so git commands still find a non-UTF-8 file.
+    """
     out = _git_ok(
         repo, "diff", "--no-renames", "-z", "--name-only", f"{base}..{commit}"
     )
-    names = (
-        name.decode("utf-8", errors="replace") for name in out.split(b"\0") if name
-    )
+    names = [
+        (raw.decode("utf-8", errors="replace"), os.fsdecode(raw))
+        for raw in out.split(b"\0")
+        if raw
+    ]
     return sorted(names)
 
 
@@ -118,12 +141,12 @@ def _build_block(repo: Path, before_head: str | None, commit: str) -> dict:
 
     lines = {category: dict.fromkeys(_KINDS, 0) for category in _CATEGORIES}
     sides: dict[str, list] = {"before": [], "after": []}
-    for path in _changed_paths(repo, base, commit):
+    for path, git_path in _changed_paths(repo, base, commit):
         language = health.language_for(path)
         category = health.category_for(path, language)[0]
         texts = {
-            "before": _text_at(repo, before_rev, path),
-            "after": _text_at(repo, commit, path),
+            "before": _text_at(repo, before_rev, git_path),
+            "after": _text_at(repo, commit, git_path),
         }
         counts = {
             side: health.line_counts(text, language) for side, text in texts.items()
