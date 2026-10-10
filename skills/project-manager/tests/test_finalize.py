@@ -33,12 +33,18 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from pm_test_helpers import (
+    UNAVAILABLE_DEVELOPER,
     PmTestCase,
     TmuxRunTestCase,
     commit_and_result_script,
+    current_origin_index,
     idle_script,
+    judge_current_developer,
+    judge_reviews,
     parse_init_output,
+    rate_reviews,
     result_heredoc,
+    result_only_script,
     stdin_draining_idle_script,
     trigger_gated_credential_prompt_script,
     write_fake_harness,
@@ -47,6 +53,7 @@ from pm_test_helpers import (
 from pm_lib import PmError
 from pm_lib import cli
 from pm_lib import code_metrics
+from pm_lib import judgments
 from pm_lib import TypedNotSubmitted
 from pm_lib import sessions
 from pm_lib import slice_ops
@@ -207,6 +214,7 @@ class TestFullAcceptance(FinalizeTestCase):
         before.pop("updated_at")
         self.assertEqual(after, before, "bare finalize must not mutate run state")
 
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, err)
         self.assertIn("ACCEPTED", out)
@@ -271,6 +279,7 @@ class TestAcceptWithFailingCodeMetrics(FinalizeTestCase):
         self._track_current_session(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
+        judge_current_developer(self, token, run_dir)
         health = code_metrics._load_health()
         with mock.patch.object(health, "python_structure", side_effect=RuntimeError("boom")):
             code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
@@ -304,8 +313,10 @@ class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
         self._track_current_session(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 1, out + err)
+        self.assertIn("5 surface FAIL", out)
 
         state = state_mod.load_state(run_dir, token)
         entry = state["slices"][0]
@@ -373,6 +384,7 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
         self.assertTrue(self._wait_for_result(run_id, token))
 
         # Missing both reviews.
+        developer_judgment = judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 1, out + err)
         self.assertIn("drift-audit", out + err)
@@ -395,6 +407,11 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
         (self.repo / "a.py").write_text("more authorized change\n", encoding="utf-8")
         self._git("add", "a.py")
         self._git("commit", "-q", "-m", "more slice work")
+        # The new commit stales the Developer judgment too; correct it, and
+        # rate the stale reports, so the gate passes and the review check is
+        # what refuses.
+        judge_current_developer(self, token, run_dir, supersedes=developer_judgment)
+        rate_reviews(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 1, out + err)
@@ -413,6 +430,7 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
              "--reviewer-command", str(fake_code2), "--token", token]
         )
         self.assertEqual(code, 0, err)
+        rate_reviews(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, out + err)
@@ -445,6 +463,7 @@ class TestRiskRatchet(FinalizeTestCase):
         self._track_current_session(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
 
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(
             ["finalize", "--risk", "elevated", "--accept", _LONG_REASONING, "--token", token]
         )
@@ -489,6 +508,7 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
         )
         self.assertEqual(code, 0, out + err)
 
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 1, out + err)
         self.assertIn("drift-audit", out + err)
@@ -531,6 +551,8 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
              "--reviewer-command", str(fake_code), "--token", token]
         )
         self.assertEqual(code, 0, err)
+        judge_current_developer(self, token, run_dir)
+        rate_reviews(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, out + err)
@@ -589,6 +611,9 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
             for skill in ("drift-audit", "code-review")
         ]
         state_mod.save_state(run_dir, state, token)
+        # These hand-written records carry no commission origin, so the gate
+        # demands no rating for them; the Developer judgment follows the grant.
+        judge_current_developer(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 1, out + err)
@@ -644,6 +669,8 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
             ["grant", "--slice", "Slice 1", "--path", "b.py", "--evidence", _LONG_GRANT_EVIDENCE, "--token", token]
         )
         self.assertEqual(code, 0, out + err)
+        judge_current_developer(self, token, run_dir)
+        rate_reviews(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 1, out + err)
@@ -665,7 +692,7 @@ class TestSteerTypedStateCleanup(PmTestCase):
         state, token, run_dir = self.make_run(plan_path=plan_path)
         artifact_dir = run_dir / "slices" / "slice-001"
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        self.set_current_slice(
+        self.launch_current_slice(
             state,
             token,
             run_dir,
@@ -675,6 +702,7 @@ class TestSteerTypedStateCleanup(PmTestCase):
             tmux_session="pm-mocked",
             attempts=0,
         )
+        judge_current_developer(self, token, run_dir)
 
         with mock.patch.object(slice_ops.sessions, "session_exists", return_value=True), \
              mock.patch.object(
@@ -709,6 +737,7 @@ class TestSteer(FinalizeTestCase):
         # Leading/trailing whitespace is meaningful in a verbatim correction
         # (e.g. an indented code block) and must survive untouched.
         correction = "  Please also update the docstring.\nAnd rerun the tests before committing.  \n"
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
         self.assertEqual(code, 0, out + err)
 
@@ -744,11 +773,14 @@ class TestSteer(FinalizeTestCase):
         self.assertEqual(steer_events[0]["note"], correction)
         self.assertNotIn("evidence", steer_events[0])
 
-        # Budget (max_attempts=1) is now exhausted: the next steer is refused.
+        # Budget (max_attempts=1) is now exhausted: the next steer is refused,
+        # although the steered submission is unjudged — the budget check
+        # precedes the judgment gate.
         code, _out, err = self.run_cli_in_repo(
             ["finalize", "--steer", "One more nudge.", "--token", token]
         )
         self.assertEqual(code, 2, err)
+        self.assertIn("attempt budget exhausted", err)
         state = state_mod.load_state(run_dir, token)
         self.assertEqual(state["status"], "needs-human")
 
@@ -774,8 +806,10 @@ class TestSteer(FinalizeTestCase):
         delivered = Path(state["current_slice"]["artifact_dir"]) / "steer-attempt-1.md"
         delivered.write_text("the correction already delivered", encoding="utf-8")
 
+        judge_current_developer(self, token, run_dir)
         code, _out, err = self.run_cli_in_repo(["finalize", "--steer", "different words", "--token", token])
         self.assertEqual(code, 2, err)
+        self.assertNotIn("unjudged", err)
         self.assertEqual(delivered.read_text(encoding="utf-8"), "the correction already delivered")
         self.assertEqual(state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 0)
 
@@ -796,6 +830,7 @@ class TestSteer(FinalizeTestCase):
         # Attempt 0 wrote a result.json BEFORE any steer.
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
 
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", "Remove the dead import.", "--token", token])
         self.assertEqual(code, 0, out + err)
 
@@ -829,6 +864,7 @@ class TestSteer(FinalizeTestCase):
             self._wait_for(lambda: "Enter API key" in sessions.pane_text(session), timeout=10.0)
         )
 
+        judge_current_developer(self, token, run_dir)
         code, _out, err = self.run_cli_in_repo(
             ["finalize", "--steer", "please continue", "--token", token]
         )
@@ -858,6 +894,7 @@ class TestSteer(FinalizeTestCase):
             state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
         )
 
+        judge_current_developer(self, token, run_dir)
         with mock.patch.object(
             slice_ops.sessions, "send_line", side_effect=PmError("never reached the pane")
         ) as never_delivered:
@@ -888,6 +925,7 @@ class TestSteer(FinalizeTestCase):
             state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
         )
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
+        judge_current_developer(self, token, run_dir)
 
         with mock.patch.object(
             slice_ops.sessions, "send_line", side_effect=PmError("never reached the pane")
@@ -924,6 +962,7 @@ class TestSteer(FinalizeTestCase):
             (artifact_dir / "result.json").write_text('{"status": "fresh"}', encoding="utf-8")
             raise PmError("never reached the pane")
 
+        judge_current_developer(self, token, run_dir)
         with mock.patch.object(slice_ops.sessions, "send_line", side_effect=_race_a_fresh_result):
             with self.assertRaises(PmError):
                 slice_ops.finalize_steer(self.repo, run_dir, token, correction="fix the other thing")
@@ -952,6 +991,7 @@ class TestSteer(FinalizeTestCase):
             state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
         )
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
+        judge_current_developer(self, token, run_dir)
 
         with mock.patch.object(
             slice_ops.sessions, "send_line", side_effect=TypedNotSubmitted("typed but unconfirmed")
@@ -977,10 +1017,12 @@ class TestSteer(FinalizeTestCase):
         self._track_current_session(run_id, token)
 
         correction = "Please rename the helper.\nAlso add a docstring."
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
         self.assertEqual(code, 0, out + err)
 
         self.assertTrue(self._wait_for_result(run_id, token))
+        judge_current_developer(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, out + err)
@@ -1039,8 +1081,10 @@ class TestStopDecision(FinalizeTestCase):
         self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
 
         correction = "Try the other approach entirely.\nSee the notes for why."
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(["finalize", "--steer", correction, "--token", token])
         self.assertEqual(code, 0, out + err)
+        judge_current_developer(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(
             [
@@ -1216,6 +1260,7 @@ class TestReportFromControllerDataAlone(FinalizeTestCase):
         self.assertEqual(code, 0)
         self._track_current_session(run_id, token)
         self.assertTrue(self._wait_for_result(run_id, token))
+        judge_current_developer(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, out + err)
@@ -1263,6 +1308,7 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
 
         # The steer itself would be attempt 1, over the budget of 0: refused,
         # and the exhaustion is a mandatory stop that force-kills the session.
+        # The submission is unjudged: the budget check precedes the gate.
         code, _out, err = self.run_cli_in_repo(
             ["finalize", "--steer", "fix it please", "--token", token]
         )
@@ -1293,7 +1339,8 @@ class TestBudgetExhaustionClosesAllPaths(FinalizeTestCase):
 
         # finalize --stop remains open even after exhaustion — recording the
         # outcome (floor passing or not) is exactly what a mandatory stop
-        # still permits.
+        # still permits — once the killed submission is judged.
+        judge_current_developer(self, token, run_dir)
         code, out, err = self.run_cli_in_repo(
             [
                 "finalize",
@@ -1421,6 +1468,7 @@ class TestAcceptReapsHungReviewer(FinalizeTestCase):
         with state_mod.locked_update(run_dir, token) as state:
             state["current_slice"]["reviewer_pids"] = [pgid]
         self.assertTrue(_pgid_alive(pgid))
+        judge_current_developer(self, token, run_dir)
 
         code, out, err = self.run_cli_in_repo(
             ["finalize", "--accept", "Diff and validation evidence check out; accepting.", "--token", token]
@@ -1433,6 +1481,566 @@ class TestAcceptReapsHungReviewer(FinalizeTestCase):
             "reviewer process group survived finalize --accept",
         )
         self.assertIsNone(state_mod.load_state(run_dir, token).get("current_slice"))
+
+
+# --- the judgment gate on every exit from a submission ------------------------
+
+
+_PANEL_GAP = "(judge-reviews order, or one unavailable comparison covering all of them)"
+
+
+def _score(review_id: str, skill: str = "code-review", **overrides) -> dict:
+    data = {
+        "schema_version": 1,
+        "slice": "Slice 1",
+        "skill": skill,
+        "review_id": review_id,
+        "score": 1,
+        "reason": "PM verified the report's findings against the diff.",
+    }
+    data.update(overrides)
+    return data
+
+
+def _order(*review_ids: str) -> dict:
+    return {
+        "schema_version": 1,
+        "slice": "Slice 1",
+        "skill": "code-review",
+        "order": list(review_ids),
+        "close": [],
+        "reason": "The first report found more that held up.",
+    }
+
+
+class TestCurrentSubmissionGaps(PmTestCase):
+    """`judgments.current_submission_gaps` on hand-built submissions: what the
+    gate demands, and what it deliberately leaves alone. The command-level
+    refusals are `TestJudgmentGate`'s."""
+
+    def _launched(self) -> tuple[str, Path]:
+        plan_path = self.write_plan(
+            self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}]
+        )
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        self.launch_current_slice(
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=head,
+            artifact_dir=artifact_dir,
+        )
+        return token, run_dir
+
+    def _add_review(
+        self,
+        token: str,
+        run_dir: Path,
+        *,
+        skill: str = "code-review",
+        adjudications: str | None = None,
+    ) -> str:
+        """Record one intact review of the current origin; returns its ID."""
+        state = state_mod.load_state(run_dir, token)
+        entry = state["slices"][0]
+        reviews = entry.setdefault("reviews", [])
+        review_id = f"review-{len(reviews) + 1}"
+        artifact = run_dir / "slices" / "slice-001" / f"{review_id}.md"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(f"{review_id} report\n", encoding="utf-8")
+        reviews.append(
+            {
+                "review_id": review_id,
+                "skill": skill,
+                "tool": "t1",
+                "model": None,
+                "effort": None,
+                "head": "head",
+                "before_head": "before",
+                "grants_seen": 0,
+                "artifact": str(artifact),
+                "sha256": slice_ops.sha256_file(artifact),
+                "origin_event": {
+                    "index": current_origin_index(run_dir),
+                    "kind": "launch",
+                    "slice": "Slice 1",
+                },
+                "review_context": {
+                    "pm_adjudications": adjudications,
+                    "drift_review": None,
+                },
+            }
+        )
+        state_mod.save_state(run_dir, state, token)
+        return review_id
+
+    def _gaps(self, token: str, run_dir: Path) -> list[str]:
+        return judgments.current_submission_gaps(
+            state_mod.load_state(run_dir, token),
+            state_mod.read_events(run_dir),
+            self.repo,
+            "Slice 1",
+        )
+
+    def _judge(self, token: str, run_dir: Path, data: dict) -> str:
+        code, out, err = judge_reviews(self, token, run_dir, data)
+        self.assertEqual(code, 0, err)
+        return out.strip().rsplit(": ", 1)[1]
+
+    def test_a_submission_without_an_origin_event_is_refused(self) -> None:
+        plan_path = self.write_plan(
+            self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}]
+        )
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=None
+        )
+
+        self.assertEqual(
+            self._gaps(token, run_dir),
+            ["no launch, relaunch or steer event for Slice 1"],
+        )
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "finalize",
+                "--stop",
+                "cannot continue",
+                "--cause",
+                "plan",
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("no launch, relaunch or steer event for Slice 1", err)
+
+    def test_an_unreadable_event_log_refuses_by_name_and_writes_nothing(self) -> None:
+        token, run_dir = self._launched()
+        judge_current_developer(self, token, run_dir)
+        with (run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write("{truncated\n")
+        run_json = (run_dir / "run.json").read_bytes()
+
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "finalize",
+                "--stop",
+                "cannot continue",
+                "--cause",
+                "plan",
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertIn("could not read PM event log", err)
+        self.assertEqual((run_dir / "run.json").read_bytes(), run_json)
+
+    def test_a_judgment_at_an_older_head_is_stale_until_superseded(self) -> None:
+        token, run_dir = self._launched()
+        origin = current_origin_index(run_dir)
+        self.assertEqual(
+            self._gaps(token, run_dir),
+            [f"Developer judgment for event {origin} (judge-developer)"],
+        )
+        first = judge_current_developer(self, token, run_dir)
+        self.assertEqual(self._gaps(token, run_dir), [])
+
+        (self.repo / "a.py").write_text("later work\n", encoding="utf-8")
+        self._git("add", "a.py")
+        self._git("commit", "-q", "-m", "work after the judgment")
+        stale = (
+            f"Developer judgment for event {origin} is stale (head or grants changed); "
+            "record a superseding judgment"
+        )
+        self.assertEqual(self._gaps(token, run_dir), [stale])
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "finalize",
+                "--stop",
+                "cannot continue",
+                "--cause",
+                "plan",
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn(stale, err)
+
+        judge_current_developer(self, token, run_dir, supersedes=first)
+        self.assertEqual(self._gaps(token, run_dir), [])
+
+    def test_a_review_with_a_missing_or_altered_artifact_is_not_demanded(self) -> None:
+        token, run_dir = self._launched()
+        judge_current_developer(self, token, run_dir)
+        self._add_review(token, run_dir, skill="drift-audit")
+        missing = self._add_review(token, run_dir)
+        altered = self._add_review(token, run_dir)
+        entry = state_mod.load_state(run_dir, token)["slices"][0]
+        artifacts = {
+            review["review_id"]: Path(review["artifact"]) for review in entry["reviews"]
+        }
+        artifacts[missing].unlink()
+        artifacts[altered].write_text(
+            "rewritten after the commission\n", encoding="utf-8"
+        )
+
+        self.assertEqual(
+            self._gaps(token, run_dir), ["rating for review-1 (drift-audit)"]
+        )
+
+    def test_gaps_on_an_earlier_origin_never_refuse(self) -> None:
+        token, run_dir = self._launched()
+        # The launch submission keeps an unrated drift report and an unordered
+        # panel, then a steer starts a new submission.
+        self._add_review(token, run_dir, skill="drift-audit")
+        self._add_review(token, run_dir)
+        self._add_review(token, run_dir)
+        state_mod.append_event(run_dir, "steer", slice_id="Slice 1", note="try again")
+        judge_current_developer(self, token, run_dir)
+
+        self.assertEqual(self._gaps(token, run_dir), [])
+        code, out, err = self.run_cli_in_repo(
+            [
+                "finalize",
+                "--stop",
+                "the plan needs a human",
+                "--cause",
+                "plan",
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("STOPPED", out)
+
+    def test_a_panel_needs_an_order_or_one_unavailable_comparison_and_a_lone_report_a_rating(
+        self,
+    ) -> None:
+        token, run_dir = self._launched()
+        judge_current_developer(self, token, run_dir)
+        first = self._add_review(token, run_dir)
+        second = self._add_review(token, run_dir)
+        lone = self._add_review(token, run_dir, adjudications="a different ruling")
+        self.assertEqual(
+            self._gaps(token, run_dir),
+            [
+                f"rating for {first} (code-review)",
+                f"rating for {second} (code-review)",
+                f"rating for {lone} (code-review)",
+                f"panel order for {first}, {second} {_PANEL_GAP}",
+            ],
+        )
+        for review_id in (first, second, lone):
+            self._judge(token, run_dir, _score(review_id))
+        self.assertEqual(
+            self._gaps(token, run_dir),
+            [f"panel order for {first}, {second} {_PANEL_GAP}"],
+        )
+
+        self._judge(
+            token,
+            run_dir,
+            {
+                "schema_version": 1,
+                "slice": "Slice 1",
+                "skill": "code-review",
+                "assessment": "comparison",
+                "status": "unavailable",
+                "review_ids": [first, second],
+                "reason": "Neither report can be fairly compared with the other.",
+            },
+        )
+        self.assertEqual(self._gaps(token, run_dir), [])
+
+    def test_an_order_naming_a_since_unavailable_member_still_covers_the_panel(
+        self,
+    ) -> None:
+        token, run_dir = self._launched()
+        judge_current_developer(self, token, run_dir)
+        ids = [self._add_review(token, run_dir) for _ in range(3)]
+        ratings = {
+            review_id: self._judge(token, run_dir, _score(review_id))
+            for review_id in ids
+        }
+        self.assertEqual(
+            self._gaps(token, run_dir),
+            [f"panel order for {', '.join(ids)} {_PANEL_GAP}"],
+        )
+        self._judge(token, run_dir, _order(*ids))
+        self.assertEqual(self._gaps(token, run_dir), [])
+
+        # The third report's rating is corrected to unavailable: the panel is
+        # now the first two, and the order naming all three still covers it.
+        self._judge(
+            token,
+            run_dir,
+            {
+                "schema_version": 1,
+                "slice": "Slice 1",
+                "skill": "code-review",
+                "assessment": "rating",
+                "status": "unavailable",
+                "review_ids": [ids[2]],
+                "supersedes": ratings[ids[2]],
+                "reason": "The third report answered a different question.",
+            },
+        )
+        self.assertEqual(self._gaps(token, run_dir), [])
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestJudgmentGate(FinalizeTestCase):
+    """Each exit from a submission is refused, before it changes anything, until
+    the current submission is judged; `pm stop` and a fresh launch are not."""
+
+    def _launch(self, script: str) -> tuple[str, Path, str]:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", script)
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        session = self._track_current_session(run_id, token)
+        self.assertTrue(
+            self._wait_for(lambda: sessions.session_exists(session), timeout=10.0)
+        )
+        return token, state_mod.resolve_run_dir(self.repo, run_id), session
+
+    def _review(self, token: str, skill: str, tool: str) -> None:
+        fake = _fake_reviewer_ok(
+            self.repo.parent / f"fake-{skill}-{tool}.sh", f"{skill} {tool}"
+        )
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                skill,
+                "--tool",
+                tool,
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 0, err)
+
+    def _snapshot(self, run_dir: Path) -> tuple[bytes, int, bytes]:
+        """run.json's bytes and inode, and the event log's bytes. `save_state`
+        replaces run.json by rename, so the inode exposes even a rewrite of
+        identical bytes inside `updated_at`'s one-second resolution."""
+        run_json = run_dir / "run.json"
+        return (
+            run_json.read_bytes(),
+            run_json.stat().st_ino,
+            (run_dir / "events.jsonl").read_bytes(),
+        )
+
+    def test_accept_names_every_gap_writes_nothing_and_proceeds_once_judged(
+        self,
+    ) -> None:
+        token, run_dir, _session = self._launch(
+            commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0)
+        )
+        artifact_dir = Path(
+            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
+        )
+        self.assertTrue(
+            self._wait_for(
+                lambda: (artifact_dir / "result.json").is_file(), timeout=15.0
+            )
+        )
+        self._review(token, "drift-audit", "t1")
+        self._review(token, "code-review", "t1")
+        self._review(token, "code-review", "t2")
+        origin = current_origin_index(run_dir)
+        before = self._snapshot(run_dir)
+
+        code, out, err = self.run_cli_in_repo(
+            ["finalize", "--accept", _LONG_REASONING, "--token", token]
+        )
+        self.assertEqual(code, 2, out + err)
+        for gap in (
+            f"Developer judgment for event {origin} (judge-developer)",
+            "rating for review-1 (drift-audit)",
+            "rating for review-2 (code-review)",
+            "rating for review-3 (code-review)",
+            f"panel order for review-2, review-3 {_PANEL_GAP}",
+        ):
+            self.assertIn(gap, err)
+        self.assertEqual(self._snapshot(run_dir), before)
+        self.assertFalse((artifact_dir / "pane.txt").exists())
+        self.assertFalse((artifact_dir / "status-after.txt").exists())
+
+        judge_current_developer(self, token, run_dir)
+        rate_reviews(self, token, run_dir)
+        code, out, err = self.run_cli_in_repo(
+            ["finalize", "--accept", _LONG_REASONING, "--token", token]
+        )
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"panel order for review-2, review-3 {_PANEL_GAP}", err)
+        self.assertNotIn("rating for", err)
+
+        code, _out, err = judge_reviews(
+            self, token, run_dir, _order("review-3", "review-2")
+        )
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli_in_repo(
+            ["finalize", "--accept", _LONG_REASONING, "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ACCEPTED", out)
+
+    def test_a_refusal_after_a_risk_raise_persists_only_the_ratchet(self) -> None:
+        token, run_dir, _session = self._launch(
+            commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0)
+        )
+
+        code, out, err = self.run_cli_in_repo(
+            [
+                "finalize",
+                "--risk",
+                "elevated",
+                "--accept",
+                _LONG_REASONING,
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("is unjudged", err)
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["slices"][0]["risk"], "elevated")
+        self.assertEqual(state["current_slice"]["risk"], "elevated")
+        kinds = [event["kind"] for event in state_mod.read_events(run_dir)]
+        self.assertIn("risk-raise", kinds)
+        self.assertNotIn("floor", kinds)
+
+    def test_steer_refused_unjudged_leaves_attempts_session_and_result(self) -> None:
+        token, run_dir, session = self._launch(_result_then_drain_script())
+        artifact_dir = Path(
+            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
+        )
+        self.assertTrue(
+            self._wait_for(
+                lambda: (artifact_dir / "result.json").is_file(), timeout=10.0
+            )
+        )
+        before = self._snapshot(run_dir)
+
+        code, _out, err = self.run_cli_in_repo(
+            ["finalize", "--steer", "Remove the dead import.", "--token", token]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertIn("is unjudged", err)
+        self.assertEqual(self._snapshot(run_dir), before)
+        self.assertTrue(sessions.session_exists(session))
+        self.assertTrue((artifact_dir / "result.json").is_file())
+        self.assertFalse((artifact_dir / "attempt-0").exists())
+        self.assertFalse((artifact_dir / "steer-attempt-1.md").exists())
+
+        judge_current_developer(self, token, run_dir)
+        code, out, err = self.run_cli_in_repo(
+            ["finalize", "--steer", "Remove the dead import.", "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(
+            state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 1
+        )
+
+    def test_stop_refused_unjudged_then_a_fresh_launch_is_ungated(self) -> None:
+        token, run_dir, session = self._launch(stdin_draining_idle_script())
+        before = self._snapshot(run_dir)
+
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "finalize",
+                "--stop",
+                "approach abandoned",
+                "--cause",
+                "developer",
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertIn("is unjudged", err)
+        self.assertEqual(self._snapshot(run_dir), before)
+        self.assertTrue(sessions.session_exists(session))
+
+        judge_current_developer(self, token, run_dir, **UNAVAILABLE_DEVELOPER)
+        code, out, err = self.run_cli_in_repo(
+            [
+                "finalize",
+                "--stop",
+                "approach abandoned",
+                "--cause",
+                "developer",
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("STOPPED", out)
+
+        # A new window: the fresh launch is not an exit from any submission.
+        code, out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("launched", out)
+        self.assertNotIn("relaunched", out)
+        self._track_current_session(run_dir.name, token)
+
+    def test_relaunch_is_gated_including_a_resume_after_pm_stop_which_is_not(
+        self,
+    ) -> None:
+        token, run_dir, session = self._launch(
+            result_only_script(delay=0.5, tail_sleep=30.0)
+        )
+        artifact_dir = Path(
+            state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"]
+        )
+        self.assertTrue(
+            self._wait_for(
+                lambda: (artifact_dir / "result.json").is_file(), timeout=10.0
+            )
+        )
+        before = self._snapshot(run_dir)
+
+        # A relaunch of the live slice: refused before rotating or killing.
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 2, err)
+        self.assertIn("is unjudged", err)
+        self.assertEqual(self._snapshot(run_dir), before)
+        self.assertTrue(sessions.session_exists(session))
+        self.assertTrue((artifact_dir / "result.json").is_file())
+        self.assertFalse((artifact_dir / "attempt-0").exists())
+
+        # `pm stop` is the ungated emergency exit; resuming after it is gated.
+        code, out, err = self.run_cli_in_repo(
+            ["stop", "--reason", "pause for a human", "--token", token]
+        )
+        self.assertEqual(code, 0, out + err)
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 2, err)
+        self.assertIn("is unjudged", err)
+
+        judge_current_developer(self, token, run_dir, **UNAVAILABLE_DEVELOPER)
+        code, out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("relaunched", out)
+        self._track_current_session(run_dir.name, token)
+        self.assertEqual(
+            state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 1
+        )
 
 
 # --- _attempts_summary: exact multiline formatting, no tmux required --------

@@ -328,6 +328,97 @@ def judge_developer(test: "PmTestCase", token: str, run_dir: Path, data: dict) -
     return _judge(test, "judge-developer", "developer-judgment.json", token, run_dir, data)
 
 
+def current_origin_index(run_dir: Path, slice_id: str = "Slice 1") -> int:
+    """The event index of `slice_id`'s latest launch, relaunch or steer."""
+    events = state_mod.read_events(run_dir)
+    return max(
+        index
+        for index, event in enumerate(events)
+        if event.get("slice") == slice_id
+        and event.get("kind") in {"launch", "relaunch", "steer"}
+    )
+
+
+# `judge_current_developer` overrides that turn its score into an unavailable
+# record, as for a dead or paused session's submission.
+UNAVAILABLE_DEVELOPER = {
+    "status": "unavailable",
+    "score": None,
+    "criteria_met": None,
+    "defects": None,
+    "reason": "The session ended before producing assessable work.",
+}
+
+
+def judge_current_developer(
+    test: "PmTestCase",
+    token: str,
+    run_dir: Path,
+    *,
+    slice_id: str = "Slice 1",
+    **overrides,
+) -> str:
+    """Record a Developer score for the current submission of `slice_id`.
+
+    Satisfies the judgment gate's Developer requirement for a test whose
+    subject is something else. `overrides` replace input fields (a
+    `supersedes`, say); an override of None drops the field, which is how an
+    `unavailable` record sheds the score fields. Asserts success and returns
+    the judgment ID.
+    """
+    data = {
+        "schema_version": 1,
+        "slice": slice_id,
+        "origin_event_index": current_origin_index(run_dir, slice_id),
+        "score": 1,
+        "criteria_met": 0,
+        "defects": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+        "reason": "PM checked the diff and validation output for this submission.",
+    }
+    data.update(overrides)
+    data = {key: value for key, value in data.items() if value is not None}
+    code, out, err = judge_developer(test, token, run_dir, data)
+    test.assertEqual(code, 0, err)
+    return out.strip().rsplit(": ", 1)[1]
+
+
+def rate_reviews(
+    test: "PmTestCase", token: str, run_dir: Path, *, slice_id: str = "Slice 1"
+) -> None:
+    """Give every not-yet-rated review of `slice_id` a score of 1, asserting success."""
+    entry = next(
+        item
+        for item in state_mod.load_state(run_dir, token)["slices"]
+        if item["id"] == slice_id
+    )
+    rated = {
+        review_id
+        for judgment in entry.get("review_judgments") or []
+        if judgment.get("assessment") == "rating"
+        for review_id in [
+            judgment.get("review_id"),
+            *(judgment.get("review_ids") or []),
+        ]
+    }
+    for review in entry.get("reviews") or []:
+        if review["review_id"] in rated:
+            continue
+        code, _out, err = judge_reviews(
+            test,
+            token,
+            run_dir,
+            {
+                "schema_version": 1,
+                "slice": slice_id,
+                "skill": review["skill"],
+                "review_id": review["review_id"],
+                "score": 1,
+                "reason": "PM verified the report's findings against the diff.",
+            },
+        )
+        test.assertEqual(code, 0, err)
+
+
 class PlanTestCase(unittest.TestCase):
     """A plain temp directory, plus the plan-writing and CLI-running helpers.
 
@@ -486,6 +577,39 @@ class PmTestCase(PlanTestCase):
         updated["current_slice"] = current
         state_mod.save_state(run_dir, updated, token)
         return state_mod.load_state(run_dir, token)
+
+    def launch_current_slice(
+        self,
+        state: dict,
+        token: str,
+        run_dir: Path,
+        *,
+        slice_id: str,
+        before_head: str | None,
+        artifact_dir: Path | None = None,
+        **overrides,
+    ) -> dict:
+        """`set_current_slice` plus what a real launch leaves behind.
+
+        Adds a `developer` identity (unless `overrides` supplies one) and
+        appends the slice's `launch` event, so the hand-built submission can
+        be judged and then decided through the judgment gate. Returns the
+        freshly loaded, persisted state.
+        """
+        overrides.setdefault(
+            "developer", {"tool": "fake", "model": None, "effort": None}
+        )
+        updated = self.set_current_slice(
+            state,
+            token,
+            run_dir,
+            slice_id=slice_id,
+            before_head=before_head,
+            artifact_dir=artifact_dir,
+            **overrides,
+        )
+        state_mod.append_event(run_dir, "launch", slice_id=slice_id, note="attempt 0")
+        return updated
 
     def record_approval(
         self, state: dict, token: str, run_dir: Path, *, slice_id: str, reason: str = "approved for test"

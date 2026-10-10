@@ -78,6 +78,41 @@ def _refuse_if_budget_exhausted(state: dict[str, Any]) -> None:
         )
 
 
+def _require_judged(
+    repo: Path,
+    run_dir: Path,
+    token: str,
+    state: dict[str, Any],
+    slice_id: str,
+    *,
+    ratcheted: bool,
+) -> None:
+    """The judgment gate on every exit from a Developer submission.
+
+    Refuses (`PmError`, naming every gap) unless the current submission of
+    `slice_id` is fully judged (`judgments.current_submission_gaps`). Callers
+    invoke it after the risk ratchet and any budget kill, before any
+    evidence, rotation or session change. A refusal persists state only when
+    this command applied a `--risk elevated` ratchet, so the ratchet and its
+    `risk-raise` event stay consistent; otherwise it writes nothing, and can
+    never overwrite a judgment or review recorded concurrently.
+    """
+    from . import judgments
+
+    # A malformed event log is a named error (exit 2), never a traceback.
+    gaps = judgments.current_submission_gaps(
+        state, judgments._read_events_or_raise(run_dir), repo, slice_id
+    )
+    if not gaps:
+        return
+    if ratcheted:
+        state_mod.save_state(run_dir, state, token)
+    raise PmError(
+        f"refused: the current submission of {slice_id} is unjudged — "
+        + "; ".join(gaps)
+    )
+
+
 # --- Path helpers ------------------------------------------------------------
 
 
@@ -772,6 +807,10 @@ def start_slice(
                 data={"cause": "developer"},
             )
             return StartSliceOutcome(kind="attempts_exhausted", slice_id=plan_slice.slice_id)
+        # A supplied --risk was ratcheted above: any other value raised there.
+        _require_judged(
+            repo, run_dir, token, state, plan_slice.slice_id, ratcheted=risk is not None
+        )
     else:
         attempts = 0
 
@@ -1388,8 +1427,10 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     if entry is None:
         raise PmError(f"{slice_id} is not present in the run's slice entries")
 
-    if apply_risk_ratchet(entry, current, risk_flag=risk):
+    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
+    if ratcheted:
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=stripped_reasoning.splitlines()[0][:120])
+    _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
     state_mod.append_event(
@@ -1516,7 +1557,8 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # verbatim correction can legitimately start or end with meaningful
     # whitespace (e.g. an indented code block).
     stripped_correction = correction.strip()
-    if apply_risk_ratchet(entry, current, risk_flag=risk):
+    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
+    if ratcheted:
         note = stripped_correction.splitlines()[0][:120] if stripped_correction else "risk raised via finalize --steer"
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
 
@@ -1542,6 +1584,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
         return SteerOutcome(
             kind="budget_exhausted", slice_id=slice_id, message="attempt budget exhausted; steer refused"
         )
+    _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
     current["attempts"] = attempts
     entry["attempts"] = attempts
@@ -1663,9 +1706,11 @@ def finalize_stop(
         raise PmError(f"{slice_id} is not present in the run's slice entries")
 
     stripped_reason = reason.strip()
-    if apply_risk_ratchet(entry, current, risk_flag=risk):
+    ratcheted = apply_risk_ratchet(entry, current, risk_flag=risk)
+    if ratcheted:
         note = stripped_reason.splitlines()[0][:120] if stripped_reason else "risk raised via finalize --stop"
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
+    _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
     report, artifact_dir = _collect_finalize_evidence(repo, state, current)
     state_mod.append_event(

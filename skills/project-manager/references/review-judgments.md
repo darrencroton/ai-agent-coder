@@ -1,6 +1,6 @@
 # Developer and reviewer judgments
 
-Record PM’s assessment of each Developer submission and each reviewer report as a 0–2 rating in signed `run.json`. Code-review panels also retain a strict best-first order with close calls flagged; Developer scores also retain the criteria met and the confirmed defects. These subjective judgments do not determine acceptance, review freshness or model selection.
+Record PM’s assessment of each Developer submission and each reviewer report as a 0–2 rating in signed `run.json`. Code-review panels also retain a strict best-first order with close calls flagged; Developer scores also retain the criteria met and the confirmed defects. Their values do not determine acceptance, review freshness or model selection; their presence does, since every exit from a submission is refused until it is judged (see [SKILL.md](../SKILL.md)).
 
 ## Judgment rubric and timing
 
@@ -15,7 +15,7 @@ Rate the contribution against the instructions and evidence available to PM. A s
 
 Judge each drift report before deciding on code review. Rate each code report, and separately order every intact code report that shares a commission context, strictly best first. Weigh valid in-scope findings, reproducible evidence, actionable advice, false positives/overreach and established material omissions. Two reports can both earn 2 while one ranks higher. A lone report is rated, never ordered. See [SKILL.md](../SKILL.md) for when each record is due.
 
-Rate an assessed Developer submission before accepting, steering, relaunching or stopping it, including when PM’s own checks needed no commissioned review. Repeated checks or reviewer commissions do not create additional Developer ratings. Preserve earlier attempts instead of replacing their scores with the final outcome. Give one concise reason identifying the evidence behind each rating or comparison. Missing judgments never prevent emergency stopping.
+Rate an assessed Developer submission before accepting, steering, relaunching or stopping it, including when PM’s own checks needed no commissioned review. Repeated checks or reviewer commissions do not create additional Developer ratings. Preserve earlier attempts instead of replacing their scores with the final outcome. Give one concise reason identifying the evidence behind each rating or comparison. Missing judgments never prevent emergency stopping: `pm stop` is ungated.
 
 ## Commands and reviewer input
 
@@ -104,7 +104,7 @@ For an assessment PM cannot make, replace `score`, `criteria_met` and `defects` 
 }
 ```
 
-Unavailable is not 0; operational failure without assessable work is not automatically a bad substantive contribution. Historical attempts missed before their decision remain explicitly unjudged.
+Unavailable is not 0; operational failure without assessable work is not automatically a bad substantive contribution. A submission can pass unjudged only when a `pm stop` ended it and it was never resumed; it then stays explicitly unjudged.
 
 Developer judgments retain the originating event, evaluated `head`, `before_head`, authorization revision (`grants_seen`), and the resolved Developer tool/model/effort recorded at launch. Steers inherit the session’s identity. A model given alongside a custom command is recorded, never forced to null; effort omitted on the COMPOSED (non-override) path is recorded as the literal string `"default"` -- a known, repeatable fact, since no effort flag was sent -- while effort omitted under a custom command stays null, since no harness profile verifies what the command actually runs. HEAD identifies the recorded Git revision, not proof that the working tree was clean or that the implementation was correct. The rationale states the evidence PM actually checked.
 

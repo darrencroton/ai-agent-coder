@@ -29,11 +29,13 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import shutil
 
 from pm_test_helpers import (
+    UNAVAILABLE_DEVELOPER,
     PlanTestCase,
     PmTestCase,
     TmuxRunTestCase,
     commit_and_result_script,
     idle_script,
+    judge_current_developer,
     parse_init_output,
     result_only_script,
     trigger_gated_churn_script,
@@ -546,6 +548,10 @@ class TestAttemptAccounting(SliceOpsTestCase):
         sessions.force_stop(session0)
         self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session0), timeout=10.0))
 
+        # The dead session's submission is judged unavailable before the
+        # relaunch, as the judgment gate requires.
+        judge_current_developer(self, token, run_dir, **UNAVAILABLE_DEVELOPER)
+
         # Relaunch: attempts becomes 1 (within budget 1), prior result rotated.
         code, out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 0, out)
@@ -579,7 +585,9 @@ class TestAttemptAccounting(SliceOpsTestCase):
         sessions.force_stop(session1)
         self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session1), timeout=10.0))
 
-        # Second relaunch would need attempts=2 > max_attempts=1: refused.
+        # Second relaunch would need attempts=2 > max_attempts=1: refused, and
+        # the budget kill comes before the judgment gate, so the unjudged
+        # relaunched submission does not change that.
         code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
         self.assertEqual(code, 2)
         self.assertIn("attempt budget exhausted", err)

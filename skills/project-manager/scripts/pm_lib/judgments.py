@@ -730,6 +730,74 @@ def unjudged_developer_origins(
     ]
 
 
+def current_submission_gaps(
+    state: dict[str, Any], events: list[dict[str, Any]], repo: Path, slice_id: str
+) -> list[str]:
+    """Name every judgment the current submission of `slice_id` still lacks.
+
+    The current submission is the latest launch, relaunch or steer event for
+    the slice; gaps on earlier submissions are never reported. An empty list
+    means the submission is fully judged: an active Developer judgment taken
+    at the current head and grant count, a rating-kind record for every
+    intact review of the submission, and an order or unavailable comparison
+    covering every panel (``panel_groups``). Reads git HEAD once; otherwise
+    pure.
+    """
+    origin = _scan_latest_developer_origin(events, slice_id)
+    if origin is None:
+        return [f"no launch, relaunch or steer event for {slice_id}"]
+    index = origin["index"]
+    entry = slice_ops.slice_entry(state, slice_id) or {}
+    gaps: list[str] = []
+
+    developer = next(
+        (
+            judgment
+            for judgment in _active_developer_judgments(entry)
+            if _developer_origin_index(judgment) == index
+        ),
+        None,
+    )
+    if developer is None:
+        gaps.append(f"Developer judgment for event {index} (judge-developer)")
+    else:
+        submission = developer.get("submission") or {}
+        if submission.get("head") != git_ops.git_head(repo) or submission.get(
+            "grants_seen"
+        ) != len(plan_mod.slice_grants(state, slice_id)):
+            gaps.append(
+                f"Developer judgment for event {index} is stale (head or grants changed); "
+                "record a superseding judgment"
+            )
+
+    active = _active_judgments(entry)
+    rated = set().union(
+        *(_referenced_ids(item) for item in active if assessment_of(item) == _RATING)
+    )
+    for review in entry.get("reviews") or []:
+        if not isinstance(review, dict):
+            continue
+        origin_event = review.get("origin_event")
+        if not isinstance(origin_event, dict) or origin_event.get("index") != index:
+            continue
+        if not _artifact_is_intact(review):
+            continue
+        review_id = review.get("review_id")
+        if review_id not in rated:
+            gaps.append(f"rating for {review_id} ({review.get('skill')})")
+
+    covers = [
+        _referenced_ids(item) for item in active if assessment_of(item) == _COMPARISON
+    ]
+    for group in panel_groups(entry, index):
+        if not any(set(group) <= covered for covered in covers):
+            gaps.append(
+                f"panel order for {', '.join(group)} (judge-reviews order, or one "
+                "unavailable comparison covering all of them)"
+            )
+    return gaps
+
+
 def publish_event(
     run_dir: Path, token: str, judgment_id: str, slice_id: str, *, kind: str = "review-judgment"
 ) -> None:
