@@ -514,7 +514,7 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     """Render `run-report.md` from controller-owned data alone.
 
     Reads only `state`, `events`, and each PM-authored ORIGINAL under
-    `run_dir` (per-slice `assessment.md`, the run's `model-performance.md`)
+    `run_dir` (per-slice `assessment.md`)
     — never from the `.pm/` mirror. This is what makes the report regenerate
     correctly with `.pm/` deleted entirely: the caller
     (`slice_ops.regenerate_report`) writes this text to the original and
@@ -599,16 +599,6 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     if not any_assessment:
         lines.append("")
         lines.append("(no slice has been accepted or stopped yet)")
-    lines.append("")
-
-    # `pm rate`'s output isn't tracked in `state`, so read the run-dir original directly.
-    lines.append("## Harness/Model Performance")
-    lines.append("")
-    performance_path = run_dir / "model-performance.md"
-    if performance_path.is_file():
-        lines.append(performance_path.read_text(encoding="utf-8").rstrip())
-    else:
-        lines.append("(not recorded)")
     lines.append("")
 
     lines.append("## Approvals")

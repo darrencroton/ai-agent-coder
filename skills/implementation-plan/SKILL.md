@@ -234,8 +234,8 @@ Confirm before starting: plan file read, branch name, the ordered slice list you
 ```md
 Plan file: <path>
 Repo: <path>
-Developer: harness <codex|claude|copilot|opencode|qwen> model <model name>
-Reviewer: harness <codex|claude|copilot|opencode|qwen> model <model name>
+Developer: harness <codex|claude|copilot|opencode|qwen> model <full model id, e.g. claude-opus-5-5>
+Reviewer: harness <codex|claude|copilot|opencode|qwen> model <full model id, e.g. claude-opus-5-5>
 
 Use the project-manager skill. You are the PM: the accountable supervisor of this run — you never write slice code yourself.
 

@@ -202,7 +202,6 @@ class TestTokenGating(SliceOpsTestCase):
             ["finalize"],
             ["stop", "--reason", "done"],
             ["notes", "--set", "x"],
-            ["rate", "--text", "Process discipline: 5/5 — no incidents."],
             ["review", "--slice", "Slice 1", "--skill", "code-review"],
         ]
         for argv in cases:

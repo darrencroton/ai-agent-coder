@@ -96,10 +96,6 @@ def notes_path(repo: Path, run_id: str) -> Path:
     return run_artifact_dir(repo, run_id) / "notes.md"
 
 
-def model_performance_path(repo: Path, run_id: str) -> Path:
-    return run_artifact_dir(repo, run_id) / "model-performance.md"
-
-
 def slice_number(slice_id: str) -> int:
     match = _SLICE_ID_RE.match(slice_id)
     if not match:
@@ -127,7 +123,7 @@ def write_pm_gitignore(repo: Path) -> None:
 
 # --- Controller-owned originals + mirrors -------------------------------------
 #
-# PM-authored artifacts (notes.md, model-performance.md, run-report.md,
+# PM-authored artifacts (notes.md, run-report.md,
 # assessment.md, review reports) have their AUTHORITATIVE ORIGINAL under the
 # run's state dir (outside the worktree, alongside run.json) and are MIRRORED
 # into `.pm/` for human reading. Nothing is ever read back from the mirror for
@@ -191,14 +187,6 @@ def write_notes(repo: Path, run_dir: Path, run_id: str, *, text: str, mode: str)
         raise PmError(f"unknown notes mode: {mode!r}")
     write_controller_artifact(repo, run_dir, run_id, "notes.md", content)
     return original, _notes_cap_warning(original.stat().st_size)
-
-
-def write_model_performance(repo: Path, run_dir: Path, run_id: str, *, text: str) -> Path:
-    """Replace the controller-owned performance rating and mirror it; reject blank text."""
-    if not text.strip():
-        raise PmError("performance rating text must be non-empty")
-    content = f"{text.rstrip()}\n"
-    return write_controller_artifact(repo, run_dir, run_id, "model-performance.md", content)
 
 
 def regenerate_report(repo: Path, run_dir: Path, state: dict[str, Any]) -> Path:

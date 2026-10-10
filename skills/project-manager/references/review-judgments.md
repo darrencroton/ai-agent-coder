@@ -1,6 +1,6 @@
 # Developer and reviewer judgments
 
-Record PM’s assessment of each Developer submission and each reviewer report as a 0–2 rating in signed `run.json`. Code-review panels also retain their independent best-first ordering and ties. These subjective judgments supplement the final model-performance narrative; they do not determine acceptance, review freshness or model selection.
+Record PM’s assessment of each Developer submission and each reviewer report as a 0–2 rating in signed `run.json`. Code-review panels also retain their independent best-first ordering and ties. These subjective judgments do not determine acceptance, review freshness or model selection.
 
 ## Judgment rubric and timing
 
@@ -109,4 +109,4 @@ Earlier records remain. Consumers exclude IDs referenced by later `supersedes` l
 
 Each command authenticates and updates the latest locked state, preserving reviews completed concurrently, then appends a concise judgment event. Signed `run.json` is authoritative even if event publication fails. Resolve the publication error and retry the exact input to publish its missing event. A malformed or truncated event log is a named error requiring recovery first; judgment commands do not silently skip or repair append-only history. Never edit `run.json` or its MAC by hand.
 
-Read-only consumers harvest `<worktree-git-dir>/pm/<run-id>/run.json`, where `git rev-parse --absolute-git-dir` resolves the supervised worktree’s Git directory. No Markdown parsing is needed. Keep Developer, drift and code ratings separate by role, retain first/final Developer trajectories, and label them as PM assessments. Independent benchmark correctness and comparative reviewer rank points remain separate measures. `model-performance.md` stays final qualitative context and must never fabricate structured values. External harvesting, aggregation and benchmark changes are separate work.
+Read-only consumers harvest `<worktree-git-dir>/pm/<run-id>/run.json`, where `git rev-parse --absolute-git-dir` resolves the supervised worktree’s Git directory. No Markdown parsing is needed. Keep Developer, drift and code ratings separate by role, retain first/final Developer trajectories, and label them as PM assessments. Independent benchmark correctness and comparative reviewer rank points remain separate measures. External harvesting, aggregation and benchmark changes are separate work.

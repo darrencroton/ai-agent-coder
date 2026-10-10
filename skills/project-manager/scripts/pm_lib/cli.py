@@ -191,17 +191,6 @@ def build_parser() -> argparse.ArgumentParser:
     notes.add_argument("--run")
     notes.add_argument("--token")
 
-    rate = subparsers.add_parser(
-        "rate", help="Record the run's harness/model performance rubric (once per run, before status --report)"
-    )
-    rate.add_argument(
-        "--text",
-        required=True,
-        help="the rubric text to record (see references/model-performance-rubric.md)",
-    )
-    rate.add_argument("--run")
-    rate.add_argument("--token")
-
     stop = subparsers.add_parser("stop", help="End the run, preserving evidence")
     stop.add_argument("--reason", required=True)
     stop.add_argument("--slice-status", choices=["stopped"])
@@ -781,23 +770,6 @@ def _run_notes(args: argparse.Namespace) -> int:
     return 0
 
 
-# --- rate -------------------------------------------------------------------
-
-
-def _run_rate(args: argparse.Namespace) -> int:
-    repo = _repo_from_cwd()
-    token = _require_token(args)
-    run_dir = state_mod.resolve_run_dir(repo, args.run)
-    # MAC-verified: the rating is a PM-only write, and the run id comes
-    # from authenticated state.
-    state = slice_ops.load_writable_state(run_dir, token)
-    original = slice_ops.write_model_performance(repo, run_dir, state["run_id"], text=args.text)
-    print(f"model-performance recorded: {original}")
-    mirror = slice_ops.model_performance_path(repo, state["run_id"])
-    print(f"mirror: {mirror}")
-    return 0
-
-
 _HANDLERS = {
     "check-plan": _run_check_plan,
     "init": _run_init,
@@ -812,7 +784,6 @@ _HANDLERS = {
     "judge-reviews": _run_judge_reviews,
     "judge-developer": _run_judge_developer,
     "notes": _run_notes,
-    "rate": _run_rate,
     "stop": _run_stop,
 }
 
