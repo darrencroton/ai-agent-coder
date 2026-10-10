@@ -452,6 +452,28 @@ def set_current(repo: Path, run_id: str) -> None:
     _atomic_write_bytes(pointer, run_id.encode("utf-8"))
 
 
+def parse_event_ts(raw: Any) -> datetime | None:
+    """Parse one event `ts` into a tz-aware UTC datetime, or None.
+
+    The one timestamp reader for the event log: `run_elapsed` and the ledger
+    rows both go through it, so a stamp that one rejects the other rejects
+    too. Non-strings and unparsable strings are None.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # Offset-naive values are malformed here, not merely imprecise: mixing
+    # them with the aware stamps `append_event` writes makes comparisons raise
+    # TypeError, and interpreting them alone would silently adopt the host's
+    # local zone and make every derived figure machine-dependent.
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 def run_elapsed(events: list[dict[str, Any]]) -> tuple[str, str, str] | None:
     """Return `(first_ts, last_ts, duration)` spanned by the run's events.
 
@@ -462,22 +484,11 @@ def run_elapsed(events: list[dict[str, Any]]) -> tuple[str, str, str] | None:
     parseable timestamp, so a malformed log degrades to an honest "unknown"
     instead of a fabricated figure.
     """
-    stamps: list[datetime] = []
-    for event in events:
-        raw = event.get("ts")
-        if not isinstance(raw, str):
-            continue
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        # Offset-naive values are malformed here, not merely imprecise: mixing
-        # them with the aware stamps `append_event` writes makes min/max raise
-        # TypeError, and interpreting them alone would silently adopt the host's
-        # local zone and make the endpoints machine-dependent.
-        if parsed.tzinfo is None:
-            continue
-        stamps.append(parsed)
+    stamps = [
+        parsed
+        for parsed in (parse_event_ts(event.get("ts")) for event in events)
+        if parsed is not None
+    ]
     if not stamps:
         return None
     first, last = min(stamps), max(stamps)

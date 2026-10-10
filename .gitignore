@@ -18,6 +18,11 @@ venv/
 .claude/
 HANDOFF.md
 
+# PM ledger: per-host run files and the rendered leaderboard are local output;
+# the frozen pre-ledger history table beside them is tracked
+skills/project-manager/ledger/*/
+skills/project-manager/ledger/leaderboard.md
+
 # Archived/superseded content (never deleted, not tracked by default)
 archive/
 

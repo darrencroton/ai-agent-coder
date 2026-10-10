@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -56,6 +57,13 @@ from pm_lib import state as state_mod  # noqa: E402
 TEST_TMUX_SOCKET = f"pm-tests-{os.getpid()}"
 os.environ["PM_TMUX_SOCKET"] = TEST_TMUX_SOCKET
 
+# Every token-bearing command regenerates the run's ledger file, so the suite
+# pins the ledger to a private per-process directory for the same reason it
+# pins tmux: fake-harness runs must never reach the real ledger beside the
+# skill. Removed with the tmux server by the `atexit` hook below.
+TEST_LEDGER_DIR = tempfile.mkdtemp(prefix="pm-tests-ledger-")
+os.environ["PM_LEDGER_DIR"] = TEST_LEDGER_DIR
+
 
 def tmux_argv(*args: str) -> list[str]:
     """`tmux` argv pinned to this process's private server.
@@ -73,7 +81,8 @@ def tmux_argv(*args: str) -> list[str]:
 
 @atexit.register
 def _kill_test_tmux_server() -> None:
-    """Tear this process's private server down when the process exits.
+    """Tear this process's private server down, and remove its private ledger
+    directory, when the process exits.
 
     Always `-L`-scoped to the frozen socket, never a bare `tmux kill-server`.
     Best effort by construction: tmux may be absent (the tmux-gated tests
@@ -83,6 +92,8 @@ def _kill_test_tmux_server() -> None:
         subprocess.run(tmux_argv("kill-server"), check=False, capture_output=True)
     except OSError:
         pass
+    shutil.rmtree(TEST_LEDGER_DIR, ignore_errors=True)
+
 
 # --- CLI-driving helpers -----------------------------------------------------
 

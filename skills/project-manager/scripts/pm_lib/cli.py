@@ -18,6 +18,7 @@ from pathlib import Path
 from . import IntegrityError, PmError
 from . import git_ops
 from . import judgments
+from . import ledger
 from . import plan as plan_mod
 from . import review as review_mod
 from . import sessions
@@ -804,22 +805,61 @@ _HANDLERS = {
 }
 
 
+def _write_ledger(args: argparse.Namespace) -> str | None:
+    """Regenerate the run's ledger file after a command; return a failure, or None.
+
+    Runs for every run-scoped command (one with a `--run` option) that has a
+    token, so the per-run file follows every decision, judgment and review
+    without a hand-kept command list. Silent when there is no run to write
+    for (no repo, no run directory, or no `run.json`, as after
+    `stop --scavenge` with the state gone). Any other failure, of any type,
+    is returned for `main` to print: the ledger is never allowed to block or
+    undo the command that triggered it.
+    """
+    if not hasattr(args, "run"):
+        return None
+    token = _resolve_token(args)
+    if not token:
+        return None
+    try:
+        try:
+            repo = _repo_from_cwd()
+            run_dir = state_mod.resolve_run_dir(repo, args.run)
+        except PmError:
+            return None
+        if not (run_dir / "run.json").exists():
+            return None
+        ledger.write_run_file(run_dir, token)
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     try:
         handler = _HANDLERS.get(args.command)
-        if handler is not None:
-            return handler(args)
-        parser.error(f"unknown command: {args.command}")
-        return 2
+        if handler is None:
+            parser.error(f"unknown command: {args.command}")
+            return 2
+        code = handler(args)
     except IntegrityError as exc:
         print(f"pm: error: INTEGRITY: {exc}", file=sys.stderr)
         return 2
     except PmError as exc:
         print(f"pm: error: {exc}", file=sys.stderr)
-        return 2
+        code = 2
+
+    failure = _write_ledger(args)
+    if failure is not None:
+        print(f"pm: ledger: not written: {failure}", file=sys.stderr)
+        # `status --report` is the finish step: a run whose ledger writes all
+        # failed must be noticed there, before its worktree is removed.
+        if args.command == "status" and args.report:
+            return 2
+    return code
 
 
 if __name__ == "__main__":
