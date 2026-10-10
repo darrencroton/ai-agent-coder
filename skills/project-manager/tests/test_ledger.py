@@ -1205,6 +1205,18 @@ class TestLeaderboardFiles(unittest.TestCase):
                 self.assertTrue(errors[0].startswith("h/bad.json: "), errors[0])
                 self.assertIn(f"- {errors[0]}", _section(text, "## Errors"))
 
+    def test_a_pathologically_nested_file_is_an_error_not_a_crash(self) -> None:
+        good = ("h/good.json", _file("good", self._rows(_ts(1))))
+
+        text, errors = ledger.render_leaderboard([good, ("h/deep.json", b"[" * 200000)])
+
+        self.assertIn("Runs: 1; slice windows: 1.", text)
+        self.assertEqual(len(errors), 1)
+        self.assertTrue(
+            errors[0].startswith("h/deep.json: not valid JSON (RecursionError"),
+            errors[0],
+        )
+
     def test_means_round_half_up_from_the_exact_value(self) -> None:
         # Scores 1×7 and 2 → 9/8 = 1.125 exactly; binary float formatting gives 1.12.
         scores = [1] * 7 + [2]
@@ -1224,7 +1236,9 @@ class TestLedgerRenderCommand(unittest.TestCase):
     def setUp(self) -> None:
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
-        self.root = Path(scratch.name) / "ledger"
+        # Resolved, so the CLI's resolved output directory and these fixture
+        # paths agree even where the temp root is a symlink (macOS /var).
+        self.root = Path(scratch.name).resolve() / "ledger"
         patcher = mock.patch.dict(os.environ, {"PM_LEDGER_DIR": str(self.root)})
         patcher.start()
         self.addCleanup(patcher.stop)

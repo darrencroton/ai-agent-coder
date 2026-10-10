@@ -413,9 +413,10 @@ def _parse_run_file(
         return None, f"{label}: unreadable"
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except ValueError as exc:
-        # Also covers bad UTF-8 and an integer too long to convert.
-        return None, f"{label}: not valid JSON ({exc})"
+    except (ValueError, RecursionError) as exc:
+        # Also covers bad UTF-8, an integer too long to convert, and nesting
+        # too deep for the parser.
+        return None, f"{label}: not valid JSON ({type(exc).__name__}: {exc})"
     if not (
         isinstance(payload, dict)
         and isinstance(payload.get("run_id"), str)
