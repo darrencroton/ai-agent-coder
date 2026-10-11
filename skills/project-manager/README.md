@@ -4,7 +4,7 @@ Mode B runs a frozen implementation plan autonomously under a supervising PM age
 
 ## Launcher
 
-To start a Mode B run, paste the launcher prompt from [SKILL.md](SKILL.md#launcher) — the single authoritative copy — into a fresh PM-capable session.
+To start a Mode B run, paste the Mode B launcher in `implementation-plan`'s SKILL.md → "Next Chat Prompt Format" — its only copy, beside both Mode A launchers — into a fresh PM-capable session. Plans written with that skill end with it already filled in.
 
 ## Requirements
 

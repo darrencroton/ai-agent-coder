@@ -66,7 +66,7 @@ The default flow for feature or bug work, at every level:
 
 Mode B reverses one step: the slice is committed *before* the reviews. The Developer commits, then PM runs the mechanical floor and commissions `drift-audit` and `code-review` against the committed diff before deciding acceptance. Committing per slice makes the reviewed state exact and any mistake one revert away.
 
-Launcher templates live in exactly one place each: both Mode A launchers in `implementation-plan`'s SKILL.md, the Mode B launcher in `project-manager`'s SKILL.md. The handoff resume prompt derives from the checkpointed Mode A launcher, as described in `handoff`'s SKILL.md. Generated plans end with the right launcher already filled in.
+All three launcher templates live in one place: `implementation-plan`'s SKILL.md → "Next Chat Prompt Format". The handoff resume prompt derives from the checkpointed Mode A launcher, as described in `handoff`'s SKILL.md. Generated plans end with the right launcher already filled in.
 
 ## Levels of independence
 
@@ -95,7 +95,7 @@ The PM seat is a model you choose, including a local one.
 
 1. Verify your machine once with the tmux-backed trial in [`skills/project-manager/README.md`](skills/project-manager/README.md) → "Verify your setup".
 2. Sanity-check the plan: `python3 skills/project-manager/scripts/pm.py check-plan --plan <plan.md>`. This also runs automatically at `init`, so a defective plan stops before any harness launches.
-3. Start the run with the launcher in [`skills/project-manager/SKILL.md`](skills/project-manager/SKILL.md) → "Launcher".
+3. Start the run with the Mode B launcher in [`skills/implementation-plan/SKILL.md`](skills/implementation-plan/SKILL.md) → "Next Chat Prompt Format".
 
 If the PM seat runs in Claude Code, consider installing the optional poll guard (`skills/project-manager/hooks/pm-poll-guard.py`). It blocks two ways a PM burns turns learning what the harness would have told it for free: a re-read of a background task's output identical to the previous read, and a backgrounded command that sleeps and then inspects a PM artifact — both redundant, since Claude Code already re-invokes the agent when a background command exits, and expensive, since each one resends the whole conversation. It fails open everywhere, and a foreground wait is always allowed. Setup: [`skills/project-manager/README.md`](skills/project-manager/README.md) → "Optional: the poll guard".
 

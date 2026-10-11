@@ -92,31 +92,6 @@ Integrity breaches (tampered state — any `INTEGRITY:` error, rewritten history
 - Cheap models are fine for docs slices and standard-slice reviews; keep strong models where the plan or risk demands. Record model choices per slice.
 - Run `lint` before commissioning any review, and say in the assessment that you did. Deterministic findings are unarguable and free; a reviewer sent at code with a dead local spends its attention on what a tool already knew. Observed across five runs of one plan: 11 of ~14 non-correctness findings were mechanical, and both commissioned reviewers missed every one.
 
-## Launcher
+## References
 
-Paste into a fresh PM-capable session (fill the bracketed values):
-
-```md
-Plan file: <path>
-Repo: <path>
-Developer: harness <codex|claude|copilot|opencode|qwen> model <full model id, e.g. claude-opus-5-5>
-Reviewer: harness <codex|claude|copilot|opencode|qwen> model <full model id, e.g. claude-opus-5-5>
-
-Use the project-manager skill. You are the PM: the accountable supervisor of this run — you never write slice code yourself.
-
-Start the run for this plan and repo on the Developer harness above, with the Reviewer harness/model as your default for commissioned reviews — turn it into a wider review panel yourself, per slice, if the risk warrants it. Keep the run token the toolkit gives you to yourself; never pass it to a Developer or Reviewer session.
-
-Then, slice by slice, in plan order:
-1. Launch a fresh Developer session scoped to that slice's frozen contract.
-2. Wait on it with a single long `observe --wait` rather than repeated checks; nudge it only if it genuinely stalls, and otherwise let the session's own signal — result, death, or a dialog marker — end the wait.
-3. Assess what it produced against the plan, the diff, and the validation evidence; run lint, investigate differential code-health when structure materially changed, and commission an independent review when risk warrants it. A review blocks until it returns or its timeout kills it; leave it to run rather than watching it.
-4. Record your decision: accept, send it back for correction, or stop for a human — whichever the evidence and the plan's gates call for.
-
-Stop the run and tell me whenever the plan or the mechanical floor requires a human decision, rather than making that call yourself.
-
-Confirm before starting: plan file read, Developer and Reviewer harness/model, and the first slice. Then begin.
-
-When every slice is decided, report from the run record: total run time (double check this), what was accepted and on what evidence, what stopped and why, and any residual risk I should know about.
-```
-
-Details the launcher relies on: CLI reference and state layout in [README.md](README.md) and [references/run-state.md](references/run-state.md); prompt contracts in [references/developer-prompt.md](references/developer-prompt.md) and [references/reviewer-prompt.md](references/reviewer-prompt.md).
+CLI reference and state layout in [README.md](README.md) and [references/run-state.md](references/run-state.md); prompt contracts in [references/developer-prompt.md](references/developer-prompt.md) and [references/reviewer-prompt.md](references/reviewer-prompt.md). The launcher that starts a run lives in `implementation-plan`'s SKILL.md → "Next Chat Prompt Format".

@@ -14,8 +14,8 @@ Each contract lives in exactly one place; everything else points at it. Before e
 |---|---|
 | Why the repo exists, principles, personas, autonomy ladder | `docs/VISION.md` |
 | Human-facing skill index, quickstart, glossary | `README.md` (top level) |
-| Mode A launchers (checkpointed default and autonomous alternate usage) | `skills/implementation-plan/SKILL.md` → "Next Chat Prompt Format" |
-| Mode B launcher and PM operating contract | `skills/project-manager/SKILL.md` → "Launcher", "Workflow" |
+| Mode A launchers (checkpointed default and autonomous alternate usage) and the Mode B launcher | `skills/implementation-plan/SKILL.md` → "Next Chat Prompt Format" |
+| PM operating contract | `skills/project-manager/SKILL.md` → "Workflow" |
 | Handoff resume prompt | Derived from the checkpointed Mode A launcher per `skills/handoff/SKILL.md` — never restated |
 | Plan format and machine-consumed fields | `skills/implementation-plan/SKILL.md` |
 | PM charter, floor facts, and always-stop rules | `skills/project-manager/SKILL.md` → "Charter", "The floor", "Always stop" |
