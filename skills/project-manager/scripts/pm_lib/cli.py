@@ -51,7 +51,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     check_plan = subparsers.add_parser("check-plan", help="Validate a plan file")
     check_plan.add_argument("--plan", required=True)
-    check_plan.add_argument("--repo")
+    check_plan.add_argument(
+        "--repo",
+        help="the repository root (not a subdirectory): directory-shaped entries are linted against it, "
+        "and a --policy file inside it protects itself by its path relative to it",
+    )
+    check_plan.add_argument(
+        "--policy",
+        metavar="FILE",
+        help="a protected-paths policy file (JSON object; its 'protected_paths' list uses authorized-surface "
+        "entry syntax): any authorized entry whose literal prefix reaches a protected path is an error",
+    )
 
     init = subparsers.add_parser("init", help="Set up a new PM run")
     init.add_argument("--repo", required=True)
@@ -264,13 +274,17 @@ def _repo_from_cwd() -> Path:
 def _run_check_plan(args: argparse.Namespace) -> int:
     plan_path = Path(args.plan)
     repo_path = Path(args.repo) if args.repo else None
-    report = plan_mod.plan_check_report(plan_path, repo=repo_path)
+    policy = plan_mod.load_policy(Path(args.policy), repo=repo_path) if args.policy else None
+    protected = policy["protected_paths"] if policy is not None else None
+    report = plan_mod.plan_check_report(plan_path, repo=repo_path, protected=protected)
     for error in report["errors"]:
         print(f"ERROR: {error}")
     for warning in report["warnings"]:
         print(f"WARNING: {warning}")
     gated = ", ".join(report["approval_gated"]) if report["approval_gated"] else "none"
     print(f"{report['slice_count']} slice(s); approval-gated: {gated}")
+    if policy is not None:
+        print(f"protected paths: {report['protected_count']} (from {policy['path']})")
     return 0 if not report["errors"] else 2
 
 

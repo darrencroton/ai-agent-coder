@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import PmError
-from .git_ops import normalize_authorized_entry
+from .git_ops import is_authorized_path, normalize_authorized_entry
 
 REQUIRED_SECTIONS: tuple[str, ...] = (
     "Intended Change",
@@ -337,7 +338,116 @@ def mask_fenced_blocks(text: str) -> tuple[str, bool]:
     return "\n".join(masked_lines), fence is not None
 
 
-def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
+def literal_prefix(entry: str) -> str:
+    """The literal directory part of one normalized authorized-surface entry.
+
+    A plain path is its own prefix; a subtree `dir/` gives `dir`; a glob gives
+    the `/`-joined segments before the first segment containing `*`, `?` or
+    `[`, which is the empty string when the first segment is already a
+    wildcard. The subtree test comes first, as in `git_ops.is_authorized_path`,
+    because that matcher reads a trailing-slash entry as a literal prefix even
+    when it contains a wildcard character.
+    """
+    if entry.endswith("/"):
+        return entry.rstrip("/")
+    if not any(marker in entry for marker in ("*", "?", "[")):
+        return entry
+    literal: list[str] = []
+    for segment in entry.split("/"):
+        if any(marker in segment for marker in ("*", "?", "[")):
+            break
+        literal.append(segment)
+    return "/".join(literal)
+
+
+def protected_overlap(entry: str, protected: list[str]) -> str | None:
+    """The first protected entry whose literal prefix overlaps `entry`'s.
+
+    Two prefixes overlap when they are equal or one is a segment-wise prefix
+    of the other (`a/b` covers `a/b/c` but not `a/bc`); an empty prefix
+    overlaps everything. This deliberately over-refuses rather than computing
+    exact glob intersections: a refused author fixes it by writing a literal
+    directory disjoint from every protected path, while the floor's check on
+    actual changed files stays exact.
+    """
+    entry_parts = _prefix_segments(literal_prefix(entry))
+    for candidate in protected:
+        candidate_parts = _prefix_segments(literal_prefix(candidate))
+        shared = min(len(entry_parts), len(candidate_parts))
+        if entry_parts[:shared] == candidate_parts[:shared]:
+            return candidate
+    return None
+
+
+def _prefix_segments(prefix: str) -> list[str]:
+    return prefix.split("/") if prefix else []
+
+
+def load_policy(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
+    """Read a protected-paths policy file into its frozen form.
+
+    The file is untrusted operator input: a UTF-8 JSON object whose optional
+    `protected_paths` list holds authorized-surface entries (absent means
+    none). Every other key, `schema` included, is ignored. Each entry must
+    pass `authorized_entry_error` and have a non-empty `literal_prefix`, since
+    an entry such as `**/*.py` would overlap every surface and leave no
+    disjoint surface to write. Entries are normalized and deduplicated in
+    first-seen order.
+
+    With `repo` given, a policy file inside the repository protects itself:
+    its repo-relative path is appended unless an entry already covers it, so
+    a later slice cannot loosen the policy by editing it.
+    """
+    resolved = path.resolve()
+    label = f"protected-paths policy file {str(resolved)!r}"
+    try:
+        raw = resolved.read_bytes()
+    except OSError as exc:
+        raise PmError(f"{label}: cannot be read: {exc.strerror or exc}") from exc
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise PmError(f"{label}: is not valid UTF-8: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise PmError(f"{label}: is not valid JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise PmError(f"{label}: top-level value must be a JSON object, got {type(document).__name__}")
+
+    raw_entries = document.get("protected_paths", [])
+    if not isinstance(raw_entries, list):
+        raise PmError(f"{label}: 'protected_paths' must be a list, got {type(raw_entries).__name__}")
+    entries: list[str] = []
+    for index, item in enumerate(raw_entries):
+        if not isinstance(item, str) or not item.strip():
+            raise PmError(f"{label}: 'protected_paths'[{index}] must be a non-empty string, got {item!r}")
+        entry_error = authorized_entry_error(item)
+        if entry_error:
+            raise PmError(f"{label}: invalid protected path: {entry_error}")
+        normalized = normalize_authorized_entry(item)
+        if not literal_prefix(normalized):
+            raise PmError(
+                f"{label}: protected path {normalized!r} has no literal directory prefix, so it would "
+                "overlap every authorized surface; begin it with a literal directory or name the file"
+            )
+        if normalized not in entries:
+            entries.append(normalized)
+
+    if repo is not None:
+        try:
+            relative = resolved.relative_to(repo.resolve()).as_posix()
+        except ValueError:
+            relative = None
+        if relative is not None and not is_authorized_path(relative, entries):
+            entries.append(relative)
+
+    return {
+        "path": str(resolved),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "protected_paths": entries,
+    }
+
+
+def plan_check_report(path: Path, repo: Path | None = None, protected: list[str] | None = None) -> dict[str, Any]:
     """Whole-plan pre-run sanity check.
 
     Validates every slice contract up front so a plan defect surfaces before
@@ -347,7 +457,9 @@ def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
     numbers, fenced or malformed slice headings). Warnings are lint for
     conditions PM cannot mechanically guard against mid-run (heuristic stop
     surfaces, Mode-A-only plan features). When `repo` is given, authorized
-    entries are additionally linted against the worktree.
+    entries are additionally linted against the worktree. When `protected`
+    is given (normalized entries from `load_policy`), every valid authorized
+    entry whose literal prefix overlaps a protected path is an error.
     """
     text = path.read_text(encoding="utf-8")
     slices = parse_plan(path)
@@ -401,6 +513,14 @@ def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
                 if entry_error:
                     errors.append(f"{prefix}: invalid authorized surface: {entry_error}")
                     continue
+                if protected:
+                    entry = normalize_authorized_entry(raw_entry)
+                    hit = protected_overlap(entry, protected)
+                    if hit is not None:
+                        errors.append(
+                            f"{prefix}: authorized entry {entry!r} reaches protected path {hit!r}; "
+                            "give it a literal prefix disjoint from every protected path"
+                        )
                 lint = surface_lint(raw_entry)
                 if lint:
                     warnings.append(f"{prefix}: {lint}")
@@ -433,6 +553,7 @@ def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
         "errors": errors,
         "warnings": warnings,
         "approval_gated": approval_gated,
+        "protected_count": len(protected or []),
     }
 
 
