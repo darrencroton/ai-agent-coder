@@ -391,8 +391,9 @@ def load_policy(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
     none). Every other key, `schema` included, is ignored. Each entry must
     pass `authorized_entry_error` and have a non-empty `literal_prefix`, since
     an entry such as `**/*.py` would overlap every surface and leave no
-    disjoint surface to write. Entries are normalized and deduplicated in
-    first-seen order.
+    disjoint surface to write. A trailing-slash entry may not contain a
+    wildcard: the matcher reads it as a literal prefix, so it would protect
+    nothing. Entries are normalized and deduplicated in first-seen order.
 
     With `repo` given, a policy file inside the repository protects itself:
     its repo-relative path is appended unless an entry already covers it, so
@@ -410,6 +411,10 @@ def load_policy(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         raise PmError(f"{label}: is not valid UTF-8: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise PmError(f"{label}: is not valid JSON: {exc}") from exc
+    except (ValueError, RecursionError) as exc:
+        # The decoder's own limits: an integer literal longer than
+        # sys.int_max_str_digits, or nesting deeper than the stack allows.
+        raise PmError(f"{label}: cannot be decoded as JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise PmError(f"{label}: top-level value must be a JSON object, got {type(document).__name__}")
 
@@ -424,6 +429,14 @@ def load_policy(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         if entry_error:
             raise PmError(f"{label}: invalid protected path: {entry_error}")
         normalized = normalize_authorized_entry(item)
+        if normalized.endswith("/") and any(marker in normalized for marker in ("*", "?", "[")):
+            # The matcher reads a trailing-slash entry as a literal prefix, so
+            # a wildcard inside one matches no real path and protects nothing.
+            raise PmError(
+                f"{label}: protected path {normalized!r} ends with '/' and contains a wildcard, so it matches "
+                "no path and protects nothing; write a literal subtree such as 'src/' or a glob such as "
+                "'src/**/*.py'"
+            )
         if not literal_prefix(normalized):
             raise PmError(
                 f"{label}: protected path {normalized!r} has no literal directory prefix, so it would "

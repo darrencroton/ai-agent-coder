@@ -544,6 +544,32 @@ class TestLoadPolicy(PlanTestCase):
                 self.assertIn(repr(entry), str(ctx.exception))
                 self.assertIn(str(path.resolve()), str(ctx.exception))
 
+    def test_json_decoder_limits_raise_naming_the_file(self) -> None:
+        cases = {
+            # Longer than sys.int_max_str_digits: json.loads raises a bare ValueError.
+            "oversized integer": '{"protected_paths": [' + "1" * 5000 + "]}",
+            # Deep enough to raise RecursionError on 3.13 (recursion limit) and 3.14 (stack guard).
+            "deep nesting": "[" * 1_000_000 + "]" * 1_000_000,
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                path = self.write_policy(text)
+                with self.assertRaises(PmError) as ctx:
+                    plan_mod.load_policy(path)
+                self.assertIn(str(path.resolve()), str(ctx.exception))
+
+    def test_wildcard_subtree_entry_refused_naming_the_entry(self) -> None:
+        # A trailing-slash entry is a literal prefix to the matcher, so a
+        # wildcard inside one would match nothing: a silent fail-open.
+        for entry in ("src/**/", "a/*/"):
+            with self.subTest(entry=entry):
+                path = self.write_policy({"protected_paths": [entry]})
+                with self.assertRaises(PmError) as ctx:
+                    plan_mod.load_policy(path)
+                self.assertIn(repr(entry), str(ctx.exception))
+                self.assertIn(str(path.resolve()), str(ctx.exception))
+                self.assertIn("'src/**/*.py'", str(ctx.exception))
+
     def test_entries_normalized_deduplicated_first_seen_order(self) -> None:
         path = self.write_policy({"protected_paths": ["b/", "`a.py` (the instrument)", " b/ ", "a.py", "c/*.json"]})
         self.assertEqual(plan_mod.load_policy(path)["protected_paths"], ["b/", "a.py", "c/*.json"])
@@ -575,6 +601,8 @@ class TestProtectedOverlap(unittest.TestCase):
             "a/b.py": "a/b.py",
             "dir/": "dir",
             "a/b/": "a/b",
+            # Trailing slash wins over the wildcard, as in git_ops.is_authorized_path.
+            "a/*/": "a/*",
             "a/b/*.py": "a/b",
             "src/**/x.py": "src",
             "a/b?/c.py": "a",
@@ -593,6 +621,8 @@ class TestProtectedOverlap(unittest.TestCase):
             ("glob whose prefix lies inside a protected subtree", "a/b/*.py", ["a/"]),
             ("empty-prefix glob against any protected entry", "**/*.py", ["x/y.json"]),
             ("equal prefixes", "a/b", ["a/b"]),
+            # Deliberate over-refusal (D4): prefixes are compared, not glob intersections.
+            ("glob on the protected side", "c/x.py", ["c/*.json"]),
         ]
         for name, entry, protected in cases:
             with self.subTest(case=name):
@@ -681,6 +711,16 @@ class TestCheckPlanPolicy(PlanTestCase):
         self.assertIn("pm: error:", err)
         self.assertIn(str(policy_path.resolve()), err)
         self.assertNotIn("slice(s); approval-gated", out)
+
+    def test_cli_oversized_integer_policy_exits_2_naming_the_file(self) -> None:
+        plan_path = self.write_plan()
+        policy_path = self.repo.parent / "policy.json"
+        policy_path.write_text('{"protected_paths": [' + "1" * 5000 + "]}", encoding="utf-8")
+        code, _out, err = self.run_cli(["check-plan", "--plan", str(plan_path), "--policy", str(policy_path)])
+        self.assertEqual(code, 2)
+        self.assertIn("pm: error:", err)
+        self.assertIn(str(policy_path.resolve()), err)
+        self.assertNotIn("Traceback", err)
 
     def test_cli_without_policy_prints_no_protected_line(self) -> None:
         plan_path = self.write_plan(slices=[{"files": ["instruments/check.py"]}])
