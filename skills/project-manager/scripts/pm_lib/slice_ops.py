@@ -1072,6 +1072,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
 
     initial_running = sessions.session_exists(session)
     result_existed_before = result_path.is_file()
+    question_existed_before = question_path.is_file()
 
     deadline = time.monotonic() + wait if wait else None
     wait_start = time.monotonic()
@@ -1153,11 +1154,12 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
 
     liveness_changed = running != initial_running
     result_newly_appeared = result_present and not result_existed_before
+    question_newly_appeared = question_present and not question_existed_before
     # A full requested wait that ended in none of the above is exactly the
     # pattern worth telling the caller about: re-asking at the same length
     # cannot return anything a longer wait would not have.
     no_signal = bool(wait) and running and not result_present and not question_present and not dialog_markers["present"]
-    changed = pane_changed or liveness_changed or result_newly_appeared
+    changed = pane_changed or liveness_changed or result_newly_appeared or question_newly_appeared
     if changed or no_signal:
         note = (
             f"pane_changed={pane_changed} liveness_changed={liveness_changed} "

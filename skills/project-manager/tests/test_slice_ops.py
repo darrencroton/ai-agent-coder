@@ -1127,6 +1127,63 @@ class TestObserveEventAppendFailure(PmTestCase):
         self.assertFalse(outcome.pane_changed)
 
 
+class TestObserveQuestion(PmTestCase):
+    """`observe` on an open question, against a synthetic live session whose
+    pane never changes, so the question is the only thing that can count."""
+
+    def _observe(self, *, wait: float | None, on_first_poll=None):
+        plan_path = self.write_plan(slices=[{"files": ["a.py"]}])
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        artifact_dir = self.repo / "artifacts"
+        artifact_dir.mkdir()
+        (artifact_dir / "pane-live.txt").write_text("same pane", encoding="utf-8")
+        self.set_current_slice(
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=None,
+            artifact_dir=artifact_dir,
+            tmux_session="pm-fake-session",
+        )
+
+        def _detect_activity(_session):
+            # The first call comes after observe has looked for question.md,
+            # so a file written here appears mid-observe, as a live one would.
+            if on_first_poll is not None:
+                on_first_poll(artifact_dir)
+            return {"running": True, "capture": "same pane"}
+
+        with (
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "detect_activity", side_effect=_detect_activity),
+        ):
+            outcome = slice_ops.observe(self.repo, run_dir, wait=wait, token=token)
+        return outcome, run_dir, artifact_dir
+
+    def test_a_question_appearing_on_an_unchanged_pane_leaves_an_observe_event(self) -> None:
+        def _ask(artifact_dir: Path) -> None:
+            (artifact_dir / "question.md").write_text("which?\n", encoding="utf-8")
+
+        outcome, run_dir, _artifact_dir = self._observe(wait=30.0, on_first_poll=_ask)
+        self.assertFalse(outcome.pane_changed, "the fixture must hold the pane still")
+        self.assertTrue(outcome.question_present)
+        self.assertFalse(outcome.no_signal)
+        self.assertLess(outcome.elapsed_seconds, 30.0)
+        notes = [e["note"] for e in state_mod.read_events(run_dir) if e["kind"] == "observe"]
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("question_present=True", notes[0])
+
+    def test_question_text_holds_the_first_forty_lines(self) -> None:
+        lines = [f"line {number}" for number in range(1, 46)]
+
+        def _ask(artifact_dir: Path) -> None:
+            (artifact_dir / "question.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        outcome, _run_dir, _artifact_dir = self._observe(wait=None, on_first_poll=_ask)
+        self.assertEqual(outcome.question_text, "\n".join(lines[:40]))
+
+
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestSendNudge(SliceOpsTestCase):
     def test_send_delivers_a_nudge_then_refuses_once_a_credential_prompt_appears(self) -> None:
