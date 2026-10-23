@@ -643,9 +643,11 @@ def grant(repo: Path, run_dir: Path, token: str, *, slice_id: str, path: str, ev
             raise PmError(f"grant refused: {dir_lint}")
 
         # Protected paths were frozen from the policy file at `init` and are
-        # read from run state only. Checked before the already-authorized
-        # refusal so a protected path always gets this message, whatever the
-        # surface around it says.
+        # read from run state only. Checked after the path-shape refusals
+        # above (invalid entry, glob or directory, dependency/license/whole-repo
+        # shape, existing directory), which keep their own messages, and
+        # before the already-authorized refusal, so a protected path is never
+        # reported as merely already authorized.
         if git_ops.is_authorized_path(normalized, plan_mod.protected_paths(state)):
             raise PmError(
                 f"grant refused: {normalized!r} is a protected path (policy frozen at init); no grant can reach it"
