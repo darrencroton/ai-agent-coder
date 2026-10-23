@@ -31,7 +31,7 @@ Choose slice size based on risk, coupling, rollback, and expected implementer st
 - **Standard strong model profile**: prefer smaller slices with one main runtime concern per slice and explicit validation after each. Keep batching optional, not required.
 - **Weaker or less trusted model profile**: prefer narrower atomic slices, more checkpoints, and less cross-file autonomy.
 
-Do not create extra slices just to separate every file or every documentation step. Split when a boundary improves authorization, reviewability, rollback, or human approval, not because smaller is automatically better.
+Do not create extra slices just to separate every file or every documentation step. Split when a boundary improves authorization, reviewability, rollback, or human approval, not because smaller is automatically better. A plan of one or two slices, or one whose only deliverable is a committed report (an evidence node under campaign mode), is a normal plan, with the same receipt shape and nothing extra for `check-plan`.
 
 Treat a slice that bundles several new functions plus their wiring plus documentation as a split signal regardless of profile — it is usually too large for one reviewable diff and one implementer turn. Split on natural seams (pure logic, then I/O, then presentation, then wiring and docs), which also tends to order the resulting slices by descending risk so cheaper models can take the later ones.
 
@@ -124,7 +124,7 @@ Reviewers surface such a conflict; only the deciding seat resolves it. Every one
 
 The authorized surface should describe the narrowest reasonable engineering boundary, not a prediction of the eventual diff. Authorize exact files when the topology is genuinely known. Authorize a directory or glob **write envelope** (`src/query/`, `tests/query/`) instead when the work is complex or the repository large enough that implementation will legitimately discover sibling files inside that boundary — matching semantics (trailing `/` for a subtree, segment-aware globs) are defined once below, in *Machine-Consumed Fields*.
 
-This is not licence to widen for convenience — an envelope must still be the narrowest boundary that honestly contains the work.
+This is not licence to widen for convenience — an envelope must still be the narrowest boundary that honestly contains the work. When a run freezes a protected-paths policy file (`check-plan --policy`, `init --policy`), an authorized entry whose literal prefix overlaps a protected path is refused at plan time, so write entries whose literal directory is disjoint from every protected path.
 
 Under Mode B, a single path discovered outside the surface is not a dead end: `project-manager` can grant it mid-run on recorded repository evidence, at the cost of mandatory elevated review (`project-manager`'s SKILL.md, *Surface grants*) — but a grant covers exactly one file, never a boundary, so it recovers one discovered path at a time rather than the envelope a slice might actually need. That recovery is real but not free, so a well-chosen envelope — the only thing that covers a *boundary* rather than a single file — is cheaper than either an over-broad surface or an over-narrow one that turns ordinary discovery into a stop.
 
@@ -240,6 +240,16 @@ Developer: <harness> <full model id> <effort>   (model and effort may be "per pl
 Drift auditor: <harness> <full model id> <effort>
 Code reviewers: <harness> <full model id> <effort>; <harness> <full model id> <effort>
 Run tag (optional): <tag>
+Campaign child (include this paragraph only when a Campaign Manager launched this run; delete it otherwise):
+- Nobody is present: confirm nothing with a human.
+- The plan is committed in the dossier at the path given, which meets the "plan committed" requirement; it is not in the product repository.
+- Skip the confirm step. After `check-plan` and the repo check, run `init` yourself with `--branch <branch>`, `--policy <protected-paths policy file, when given>`, `--run-tag <campaign tag>`, `--max-attempts <N>` and full model ids, and hold the token.
+- Keep HANDOFF.md as usual; it is archived with your run.
+- Resolve natural plan defects yourself, as the Plan defects paragraph below says.
+- A decision the Campaign Manager can give in a line (a reading the plan leaves genuinely open, a tolerance) goes to `.pm/campaign/cm-question.md` with the options and your recommendation; then wait for the one-line pointer to the answer.
+- A human gate, a floor failure you cannot steer within budget, an integrity stop, a dialog or an exhausted budget ends the run.
+- When the run is decided, run `status --report`, confirm the ledger was written, write `.pm/campaign/child-result.json` as `{"status": "complete" | "stopped" | "needs-human", "run_id": "<run id, or null when init never succeeded>", "summary": "<one paragraph>"}`, write the final report as your last message, and stay idle.
+- Where this paragraph contradicts the confirm or resume steps below, it wins.
 
 Use the project-manager skill. You are the PM: the accountable supervisor of this run. You never write slice code.
 
