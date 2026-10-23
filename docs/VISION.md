@@ -34,7 +34,7 @@ Choosing a rung is a function of stakes, plan length, model strength, and availa
 
 ## The Roles
 
-**Project Manager (PM) — the accountable supervisor.** One agent seat, backed by a small deterministic toolkit. The toolkit owns run state, session control, artifact capture, and the mechanical floor; the PM agent owns everything that requires reading and judgement: assessing completed work against the contract, choosing proportionate validation depth, deciding whether a deviation is material, commissioning independent review, steering repairs, and deciding when a human is genuinely needed. PM never writes slice code and never authors or expands plans. Authority and accountability sit in the same seat: every PM acceptance is recorded with its reasoning and evidence, and PM answers for it.
+**Project Manager (PM) — the accountable supervisor.** One agent seat, backed by a small deterministic toolkit. The toolkit owns run state, session control, artifact capture, and the mechanical floor; the PM agent owns everything that requires reading and judgement: assessing completed work against the contract, choosing proportionate validation depth, deciding whether a deviation is material, commissioning independent review, steering repairs, and deciding when a human is genuinely needed. PM never writes slice code and never authors or expands plans. In campaign mode one exception is deliberate: a PM seat, the Campaign Manager, writes node plans within a brief the owner approved, child PMs supervise those plans, and the human-approved contract moves up one level, from the plan to the brief; a PM in plan mode keeps the prohibition. A node plan's risk and approval flags are then written by the Campaign Manager against the brief, so principle 4's "the plan declares risk" rests on that seat's judgement within the brief, with reserved classes approved by the owner in the dossier. Authority and accountability sit in the same seat: every PM acceptance is recorded with its reasoning and evidence, and PM answers for it.
 
 **Developer — the context-rich executor.** A fresh implementing session per slice. It owns implementation, tests, validation, and the slice commit, inside the frozen contract. It reports completion with pointers to evidence; it holds no acceptance authority. Its job is engineering, not paperwork: the reporting burden on the Developer is deliberately minimal.
 
@@ -90,7 +90,7 @@ Controls scale with risk; the floor does not.
 
 ## Non-Goals
 
-- **Not a planner-free autopilot.** Nothing here invents or repairs plans on the fly. Plan quality is the ceiling on everything above it, and keeping planning human-approved is a feature.
+- **Not a planner-free autopilot.** Nothing here invents or repairs plans mid-implementation: a plan is written before implementation and approved by a human — or, in campaign mode, written by a Campaign Manager inside a brief the human approved, with every target and tolerance the owner's. Plan quality is the ceiling on everything above it, and keeping planning human-approved is a feature.
 - **Not a sandbox or container system.** Isolation, when needed, is the environment's job. Containment here is contractual and evidential, not OS-level.
 - **Not adversary-proof.** The floor covers the highest-harm failure shapes; the residual gap is documented, not papered over.
 - **Not tied to any vendor, harness, or model.** Harnesses are pluggable; every supported tool is eligible for any seat; factual enforcement differences are documented without becoming rankings.
