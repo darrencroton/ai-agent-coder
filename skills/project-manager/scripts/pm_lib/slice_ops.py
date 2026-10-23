@@ -323,6 +323,7 @@ def init_run(
     harness_command: str | None,
     model_tag: str | None,
     run_tag: str | None,
+    policy: dict[str, Any] | None = None,
 ) -> InitResult:
     """Preflight, branch setup, and state/artifact creation for `init`.
 
@@ -330,6 +331,9 @@ def init_run(
     stopped on errors (this function assumes the plan is clean); it does
     not re-check the plan. `model_tag` (the run's default Developer tag) and
     `run_tag` are stored as given, already validated by `state.tag_value`.
+    `policy` is `plan.load_policy`'s result (or None): its protected entries
+    and source digest are frozen into run state here, and the policy file is
+    never read again for the rest of the run.
     """
     if not _executable_exists("tmux"):
         raise PmError("tmux is required to run PM; install it before running init")
@@ -389,7 +393,11 @@ def init_run(
         "model": reviewer_model,
         "effort": reviewer_effort,
     }
-    policy_block = {"max_attempts": max_attempts if max_attempts is not None else 10}
+    policy_block = {
+        "max_attempts": max_attempts if max_attempts is not None else 10,
+        "protected_paths": policy["protected_paths"] if policy else [],
+        "protected_paths_source": {"path": policy["path"], "sha256": policy["sha256"]} if policy else None,
+    }
 
     state, token, run_dir = state_mod.create_run(
         repo,
@@ -406,7 +414,12 @@ def init_run(
 
     write_pm_gitignore(repo)
     (run_artifact_dir(repo, state["run_id"]) / "slices").mkdir(parents=True, exist_ok=True)
-    state_mod.append_event(run_dir, "init", note=f"harness={harness} branch={resolved_branch} slices={len(slices)}")
+    state_mod.append_event(
+        run_dir,
+        "init",
+        note=f"harness={harness} branch={resolved_branch} slices={len(slices)} "
+        f"protected={len(policy_block['protected_paths'])}",
+    )
 
     return InitResult(
         run_id=state["run_id"], run_dir=run_dir, token=token, state=state, slices=slices, branch=resolved_branch
@@ -628,6 +641,15 @@ def grant(repo: Path, run_dir: Path, token: str, *, slice_id: str, path: str, ev
         dir_lint = plan_mod.directory_surface_lint(path, repo)
         if dir_lint is not None:
             raise PmError(f"grant refused: {dir_lint}")
+
+        # Protected paths were frozen from the policy file at `init` and are
+        # read from run state only. Checked before the already-authorized
+        # refusal so a protected path always gets this message, whatever the
+        # surface around it says.
+        if git_ops.is_authorized_path(normalized, plan_mod.protected_paths(state)):
+            raise PmError(
+                f"grant refused: {normalized!r} is a protected path (policy frozen at init); no grant can reach it"
+            )
 
         # A grant into a path already covered by the effective surface would still
         # ratchet the slice to elevated and mandate two reviews for nothing, so a

@@ -230,6 +230,48 @@ class TestGrantsShapeValidation(PmTestCase):
         self.assertIn("without a path", str(ctx.exception))
 
 
+class TestProtectedPathsShapeValidation(PmTestCase):
+    """`_validate_shape` fails closed on a malformed `policy.protected_paths`:
+    the floor and `grant` read it to refuse writes, so bad data must refuse to
+    load rather than silently protect nothing. A policy without the key (a run
+    from before protected paths existed) stays valid."""
+
+    def _write_protected(self, run_dir: Path, value: object) -> None:
+        raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        raw["policy"]["protected_paths"] = value
+        (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    def test_non_list_and_null_protected_paths_rejected(self) -> None:
+        plan_path = self.write_plan()
+        _state, _token, run_dir = self.make_run(plan_path=plan_path)
+        for value in ("instruments/", None, {"instruments/": True}):
+            with self.subTest(value=value):
+                self._write_protected(run_dir, value)
+                with self.assertRaises(PmError) as ctx:
+                    state_mod.load_state(run_dir)
+                self.assertIn("non-list 'protected_paths'", str(ctx.exception))
+
+    def test_non_string_or_blank_entry_rejected(self) -> None:
+        plan_path = self.write_plan()
+        _state, _token, run_dir = self.make_run(plan_path=plan_path)
+        for item in (7, None, "", "   ", ["instruments/"]):
+            with self.subTest(item=item):
+                self._write_protected(run_dir, ["instruments/", item])
+                with self.assertRaises(PmError) as ctx:
+                    state_mod.load_state(run_dir)
+                self.assertIn("not a non-empty string", str(ctx.exception))
+
+    def test_absent_key_and_well_formed_list_load(self) -> None:
+        plan_path = self.write_plan()
+        _state, token, run_dir = self.make_run(plan_path=plan_path)
+        loaded = state_mod.load_state(run_dir, token)
+        self.assertNotIn("protected_paths", loaded["policy"])
+
+        self._write_protected(run_dir, ["instruments/", "policy.json"])
+        loaded = state_mod.load_state(run_dir)
+        self.assertEqual(loaded["policy"]["protected_paths"], ["instruments/", "policy.json"])
+
+
 class TestEventsAndReadback(PmTestCase):
     def test_append_event_does_not_rewrite_run_json(self) -> None:
         plan_path = self.write_plan()

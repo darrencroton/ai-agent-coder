@@ -11,6 +11,7 @@ drives the same launch through to a recorded decision.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -135,6 +136,69 @@ class TestInitHappyPath(SliceOpsTestCase):
         self.assertTrue(state_mod.resolve_run_dir(self.repo, run_id1).is_dir())
         self.assertTrue(state_mod.resolve_run_dir(self.repo, run_id2).is_dir())
 
+    def test_init_policy_freezes_entries_and_source_digest_into_state(self) -> None:
+        plan_path = self.write_plan(self._plan_path())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        # Outside the repository, so nothing is appended for self-protection.
+        policy_path = self.repo.parent / "policy.json"
+        policy_bytes = json.dumps(
+            {"schema": 1, "protected_paths": ["instruments/", "`docs/spec.md` (frozen)", "instruments/"]}
+        ).encode("utf-8")
+        policy_path.write_bytes(policy_bytes)
+
+        code, out, err = self._init(plan_path, harness, extra=["--policy", str(policy_path)])
+        self.assertEqual(code, 0, out + err)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        policy = state_mod.load_state(run_dir, token)["policy"]
+        expected = plan_mod.load_policy(policy_path, repo=self.repo)
+        self.assertEqual(policy["protected_paths"], expected["protected_paths"])
+        self.assertEqual(policy["protected_paths"], ["instruments/", "docs/spec.md"])
+        self.assertEqual(
+            policy["protected_paths_source"],
+            {"path": str(policy_path.resolve()), "sha256": hashlib.sha256(policy_bytes).hexdigest()},
+        )
+        self.assertEqual(policy["max_attempts"], 10)
+
+        # Printed after the slices list, before the token line.
+        lines = out.splitlines()
+        index = lines.index(f"protected paths: 2 (from {policy_path.resolve()})")
+        self.assertGreater(index, lines.index("slices:"))
+        self.assertTrue(lines[index - 1].strip().startswith("Slice 1"))
+        self.assertTrue(lines[index + 1].startswith("PM_RUN_TOKEN="))
+
+        [init_event] = [event for event in state_mod.read_events(run_dir) if event["kind"] == "init"]
+        self.assertTrue(init_event["note"].endswith(" slices=1 protected=2"), init_event["note"])
+
+    def test_init_without_policy_records_no_protection(self) -> None:
+        plan_path = self.write_plan(self._plan_path())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+
+        code, out, err = self._init(plan_path, harness, extra=["--max-attempts", "4"])
+        self.assertEqual(code, 0, out + err)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        policy = state_mod.load_state(run_dir, token)["policy"]
+        self.assertEqual(policy, {"max_attempts": 4, "protected_paths": [], "protected_paths_source": None})
+        self.assertNotIn("protected paths:", out)
+        [init_event] = [event for event in state_mod.read_events(run_dir) if event["kind"] == "init"]
+        self.assertTrue(init_event["note"].endswith(" protected=0"), init_event["note"])
+
+    def test_init_policy_committed_inside_the_repository_protects_itself(self) -> None:
+        policy_path = self.repo / "campaign-policy.json"
+        policy_path.write_text(json.dumps({"protected_paths": ["instruments/"]}), encoding="utf-8")
+        self._git("add", "campaign-policy.json")
+        self._git("commit", "-q", "-m", "add the protected-paths policy")
+        plan_path = self.write_plan(self._plan_path())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+
+        code, out, err = self._init(plan_path, harness, extra=["--policy", str(policy_path)])
+        self.assertEqual(code, 0, out + err)
+        run_id, token = parse_init_output(out)
+        policy = state_mod.load_state(state_mod.resolve_run_dir(self.repo, run_id), token)["policy"]
+        self.assertEqual(policy["protected_paths"], ["instruments/", "campaign-policy.json"])
+        self.assertIn(f"protected paths: 2 (from {policy_path.resolve()})", out)
+
 
 # --- init failures -----------------------------------------------------------
 
@@ -208,6 +272,39 @@ class TestInitFailures(SliceOpsTestCase):
         code, out, _err = self._init(plan_path, harness, extra=["--branch", "main"])
         self.assertEqual(code, 0)
         self.assertIn("branch: main", out)
+
+    def _assert_no_run_created(self) -> None:
+        self.assertFalse((self.repo / ".pm").exists())
+        root = state_mod.state_root(self.repo)
+        self.assertEqual(sorted(root.iterdir()) if root.exists() else [], [])
+
+    def test_init_policy_refuses_a_surface_reaching_a_protected_path(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["instruments/check.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        policy_path = self.repo.parent / "policy.json"
+        policy_path.write_text(json.dumps({"protected_paths": ["instruments/"]}), encoding="utf-8")
+
+        code, out, _err = self._init(plan_path, harness, extra=["--policy", str(policy_path)])
+        self.assertEqual(code, 2)
+        self.assertIn(
+            "ERROR: Slice 1 (Slice 1 title): authorized entry 'instruments/check.py' reaches protected path "
+            "'instruments/'; give it a literal prefix disjoint from every protected path",
+            out,
+        )
+        self.assertNotIn("PM_RUN_TOKEN=", out)
+        self._assert_no_run_created()
+
+    def test_init_with_a_malformed_policy_file_exits_two_nothing_created(self) -> None:
+        plan_path = self.write_plan(self._plan_path())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        policy_path = self.repo.parent / "policy.json"
+        policy_path.write_text(json.dumps({"protected_paths": "instruments/"}), encoding="utf-8")
+
+        code, _out, err = self._init(plan_path, harness, extra=["--policy", str(policy_path)])
+        self.assertEqual(code, 2)
+        self.assertIn("pm: error:", err)
+        self.assertIn(str(policy_path.resolve()), err)
+        self._assert_no_run_created()
 
 
 # --- token gating ------------------------------------------------------------
@@ -512,6 +609,58 @@ class TestGrant(SliceOpsTestCase):
         slices = plan_mod.parse_plan(plan_path)
         plan_slice = plan_mod.plan_slice_by_id(slices, "Slice 1")
         self.assertIn("b.py", plan_mod.effective_authorized_files(plan_slice, reloaded))
+
+    def _launch_with_policy(self, protected: list[str]) -> tuple[str, Path, Path]:
+        """Like `_launch_single_slice`, with a protected-paths policy file
+        (outside the repository) passed to `init`."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        policy_path = self.repo.parent / "policy.json"
+        policy_path.write_text(json.dumps({"protected_paths": protected}), encoding="utf-8")
+        code, out, err = self._init(plan_path, harness, extra=["--policy", str(policy_path)])
+        self.assertEqual(code, 0, out + err)
+        run_id, token = parse_init_output(out)
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        self._track_current_session(run_id, token)
+        return token, state_mod.resolve_run_dir(self.repo, run_id), policy_path
+
+    def _assert_grant_refused_as_protected(self, token: str, run_dir: Path, path: str, normalized: str) -> None:
+        before = ((run_dir / "run.json").read_bytes(), (run_dir / "events.jsonl").read_bytes())
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", path, "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertIn(
+            f"grant refused: {normalized!r} is a protected path (policy frozen at init); no grant can reach it", err
+        )
+        self.assertEqual(((run_dir / "run.json").read_bytes(), (run_dir / "events.jsonl").read_bytes()), before)
+
+    def test_grant_refuses_a_protected_path_even_when_otherwise_grantable(self) -> None:
+        # `b.py` is granted successfully on a run without a policy
+        # (test_grant_records_path_evidence_and_ratchets_risk_elevated).
+        token, run_dir, _policy_path = self._launch_with_policy(["instruments/", "b.py"])
+        for path, normalized in (
+            ("b.py", "b.py"),
+            ("`b.py` (discovered)", "b.py"),
+            ("instruments/deep/check.py", "instruments/deep/check.py"),
+        ):
+            with self.subTest(path=path):
+                self._assert_grant_refused_as_protected(token, run_dir, path, normalized)
+
+    def test_grant_refusal_survives_editing_or_deleting_the_policy_file(self) -> None:
+        token, run_dir, policy_path = self._launch_with_policy(["b.py"])
+
+        policy_path.write_text(json.dumps({"protected_paths": []}), encoding="utf-8")
+        self._assert_grant_refused_as_protected(token, run_dir, "b.py", "b.py")
+        policy_path.unlink()
+        self._assert_grant_refused_as_protected(token, run_dir, "b.py", "b.py")
+
+        # An unprotected path is still grantable with the policy file gone.
+        code, _out, err = self.run_cli_in_repo(
+            ["grant", "--slice", "Slice 1", "--path", "c.py", "--evidence", _LONG_EVIDENCE, "--token", token]
+        )
+        self.assertEqual(code, 0, err)
 
 
 # --- review freshness --------------------------------------------------------

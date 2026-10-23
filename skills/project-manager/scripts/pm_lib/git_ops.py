@@ -105,9 +105,9 @@ def changed_files_between(repo: Path, before_head: str | None, after_head: str |
     """Union of committed changes (before_head..after_head) and dirty-tree changes."""
     files: set[str] = set()
     if before_head and after_head and before_head != after_head:
-        files.update(git(repo, "diff", "--name-only", before_head, after_head).splitlines())
+        files.update(git(repo, "diff", "--no-renames", "--name-only", before_head, after_head).splitlines())
     elif after_head and before_head is None:
-        files.update(git(repo, "show", "--name-only", "--format=", after_head).splitlines())
+        files.update(git(repo, "show", "--no-renames", "--name-only", "--format=", after_head).splitlines())
     files.update(status_changed_files(after_status))
     return {path for path in files if path}
 

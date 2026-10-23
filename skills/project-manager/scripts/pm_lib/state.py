@@ -173,6 +173,21 @@ def _validate_shape(state: dict[str, Any]) -> None:
     plan = state.get("plan")
     if not isinstance(plan, dict) or not plan.get("sha256"):
         raise PmError("run state is missing plan.sha256")
+    # Protected paths are an authorization field, so a malformed list fails
+    # closed here; `"protected_paths" in policy` (not `.get(...) is not None`)
+    # so a JSON `null` is refused too, as for `grants` below. A policy without
+    # the key (a run from before protected paths existed) enforces nothing.
+    policy = state.get("policy")
+    if isinstance(policy, dict) and "protected_paths" in policy:
+        protected = policy["protected_paths"]
+        if not isinstance(protected, list):
+            raise PmError("run state policy has a non-list 'protected_paths' field")
+        for item in protected:
+            if not isinstance(item, str) or not item.strip():
+                raise PmError(
+                    f"run state policy has a protected path that is not a non-empty string: {item!r}; "
+                    "protected paths restrict writes, so a malformed one fails closed"
+                )
     slices = state.get("slices")
     if not isinstance(slices, list):
         raise PmError("run state 'slices' field must be a list")

@@ -631,6 +631,21 @@ def slice_grants(state: dict[str, Any], slice_id: str) -> list[dict[str, Any]]:
     return []
 
 
+def protected_paths(state: dict[str, Any]) -> list[str]:
+    """The run's frozen protected paths, copied from the policy file at `init`.
+
+    Tolerant: an absent or non-dict `policy`, or a policy without the key (a
+    run initialized before protected paths existed), protects nothing.
+    `state._validate_shape` already refuses a malformed list, so the entries
+    reaching here are non-empty strings. The policy file itself is never
+    re-read: what `init` froze is what the run enforces.
+    """
+    policy = state.get("policy")
+    if not isinstance(policy, dict):
+        return []
+    return list(policy.get("protected_paths") or [])
+
+
 def effective_authorized_files(plan_slice: PlanSlice, state: dict[str, Any]) -> list[str]:
     """The frozen plan surface plus every recorded PM grant path — the surface
     floor fact 5 actually checks.

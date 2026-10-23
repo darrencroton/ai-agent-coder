@@ -118,6 +118,27 @@ class TestGitFacts(PmTestCase):
         self.assertIn("committed.py", changed)
         self.assertIn("dirty.py", changed)
 
+    def test_changed_files_between_reports_both_sides_of_a_committed_rename(self) -> None:
+        """Without `--no-renames`, git reports only a rename's destination, so
+        a file moved out of a protected or unauthorized path would be invisible
+        to fact 5. Covers both the diff branch and the unborn-before `show`
+        branch."""
+        (self.repo / "protected").mkdir()
+        (self.repo / "protected" / "check.py").write_text("print('instrument')\n" * 20, encoding="utf-8")
+        self._git("add", "protected/check.py")
+        self._git("commit", "-q", "-m", "add protected/check.py")
+        before_head = git_ops.git_head(self.repo)
+        (self.repo / "src").mkdir()
+        self._git("mv", "protected/check.py", "src/check.py")
+        self._git("commit", "-q", "-m", "move check.py")
+        after_head = git_ops.git_head(self.repo)
+        after_status = git_ops.git_status_text(self.repo)
+
+        between = git_ops.changed_files_between(self.repo, before_head, after_head, after_status)
+        self.assertEqual(between, {"protected/check.py", "src/check.py"})
+        shown = git_ops.changed_files_between(self.repo, None, after_head, after_status)
+        self.assertEqual(shown, {"protected/check.py", "src/check.py"})
+
     def test_commit_is_descendant_true(self) -> None:
         before_head = git_ops.git_head(self.repo)
         (self.repo / "next.py").write_text("z = 3\n", encoding="utf-8")

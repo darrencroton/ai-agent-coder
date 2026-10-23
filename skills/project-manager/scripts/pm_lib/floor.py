@@ -28,7 +28,8 @@ the exact pass/fail wording in its `detail` strings:
 3. approval — an approval-flagged slice has a recorded human approval.
 4. result — result.json exists, parses, and names this slice.
 5. surface — changed files are a subset of the effective authorized surface
-   (frozen plan surface + PM grants).
+   (frozen plan surface + PM grants), and none matches a protected path
+   frozen into run state at `init`.
 6. commit-ancestry — a commit exists, descends from before_head, and is the
    recorded branch's tip.
 7. clean-worktree — nothing dirty outside `.pm/`.
@@ -47,6 +48,7 @@ from .plan import PlanSlice
 from .plan import effective_authorized_files
 from .plan import plan_digest as compute_plan_digest
 from .plan import plan_slice_by_id
+from .plan import protected_paths
 from .plan import slice_grants
 
 
@@ -200,12 +202,22 @@ def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | Non
     evidence["unauthorized_files"] = unauthorized
     evidence["authorized_surface"] = list(plan_slice.authorized_files)
     evidence["granted_surface"] = [g["path"] for g in slice_grants(state, plan_slice.slice_id)]
-    passed = not unauthorized
-    detail = (
-        "all changed files are within the effective authorized surface"
-        if passed
-        else "changed files include entries outside the effective authorized surface"
-    )
+    # No authorized entry can legitimately cover a protected file: check-plan
+    # and init refuse an overlapping surface, and grant refuses a protected
+    # path. A hit is therefore a planning bypass or a bug, and fails closed.
+    protected = protected_paths(state)
+    protected_hits = sorted(path for path in changed if git_ops.is_authorized_path(path, protected))
+    evidence["protected_files"] = protected_hits
+    evidence["protected_surface"] = protected
+    passed = not unauthorized and not protected_hits
+    if passed:
+        detail = "all changed files are within the effective authorized surface"
+    elif not protected_hits:
+        detail = "changed files include entries outside the effective authorized surface"
+    elif not unauthorized:
+        detail = "changed files include protected paths"
+    else:
+        detail = "changed files include entries outside the effective authorized surface and protected paths"
     return FloorFact(5, "surface", passed, detail, evidence)
 
 

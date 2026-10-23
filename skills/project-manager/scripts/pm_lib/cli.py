@@ -88,6 +88,12 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--reviewer-model")
     init.add_argument("--reviewer-effort")
     init.add_argument("--harness-command")
+    init.add_argument(
+        "--policy",
+        metavar="FILE",
+        help="a protected-paths policy file (as for check-plan): its entries are frozen into run state, any "
+        "authorized entry reaching one refuses init, grant refuses one, and floor fact 5 fails on one",
+    )
 
     status = subparsers.add_parser("status", help="Show run status")
     status.add_argument("--report", action="store_true")
@@ -297,7 +303,11 @@ def _run_init(args: argparse.Namespace) -> int:
     repo = git_ops.resolve_repo(Path(args.repo))
     plan_path = git_ops.resolve_plan(Path(args.plan))
 
-    report = plan_mod.plan_check_report(plan_path, repo=repo)
+    # Loaded exactly once: init freezes these entries into run state, and
+    # nothing reads the policy file again for the rest of the run.
+    policy = plan_mod.load_policy(Path(args.policy), repo=repo) if args.policy else None
+    protected = policy["protected_paths"] if policy is not None else None
+    report = plan_mod.plan_check_report(plan_path, repo=repo, protected=protected)
     for error in report["errors"]:
         print(f"ERROR: {error}")
     for warning in report["warnings"]:
@@ -321,6 +331,7 @@ def _run_init(args: argparse.Namespace) -> int:
         harness_command=args.harness_command,
         model_tag=model_tag,
         run_tag=run_tag,
+        policy=policy,
     )
 
     print(f"run id: {result.run_id}")
@@ -331,6 +342,8 @@ def _run_init(args: argparse.Namespace) -> int:
         print(
             f"  {entry['id']:<10} {plan_slice.title:<40} risk={entry['risk']:<9} status={entry['status'] or 'pending'}"
         )
+    if policy is not None:
+        print(f"protected paths: {report['protected_count']} (from {policy['path']})")
     print(f"PM_RUN_TOKEN={result.token}")
     print(
         "Keep this token out of Developer sessions — it authorizes PM state writes; "
