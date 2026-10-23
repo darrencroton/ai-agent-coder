@@ -121,6 +121,34 @@ class TestRenderSteerPointer(unittest.TestCase):
             self.assertIn("/p/steer-attempt-1.md", rendered)
 
 
+class TestRenderAnswerPointer(unittest.TestCase):
+    def test_single_line_pointer_names_the_answer_path_and_states_frozen_contract(self) -> None:
+        rendered = prompts.render_answer_pointer(Path("/runs/x/slices/slice-001/answer-2.md"))
+        # One line, no newline: sessions.send_line refuses a newline, and the
+        # answer itself stays in the file.
+        self.assertNotIn("\n", rendered)
+        self.assertIn("/runs/x/slices/slice-001/answer-2.md", rendered)
+        self.assertNotIn("{answer_path}", rendered)
+        self.assertIn("frozen contract", rendered)
+        self.assertIn("never widens your authorized surface", rendered)
+
+    def test_wording_is_sourced_from_the_answer_pointer_section(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "custom-developer-prompt.md"
+            path.write_text(
+                "# Top\n\n```md\nmain: {slice_id}\n```\n\n"
+                "## Steer Message Template\n\n"
+                "```md\nsteer: {correction_path}\n```\n\n"
+                "## Answer Pointer\n\n"
+                "```md\nCUSTOM_ANSWER_MARKER_7c55 read {answer_path}\n```\n",
+                encoding="utf-8",
+            )
+            rendered = prompts.render_answer_pointer(Path("/p/answer-1.md"), reference_path=path)
+            self.assertEqual(rendered, "CUSTOM_ANSWER_MARKER_7c55 read /p/answer-1.md")
+
+
 class TestRenderLaunchPointer(unittest.TestCase):
     def test_single_line_pointer_names_the_contract_path(self) -> None:
         rendered = prompts.render_launch_pointer(Path("/runs/x/slices/slice-001/prompt.md"))
@@ -181,6 +209,35 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
 
         # No brace-wrapped identifier survives rendering.
         self.assertIsNone(re.search(r"\{[a-z_]+\}", rendered))
+
+    def test_question_path_is_named_in_the_workflow_hard_rule_and_stop_rules(self) -> None:
+        rendered = prompts.render_developer_prompt(
+            _make_plan_slice(3),
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/a"),
+            notes_path=Path("/repo/n.md"),
+            result_path=Path("/repo/a/result.json"),
+            question_path=Path("/elsewhere/q.md"),
+        )
+        self.assertIn("write one question to `/elsewhere/q.md` with the options and your recommendation", rendered)
+        self.assertIn("write only your code changes, `validation.md`, `/elsewhere/q.md`, and", rendered)
+        self.assertIn("is a question, not a stop: write it to `/elsewhere/q.md`", rendered)
+        self.assertIn(
+            'Stop (status "blocked") when: a second reading is also implementable and PM has not answered '
+            "your question about it, or",
+            rendered,
+        )
+        self.assertNotIn("/repo/a/question.md", rendered)
+
+    def test_question_path_defaults_to_the_artifact_dir(self) -> None:
+        rendered = prompts.render_developer_prompt(
+            _make_plan_slice(3),
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/a"),
+            notes_path=Path("/repo/n.md"),
+            result_path=Path("/repo/a/result.json"),
+        )
+        self.assertEqual(rendered.count("`/repo/a/question.md`"), 3)
 
     def test_lint_base_is_the_slices_starting_commit(self) -> None:
         # The lint ref must be before_head, not HEAD: once the Developer has

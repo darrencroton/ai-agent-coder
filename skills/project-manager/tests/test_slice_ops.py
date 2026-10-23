@@ -38,7 +38,9 @@ from pm_test_helpers import (
     idle_script,
     judge_current_developer,
     parse_init_output,
+    question_then_result_script,
     result_only_script,
+    stdin_draining_idle_script,
     trigger_gated_churn_script,
     trigger_gated_credential_prompt_script,
     trigger_gated_exit_script,
@@ -46,7 +48,7 @@ from pm_test_helpers import (
     write_fake_harness,
 )
 
-from pm_lib import PmError
+from pm_lib import PmError, TypedNotSubmitted
 from pm_lib import plan as plan_mod
 from pm_lib import sessions
 from pm_lib import slice_ops
@@ -1181,6 +1183,249 @@ class TestSendNudge(SliceOpsTestCase):
         # reach for a relaunch that costs an attempt.
         self.assertIn("Enter API key", err)
         self.assertIn("re-issue after the next observe", err)
+
+
+# --- question channel: question.md, observe, pm answer ------------------------
+
+
+_QUESTION_TEXT = "Which reading?\nA: the first\nB: the second\nRecommendation: A\n"
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestQuestionChannel(SliceOpsTestCase):
+    """A Developer writes `$PM_QUESTION_PATH` and waits; `observe --wait`
+    returns on it; `pm answer` writes a numbered answer file, archives the
+    question, and types a one-line pointer into the live session — free, and
+    recorded only as an `answer` event."""
+
+    def _launch(self, harness_body: str) -> tuple[str, str, Path, Path, str]:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", harness_body)
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        code, _out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        session = self._track_current_session(run_id, token)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        return token, run_id, run_dir, artifact_dir, session
+
+    def _answer(self, token: str, text: str) -> tuple[int, str, str]:
+        return self.run_cli_in_repo(["answer", "--text", text, "--token", token])
+
+    def _snapshot(self, artifact_dir: Path) -> dict[str, bytes]:
+        """Every question/answer file in the artifact dir, by name."""
+        return {
+            path.name: path.read_bytes()
+            for pattern in ("question*.md", "answer-*.md")
+            for path in artifact_dir.glob(pattern)
+        }
+
+    def test_a_question_ends_the_wait_and_the_answer_lets_the_developer_finish(self) -> None:
+        trigger = self.repo.parent / "question_trigger"
+        token, _run_id, run_dir, artifact_dir, session = self._launch(question_then_result_script(trigger))
+        prompt_text = (artifact_dir / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn(f"`{artifact_dir / 'question.md'}`", prompt_text)
+
+        # (a) The fake writes $PM_QUESTION_PATH once triggered; finding it at
+        # <artifact_dir>/question.md is what proves the environment variable.
+        trigger.write_text("go\n", encoding="utf-8")
+        start = time.monotonic()
+        code, out, err = self.run_cli_in_repo(["observe", "--wait", "30", "--token", token])
+        elapsed = time.monotonic() - start
+        self.assertEqual(code, 0, err)
+        self.assertLess(elapsed, 30.0)
+        self.assertIn("question present: yes\n" + _QUESTION_TEXT, out)
+        self.assertIn("result present: False\nquestion present: yes", out)
+        self.assertNotIn("note:", out, "a question is a signal, not a no-signal wait")
+        observe_notes = [e["note"] for e in state_mod.read_events(run_dir) if e["kind"] == "observe"]
+        self.assertTrue(observe_notes)
+        self.assertTrue(all("question_present=" in note for note in observe_notes), observe_notes)
+
+        # (b) The answer is delivered, archived, recorded, and free.
+        run_json = run_dir / "run.json"
+        before_bytes = run_json.read_bytes()
+        answer_text = "Take reading A.\n  Keep the existing tolerance.\n"
+        code, out, err = self._answer(token, answer_text)
+        self.assertEqual(code, 0, err)
+        answer_path = artifact_dir / "answer-1.md"
+        archived = artifact_dir / "question-1.md"
+        self.assertIn(f"answered Slice 1: {answer_path}", out)
+        self.assertIn(f"question archived: {archived}", out)
+        self.assertEqual(answer_path.read_text(encoding="utf-8"), answer_text)
+        self.assertEqual(archived.read_text(encoding="utf-8"), _QUESTION_TEXT)
+        self.assertFalse((artifact_dir / "question.md").exists())
+        self.assertEqual(run_json.read_bytes(), before_bytes, "an answer saves no state and charges no attempt")
+        self.assertEqual(state_mod.load_state(run_dir, token)["current_slice"]["attempts"], 0)
+
+        answers = [e for e in state_mod.read_events(run_dir) if e["kind"] == "answer"]
+        self.assertEqual(len(answers), 1)
+        self.assertEqual(answers[0]["slice"], "Slice 1")
+        self.assertEqual(answers[0]["note"], answer_text)
+        self.assertEqual(answers[0]["evidence"], str(answer_path))
+        self.assertEqual(answers[0]["data"], {"question": "question-1.md"})
+
+        pointer = f"Your supervisor's answer to your question is at {answer_path}"
+        self.assertTrue(self._wait_for(lambda: pointer in sessions.pane_text(session), timeout=10.0))
+
+        # The Developer then finishes, and observe reports no open question.
+        self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=15.0))
+        code, out, _err = self.run_cli_in_repo(["observe", "--token", token])
+        self.assertEqual(code, 0)
+        self.assertIn("result present: True (status=done)\nquestion present: no", out)
+
+        # (c) With result.json present, an answer is refused: the submission
+        # is in, and finalize --steer is the way to reach it.
+        (artifact_dir / "question.md").write_text("late question\n", encoding="utf-8")
+        snapshot = self._snapshot(artifact_dir)
+        code, _out, err = self._answer(token, "too late")
+        self.assertEqual(code, 2)
+        self.assertIn("finalize --steer", err)
+        self.assertEqual(self._snapshot(artifact_dir), snapshot)
+
+    def test_a_second_answer_is_numbered_two_and_each_refusal_leaves_the_files_unchanged(self) -> None:
+        token, _run_id, run_dir, artifact_dir, session = self._launch(stdin_draining_idle_script())
+
+        # (c) No open question.
+        code, _out, err = self._answer(token, "an answer to nothing")
+        self.assertEqual(code, 2)
+        self.assertIn("no open question", err)
+        self.assertEqual(self._snapshot(artifact_dir), {})
+
+        # (c) Blank text.
+        (artifact_dir / "question.md").write_text("first?\n", encoding="utf-8")
+        snapshot = self._snapshot(artifact_dir)
+        code, _out, err = self._answer(token, "  \n ")
+        self.assertEqual(code, 2)
+        self.assertIn("must be non-empty", err)
+        self.assertEqual(self._snapshot(artifact_dir), snapshot)
+
+        code, _out, err = self._answer(token, "first answer")
+        self.assertEqual(code, 0, err)
+        (artifact_dir / "question.md").write_text("second?\n", encoding="utf-8")
+        code, _out, err = self._answer(token, "second answer")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            self._snapshot(artifact_dir),
+            {
+                "question-1.md": b"first?\n",
+                "answer-1.md": b"first answer",
+                "question-2.md": b"second?\n",
+                "answer-2.md": b"second answer",
+            },
+        )
+        answers = [e["data"] for e in state_mod.read_events(run_dir) if e["kind"] == "answer"]
+        self.assertEqual(answers, [{"question": "question-1.md"}, {"question": "question-2.md"}])
+
+        # (c) No live session.
+        sessions.force_stop(session)
+        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
+        (artifact_dir / "question.md").write_text("third?\n", encoding="utf-8")
+        snapshot = self._snapshot(artifact_dir)
+        code, _out, err = self._answer(token, "nobody is listening")
+        self.assertEqual(code, 2)
+        self.assertIn("no live session", err)
+        self.assertEqual(self._snapshot(artifact_dir), snapshot)
+
+    def test_a_relaunch_rotates_an_open_question_with_its_attempt(self) -> None:
+        token, run_id, run_dir, artifact_dir, session = self._launch(stdin_draining_idle_script())
+        (artifact_dir / "question.md").write_text("first?\n", encoding="utf-8")
+        code, _out, err = self._answer(token, "first answer")
+        self.assertEqual(code, 0, err)
+        (artifact_dir / "question.md").write_text("unanswered?\n", encoding="utf-8")
+
+        sessions.force_stop(session)
+        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
+        judge_current_developer(self, token, run_dir, **UNAVAILABLE_DEVELOPER)
+        code, out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, err)
+        self.assertIn("relaunched", out)
+        self._track_current_session(run_id, token)
+
+        self.assertFalse((artifact_dir / "question.md").exists())
+        self.assertEqual((artifact_dir / "attempt-0" / "question.md").read_text(encoding="utf-8"), "unanswered?\n")
+        # Answered pairs are numbered across the slice and stay in place.
+        self.assertEqual((artifact_dir / "question-1.md").read_text(encoding="utf-8"), "first?\n")
+        self.assertEqual((artifact_dir / "answer-1.md").read_text(encoding="utf-8"), "first answer")
+
+
+class TestAnswerWithoutTmux(PmTestCase):
+    """`answer`'s send-failure handling and budget refusal, against a
+    synthetic live session: `sessions.send_line` is patched, so no tmux is
+    needed and the failure is exactly the one under test."""
+
+    def _run_with_question(self, *, budget_exhausted: bool = False) -> tuple[str, Path, Path]:
+        plan_path = self.write_plan(slices=[{"files": ["a.py"]}])
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        if budget_exhausted:
+            state["status"] = "needs-human"
+            state["stop_reason"] = "attempt budget exhausted"
+            state_mod.save_state(run_dir, state, token)
+            state = state_mod.load_state(run_dir, token)
+        artifact_dir = self.repo / "artifacts"
+        artifact_dir.mkdir()
+        (artifact_dir / "question.md").write_text("which?\n", encoding="utf-8")
+        self.set_current_slice(
+            state,
+            token,
+            run_dir,
+            slice_id="Slice 1",
+            before_head=None,
+            artifact_dir=artifact_dir,
+            tmux_session="pm-fake-session",
+        )
+        return token, run_dir, artifact_dir
+
+    def _answer_with_send(self, side_effect: BaseException) -> tuple[Path, Path, mock.MagicMock]:
+        token, run_dir, artifact_dir = self._run_with_question()
+        with (
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "send_line", side_effect=side_effect) as send_line,
+        ):
+            with self.assertRaises(type(side_effect)):
+                slice_ops.answer(self.repo, run_dir, token, text="answer text")
+        self.assertEqual([e for e in state_mod.read_events(run_dir) if e["kind"] == "answer"], [])
+        return run_dir, artifact_dir, send_line
+
+    def test_typed_not_submitted_leaves_the_answer_and_archived_question_in_place(self) -> None:
+        _run_dir, artifact_dir, send_line = self._answer_with_send(TypedNotSubmitted("typed, Enter withheld"))
+        # The pointer is typed in the input line, so the file it names stays.
+        self.assertEqual((artifact_dir / "answer-1.md").read_text(encoding="utf-8"), "answer text")
+        self.assertEqual((artifact_dir / "question-1.md").read_text(encoding="utf-8"), "which?\n")
+        self.assertFalse((artifact_dir / "question.md").exists())
+        [(session, pointer), _kwargs] = send_line.call_args
+        self.assertEqual(session, "pm-fake-session")
+        self.assertIn(str(artifact_dir / "answer-1.md"), pointer)
+
+    def test_an_untyped_send_failure_restores_the_question_and_removes_the_answer(self) -> None:
+        _run_dir, artifact_dir, _send_line = self._answer_with_send(PmError("refusing to send into a dialog"))
+        self.assertEqual((artifact_dir / "question.md").read_text(encoding="utf-8"), "which?\n")
+        self.assertFalse((artifact_dir / "answer-1.md").exists())
+        self.assertFalse((artifact_dir / "question-1.md").exists())
+
+    def test_an_exhausted_budget_refuses_with_the_files_unchanged(self) -> None:
+        token, run_dir, artifact_dir = self._run_with_question(budget_exhausted=True)
+        with (
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "send_line") as send_line,
+        ):
+            code, _out, err = self.run_cli_in_repo(["answer", "--text", "an answer", "--token", token])
+        self.assertEqual(code, 2)
+        self.assertIn("attempt budget exhausted", err)
+        send_line.assert_not_called()
+        self.assertEqual(sorted(path.name for path in artifact_dir.iterdir()), ["question.md"])
+
+    def test_rotation_moves_an_open_question_and_leaves_numbered_pairs(self) -> None:
+        artifact_dir = self.repo / "artifacts"
+        artifact_dir.mkdir()
+        for name in ("question.md", "question-1.md", "answer-1.md"):
+            (artifact_dir / name).write_text(name, encoding="utf-8")
+        moved = slice_ops._rotate_prior_attempt(artifact_dir, 2)
+        self.assertEqual(moved, ["question.md"])
+        self.assertEqual((artifact_dir / "attempt-2" / "question.md").read_text(encoding="utf-8"), "question.md")
+        self.assertTrue((artifact_dir / "question-1.md").is_file())
+        self.assertTrue((artifact_dir / "answer-1.md").is_file())
 
 
 class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):

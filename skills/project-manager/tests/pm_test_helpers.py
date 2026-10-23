@@ -222,6 +222,30 @@ def trigger_gated_result_script(trigger_path: Path, *, tail_sleep: float = 10.0)
     return f"{_READY}\ncat - >/dev/null &\n{trigger_wait(trigger_path)}\n{result_heredoc()}\nsleep {tail_sleep}"
 
 
+def question_then_result_script(trigger_path: Path, *, tail_sleep: float = 30.0) -> str:
+    """A Developer that asks PM one question, waits for the answer, then
+    finishes: once `trigger_path` exists it writes `$PM_QUESTION_PATH`, then
+    waits for `answer-1.md` in its artifact directory, commits a change to
+    `a.py` in its working directory (the repository) and writes result.json.
+
+    stdin is drained in the background, so the answer pointer `pm answer`
+    injects never accumulates unread; the terminal still echoes it into the
+    pane.
+    """
+    return (
+        f"{_READY}\n"
+        "cat - >/dev/null &\n"
+        f"{trigger_wait(trigger_path)}\n"
+        'printf "Which reading?\\nA: the first\\nB: the second\\nRecommendation: A\\n" > "$PM_QUESTION_PATH"\n'
+        'while [ ! -f "$PM_SLICE_ARTIFACT_DIR/answer-1.md" ]; do sleep 0.05; done\n'
+        'echo "answered change" >> a.py\n'
+        "git add a.py\n"
+        'git commit -q -m "slice work"\n'
+        f"{result_heredoc()}\n"
+        f"sleep {tail_sleep}"
+    )
+
+
 def trigger_gated_exit_script(trigger_path: Path) -> str:
     """Stays alive until `trigger_path` exists, then exits, so the session's
     death is timed by the test rather than by a launch-relative clock."""

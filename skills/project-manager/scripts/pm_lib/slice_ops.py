@@ -44,6 +44,7 @@ _SLICE_ID_RE = re.compile(r"^Slice\s+(?P<number>\d+)$")
 # Artifact rotation / observe polling.
 _OBSERVE_POLL_SECONDS = 2.0
 _OBSERVE_TAIL_LINES = 40
+_OBSERVE_QUESTION_LINES = 40
 
 # Controller-owned notes.md tripwire: a hard cap kept as a non-fatal warning,
 # since a runaway notes file silently degrades every later Developer prompt.
@@ -703,7 +704,12 @@ def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> list[s
     # Returns the names actually moved (empty if there was nothing to rotate)
     # so a caller that later fails to deliver can restore exactly those names
     # with `_restore_rotated_attempt` — see finalize_steer.
-    names = ("result.json", "pane.txt", "pane-live.txt", "validation.md")
+    #
+    # An open `question.md` rotates too: it belongs to the attempt that asked
+    # it, and left in place it would read as the new attempt's question.
+    # Answered questions (`question-<n>.md`) and their `answer-<n>.md` files
+    # stay at the top level, numbered across the whole slice.
+    names = ("result.json", "pane.txt", "pane-live.txt", "validation.md", "question.md")
     present = [name for name in names if (artifact_dir / name).exists()]
     if not present:
         return []
@@ -879,6 +885,7 @@ def start_slice(
     slice_notes_path.write_bytes(original_notes.read_bytes())
 
     result_path = artifact_dir / "result.json"
+    question_path = artifact_dir / "question.md"
     prompt_text = prompts.render_developer_prompt(
         plan_slice,
         plan_path=plan_path,
@@ -887,6 +894,7 @@ def start_slice(
         result_path=result_path,
         before_head=before_head,
         granted_surface=plan_mod.slice_grants(state, plan_slice.slice_id),
+        question_path=question_path,
     )
     prompt_path = artifact_dir / "prompt.md"
     prompt_path.write_text(prompt_text, encoding="utf-8")
@@ -899,6 +907,7 @@ def start_slice(
         "PM_SLICE_ID": plan_slice.slice_id,
         "PM_NOTES_PATH": str(slice_notes_path),
         "PM_RESULT_PATH": str(result_path),
+        "PM_QUESTION_PATH": str(question_path),
         "TMPDIR": str(tmp_dir),
     }
 
@@ -1037,9 +1046,14 @@ class ObserveOutcome:
     tail: str = ""
     slice_id: str | None = None
     elapsed_seconds: float = 0.0
-    # True when a requested wait elapsed with no session-death, result, or
-    # dialog-marker signal — the caller should wait longer next time, not re-ask.
+    # True when a requested wait elapsed with no session-death, result,
+    # question, or dialog-marker signal — the caller should wait longer next
+    # time, not re-ask.
     no_signal: bool = False
+    # An open `question.md` in the slice artifact directory: the Developer is
+    # waiting on `pm answer`. `question_text` is its first 40 lines.
+    question_present: bool = False
+    question_text: str | None = None
 
 
 def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str | None = None) -> ObserveOutcome:
@@ -1054,6 +1068,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     pane_live_path = artifact_dir / "pane-live.txt"
     previous_capture = pane_live_path.read_text(encoding="utf-8") if pane_live_path.exists() else ""
     result_path = artifact_dir / "result.json"
+    question_path = artifact_dir / "question.md"
 
     initial_running = sessions.session_exists(session)
     result_existed_before = result_path.is_file()
@@ -1066,9 +1081,9 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     # the evidence finalize falls back to after session exit.
     capture = activity["capture"] if activity["capture"] is not None else previous_capture
     # Wait exits early ONLY on a meaningful signal — session death, result.json
-    # appearing, or a dialog marker on the visible pane — never on a mere
-    # pane byte-change; TUI spinner/stream churn would otherwise defeat the
-    # wait almost immediately.
+    # or question.md appearing, or a dialog marker on the visible pane — never
+    # on a mere pane byte-change; TUI spinner/stream churn would otherwise
+    # defeat the wait almost immediately.
     marker_observation: sessions.PaneObservation | None = None
     while deadline is not None and time.monotonic() < deadline:
         visible = sessions.scan_visible_pane(session)
@@ -1078,7 +1093,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
             # marker reported, but marker absent from the tail and pane-live.
             marker_observation = visible
             break
-        if not activity["running"] or result_path.is_file():
+        if not activity["running"] or result_path.is_file() or question_path.is_file():
             break
         time.sleep(_OBSERVE_POLL_SECONDS)
         activity = sessions.detect_activity(session)
@@ -1116,6 +1131,15 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         except (OSError, json.JSONDecodeError):
             result_status = None
 
+    question_present = question_path.is_file()
+    question_text: str | None = None
+    if question_present:
+        try:
+            question_lines = question_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            question_text = "\n".join(question_lines[:_OBSERVE_QUESTION_LINES])
+        except OSError:
+            question_text = None
+
     # Visible pane, not the scrollback `capture` above: an interactive dialog
     # is only actionable while it is on screen, and a dead session captures
     # nothing (so this reads clear, as it should).
@@ -1132,13 +1156,13 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     # A full requested wait that ended in none of the above is exactly the
     # pattern worth telling the caller about: re-asking at the same length
     # cannot return anything a longer wait would not have.
-    no_signal = bool(wait) and running and not result_present and not dialog_markers["present"]
+    no_signal = bool(wait) and running and not result_present and not question_present and not dialog_markers["present"]
     changed = pane_changed or liveness_changed or result_newly_appeared
     if changed or no_signal:
         note = (
             f"pane_changed={pane_changed} liveness_changed={liveness_changed} "
             f"running={running} result_present={result_present} "
-            f"elapsed={elapsed_seconds:.1f}s"
+            f"question_present={question_present} elapsed={elapsed_seconds:.1f}s"
         )
         evidence = str(pane_live_path) if pane_changed else None
         try:
@@ -1162,6 +1186,8 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         slice_id=current.get("id"),
         elapsed_seconds=elapsed_seconds,
         no_signal=no_signal,
+        question_present=question_present,
+        question_text=question_text,
     )
 
 
@@ -1177,6 +1203,118 @@ def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> No
         raise PmError("no live session — not driving a dead pane")
     sessions.send_line(session, text)
     state_mod.append_event(run_dir, "send", slice_id=current.get("id"), note=reason)
+
+
+# --- answer -------------------------------------------------------------------
+
+
+def deliver_answer(directory: Path, prefix: str, session: str, text: str) -> tuple[Path, Path, int]:
+    """Deliver a supervisor's answer to the open question in `directory`.
+
+    Writes `<prefix>answer-<n>.md` exclusively with `text` verbatim, where
+    `n` is one more than the number of existing `<prefix>answer-*.md` files;
+    renames `<prefix>question.md` to `<prefix>question-<n>.md`; then injects
+    the one-line answer pointer into `session` through `sessions.send_line`,
+    so the dialog guard applies. Returns the answer path, the archived
+    question path, and `n`.
+
+    The caller checks that the question exists and that the session is live.
+    On `TypedNotSubmitted` both files stay in place and the error propagates:
+    the pointer is typed in the session's input line, so removing the file it
+    names would leave a dangling pointer (the rule `finalize_steer` follows).
+    On any other `PmError` from the send nothing was typed, so the question is
+    renamed back, the answer file is removed, and the error propagates.
+    """
+    number = len(list(directory.glob(f"{prefix}answer-*.md"))) + 1
+    question_path = directory / f"{prefix}question.md"
+    answer_path = directory / f"{prefix}answer-{number}.md"
+    archived_path = directory / f"{prefix}question-{number}.md"
+    if archived_path.exists():
+        raise PmError(f"{archived_path} already exists; the question and answer numbering disagree — read both by hand")
+    try:
+        with answer_path.open("x", encoding="utf-8") as handle:
+            handle.write(text)
+    except FileExistsError as exc:
+        raise PmError(
+            f"{answer_path} already exists; the question and answer numbering disagree — read both by hand"
+        ) from exc
+    try:
+        question_path.rename(archived_path)
+    except OSError as exc:
+        answer_path.unlink(missing_ok=True)
+        raise PmError(f"could not archive {question_path} as {archived_path}: {exc}") from exc
+    try:
+        sessions.send_line(session, prompts.render_answer_pointer(answer_path))
+    except TypedNotSubmitted:
+        raise
+    except PmError:
+        # Best-effort: a failed cleanup must never mask the send failure.
+        try:
+            archived_path.rename(question_path)
+        except OSError:
+            pass
+        try:
+            answer_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return answer_path, archived_path, number
+
+
+@dataclass
+class AnswerOutcome:
+    slice_id: str
+    answer_path: Path
+    question_archived_path: Path
+    answer_number: int
+
+
+def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome:
+    """`answer --text`: deliver PM's answer to the Developer's open question.
+
+    Free and recorded: no attempt is charged, no state is saved, and the
+    judgment gate does not apply, because an answer is not an exit from a
+    submission. The `answer` event's note carries the full answer verbatim
+    and is the durable record; `answer-<n>.md` sits in the Developer-writable
+    `.pm/` directory, so it is a delivery artifact, not a second source of
+    truth.
+    """
+    state = load_writable_state(run_dir, token)
+    _refuse_if_budget_exhausted(state)
+    current = state.get("current_slice")
+    if not current or not current.get("id"):
+        raise PmError("no current slice to answer")
+    slice_id = current["id"]
+    if not text.strip():
+        raise PmError("--text answer must be non-empty (there is nothing to deliver)")
+    artifact_dir = Path(current["artifact_dir"])
+    question_path = artifact_dir / "question.md"
+    if not question_path.is_file():
+        raise PmError(f"no open question for {slice_id}: {question_path} does not exist")
+    if (artifact_dir / "result.json").exists():
+        raise PmError(
+            f"{slice_id}'s submission is in (result.json exists); an answer cannot reach it — "
+            "assess it with finalize, and deliver a correction with finalize --steer"
+        )
+    session = current.get("tmux_session")
+    if not session or not sessions.session_exists(session):
+        raise PmError(f"no live session to answer for {slice_id} — relaunch with start-slice")
+
+    answer_path, archived_path, number = deliver_answer(artifact_dir, "", session, text)
+    state_mod.append_event(
+        run_dir,
+        "answer",
+        slice_id=slice_id,
+        note=text,
+        evidence=str(answer_path),
+        data={"question": archived_path.name},
+    )
+    return AnswerOutcome(
+        slice_id=slice_id,
+        answer_path=answer_path,
+        question_archived_path=archived_path,
+        answer_number=number,
+    )
 
 
 # --- finalize -------------------------------------------------------------

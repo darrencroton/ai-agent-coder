@@ -149,6 +149,15 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--run")
     send.add_argument("--token")
 
+    answer = subparsers.add_parser(
+        "answer",
+        help="Answer the Developer's open question (question.md): writes answer-<n>.md, archives the question "
+        "as question-<n>.md, and sends a one-line pointer into the live session; free, recorded",
+    )
+    answer.add_argument("--text", required=True, help="the answer, delivered verbatim through a file")
+    answer.add_argument("--run")
+    answer.add_argument("--token")
+
     finalize = subparsers.add_parser("finalize", help="Run the floor and collect assessment evidence")
     finalize_group = finalize.add_mutually_exclusive_group()
     finalize_group.add_argument("--accept", help="accept the slice; reasoning must be >= 40 characters")
@@ -560,6 +569,11 @@ def _run_observe(args: argparse.Namespace) -> int:
     print(f"pane changed: {outcome.pane_changed}")
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
     print(f"result present: {outcome.result_present}{status_note}")
+    if outcome.question_present:
+        print("question present: yes")
+        print(outcome.question_text if outcome.question_text is not None else "(question file could not be read)")
+    else:
+        print("question present: no")
     if outcome.dialog_markers["present"]:
         # Named as a signal, not a verdict: no fact reads this, PM decides what
         # a marker means. Carries the matched literal for the same reason the
@@ -590,6 +604,19 @@ def _run_send(args: argparse.Namespace) -> int:
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     slice_ops.send(repo, run_dir, token, text=args.text, reason=args.reason)
     print(f"sent: {args.text!r} ({args.reason})")
+    return 0
+
+
+# --- answer -------------------------------------------------------------------
+
+
+def _run_answer(args: argparse.Namespace) -> int:
+    token = _require_token(args)
+    repo = _repo_from_cwd()
+    run_dir = state_mod.resolve_run_dir(repo, args.run)
+    outcome = slice_ops.answer(repo, run_dir, token, text=args.text)
+    print(f"answered {outcome.slice_id}: {outcome.answer_path}")
+    print(f"question archived: {outcome.question_archived_path}")
     return 0
 
 
@@ -902,6 +929,7 @@ _HANDLERS = {
     "start-slice": _run_start_slice,
     "observe": _run_observe,
     "send": _run_send,
+    "answer": _run_answer,
     "finalize": _run_finalize,
     "review": _run_review,
     "judge-reviews": _run_judge_reviews,

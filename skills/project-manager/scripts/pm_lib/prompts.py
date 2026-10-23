@@ -35,6 +35,7 @@ _HEADING_RE = re.compile(r"^#{1,6} .*$", re.MULTILINE)
 
 _STEER_MESSAGE_HEADING = "## Steer Message Template"
 _LAUNCH_POINTER_HEADING = "## Launch Pointer"
+_ANSWER_POINTER_HEADING = "## Answer Pointer"
 
 
 def _section_text(text: str, heading: str | None) -> str:
@@ -117,6 +118,7 @@ def render_developer_prompt(
     result_path: Path,
     before_head: str | None = None,
     granted_surface: list[dict[str, Any]] | None = None,
+    question_path: Path | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
 ) -> str:
@@ -135,6 +137,10 @@ def render_developer_prompt(
     `lint_base` is interpolated for the same reason: the template used to
     hardcode `--base HEAD`, which is correct only until the Developer commits.
     The slice's `before_head` is correct on every attempt.
+
+    `question_path` is where the Developer writes a question for PM; it
+    defaults to `question.md` in `artifact_dir`, the path `start_slice` also
+    exports as `PM_QUESTION_PATH`.
     """
     template = load_template(reference_path)
     sections = plan_slice.sections
@@ -149,6 +155,7 @@ def render_developer_prompt(
         "artifact_dir": str(artifact_dir),
         "notes_path": str(notes_path),
         "result_path": str(result_path),
+        "question_path": str(question_path or artifact_dir / "question.md"),
         "intended_change": sections.get("Intended Change", "").rstrip(),
         "acceptance_criteria": sections.get("Acceptance Criteria", "").rstrip(),
         "authorized_surface": sections.get("Authorized Surface", "").rstrip(),
@@ -192,6 +199,22 @@ def render_steer_pointer(correction_path: Path, *, reference_path: Path | None =
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_STEER_MESSAGE_HEADING)
     return _render(template, path, "steer message", correction_path=str(correction_path))
+
+
+def render_answer_pointer(answer_path: Path, *, reference_path: Path | None = None) -> str:
+    """Render the one-line pointer that tells a live session to read its
+    supervisor's answer to its question from `answer_path`.
+
+    The answer is written verbatim to `answer_path` for the reason a steer
+    correction is (see `render_steer_pointer`): it may be multi-line, and no
+    harness TUI is trusted with such a paste. Wording is sourced from the
+    "## Answer Pointer" section of `references/developer-prompt.md` so it
+    lives in exactly one place. The result must be one line —
+    `sessions.send_line` rejects a newline.
+    """
+    path = reference_path or _DEFAULT_REFERENCE_PATH
+    template = load_template(path, heading=_ANSWER_POINTER_HEADING)
+    return _render(template, path, "answer pointer", answer_path=str(answer_path))
 
 
 # --- Transitive skill-bundle embedding --------------------------------------

@@ -46,8 +46,9 @@ Workflow:
        python3 {lint_script} check --base {lint_base}
 
    That ref is this slice's starting commit, so the command is correct whether or not you have committed yet — never swap it for `HEAD`, which scopes zero files once you have committed and then exits 3 having linted nothing. Run that script — do not substitute a bare linter invocation of your own (`ruff check --diff HEAD` and the like lint nothing and exit 0, which is a false pass, not evidence). Fix every new lint finding whose fix is inside your authorized surface; if a fix needs a file outside it, leave it and say so. If a linter for a changed language is not installed, report that gap plainly -- do NOT install anything, and do not treat missing coverage as a pass. In `validation.md`, quote the command you ran and the script's own final `verdict:` line verbatim; a lint section without that line reads as unevidenced. Write what you ran and the actual output that matters to `{artifact_dir}/validation.md` — honest evidence, including failures. Structure it as one line per acceptance criterion, each with the evidence that settles it, instead of a prose narrative; an unmet or unevidenced criterion is an incomplete slice, so say so plainly rather than leaving it out.
-3. When the slice passes its validation, commit it with the commit skill (or a clean conventional commit if the skill is unavailable). Commit only this slice's work. This is an unattended, supervised run: no human is present to answer a confirmation prompt, so once validation passes you have explicit permission to commit directly — do not pause to ask for confirmation, even if your own project instructions otherwise say to ask before committing; nothing here authorizes anything beyond this one slice's commit.
-4. Write `{result_path}` as your completion signal:
+3. When the contract leaves open a decision PM can give in a line (which of two readings; a tolerance; which existing test to extend), and it is not scope or surface you are forbidden, write one question to `{question_path}` with the options and your recommendation, then wait; PM's answer arrives as a one-line pointer to an answer file. A question is not a completion: do not write the result file until the work is done.
+4. When the slice passes its validation, commit it with the commit skill (or a clean conventional commit if the skill is unavailable). Commit only this slice's work. This is an unattended, supervised run: no human is present to answer a confirmation prompt, so once validation passes you have explicit permission to commit directly — do not pause to ask for confirmation, even if your own project instructions otherwise say to ask before committing; nothing here authorizes anything beyond this one slice's commit.
+5. Write `{result_path}` as your completion signal:
 
     {{"slice": "{slice_id}", "status": "done", "summary": "<one honest paragraph>", "notes": "<optional: decisions, interfaces, lessons, or warnings worth carrying to later slices>"}}
 
@@ -56,13 +57,13 @@ Workflow:
 Hard rules:
 - Change no file outside the authorized surface or the PM-granted additions above. If the work genuinely requires one, stop and report blocked — never touch it. Say which path you need and quote the repository evidence that makes it necessary to satisfy this slice's existing acceptance criteria; PM may then grant it, or stop the run for a human. That decision is PM's, never yours, and a grant is never something to assume in advance.
 - Do not push, open a PR, release, deploy, publish, install or change dependencies, change licenses, enter credentials, or perform destructive or external actions. Nothing in this run authorizes them.
-- Do not read or modify Project Manager's run state (`run.json`, the event log, status files) or any other slice's artifacts. The files this prompt points you to are the exception — read your slice contract and the run notes at the paths named above — and write only your code changes, `validation.md`, and `{result_path}`.
+- Do not read or modify Project Manager's run state (`run.json`, the event log, status files) or any other slice's artifacts. The files this prompt points you to are the exception — read your slice contract and the run notes at the paths named above — and write only your code changes, `validation.md`, `{question_path}`, and `{result_path}`.
 - Do not weaken or delete failing tests to get a pass; a real failure you cannot fix inside the surface is a blocked report, not a workaround.
 - You hold no acceptance authority: report honestly and let the evidence speak. PM independently checks the diff, the commit, and your validation output.
 
 If the contract contradicts itself — prose an obviously later decision superseded, a requirement its own conventions forbid you to satisfy — and its binding text leaves exactly one implementable reading, implement that reading rather than stopping. Record it under a `Contract defects` heading in `validation.md`, separate from the per-criterion lines, and in your result `summary`: quote the conflicting clauses and the reading you took. Never resolve such a conflict by widening your authorized surface or adding scope; if that reading needs either, that is a stop. Do not stay silent — PM can only act on a conflict it knows about, and will otherwise meet it later through a reviewer.
 
-Stop (status "blocked") when: a second reading is also implementable, or the contract leaves a rule or boundary unstated, or it contradicts the repository, validation fails and the fix is outside the surface, the work needs an unauthorized file/tool/credential/external effect, or anything requires human judgement beyond the bounded contract-conflict reading described above. A prompt on screen asking for credentials, permissions, or an external side effect is always a stop, never something to answer.
+Stop (status "blocked") when: a second reading is also implementable and PM has not answered your question about it, or the contract leaves a rule or boundary unstated, or it contradicts the repository, validation fails and the fix is outside the surface, the work needs an unauthorized file/tool/credential/external effect, or anything requires human judgement beyond the bounded contract-conflict reading described above. A prompt on screen asking for credentials, permissions, or an external side effect is always a stop, never something to answer. A decision PM can give in a line is a question, not a stop: write it to `{question_path}` as the Workflow says.
 ```
 
 ## Launch Pointer
@@ -79,4 +80,12 @@ PM renders this one-line pointer into your live session to deliver a corrective 
 
 ```md
 PM correction — read it at {correction_path} now, in full, before doing anything else. It stays inside your frozen slice contract: a steer never expands your authorized surface, adds scope, or grants new authority. Only a PM grant recorded in run state can add a path, and the correction names it when one applies.
+```
+
+## Answer Pointer
+
+PM renders this one-line pointer into your live session to deliver its answer to the question you wrote; the answer itself is written verbatim to `answer-<n>.md` in the slice artifact directory and you read it from there, for the same reason a steer correction goes in a file. The rendered block must stay a single line — `send_line` refuses a newline — and the only brace in it is the `{answer_path}` field.
+
+```md
+Your supervisor's answer to your question is at {answer_path} — read it now, in full, then continue inside your frozen contract; an answer never widens your authorized surface or adds scope.
 ```
