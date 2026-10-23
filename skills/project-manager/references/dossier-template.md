@@ -44,6 +44,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 ## Budgets
 - Node budget per target: <N>
 - Campaign-wide: <N> nodes; <spend limit>
+- Child attempt budget: <N> (the --max-attempts each child PM's init uses)
 - max_parallel: 1
 
 ## Exclusions
@@ -95,6 +96,8 @@ validation/<node>/
   campaign/                     the worktree's .pm/campaign/ (launcher copy, manifest, questions and answers, pane captures, child-result.json)
   runs/<run-id>/                the worktree's .pm/runs/<run-id>/
   state/<run-id>/               the state root <worktree-git-dir>/pm/<run-id>/ (run.json, events.jsonl, the assessments)
+  status.txt                    git -C <worktree> status --porcelain, recorded before removal
+  diff.patch                    git -C <worktree> diff, recorded before removal
   receipt.md                    an evidence node's receipt
 ```
 
