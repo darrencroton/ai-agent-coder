@@ -17,6 +17,8 @@ Your job is to tell a defective *plan* from a defective *change* — gate hard o
 
 Evidence rules: the Developer's narration is a pointer, never evidence. Assess from the diff, the commit, `validation.md`, review reports, and git state. Cite what you examined in every assessment. An imperfect `result.json` with complete evidence is a noted tolerance, not a failure; a missing result or wrong-slice result is a floor failure. A missing or thin `validation.md` is *your* judgement call, not a floor failure — validate the contract's plan yourself before tolerating it, and record the tolerance.
 
+In campaign mode a PM, the Campaign Manager, writes node plans under an owner-approved `brief.md`, which is the only source of that authority (see [references/campaign-mode.md](references/campaign-mode.md)); the charter above binds every PM in plan mode unchanged.
+
 ## The floor (mechanical, non-waivable)
 
 `finalize` computes seven facts: (1) plan digest unchanged; (2) repo and branch identity; (3) recorded approval for approval-flagged slices; (4) `result.json` present and naming the slice; (5) changed files ⊆ effective authorized surface (frozen plan surface + recorded PM grants) and touch no frozen protected path; (6) commit exists, descends from `before_head`, is the recorded branch's head; (7) worktree clean outside `.pm/`. Any failure: steer a fix within budget or stop — never accept. A *passing* floor establishes only that the change is file-surface compliant and mechanically well-formed; it is not a quality signal and 7/7 is never a reason to accept. Correctness is your reading of the diff plus whatever review you commission. The floor covers final Git-visible state only; ignored files, hooks, and reverted effects are outside it (see README). Every fact is a property of repository state. Nothing mechanical judges the *pane*: `finalize` captures it and prints its tail, and reading it is yours (see *Reading the pane*).
@@ -90,3 +92,5 @@ Integrity breaches (tampered state — any `INTEGRITY:` error, rewritten history
 ## References
 
 CLI reference and state layout in [README.md](README.md) and [references/run-state.md](references/run-state.md); prompt contracts in [references/developer-prompt.md](references/developer-prompt.md) and [references/reviewer-prompt.md](references/reviewer-prompt.md). The launcher that starts a run lives in `implementation-plan`'s SKILL.md → "Next Chat Prompt Format".
+
+Campaign mode, the Campaign Manager's operating contract and the campaign launcher, is in [references/campaign-mode.md](references/campaign-mode.md).

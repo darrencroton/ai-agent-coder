@@ -6,6 +6,15 @@ Mode B runs a frozen implementation plan autonomously under a supervising PM age
 
 To start a Mode B run, paste the Mode B launcher in `implementation-plan`'s SKILL.md → "Next Chat Prompt Format" — its only copy, beside both Mode A launchers — into a fresh PM-capable session. Plans written with that skill end with it already filled in.
 
+## Campaign mode
+
+A Campaign Manager is a PM seat in campaign mode: it turns an owner-approved `brief.md` into a validated outcome across many small node plans, each supervised by an ordinary child PM in its own worktree. Its operating contract and the campaign launcher, its only copy, are in [references/campaign-mode.md](references/campaign-mode.md); the dossier it keeps is templated in [references/dossier-template.md](references/dossier-template.md). The toolkit touchpoints:
+
+- `--policy FILE` on `check-plan` and `init`: a protected-paths policy file whose entries no plan surface, `grant` or commit can reach.
+- The four child commands, `launch-child`, `wait-child`, `answer-child` and `stop-child` (see [CLI](#cli)), which take paths and no run token.
+- A private tmux socket per child (`--socket`, default `pm-child-<b>-<hex>`), shared by the child PM and every Developer it launches, so `stop-child` ends the child and its Developer sessions together and a human can `tmux -L <socket> attach` to watch both.
+- The question channel: a child PM writes `.pm/campaign/cm-question.md`, `wait-child` returns on it, and `answer-child` answers it, as `observe` and `answer` do for a Developer's `question.md`.
+
 ## Requirements
 
 - Python ≥ 3.13 (`PurePosixPath.full_match` drives authorized-surface matching; `pm.py` refuses older interpreters)
