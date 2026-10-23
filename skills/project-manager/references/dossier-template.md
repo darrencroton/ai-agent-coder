@@ -96,8 +96,8 @@ validation/<node>/
   campaign/                     the worktree's .pm/campaign/ (launcher copy, manifest, questions and answers, pane captures, child-result.json)
   runs/<run-id>/                the worktree's .pm/runs/<run-id>/
   state/<run-id>/               the state root <worktree-git-dir>/pm/<run-id>/ (run.json, events.jsonl, the assessments)
-  status.txt                    git -C <worktree> status --porcelain, recorded before removal
-  diff.patch                    git -C <worktree> diff, recorded before removal
+  status.txt                    git -C <worktree> status --porcelain, written first, before removal
+  diff.patch                    git -C <worktree> diff --cached --binary HEAD after git -C <worktree> add -A: staged, unstaged and new non-ignored files, binary-safe
   receipt.md                    an evidence node's receipt
 ```
 
