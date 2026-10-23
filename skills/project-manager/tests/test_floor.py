@@ -13,6 +13,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -20,7 +21,9 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from pm_test_helpers import PmTestCase
 
+from pm_lib import PmError
 from pm_lib import floor as floor_mod
+from pm_lib import git_ops
 from pm_lib import plan as plan_mod
 from pm_lib import state as state_mod
 
@@ -485,6 +488,29 @@ class TestFactSurfaceProtectedPaths(FloorTestCase):
         self.assertTrue(report.passed)
         self.assertEqual(surface.evidence["protected_files"], [])
         self.assertEqual(surface.evidence["protected_surface"], [])
+
+    def test_slice_missing_from_the_plan_still_reports_both_protected_keys(self) -> None:
+        state, token, run_dir, _slices = self._protected_run(files=["a.py"], protected=["instruments/"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit_authorized_change()
+
+        surface = _facts_by_name(self._evaluate(state, token, run_dir, [], before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.detail, "slice not found in the parsed plan; authorized surface is unknown")
+        self.assertEqual(surface.evidence["protected_files"], [])
+        self.assertEqual(surface.evidence["protected_surface"], ["instruments/"])
+
+    def test_uncomputable_changed_files_still_report_both_protected_keys(self) -> None:
+        state, token, run_dir, slices = self._protected_run(files=["a.py"], protected=["instruments/"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit_authorized_change()
+
+        with mock.patch.object(git_ops, "changed_files_between", side_effect=PmError("git diff failed")):
+            surface = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.detail, "changed files could not be computed: git diff failed")
+        self.assertEqual(surface.evidence["protected_files"], [])
+        self.assertEqual(surface.evidence["protected_surface"], ["instruments/"])
 
     def test_editing_or_deleting_the_policy_file_after_init_changes_nothing(self) -> None:
         """Fact 5 reads only the entries frozen into run state; the policy

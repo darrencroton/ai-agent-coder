@@ -182,7 +182,10 @@ def _fact_result(artifact_dir: Path, slice_id: str) -> FloorFact:
 def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | None) -> FloorFact:
     current_slice = state.get("current_slice") if isinstance(state.get("current_slice"), dict) else {}
     before_head = current_slice.get("before_head")
-    evidence: dict[str, Any] = {"before_head": before_head}
+    # Both protected-path keys are present on every return, including the
+    # early failures below, where no changed files were computed.
+    protected = protected_paths(state)
+    evidence: dict[str, Any] = {"before_head": before_head, "protected_files": [], "protected_surface": protected}
     if plan_slice is None:
         return FloorFact(
             5, "surface", False, "slice not found in the parsed plan; authorized surface is unknown", evidence
@@ -205,10 +208,8 @@ def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | Non
     # No authorized entry can legitimately cover a protected file: check-plan
     # and init refuse an overlapping surface, and grant refuses a protected
     # path. A hit is therefore a planning bypass or a bug, and fails closed.
-    protected = protected_paths(state)
     protected_hits = sorted(path for path in changed if git_ops.is_authorized_path(path, protected))
     evidence["protected_files"] = protected_hits
-    evidence["protected_surface"] = protected
     passed = not unauthorized and not protected_hits
     if passed:
         detail = "all changed files are within the effective authorized surface"
