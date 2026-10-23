@@ -34,7 +34,7 @@ import shlex
 import shutil
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -52,6 +52,7 @@ _TAIL_LINES = 40
 _QUESTION_LINES = 40
 
 _SOCKET_ENV_VAR = "PM_TMUX_SOCKET"
+_RUN_TOKEN_ENV_VAR = "PM_RUN_TOKEN"
 _MANIFEST_FIELDS = ("socket", "session", "branch", "base", "worktree", "launcher", "launched_at")
 # tmux rejects `.` and `:` in a session name, and a `-t` target containing
 # `.` parses as window.pane, so a branch is reduced to this set for names.
@@ -103,18 +104,27 @@ def check_socket_name(socket: str, *, what: str) -> None:
 
 
 @contextmanager
-def _tmux_socket(socket: str) -> Iterator[None]:
-    """Point `PM_TMUX_SOCKET` at `socket` for the block; restore the caller's
-    value (or its absence) on the way out, whatever the block raised."""
-    previous = os.environ.get(_SOCKET_ENV_VAR)
-    os.environ[_SOCKET_ENV_VAR] = socket
+def _scoped_environ(name: str, value: str | None) -> Iterator[None]:
+    """Set `name` to `value` (unset it when `value` is None) for the block;
+    restore the caller's value (or its absence) on the way out, whatever the
+    block raised."""
+    previous = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
     try:
         yield
     finally:
         if previous is None:
-            os.environ.pop(_SOCKET_ENV_VAR, None)
+            os.environ.pop(name, None)
         else:
-            os.environ[_SOCKET_ENV_VAR] = previous
+            os.environ[name] = previous
+
+
+def _tmux_socket(socket: str) -> AbstractContextManager[None]:
+    """Point `PM_TMUX_SOCKET` at `socket` for the block (see `_scoped_environ`)."""
+    return _scoped_environ(_SOCKET_ENV_VAR, socket)
 
 
 def load_manifest(worktree: Path) -> dict[str, Any]:
@@ -259,14 +269,16 @@ def launch_child(
         raise PmError(f"prompt file could not be read: {prompt_file} ({exc})") from exc
     if not prompt_text.strip():
         raise PmError(f"prompt file is blank: {prompt_file}")
-    if not harness_command and harness not in profiles.SUPPORTED_HARNESSES:
+    # `is not None`, not truthiness: an explicit blank override is refused as
+    # a blank command below rather than silently replaced by the composed one.
+    if harness_command is None and harness not in profiles.SUPPORTED_HARNESSES:
         supported = ", ".join(profiles.SUPPORTED_HARNESSES)
         raise PmError(f"--harness {harness!r} is not supported (one of {supported}), and no --harness-command is given")
     if socket is not None:
         check_socket_name(socket, what="--socket")
 
     expected_model_display: str | None = None
-    if harness_command:
+    if harness_command is not None:
         command = harness_command
     else:
         session_id = str(uuid.uuid4()) if harness == "claude" else None
@@ -334,7 +346,13 @@ def launch_child(
     }
     with _tmux_socket(socket):
         try:
-            sessions.start_session(session, worktree, command, env)
+            # The child's private server is born here, and tmux copies the
+            # starting process's environment into that server's global
+            # environment, so a caller-exported token would be readable inside
+            # the child (`show-environment -g`) even though `start_session`
+            # unsets it in the session shell. Keep it out of the server.
+            with _scoped_environ(_RUN_TOKEN_ENV_VAR, None):
+                sessions.start_session(session, worktree, command, env)
         except PmError as exc:
             raise PmError(f"child session did not start ({exc}); {_left_behind(branch, worktree)}") from exc
         # The session is live from here. The manifest is written first, so a

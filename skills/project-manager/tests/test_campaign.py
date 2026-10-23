@@ -16,6 +16,7 @@ is needed. Worktrees, prompt files and the fake's records all sit under
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -39,6 +40,7 @@ from pm_test_helpers import TEST_TMUX_SOCKET, PmTestCase, trigger_wait, write_fa
 
 from pm_lib import PmError
 from pm_lib import campaign
+from pm_lib import cli
 from pm_lib import prompts
 from pm_lib import sessions
 from pm_lib import slice_ops
@@ -151,6 +153,42 @@ class TestChildLaunchPointer(unittest.TestCase):
         self.assertEqual(pointer, "CHILD /x/launcher.md")
 
 
+class TestCampaignParsers(unittest.TestCase):
+    _EXPECTED_FLAGS = {
+        "launch-child": {
+            "--repo",
+            "--base",
+            "--branch",
+            "--worktree",
+            "--prompt-file",
+            "--harness",
+            "--model",
+            "--effort",
+            "--socket",
+            "--harness-command",
+        },
+        "wait-child": {"--worktree", "--wait"},
+        "answer-child": {"--worktree", "--text"},
+        "stop-child": {"--worktree", "--reason"},
+    }
+
+    def test_each_campaign_command_takes_exactly_its_flags_and_never_run_or_token(self) -> None:
+        subparsers = next(
+            action for action in cli.build_parser()._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        for name, expected in self._EXPECTED_FLAGS.items():
+            with self.subTest(command=name):
+                flags = {
+                    option
+                    for action in subparsers.choices[name]._actions
+                    for option in action.option_strings
+                    if option not in ("-h", "--help")
+                }
+                self.assertEqual(flags, expected)
+                self.assertNotIn("--run", flags)
+                self.assertNotIn("--token", flags)
+
+
 class TestKillServer(unittest.TestCase):
     def test_runs_the_socket_scoped_kill_with_the_given_socket_not_the_environment(self) -> None:
         with (
@@ -242,6 +280,17 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assert_refused(argv, "not found on PATH")
         self.assertFalse(self.worktree.exists())
 
+    def test_an_explicitly_blank_harness_command_is_refused_not_replaced(self) -> None:
+        # `--harness fake` on purpose: were a blank override ever treated as
+        # omitted again, this refuses as an unsupported harness rather than
+        # composing — and launching — a real CLI that may be on PATH.
+        argv = self.launch_argv(self.harness)
+        for blank in ("", "   "):
+            with self.subTest(command=blank):
+                argv[argv.index("--harness-command") + 1] = blank
+                self.assert_refused(argv, "harness command is blank")
+                self.assertFalse(self.worktree.exists())
+
     def test_a_dangling_symlink_at_the_worktree_path_is_refused_and_left_unchanged(self) -> None:
         target = self.repo.parent / "missing-target"
         self.worktree.symlink_to(target)
@@ -275,8 +324,19 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assertEqual(_child_tmux(socket, "has-session", "-t", "bystander").returncode, 0)
 
     def test_a_failure_after_the_worktree_exists_names_the_branch_and_worktree(self) -> None:
-        with mock.patch.object(campaign.sessions, "start_session", side_effect=PmError("tmux start failed: boom")):
+        seen: list[str | None] = []
+
+        def failing_start(*_args) -> None:
+            seen.append(os.environ.get("PM_RUN_TOKEN"))
+            raise PmError("tmux start failed: boom")
+
+        with (
+            mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "caller-token"}),
+            mock.patch.object(campaign.sessions, "start_session", side_effect=failing_start),
+        ):
             code, out, err = self.run_cli(self.launch_argv(self.harness))
+            self.assertEqual(os.environ.get("PM_RUN_TOKEN"), "caller-token", "restored after a failed start")
+        self.assertEqual(seen, [None], "the token is absent while the child's server starts")
         self.assertEqual(code, 2, out + err)
         self.assertIn("pm: error:", err)
         self.assertIn("boom", err)
@@ -425,10 +485,18 @@ class TestChildLifecycle(CampaignTestCase):
         os.environ["PM_RUN_TOKEN"] = "caller-token-must-not-leak"
         try:
             code, out, err = self.run_cli(self.launch_argv(harness))
+            caller_token = os.environ.get("PM_RUN_TOKEN")
         finally:
             del os.environ["PM_RUN_TOKEN"]
         self.assertEqual(code, 0, out + err)
+        self.assertEqual(caller_token, "caller-token-must-not-leak", "the caller's token must be restored")
         self.assert_socket_untouched()
+        # tmux copies the starting process's environment into a new server's
+        # global environment; the token must not be there either.
+        server_env = _child_tmux(CHILD_SOCKET, "show-environment", "-g", "PM_RUN_TOKEN")
+        self.assertNotIn("caller-token-must-not-leak", server_env.stdout)
+        self.assertNotIn("PM_RUN_TOKEN=", server_env.stdout)
+        self.assertNotIn("caller-token-must-not-leak", _child_tmux(CHILD_SOCKET, "show-environment", "-g").stdout)
         worktree = self.worktree.resolve()
         directory = campaign.campaign_dir(worktree)
         launcher = directory / "launcher.md"
