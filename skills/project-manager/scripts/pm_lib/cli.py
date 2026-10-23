@@ -268,7 +268,8 @@ def build_parser() -> argparse.ArgumentParser:
     launch_child.add_argument(
         "--socket",
         metavar="NAME",
-        help="the child's private tmux server; non-blank, no whitespace, no '/' (default pm-child-<b>-<6 hex>, "
+        help="the child's private tmux server; non-blank, no whitespace, no '/', and hosting no session "
+        "(default pm-child-<b>-<6 hex>, "
         "<b> the branch with every character outside [A-Za-z0-9_-] replaced by '-')",
     )
     launch_child.add_argument("--harness-command")

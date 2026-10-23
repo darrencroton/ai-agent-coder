@@ -242,6 +242,38 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assert_refused(argv, "not found on PATH")
         self.assertFalse(self.worktree.exists())
 
+    def test_a_dangling_symlink_at_the_worktree_path_is_refused_and_left_unchanged(self) -> None:
+        target = self.repo.parent / "missing-target"
+        self.worktree.symlink_to(target)
+        self.assert_refused(self.launch_argv(self.harness), "already exists")
+        self.assertTrue(self.worktree.is_symlink())
+        self.assertEqual(os.readlink(self.worktree), str(target))
+        self.assertFalse(target.exists())
+
+    def test_a_composed_command_whose_executable_is_not_on_path_is_refused(self) -> None:
+        # PATH holds only git, which the earlier preconditions need, so the
+        # composed codex command cannot find its executable.
+        bin_dir = self.repo.parent / "bin-git-only"
+        bin_dir.mkdir()
+        (bin_dir / "git").symlink_to(shutil.which("git"))
+        argv = self.launch_argv(self.harness)
+        del argv[argv.index("--harness-command") : argv.index("--harness-command") + 2]
+        argv[argv.index("--harness") + 1] = "codex"
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
+            self.assert_refused(argv, "harness executable not found on PATH: codex")
+        self.assertFalse(self.worktree.exists())
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required to start a server on the socket")
+    def test_a_socket_whose_server_hosts_a_session_is_refused_and_the_session_survives(self) -> None:
+        socket = f"{TEST_TMUX_SOCKET}-occupied"
+        self.addCleanup(sessions.kill_server, socket)
+        started = _child_tmux(socket, "new-session", "-d", "-s", "bystander", "sleep 120")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        err = self.assert_refused(self.launch_argv(self.harness, socket=socket), "a child needs a private server")
+        self.assertIn(socket, err)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(_child_tmux(socket, "has-session", "-t", "bystander").returncode, 0)
+
     def test_a_failure_after_the_worktree_exists_names_the_branch_and_worktree(self) -> None:
         with mock.patch.object(campaign.sessions, "start_session", side_effect=PmError("tmux start failed: boom")):
             code, out, err = self.run_cli(self.launch_argv(self.harness))

@@ -220,7 +220,8 @@ def launch_child(
 ) -> LaunchChildOutcome:
     """Create the node branch and worktree, then launch a child PM in tmux.
 
-    Every precondition is checked before anything is created. Then
+    Every precondition is checked before anything is created, the last
+    being that no tmux server on the chosen socket hosts a session. Then
     `git worktree add -b <branch> <worktree> <base commit>`, the self-ignoring
     `.pm/.gitignore`, `.pm/campaign/` and a byte copy of the prompt file as
     `launcher.md`; then the session starts as `start_slice` starts a
@@ -243,8 +244,13 @@ def launch_child(
     returncode, _stdout, _stderr = git_ops.git_result(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
     if returncode == 0:
         raise PmError(f"branch {branch!r} already exists in {repo}; a child launches on a new branch")
-    worktree = worktree.expanduser().resolve()
-    if worktree.exists() or worktree.is_symlink():
+    # Checked before resolving: a dangling symlink resolves to its missing
+    # target, and both tests would then pass on a path that exists.
+    expanded = worktree.expanduser()
+    if expanded.exists() or expanded.is_symlink():
+        raise PmError(f"worktree path already exists: {expanded}")
+    worktree = expanded.resolve()
+    if worktree.exists():
         raise PmError(f"worktree path already exists: {worktree}")
     try:
         prompt_bytes = prompt_file.read_bytes()
@@ -280,6 +286,17 @@ def launch_child(
         raise PmError(f"harness executable not found on PATH: {executable}")
 
     session, socket = child_names(branch, secrets.token_hex(3), socket)
+    # The server must be private to this child: stop-child and the launch
+    # failure guard kill it whole, so joining a live one — the caller's own,
+    # another child's, `default` — would destroy sessions this child does
+    # not own.
+    with _tmux_socket(socket):
+        existing = sessions.sessions_with_prefix("")
+    if existing:
+        raise PmError(
+            f"tmux server {socket} already hosts {len(existing)} session(s); a child needs a private server "
+            "(omit --socket, or name one with no server)"
+        )
 
     # --- The worktree. From here every failure names what is left behind.
     try:
