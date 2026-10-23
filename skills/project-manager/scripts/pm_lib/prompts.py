@@ -36,6 +36,7 @@ _HEADING_RE = re.compile(r"^#{1,6} .*$", re.MULTILINE)
 _STEER_MESSAGE_HEADING = "## Steer Message Template"
 _LAUNCH_POINTER_HEADING = "## Launch Pointer"
 _ANSWER_POINTER_HEADING = "## Answer Pointer"
+_CHILD_LAUNCH_POINTER_HEADING = "## Child Launch Pointer"
 
 
 def _section_text(text: str, heading: str | None) -> str:
@@ -215,6 +216,22 @@ def render_answer_pointer(answer_path: Path, *, reference_path: Path | None = No
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_ANSWER_POINTER_HEADING)
     return _render(template, path, "answer pointer", answer_path=str(answer_path))
+
+
+def render_child_launch_pointer(launcher_path: Path, *, reference_path: Path | None = None) -> str:
+    """Render the one-line pointer that tells a fresh child PM session to
+    read its Campaign Manager's launcher from `launcher_path`.
+
+    The child's counterpart of `render_launch_pointer`: `launch-child`
+    copies the launcher to `launcher.md` in the child worktree's
+    `.pm/campaign/` and injects only this line, for the same reason. Wording
+    is sourced from the "## Child Launch Pointer" section of
+    `references/developer-prompt.md` so it lives in exactly one place. The
+    result must be one line — `sessions.send_prompt` rejects a newline.
+    """
+    path = reference_path or _DEFAULT_REFERENCE_PATH
+    template = load_template(path, heading=_CHILD_LAUNCH_POINTER_HEADING)
+    return _render(template, path, "child launch pointer", launcher_path=str(launcher_path))
 
 
 # --- Transitive skill-bundle embedding --------------------------------------

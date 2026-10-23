@@ -1,6 +1,6 @@
 # Run State Reference (`lite-2`)
 
-Authoritative run state is a **single copy outside the worktree**: `<worktree-git-dir>/pm/<run-id>/` (found via `git rev-parse --absolute-git-dir`, so each linked worktree gets its own state). `<worktree-git-dir>/pm/current` names the active run; every run-scoped command (all except `check-plan` and `init`) defaults to it and accepts `--run <id>`.
+Authoritative run state is a **single copy outside the worktree**: `<worktree-git-dir>/pm/<run-id>/` (found via `git rev-parse --absolute-git-dir`, so each linked worktree gets its own state). `<worktree-git-dir>/pm/current` names the active run; every run-scoped command (all except `check-plan`, `init` and the four campaign commands `launch-child`, `wait-child`, `answer-child` and `stop-child`) defaults to it and accepts `--run <id>`.
 
 ## Files in a run directory
 

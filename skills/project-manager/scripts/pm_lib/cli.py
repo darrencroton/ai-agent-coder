@@ -2,9 +2,10 @@
 
 Every subcommand below (see `_HANDLERS`) is wired the same thin way:
 argument parsing, resolving the repo/run/token, dispatching into
-`slice_ops`/`review`, and formatting output. The actual mechanics (state
-mutation, session control, git facts, review commissioning) live in the
-modules that own them; nothing here decides anything semantic.
+`slice_ops`/`review`/`campaign`, and formatting output. The actual mechanics
+(state mutation, session control, git facts, review commissioning, campaign
+child control) live in the modules that own them; nothing here decides
+anything semantic.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import sys
 from pathlib import Path
 
 from . import IntegrityError, PmError
+from . import campaign
 from . import git_ops
 from . import judgments
 from . import leaderboard, ledger
@@ -241,6 +243,55 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--scavenge", action="store_true")
     stop.add_argument("--run")
     stop.add_argument("--token")
+
+    # The four campaign commands take a node worktree path and never a run or
+    # a token, so the post-command ledger hook never fires for them.
+    launch_child = subparsers.add_parser(
+        "launch-child",
+        help="Create a node branch and worktree and launch a child PM there in tmux on a private socket",
+    )
+    launch_child.add_argument("--repo", required=True, help="the repository the node worktree is added to")
+    launch_child.add_argument("--base", required=True, metavar="REF", help="the commit the node branch starts at")
+    launch_child.add_argument("--branch", required=True, help="the node branch to create; it must not exist")
+    launch_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree; it must not exist")
+    launch_child.add_argument(
+        "--prompt-file",
+        required=True,
+        metavar="FILE",
+        help="the child's launcher, copied byte for byte to .pm/campaign/launcher.md in the worktree",
+    )
+    launch_child.add_argument(
+        "--harness", required=True, help="child PM harness: one of codex, claude, copilot, opencode, qwen"
+    )
+    launch_child.add_argument("--model")
+    launch_child.add_argument("--effort")
+    launch_child.add_argument(
+        "--socket",
+        metavar="NAME",
+        help="the child's private tmux server; non-blank, no whitespace, no '/' (default pm-child-<b>-<6 hex>, "
+        "<b> the branch with every character outside [A-Za-z0-9_-] replaced by '-')",
+    )
+    launch_child.add_argument("--harness-command")
+
+    wait_child = subparsers.add_parser(
+        "wait-child", help="Show evidence of a child PM's progress; a wait returns early on a signal"
+    )
+    wait_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree")
+    wait_child.add_argument("--wait", type=_positive_seconds)
+
+    answer_child = subparsers.add_parser(
+        "answer-child",
+        help="Answer the child PM's open question (cm-question.md): writes cm-answer-<n>.md, archives the "
+        "question as cm-question-<n>.md, and sends a one-line pointer into the child's session",
+    )
+    answer_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree")
+    answer_child.add_argument("--text", required=True, help="the answer, delivered verbatim through a file")
+
+    stop_child = subparsers.add_parser(
+        "stop-child", help="Capture the child PM's pane and kill its private tmux server"
+    )
+    stop_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree")
+    stop_child.add_argument("--reason", required=True)
 
     # Reads only the ledger directory: no run, no token, so the post-command
     # ledger hook never fires for it.
@@ -852,6 +903,92 @@ def _run_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- campaign child commands -----------------------------------------------
+
+
+def _run_launch_child(args: argparse.Namespace) -> int:
+    outcome = campaign.launch_child(
+        repo=Path(args.repo),
+        base=args.base,
+        branch=args.branch,
+        worktree=Path(args.worktree),
+        prompt_file=Path(args.prompt_file).expanduser(),
+        harness=args.harness,
+        model=args.model,
+        effort=args.effort,
+        socket=args.socket,
+        harness_command=args.harness_command,
+    )
+    print(
+        f"child launched: session={outcome.session} socket={outcome.socket} "
+        f"worktree={outcome.worktree} launcher={outcome.launcher}"
+    )
+    return 0
+
+
+def _run_wait_child(args: argparse.Namespace) -> int:
+    outcome = campaign.wait_child(Path(args.worktree), wait=args.wait)
+    if args.wait:
+        print(f"waited: {outcome.elapsed_seconds:.1f}s (requested {args.wait:g}s)")
+    print(f"session running: {outcome.running}")
+    status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
+    print(f"result present: {outcome.result_present}{status_note}")
+    if outcome.question_present:
+        print("question present: yes")
+        print(outcome.question_text if outcome.question_text is not None else "(question file could not be read)")
+    else:
+        print("question present: no")
+    if outcome.dialog_markers["present"]:
+        print(f"dialog marker: {sessions.dialog_marker_detail(outcome.dialog_markers)}")
+    else:
+        print("dialog marker: clear")
+    # Printed, never enforced — length is the CM's judgement call.
+    if outcome.no_signal:
+        print(
+            "note: this wait returned no signal. Re-asking at the same length cannot "
+            "return anything a longer wait would not have. Either wait longer, or act: "
+            "attach to the child's tmux server and read it, or stop-child."
+        )
+    if outcome.runs_error is not None:
+        print(f"child runs: state root unavailable ({outcome.runs_error})")
+    for run in outcome.runs:
+        print(f"child run {run.run_id}: status={run.status} stop_reason={run.stop_reason} (unverified: tokenless read)")
+    if outcome.pane_live_error is not None:
+        print(f"pane-live: not written ({outcome.pane_live_error})")
+    print("--- pane tail ---")
+    print(outcome.tail)
+    return 0
+
+
+def _run_answer_child(args: argparse.Namespace) -> int:
+    outcome = campaign.answer_child(Path(args.worktree), text=args.text)
+    print(f"answered: {outcome.answer_path}")
+    print(f"question archived: {outcome.question_archived_path}")
+    return 0
+
+
+def _run_stop_child(args: argparse.Namespace) -> int:
+    outcome = campaign.stop_child(Path(args.worktree))
+    if outcome.runs_error is not None:
+        print(f"child runs: state root unavailable ({outcome.runs_error}); recorded reviewer process groups unknown")
+    if outcome.reviewer_pgids:
+        pgids = ", ".join(str(pgid) for pgid in outcome.reviewer_pgids)
+        print(
+            f"reviewer process groups the child recorded: {pgids}; they are outside the child's tmux server "
+            "— verify and kill them by hand"
+        )
+    if outcome.pane_error is not None:
+        print(f"pane: not captured ({outcome.pane_error})")
+    elif outcome.pane_kept:
+        print(f"pane: {outcome.pane_path} (kept from an earlier capture; the session was already gone)")
+    else:
+        print(f"pane: {outcome.pane_path}")
+    state = "was running" if outcome.was_running else "was not running"
+    print(f"stopped child: session={outcome.session} ({state}); killed tmux server {outcome.socket}")
+    print(f"reason: {args.reason}")
+    return 0
+
+
 # --- notes ----------------------------------------------------------------
 
 
@@ -937,6 +1074,10 @@ _HANDLERS = {
     "notes": _run_notes,
     "stop": _run_stop,
     "ledger": _run_ledger,
+    "launch-child": _run_launch_child,
+    "wait-child": _run_wait_child,
+    "answer-child": _run_answer_child,
+    "stop-child": _run_stop_child,
 }
 
 

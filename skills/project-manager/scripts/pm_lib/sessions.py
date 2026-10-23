@@ -330,6 +330,23 @@ def force_stop(session: str) -> None:
         _run_tmux("kill-session", "-t", session)
 
 
+def kill_server(socket: str) -> None:
+    """`tmux -L <socket> kill-server`: end the named private server and every
+    session on it.
+
+    The socket is the argument, never `PM_TMUX_SOCKET`: a campaign child's
+    server is named in its manifest, and the caller's own override must not
+    redirect this kill to a different server — least of all to the unscoped
+    default one, which `tmux_argv` falls back to when the variable is unset.
+    A non-zero exit (no server on that socket) and a missing tmux binary are
+    both ignored: either way no server is left to kill.
+    """
+    try:
+        subprocess.run(["tmux", "-L", socket, "kill-server"], check=False, text=True, capture_output=True)
+    except OSError:
+        pass
+
+
 # --- Readiness -------------------------------------------------------------
 
 

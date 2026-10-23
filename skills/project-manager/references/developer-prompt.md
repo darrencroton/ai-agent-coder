@@ -89,3 +89,11 @@ PM renders this one-line pointer into your live session to deliver its answer to
 ```md
 Your supervisor's answer to your question is at {answer_path} — read it now, in full, then continue inside your frozen contract; an answer never widens your authorized surface or adds scope.
 ```
+
+## Child Launch Pointer
+
+A Campaign Manager delivers only this one-line pointer into a fresh child PM session at `launch-child`; the launcher itself is copied to `launcher.md` in the child worktree's `.pm/campaign/` and the child reads it from there, for the reason the Developer's launch pointer exists. The rendered block must stay a single line — `send_prompt` refuses a newline — and the only brace in it is the `{launcher_path}` field.
+
+```md
+You are a Project Manager launched by a Campaign Manager. Read your launcher at {launcher_path} now, in full, before doing anything else, then follow it exactly.
+```
