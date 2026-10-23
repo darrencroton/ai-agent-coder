@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import PmError
-from .git_ops import is_authorized_path, normalize_authorized_entry
+from .git_ops import has_glob, is_protected_path, normalize_authorized_entry
 
 REQUIRED_SECTIONS: tuple[str, ...] = (
     "Intended Change",
@@ -295,7 +296,7 @@ def directory_surface_lint(entry: str, repo: Path) -> str | None:
     normalized = normalize_authorized_entry(entry)
     if not normalized or normalized.endswith("/"):
         return None
-    if any(marker in normalized for marker in ("*", "?", "[")):
+    if has_glob(normalized):
         return None
     if (repo / normalized).is_dir():
         return (
@@ -350,11 +351,9 @@ def literal_prefix(entry: str) -> str:
     """
     if entry.endswith("/"):
         return entry.rstrip("/")
-    if not any(marker in entry for marker in ("*", "?", "[")):
-        return entry
     literal: list[str] = []
     for segment in entry.split("/"):
-        if any(marker in segment for marker in ("*", "?", "[")):
+        if has_glob(segment):
             break
         literal.append(segment)
     return "/".join(literal)
@@ -393,12 +392,31 @@ def load_policy(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
     an entry such as `**/*.py` would overlap every surface and leave no
     disjoint surface to write. A trailing-slash entry may not contain a
     wildcard: the matcher reads it as a literal prefix, so it would protect
-    nothing. Entries are normalized and deduplicated in first-seen order.
+    nothing. Entries are normalized and deduplicated in first-seen order. A
+    plain entry naming a directory ("instruments", no slash) is legal: at
+    `grant` and fact 5 `git_ops.is_protected_path` covers its subtree, in
+    agreement with the segment-wise overlap test `protected_overlap` applies
+    at plan time.
 
     With `repo` given, a policy file inside the repository protects itself:
-    its repo-relative path is appended unless an entry already covers it, so
-    a later slice cannot loosen the policy by editing it.
+    its repo-relative path is appended unless an entry already protects it
+    as `git_ops.is_protected_path` reads entries (so a plain directory entry
+    counts), and a later slice cannot loosen the policy by editing it. A
+    symlinked policy file is refused: it would be protected at its target,
+    not at the tracked link a later node could re-point. So is a path that
+    reaches the file through a symlinked directory inside the repository
+    (whether the link's target lies inside or outside it), for the same
+    reason; a repository that itself sits under a symlinked directory (macOS
+    `/tmp`) is fine, since the spelled path is measured from the ancestor
+    that resolves to the repository. So, last, is an in-repository path containing
+    a glob marker, which the matcher would read as a pattern and so protect
+    nothing (`policy[1].json`).
     """
+    if path.is_symlink():
+        raise PmError(
+            f"protected-paths policy file {str(path)!r}: is a symbolic link; name the real file so the "
+            "protection lands on the path a later slice would edit"
+        )
     resolved = path.resolve()
     label = f"protected-paths policy file {str(resolved)!r}"
     try:
@@ -429,7 +447,7 @@ def load_policy(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         if entry_error:
             raise PmError(f"{label}: invalid protected path: {entry_error}")
         normalized = normalize_authorized_entry(item)
-        if normalized.endswith("/") and any(marker in normalized for marker in ("*", "?", "[")):
+        if normalized.endswith("/") and has_glob(normalized):
             # The matcher reads a trailing-slash entry as a literal prefix, so
             # a wildcard inside one matches no real path and protects nothing.
             raise PmError(
@@ -446,11 +464,37 @@ def load_policy(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
             entries.append(normalized)
 
     if repo is not None:
+        resolved_repo = repo.resolve()
         try:
-            relative = resolved.relative_to(repo.resolve()).as_posix()
+            relative = resolved.relative_to(resolved_repo).as_posix()
         except ValueError:
             relative = None
-        if relative is not None and not is_authorized_path(relative, entries):
+        # normpath, not resolve: it folds `..` without following links, so
+        # this is the path as spelled. The repository may be reached through
+        # a link itself (and the CLI passes it resolved), so the spelled
+        # in-repository path starts at the outermost ancestor that resolves to
+        # the repository; none means a policy named outside it.
+        spelled_path = Path(os.path.normpath(path.absolute()))
+        spelled = next(
+            (
+                spelled_path.relative_to(ancestor)
+                for ancestor in reversed(spelled_path.parents)
+                if ancestor.resolve() == resolved_repo
+            ),
+            None,
+        )
+        if spelled is not None and spelled.as_posix() != relative:
+            target = repr(relative) if relative is not None else "outside the repository"
+            raise PmError(
+                f"{label}: {str(path)!r} reaches the file through a symlink inside the repository "
+                f"({spelled.as_posix()!r} resolves to {target}); name the real path"
+            )
+        if relative is not None and has_glob(relative):
+            raise PmError(
+                f"{label}: its repo-relative path {relative!r} contains a glob character, so the matcher "
+                "would read the self-protection entry as a pattern and protect nothing; rename the file"
+            )
+        if relative is not None and not is_protected_path(relative, entries):
             entries.append(relative)
 
     return {

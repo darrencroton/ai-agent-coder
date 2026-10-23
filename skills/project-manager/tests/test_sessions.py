@@ -30,7 +30,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # Imported for its side effect as much as its helper: pm_test_helpers pins
 # PM_TMUX_SOCKET, so both the code under test and the direct tmux calls below
 # drive this process's private tmux server rather than the caller's.
-from pm_test_helpers import tmux_argv, write_fake_harness
+from pm_test_helpers import TEST_TMUX_SOCKET, tmux_argv, write_fake_harness
 
 from pm_lib import PmError
 from pm_lib import TypedNotSubmitted
@@ -750,6 +750,141 @@ class TestStartSessionStripsInheritedToken(TmuxSessionTestCase):
         self._start(name, str(script_path), {})
         self.assertTrue(self._wait_for(lambda: "TOKEN_IS=" in sessions.pane_text(name)))
         self.assertIn("TOKEN_IS=ABSENT", sessions.pane_text(name))
+
+    def test_start_session_keeps_run_token_out_of_a_new_servers_global_environment(self) -> None:
+        # tmux seeds a NEW server's global environment from the process that
+        # starts it, so a fresh socket is the case the `unset` in the session
+        # shell cannot cover: `show-environment -g` from inside the session
+        # would print the token.
+        socket = f"{TEST_TMUX_SOCKET}-token"
+        self.addCleanup(sessions.kill_server, socket)
+        token = "secret-fresh-server-token"
+        with sessions.scoped_environ("PM_RUN_TOKEN", token), sessions.scoped_environ("PM_TMUX_SOCKET", socket):
+            sessions.start_session("pm-test-freshtoken-s01a0", self.repo, "bash -c 'sleep 15'", {})
+            self.assertEqual(os.environ["PM_RUN_TOKEN"], token)
+        shown = subprocess.run(
+            ["tmux", "-L", socket, "show-environment", "-g", "PM_RUN_TOKEN"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        output = shown.stdout + shown.stderr
+        self.assertNotIn(token, output)
+        self.assertNotIn("PM_RUN_TOKEN=", output)
+
+
+class TestScopedEnviron(unittest.TestCase):
+    def test_sets_and_restores_the_callers_value_even_when_the_block_raises(self) -> None:
+        with mock.patch.dict(os.environ, {"PM_TEST_SCOPED": "before"}):
+            with self.assertRaises(RuntimeError):
+                with sessions.scoped_environ("PM_TEST_SCOPED", "during"):
+                    self.assertEqual(os.environ["PM_TEST_SCOPED"], "during")
+                    raise RuntimeError("boom")
+            self.assertEqual(os.environ["PM_TEST_SCOPED"], "before")
+
+    def test_none_unsets_for_the_block_and_restores_absence(self) -> None:
+        with mock.patch.dict(os.environ, {"PM_TEST_SCOPED": "before"}):
+            with sessions.scoped_environ("PM_TEST_SCOPED", None):
+                self.assertNotIn("PM_TEST_SCOPED", os.environ)
+            self.assertEqual(os.environ["PM_TEST_SCOPED"], "before")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PM_TEST_SCOPED", None)
+            with sessions.scoped_environ("PM_TEST_SCOPED", "during"):
+                self.assertEqual(os.environ["PM_TEST_SCOPED"], "during")
+            self.assertNotIn("PM_TEST_SCOPED", os.environ)
+
+
+class TestKillServerResult(unittest.TestCase):
+    def test_kills_the_given_socket_not_the_environments_and_returns_what_is_still_listed(self) -> None:
+        results = [
+            subprocess.CompletedProcess([], 1, "", "kill failed"),
+            subprocess.CompletedProcess([], 0, "pm-x-s01a0\n", ""),
+        ]
+        with (
+            mock.patch.dict(os.environ, {"PM_TMUX_SOCKET": "some-other-server"}),
+            mock.patch.object(sessions.subprocess, "run", side_effect=results) as run,
+        ):
+            self.assertEqual(sessions.kill_server("pm-child-node-abcdef"), ["pm-x-s01a0"])
+        self.assertEqual(run.call_args_list[0].args[0], ["tmux", "-L", "pm-child-node-abcdef", "kill-server"])
+
+    def test_a_missing_tmux_binary_means_no_server_remains(self) -> None:
+        with mock.patch.object(sessions.subprocess, "run", side_effect=FileNotFoundError("tmux")):
+            self.assertEqual(sessions.kill_server("pm-child-node-abcdef"), [])
+
+    def test_any_other_failure_to_run_the_kill_raises_naming_the_socket(self) -> None:
+        # Nothing was killed or probed, so `[]` would claim a server gone.
+        with mock.patch.object(sessions.subprocess, "run", side_effect=PermissionError("denied")) as run:
+            with self.assertRaises(PmError) as ctx:
+                sessions.kill_server("pm-child-node-abcdef")
+        self.assertIn("'pm-child-node-abcdef'", str(ctx.exception))
+        self.assertIn("denied", str(ctx.exception))
+        run.assert_called_once()
+
+    def test_a_server_exiting_under_the_re_probe_means_no_server_remains(self) -> None:
+        # tmux's usual reply to a probe sent right after kill-server.
+        results = [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", "server exited unexpectedly\n"),
+        ]
+        with mock.patch.object(sessions.subprocess, "run", side_effect=results):
+            self.assertEqual(sessions.kill_server("pm-child-node-abcdef"), [])
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required")
+    def test_a_never_started_socket_has_no_server_remaining(self) -> None:
+        self.assertEqual(sessions.kill_server(f"{TEST_TMUX_SOCKET}-kill-never-started"), [])
+
+
+class TestServerEnvironment(unittest.TestCase):
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required")
+    def test_a_value_set_on_a_fresh_server_reads_back_and_a_never_started_socket_reads_none(self) -> None:
+        socket = f"{TEST_TMUX_SOCKET}-env"
+        self.addCleanup(sessions.kill_server, socket)
+        with sessions.scoped_environ("PM_TMUX_SOCKET", socket):
+            sessions.start_session("pm-test-env-s01a0", Path(tempfile.gettempdir()), "bash -c 'sleep 15'", {})
+        self.assertIsNone(sessions.server_environment(socket, "PM_TEST_MARK"))
+        sessions.set_server_environment(socket, "PM_TEST_MARK", "/a b/c=d")
+        self.assertEqual(sessions.server_environment(socket, "PM_TEST_MARK"), "/a b/c=d")
+        self.assertIsNone(sessions.server_environment(f"{TEST_TMUX_SOCKET}-env-never-started", "PM_TEST_MARK"))
+
+    def test_a_removed_variable_reads_none(self) -> None:
+        removed = subprocess.CompletedProcess([], 0, "-PM_TEST_MARK\n", "")
+        with mock.patch.object(sessions.subprocess, "run", return_value=removed):
+            self.assertIsNone(sessions.server_environment("pm-child-node-abcdef", "PM_TEST_MARK"))
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required")
+class TestListSessionsOn(unittest.TestCase):
+    def test_a_socket_with_no_server_lists_nothing(self) -> None:
+        self.assertEqual(sessions.list_sessions_on(f"{TEST_TMUX_SOCKET}-list-never-started"), [])
+
+    def test_an_over_long_socket_name_raises_naming_the_socket_and_tmuxs_complaint(self) -> None:
+        # Verified on tmux 3.5a: the socket path exceeds sun_path, so tmux
+        # reports "File name too long" rather than "no server running".
+        # sun_path is 104 bytes on macOS and 108 on Linux; Linux's
+        # `/tmp/tmux-<uid>/` leaves room for about 89 characters and macOS's
+        # `/private/tmp/tmux-<uid>/` about 76, so 84 overflows only on macOS.
+        # 120 overflows both.
+        socket = "x" * 120
+        with self.assertRaises(PmError) as ctx:
+            sessions.list_sessions_on(socket)
+        self.assertIn(socket, str(ctx.exception))
+        self.assertIn("File name too long", str(ctx.exception))
+
+    def test_lists_the_sessions_of_the_named_server_not_the_environments(self) -> None:
+        socket = f"{TEST_TMUX_SOCKET}-list-live"
+        self.addCleanup(sessions.kill_server, socket)
+        with sessions.scoped_environ("PM_TMUX_SOCKET", socket):
+            sessions.start_session("pm-test-listed-s01a0", Path(tempfile.gettempdir()), "bash -c 'sleep 15'", {})
+        self.assertEqual(sessions.list_sessions_on(socket), ["pm-test-listed-s01a0"])
+        self.assertNotIn("pm-test-listed-s01a0", sessions.list_sessions_on(f"{TEST_TMUX_SOCKET}-list-other"))
+
+
+class TestListSessionsOnWithoutTmux(unittest.TestCase):
+    def test_a_missing_tmux_binary_raises(self) -> None:
+        with mock.patch.object(sessions.subprocess, "run", side_effect=FileNotFoundError("tmux")):
+            with self.assertRaises(PmError) as ctx:
+                sessions.list_sessions_on("pm-child-node-abcdef")
+        self.assertIn("pm-child-node-abcdef", str(ctx.exception))
 
 
 class TestSendPromptCredentialGuard(TmuxSessionTestCase):

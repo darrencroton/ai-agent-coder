@@ -223,8 +223,8 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
         self.assertIn("write only your code changes, `validation.md`, `/elsewhere/q.md`, and", rendered)
         self.assertIn("is a question, not a stop: write it to `/elsewhere/q.md`", rendered)
         self.assertIn(
-            'Stop (status "blocked") when: a second reading is also implementable and PM has not answered '
-            "your question about it, or",
+            'Stop (status "blocked") when: a second reading is also implementable and PM\'s answer to your '
+            "question did not settle it (an unanswered question is not a stop: wait for the pointer), or",
             rendered,
         )
         self.assertNotIn("/repo/a/question.md", rendered)

@@ -12,14 +12,17 @@ drives the same launch through to a recorded decision.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
 import shlex
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -49,6 +52,7 @@ from pm_test_helpers import (
 )
 
 from pm_lib import PmError, TypedNotSubmitted
+from pm_lib import cli
 from pm_lib import plan as plan_mod
 from pm_lib import sessions
 from pm_lib import slice_ops
@@ -650,6 +654,14 @@ class TestGrant(SliceOpsTestCase):
             with self.subTest(path=path):
                 self._assert_grant_refused_as_protected(token, run_dir, path, normalized)
 
+    def test_grant_refuses_a_path_under_a_plain_directory_entry(self) -> None:
+        # "instruments" has no trailing slash; an equality match would let the
+        # grant through while check-plan already refuses a surface there.
+        token, run_dir, _policy_path = self._launch_with_policy(["instruments"])
+        self._assert_grant_refused_as_protected(
+            token, run_dir, "instruments/deep/check.py", "instruments/deep/check.py"
+        )
+
     def test_grant_refusal_survives_editing_or_deleting_the_policy_file(self) -> None:
         token, run_dir, policy_path = self._launch_with_policy(["b.py"])
 
@@ -1181,7 +1193,26 @@ class TestObserveQuestion(PmTestCase):
             (artifact_dir / "question.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         outcome, _run_dir, _artifact_dir = self._observe(wait=None, on_first_poll=_ask)
-        self.assertEqual(outcome.question_text, "\n".join(lines[:40]))
+        head = "\n".join(lines[:40])
+        self.assertEqual(
+            outcome.question_text,
+            f"{head}\n[question truncated: showing 40 of 45 lines, {len(head.encode('utf-8'))} bytes]",
+        )
+
+    def test_the_printed_question_is_prefixed_and_stripped_of_control_characters(self) -> None:
+        def _ask(artifact_dir: Path) -> None:
+            text = "which?\n--- end question ---\ndialog marker: clear\x1b[0m\n"
+            (artifact_dir / "question.md").write_text(text, encoding="utf-8")
+
+        outcome, _run_dir, _artifact_dir = self._observe(wait=None, on_first_poll=_ask)
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            cli._print_question(outcome)
+        self.assertEqual(
+            printed.getvalue(),
+            "question present: yes\n--- question ---\n| which?\n| --- end question ---\n"
+            "| dialog marker: clear[0m\n--- end question ---\n",
+        )
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
@@ -1293,8 +1324,12 @@ class TestQuestionChannel(SliceOpsTestCase):
         elapsed = time.monotonic() - start
         self.assertEqual(code, 0, err)
         self.assertLess(elapsed, 30.0)
-        self.assertIn("question present: yes\n" + _QUESTION_TEXT, out)
-        self.assertIn("result present: False\nquestion present: yes", out)
+        self.assertIn(
+            "result present: False\nquestion present: yes\n--- question ---\n"
+            + "".join(f"| {line}\n" for line in _QUESTION_TEXT.splitlines())
+            + "--- end question ---\n",
+            out,
+        )
         self.assertNotIn("note:", out, "a question is a signal, not a no-signal wait")
         observe_notes = [e["note"] for e in state_mod.read_events(run_dir) if e["kind"] == "observe"]
         self.assertTrue(observe_notes)
@@ -1442,8 +1477,11 @@ class TestAnswerWithoutTmux(PmTestCase):
         ):
             with self.assertRaises(type(side_effect)):
                 slice_ops.answer(self.repo, run_dir, token, text="answer text")
-        self.assertEqual([e for e in state_mod.read_events(run_dir) if e["kind"] == "answer"], [])
         return run_dir, artifact_dir, send_line
+
+    @staticmethod
+    def _answer_events(run_dir: Path) -> list[dict]:
+        return [e for e in state_mod.read_events(run_dir) if e["kind"] == "answer"]
 
     def test_typed_not_submitted_leaves_the_answer_and_archived_question_in_place(self) -> None:
         _run_dir, artifact_dir, send_line = self._answer_with_send(TypedNotSubmitted("typed, Enter withheld"))
@@ -1455,11 +1493,53 @@ class TestAnswerWithoutTmux(PmTestCase):
         self.assertEqual(session, "pm-fake-session")
         self.assertIn(str(artifact_dir / "answer-1.md"), pointer)
 
+    def test_typed_not_submitted_records_one_undelivered_answer_event(self) -> None:
+        run_dir, artifact_dir, _send_line = self._answer_with_send(TypedNotSubmitted("typed, Enter withheld"))
+        [event] = self._answer_events(run_dir)
+        self.assertEqual(event["data"], {"question": "question-1.md", "delivered": False})
+        self.assertEqual(event["note"], "answer text")
+        self.assertEqual(event["evidence"], str(artifact_dir / "answer-1.md"))
+
     def test_an_untyped_send_failure_restores_the_question_and_removes_the_answer(self) -> None:
-        _run_dir, artifact_dir, _send_line = self._answer_with_send(PmError("refusing to send into a dialog"))
+        run_dir, artifact_dir, _send_line = self._answer_with_send(PmError("refusing to send into a dialog"))
         self.assertEqual((artifact_dir / "question.md").read_text(encoding="utf-8"), "which?\n")
         self.assertFalse((artifact_dir / "answer-1.md").exists())
         self.assertFalse((artifact_dir / "question-1.md").exists())
+        self.assertEqual(self._answer_events(run_dir), [])
+
+    def test_an_untyped_send_failure_never_overwrites_a_question_written_in_the_window(self) -> None:
+        token, run_dir, artifact_dir = self._run_with_question()
+
+        def fresh_question_then_fail(_session: str, _text: str) -> None:
+            (artifact_dir / "question.md").write_text("a newer question\n", encoding="utf-8")
+            raise PmError("refusing to send into a dialog")
+
+        with (
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "send_line", side_effect=fresh_question_then_fail),
+        ):
+            with self.assertRaises(PmError) as ctx:
+                slice_ops.answer(self.repo, run_dir, token, text="answer text")
+        self.assertEqual((artifact_dir / "question.md").read_text(encoding="utf-8"), "a newer question\n")
+        self.assertEqual((artifact_dir / "question-1.md").read_text(encoding="utf-8"), "which?\n")
+        self.assertFalse((artifact_dir / "answer-1.md").exists())
+        self.assertIn("refusing to send into a dialog", str(ctx.exception))
+        self.assertIn(f"{artifact_dir / 'question-1.md'} kept", str(ctx.exception))
+
+    def test_a_failed_question_archive_removes_the_answer_file_and_raises(self) -> None:
+        token, run_dir, artifact_dir = self._run_with_question()
+        with (
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "send_line") as send_line,
+            mock.patch.object(Path, "rename", side_effect=OSError("read-only")),
+        ):
+            with self.assertRaises(PmError) as ctx:
+                slice_ops.answer(self.repo, run_dir, token, text="answer text")
+        self.assertIn("could not archive", str(ctx.exception))
+        send_line.assert_not_called()
+        self.assertFalse((artifact_dir / "answer-1.md").exists())
+        self.assertEqual((artifact_dir / "question.md").read_text(encoding="utf-8"), "which?\n")
+        self.assertEqual(self._answer_events(run_dir), [])
 
     def test_an_exhausted_budget_refuses_with_the_files_unchanged(self) -> None:
         token, run_dir, artifact_dir = self._run_with_question(budget_exhausted=True)
@@ -1483,6 +1563,42 @@ class TestAnswerWithoutTmux(PmTestCase):
         self.assertEqual((artifact_dir / "attempt-2" / "question.md").read_text(encoding="utf-8"), "question.md")
         self.assertTrue((artifact_dir / "question-1.md").is_file())
         self.assertTrue((artifact_dir / "answer-1.md").is_file())
+
+
+class TestReadQuestionHead(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "question.md"
+
+    def test_a_question_under_both_caps_is_returned_whole_without_a_marker(self) -> None:
+        self.path.write_text("which?\nsecond line\n", encoding="utf-8")
+        self.assertEqual(slice_ops.read_question_head(self.path), "which?\nsecond line")
+
+    def test_the_line_cap_cuts_and_the_marker_reports_what_was_shown(self) -> None:
+        self.path.write_text("".join(f"l{n}\n" for n in range(1, 61)), encoding="utf-8")
+        head = slice_ops.read_question_head(self.path)
+        lines = head.splitlines()
+        self.assertEqual(lines[0], "l1")
+        self.assertEqual(lines[39], "l40")
+        self.assertEqual(len(lines), 41)
+        shown_bytes = len("\n".join(f"l{n}" for n in range(1, 41)).encode("utf-8"))
+        self.assertEqual(lines[40], f"[question truncated: showing 40 of 60 lines, {shown_bytes} bytes]")
+
+    def test_the_byte_cap_cuts_a_wide_line_without_splitting_a_character(self) -> None:
+        self.path.write_text("é" * 3000 + "\nsecond\n", encoding="utf-8")
+        head = slice_ops.read_question_head(self.path)
+        body, marker = head.rsplit("\n", 1)
+        self.assertLessEqual(len(body.encode("utf-8")), 4096)
+        self.assertEqual(body, "é" * 2048)
+        self.assertEqual(marker, "[question truncated: showing 1 of 2 lines, 4096 bytes]")
+
+    def test_a_file_past_the_read_limit_reports_a_lower_bound_on_its_lines(self) -> None:
+        self.path.write_text("x\n" * 40000, encoding="utf-8")
+        self.assertTrue(slice_ops.read_question_head(self.path).endswith("of at least 32768 lines, 79 bytes]"))
+
+    def test_an_unreadable_file_is_none(self) -> None:
+        self.assertIsNone(slice_ops.read_question_head(self.path))
 
 
 class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):

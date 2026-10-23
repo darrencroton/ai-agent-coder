@@ -60,7 +60,9 @@ def git_status_text(repo: Path) -> str:
     # `status --short` output is positional — a leading space on the first
     # line (" M file", an unstaged modify) is part of the status code.
     # Stripping it would shift that line's path parse by one character.
-    returncode, stdout, stderr = git_result(repo, "status", "--short", "--untracked-files=all")
+    # `--no-renames` reports a dirty rename as a delete plus an add, so both
+    # sides reach the surface check, as they do for a committed rename.
+    returncode, stdout, stderr = git_result(repo, "status", "--short", "--untracked-files=all", "--no-renames")
     if returncode != 0:
         raise PmError(stderr.strip() or stdout.strip() or "git status failed")
     return stdout
@@ -69,7 +71,8 @@ def git_status_text(repo: Path) -> str:
 def status_path(line: str) -> str:
     """Extract the path from one `git status --short` line.
 
-    A rename line ("R  a -> b") takes the target (b). Surrounding quotes
+    `git_status_text` asks for `--no-renames`, so a rename line ("R  a -> b")
+    should not occur; one handed in from elsewhere takes the target (b). Surrounding quotes
     (git quotes paths containing unusual characters) are stripped, but the
     quoted content is not C-unescaped — an unusual path simply won't
     string-match an authorized entry, which fails closed rather than open.
@@ -167,13 +170,18 @@ def normalize_authorized_entry(entry: str) -> str:
     return stripped.strip("`").rstrip(".")
 
 
+def has_glob(entry: str) -> bool:
+    """True when `entry` carries a glob marker, so `is_authorized_path` reads it as a pattern."""
+    return any(marker in entry for marker in ("*", "?", "["))
+
+
 def is_authorized_path(path: str, authorized_entries: list[str]) -> bool:
     for raw_entry in authorized_entries:
         entry = normalize_authorized_entry(raw_entry)
         if entry.endswith("/"):
             if path.startswith(entry):
                 return True
-        elif any(marker in entry for marker in ("*", "?", "[")):
+        elif has_glob(entry):
             # PurePosixPath.full_match is path-segment aware: a single "*"
             # does not cross "/", so "*.md" matches only top-level markdown,
             # not "deep/nested/anything.md". Authors who want a recursive
@@ -183,6 +191,26 @@ def is_authorized_path(path: str, authorized_entries: list[str]) -> bool:
                 return True
         elif path == entry:
             return True
+    return False
+
+
+def is_protected_path(path: str, protected: list[str]) -> bool:
+    """True when `path` falls under a protected entry.
+
+    Protection fails closed, so a plain entry naming a directory
+    ("instruments", no trailing slash) covers its whole subtree as well as the
+    path itself. `is_authorized_path` must not do the same: it decides what a
+    slice may change, and a surface that widened from `src` to `src/**` would
+    grant more than the plan froze. Slash, glob and exact entries behave as in
+    `is_authorized_path`.
+    """
+    if is_authorized_path(path, protected):
+        return True
+    for raw_entry in protected:
+        entry = normalize_authorized_entry(raw_entry)
+        if entry and not entry.endswith("/") and not has_glob(entry):
+            if path == entry or path.startswith(entry + "/"):
+                return True
     return False
 
 

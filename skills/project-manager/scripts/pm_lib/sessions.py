@@ -27,9 +27,10 @@ import shlex
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import PmError
 from . import TypedNotSubmitted
@@ -200,6 +201,25 @@ def sessions_for_run(run_id: str) -> list[str]:
     return [name for name in _session_names() if pattern.match(name)]
 
 
+@contextmanager
+def scoped_environ(name: str, value: str | None) -> Iterator[None]:
+    """Set `name` to `value` (unset it when `value` is None) for the block;
+    restore the caller's value (or its absence) on the way out, whatever the
+    block raised."""
+    previous = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
 def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -> None:
     """`tmux new-session -d -s <session> -c <repo> "unset PM_RUN_TOKEN; <env-prefix> <command>"`.
 
@@ -209,6 +229,12 @@ def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -
     session inherits the server's (ultimately the controller's) environment,
     so an exported PM_RUN_TOKEN would otherwise be visible inside every
     Developer session. The `unset` runs in the session's own shell first.
+
+    That `unset` does not reach the server's *global* environment, which tmux
+    seeds from the process that starts a new server: an exported token would
+    stay readable from inside the session via `tmux show-environment -g`. So
+    the `new-session` call itself runs with the token removed from this
+    process's environment.
     """
     if "PM_RUN_TOKEN" in env:
         raise PmError("session environment must never contain PM_RUN_TOKEN")
@@ -217,7 +243,8 @@ def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
     payload = f"{env_prefix} {command}".strip() if env_prefix else command
     shell_command = f"unset PM_RUN_TOKEN; {payload}"
-    _tmux_or_raise(["new-session", "-d", "-s", session, "-c", str(repo), shell_command], "tmux start failed")
+    with scoped_environ("PM_RUN_TOKEN", None):
+        _tmux_or_raise(["new-session", "-d", "-s", session, "-c", str(repo), shell_command], "tmux start failed")
 
 
 def _pane_capture(session: str, *, visible: bool, required: bool = False) -> str | None:
@@ -330,21 +357,107 @@ def force_stop(session: str) -> None:
         _run_tmux("kill-session", "-t", session)
 
 
-def kill_server(socket: str) -> None:
+def kill_server(socket: str) -> list[str]:
     """`tmux -L <socket> kill-server`: end the named private server and every
-    session on it.
+    session on it; returns the sessions still listed on `socket` afterwards,
+    so `[]` means no server remains.
 
     The socket is the argument, never `PM_TMUX_SOCKET`: a campaign child's
     server is named in its manifest, and the caller's own override must not
     redirect this kill to a different server — least of all to the unscoped
     default one, which `tmux_argv` falls back to when the variable is unset.
-    A non-zero exit (no server on that socket) and a missing tmux binary are
-    both ignored: either way no server is left to kill.
+    The kill's own exit status says nothing (it is non-zero both when there
+    was no server and when the kill failed), so the result is a re-probe
+    through `list_sessions_on`, with its error semantics: a probe that fails
+    other than by finding no server raises PmError. A missing tmux binary
+    returns `[]`, since no server can exist without one; any other failure to
+    run the kill (a PermissionError, say) raises PmError, because nothing was
+    killed or probed and `[]` would claim a server gone.
     """
     try:
         subprocess.run(["tmux", "-L", socket, "kill-server"], check=False, text=True, capture_output=True)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise PmError(f"could not kill the tmux server on socket {socket!r}: {exc}") from exc
+    return list_sessions_on(socket)
+
+
+def _no_server(detail: str) -> bool:
+    """tmux's ways of saying no server runs on a socket: a stale socket file
+    ("no server running"), none at all ("No such file or directory"), or a
+    server that exited while answering ("server exited unexpectedly") — the
+    usual reply to a probe sent right after `kill-server` (verified on tmux
+    3.5a), and a server with no sessions left either way."""
+    return any(
+        phrase in detail for phrase in ("no server running", "No such file or directory", "server exited unexpectedly")
+    )
+
+
+def list_sessions_on(socket: str) -> list[str]:
+    """Session names on the server named `socket`; [] when no such server runs.
+
+    The socket is the argument, never `PM_TMUX_SOCKET` (see `kill_server`).
+    Unlike `_session_names`, which reads any failure as "nothing there", this
+    separates the two cases that matter to a pre-launch occupancy check: tmux
+    reporting no server (an absent socket file, or a stale one) is an empty
+    answer (see `_no_server`), while any other failure — an over-long socket
+    path ("File name too long") or a missing tmux binary — raises, because the check could not look
+    and a pass would be a guess.
+    """
+    argv = ["tmux", "-L", socket, "list-sessions", "-F", "#{session_name}"]
+    try:
+        result = subprocess.run(argv, check=False, text=True, capture_output=True)
+    except OSError as exc:
+        raise PmError(f"could not list sessions on tmux socket {socket!r}: tmux not found ({exc})") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if _no_server(detail):
+            return []
+        raise PmError(f"could not list sessions on tmux socket {socket!r}: {detail or 'tmux failed'}")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def set_server_environment(socket: str, name: str, value: str) -> None:
+    """`tmux -L <socket> set-environment -g <name> <value>`; PmError on failure.
+
+    The socket is the argument, never `PM_TMUX_SOCKET` (see `kill_server`).
+    Any process that can reach the socket can rewrite a value set here, so
+    it records who set it up, not who may change it.
+    """
+    argv = ["tmux", "-L", socket, "set-environment", "-g", name, value]
+    try:
+        result = subprocess.run(argv, check=False, text=True, capture_output=True)
+    except OSError as exc:
+        raise PmError(f"could not set {name} on tmux socket {socket!r}: tmux not found ({exc})") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise PmError(f"could not set {name} on tmux socket {socket!r}: {detail or 'tmux failed'}")
+
+
+def server_environment(socket: str, name: str) -> str | None:
+    """The value of `name` in the global environment of the server on
+    `socket`, read with `tmux -L <socket> show-environment -g <name>`.
+
+    None when the variable is unset (tmux prints `-NAME` for a removed one
+    and fails with "unknown variable" for one never set), when no server
+    runs on `socket`, or when tmux is missing — in each case no server
+    carries the value. Any other failure raises PmError: the caller is
+    proving ownership, and an unreadable answer is not "unset".
+    """
+    argv = ["tmux", "-L", socket, "show-environment", "-g", name]
+    try:
+        result = subprocess.run(argv, check=False, text=True, capture_output=True)
     except OSError:
-        pass
+        return None
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if _no_server(detail) or detail.startswith("unknown variable"):
+            return None
+        raise PmError(f"could not read {name} on tmux socket {socket!r}: {detail or 'tmux failed'}")
+    line = result.stdout.rstrip("\n")
+    prefix = f"{name}="
+    return line[len(prefix) :] if line.startswith(prefix) else None
 
 
 # --- Readiness -------------------------------------------------------------

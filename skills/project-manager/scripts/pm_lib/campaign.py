@@ -16,8 +16,13 @@ captures and the launcher copy.
 Each command points `PM_TMUX_SOCKET` at the child's socket for its own
 `sessions` calls (which read it through `sessions.tmux_argv`) and restores
 the caller's value before returning, so an in-process caller keeps its own
-server. The one tmux call that names its socket directly is
-`sessions.kill_server`.
+server. The tmux calls that name their socket directly are
+`sessions.list_sessions_on`, `sessions.kill_server` and the server
+environment pair `sessions.set_server_environment`/`server_environment`.
+
+The manifest is child-writable, so the server it names is not trusted to be
+the child's: `launch-child` marks the server at launch and `stop-child` kills
+only a server carrying this worktree's mark (see `stop_child`).
 
 A child's `run.json` files are read here without a token, so what they say
 is unverified: `wait-child` and `stop-child` print it labelled as such, as a
@@ -27,17 +32,15 @@ cross-check on the child's own completion file, never as a fact.
 from __future__ import annotations
 
 import json
-import os
 import re
 import secrets
 import shlex
 import shutil
 import time
-import uuid
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from . import PmError
 from . import git_ops
@@ -49,14 +52,25 @@ from . import state as state_mod
 
 _WAIT_POLL_SECONDS = 2.0
 _TAIL_LINES = 40
-_QUESTION_LINES = 40
 
 _SOCKET_ENV_VAR = "PM_TMUX_SOCKET"
-_RUN_TOKEN_ENV_VAR = "PM_RUN_TOKEN"
 _MANIFEST_FIELDS = ("socket", "session", "branch", "base", "worktree", "launcher", "launched_at")
 # tmux rejects `.` and `:` in a session name, and a `-t` target containing
 # `.` parses as window.pane, so a branch is reduced to this set for names.
 _NAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+# tmux puts a `-L` socket at `/private/tmp/tmux-<uid>/<name>` on macOS, where
+# a Unix socket path is limited to 104 bytes: an 84-character name fails with
+# "File name too long". The branch component is cut so the default socket
+# (`pm-child-<b>-<6 hex>`, 48 characters at most) fits, and an explicit name
+# is capped with room to spare for a long uid or temporary directory.
+_NAME_COMPONENT_MAX = 32
+_SOCKET_NAME_MAX = 64
+# What a child's server may host: its own `campaign-*` session and the
+# `pm-*` Developer sessions the child launches. Anything else is a bystander.
+_OWNED_SESSION_RE = re.compile(r"^(campaign|pm)-")
+# The server-environment mark `launch-child` sets on a child's server: the
+# worktree it was launched for. `stop-child` kills no server without it.
+_OWNER_ENV_VAR = "PM_CHILD_WORKTREE"
 
 
 # --- Paths and names -----------------------------------------------------------
@@ -82,18 +96,23 @@ def child_names(branch: str, suffix: str, socket: str | None = None) -> tuple[st
     The session is `campaign-<b>-<suffix>`, deliberately outside `pm-*`, the
     shape the unscoped `stop --scavenge` sweep kills. The socket is `socket`
     when given, else `pm-child-<b>-<suffix>`: one server per child, so two
-    nodes or two repositories never share one.
+    nodes or two repositories never share one. `<b>` is `name_component`
+    cut to 32 characters (see `_NAME_COMPONENT_MAX`); the random suffix
+    still tells apart two branches that share a long prefix.
     """
-    component = name_component(branch)
+    component = name_component(branch)[:_NAME_COMPONENT_MAX]
     return f"campaign-{component}-{suffix}", socket or f"pm-child-{component}-{suffix}"
 
 
 def check_socket_name(socket: str, *, what: str) -> None:
-    """Refuse a socket name that is blank, contains whitespace, or contains `/`.
+    """Refuse a socket name that is blank, contains whitespace or `/`, is
+    `default`, or is longer than 64 characters.
 
-    A blank name would leave `PM_TMUX_SOCKET` effectively unset, putting the
-    child on the caller's default server — which `stop-child`'s
-    `kill-server` would then destroy.
+    A blank name would leave `PM_TMUX_SOCKET` effectively unset, and
+    `default` names the unscoped default server outright: either puts the
+    child on the operator's own server, which `stop-child`'s `kill-server`
+    would then destroy. A longer name risks the socket path limit (see
+    `_SOCKET_NAME_MAX`).
     """
     if not socket.strip():
         raise PmError(f"{what} must be non-blank")
@@ -101,30 +120,18 @@ def check_socket_name(socket: str, *, what: str) -> None:
         raise PmError(f"{what} must not contain whitespace: {socket!r}")
     if "/" in socket:
         raise PmError(f"{what} must not contain '/': {socket!r}")
-
-
-@contextmanager
-def _scoped_environ(name: str, value: str | None) -> Iterator[None]:
-    """Set `name` to `value` (unset it when `value` is None) for the block;
-    restore the caller's value (or its absence) on the way out, whatever the
-    block raised."""
-    previous = os.environ.get(name)
-    if value is None:
-        os.environ.pop(name, None)
-    else:
-        os.environ[name] = value
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = previous
+    if socket == "default":
+        raise PmError(f"{what} must not be 'default', the unscoped tmux server the operator's own sessions use")
+    if len(socket) > _SOCKET_NAME_MAX:
+        raise PmError(
+            f"{what} must be at most {_SOCKET_NAME_MAX} characters (a tmux socket path is length-limited), "
+            f"got {len(socket)}: {socket!r}"
+        )
 
 
 def _tmux_socket(socket: str) -> AbstractContextManager[None]:
-    """Point `PM_TMUX_SOCKET` at `socket` for the block (see `_scoped_environ`)."""
-    return _scoped_environ(_SOCKET_ENV_VAR, socket)
+    """Point `PM_TMUX_SOCKET` at `socket` for the block (see `sessions.scoped_environ`)."""
+    return sessions.scoped_environ(_SOCKET_ENV_VAR, socket)
 
 
 def load_manifest(worktree: Path) -> dict[str, Any]:
@@ -195,6 +202,15 @@ def read_child_runs(worktree: Path) -> list[ChildRun]:
     return runs
 
 
+def _runs_or_error(worktree: Path) -> tuple[list[ChildRun], str | None]:
+    """`read_child_runs`, or no runs and why: a report on a child never fails
+    because the child's state root cannot be read."""
+    try:
+        return read_child_runs(worktree), None
+    except (PmError, OSError) as exc:
+        return [], str(exc)
+
+
 # --- launch-child ---------------------------------------------------------------
 
 
@@ -206,6 +222,22 @@ class LaunchChildOutcome:
     launcher: Path
     branch: str
     base: str
+
+
+@dataclass
+class _ChildLaunch:
+    """What `launch_child`'s preconditions resolved, for the steps that create things."""
+
+    repo: Path
+    branch: str
+    base_commit: str
+    worktree: Path
+    prompt_bytes: bytes
+    command: str
+    executable: str
+    expected_model_display: str | None
+    session: str
+    socket: str
 
 
 def _left_behind(branch: str, worktree: Path) -> str:
@@ -232,25 +264,71 @@ def launch_child(
 
     Every precondition is checked before anything is created, the last
     being that no tmux server on the chosen socket hosts a session. Then
-    `git worktree add -b <branch> <worktree> <base commit>`, the self-ignoring
-    `.pm/.gitignore`, `.pm/campaign/` and a byte copy of the prompt file as
-    `launcher.md`; then the session starts as `start_slice` starts a
-    Developer's, the manifest is written as soon as it exists, readiness is
+    `git worktree add -b <branch> <worktree> <base commit>`, `/HANDOFF.md` in
+    the git exclude file the worktree reads (verified with `git
+    check-ignore`), the self-ignoring `.pm/.gitignore`, `.pm/campaign/` and
+    a byte copy of the prompt file as `launcher.md`; then the session starts
+    as `start_slice` starts a Developer's, its server is marked as this
+    child's (`PM_CHILD_WORKTREE`), the manifest is written, readiness is
     awaited, and the one-line child launch pointer is injected.
 
     There is no rollback: a failure after the worktree exists names the
     branch and worktree left behind for the CM to remove by hand, and a
-    failure after the session started also kills the child's private server
-    (which may already host Developers the child launched) and keeps the
-    manifest, so `stop-child` can be re-run against it.
+    failure after the session started also captures the pane to `pane.txt`
+    when it can, kills the child's private server (which may already host
+    Developers the child launched), reports whether that kill was confirmed,
+    and keeps any manifest written, so `stop-child` can be re-run against it.
     """
-    # --- Preconditions: nothing is created until every one has passed.
+    launch = _check_launch_preconditions(
+        repo=repo,
+        base=base,
+        branch=branch,
+        worktree=worktree,
+        prompt_file=prompt_file,
+        harness=harness,
+        model=model,
+        effort=effort,
+        socket=socket,
+        harness_command=harness_command,
+    )
+    launcher = _create_node_worktree(launch)
+    _start_child_session(launch, launcher)
+    return LaunchChildOutcome(
+        session=launch.session,
+        socket=launch.socket,
+        worktree=launch.worktree,
+        launcher=launcher,
+        branch=launch.branch,
+        base=launch.base_commit,
+    )
+
+
+def _check_launch_preconditions(
+    *,
+    repo: Path,
+    base: str,
+    branch: str,
+    worktree: Path,
+    prompt_file: Path,
+    harness: str,
+    model: str | None,
+    effort: str | None,
+    socket: str | None,
+    harness_command: str | None,
+) -> _ChildLaunch:
+    """Every refusal `launch_child` makes before anything is created: the
+    inputs first, then the environment (tmux, the harness executable, the
+    socket's server)."""
     repo = git_ops.resolve_repo(repo)
     returncode, stdout, stderr = git_ops.git_result(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
     if returncode != 0 or not stdout.strip():
         detail = stderr.strip()
         raise PmError(f"--base {base!r} does not resolve to a commit in {repo}" + (f": {detail}" if detail else ""))
     base_commit = stdout.strip()
+    # A tracked HANDOFF.md cannot be hidden by an exclude line, so the child
+    # PM's own handoff would be a modification in its node diff.
+    if git_ops.git_result(repo, "cat-file", "-e", f"{base_commit}:HANDOFF.md")[0] == 0:
+        raise PmError("the base commit tracks HANDOFF.md; a child PM's handoff must be an untracked file")
     returncode, _stdout, _stderr = git_ops.git_result(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
     if returncode == 0:
         raise PmError(f"branch {branch!r} already exists in {repo}; a child launches on a new branch")
@@ -260,8 +338,6 @@ def launch_child(
     if expanded.exists() or expanded.is_symlink():
         raise PmError(f"worktree path already exists: {expanded}")
     worktree = expanded.resolve()
-    if worktree.exists():
-        raise PmError(f"worktree path already exists: {worktree}")
     try:
         prompt_bytes = prompt_file.read_bytes()
         prompt_text = prompt_bytes.decode("utf-8")
@@ -277,16 +353,11 @@ def launch_child(
     if socket is not None:
         check_socket_name(socket, what="--socket")
 
-    expected_model_display: str | None = None
-    if harness_command is not None:
-        command = harness_command
-    else:
-        session_id = str(uuid.uuid4()) if harness == "claude" else None
-        if harness == "opencode" and model:
-            identity = profiles.query_model_identity(harness, model)
-            if identity:
-                expected_model_display = identity["display_name"]
-        command = profiles.compose_command(harness, model=model, effort=effort, session_id=session_id)
+    if shutil.which("tmux") is None:
+        raise PmError("tmux is required to launch a child; install it")
+    command, expected_model_display = profiles.launch_command(
+        harness, override=harness_command, model=model, effort=effort
+    )
     try:
         argv = shlex.split(command)
     except ValueError as exc:
@@ -300,23 +371,39 @@ def launch_child(
     session, socket = child_names(branch, secrets.token_hex(3), socket)
     # The server must be private to this child: stop-child and the launch
     # failure guard kill it whole, so joining a live one — the caller's own,
-    # another child's, `default` — would destroy sessions this child does
-    # not own.
-    with _tmux_socket(socket):
-        existing = sessions.sessions_with_prefix("")
+    # another child's — would destroy sessions this child does not own. A
+    # server that cannot be listed (an over-long socket path, say) raises
+    # here: a pass would be a guess.
+    existing = sessions.list_sessions_on(socket)
     if existing:
         raise PmError(
             f"tmux server {socket} already hosts {len(existing)} session(s); a child needs a private server "
             "(omit --socket, or name one with no server)"
         )
+    return _ChildLaunch(
+        repo=repo,
+        branch=branch,
+        base_commit=base_commit,
+        worktree=worktree,
+        prompt_bytes=prompt_bytes,
+        command=command,
+        executable=executable,
+        expected_model_display=expected_model_display,
+        session=session,
+        socket=socket,
+    )
 
-    # --- The worktree. From here every failure names what is left behind.
+
+def _create_node_worktree(launch: _ChildLaunch) -> Path:
+    """The node worktree and its campaign files; returns the launcher path.
+    From here every failure names what is left behind."""
+    branch, worktree = launch.branch, launch.worktree
     try:
-        git_ops.git(repo, "worktree", "add", "-b", branch, str(worktree), base_commit)
+        git_ops.git(launch.repo, "worktree", "add", "-b", branch, str(worktree), launch.base_commit)
     except PmError as exc:
         # git normally leaves nothing behind on failure; say so when it did.
         leftovers = []
-        if git_ops.git_result(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")[0] == 0:
+        if git_ops.git_result(launch.repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")[0] == 0:
             leftovers.append(f"branch {branch} exists (git branch -D {branch})")
         if worktree.exists():
             leftovers.append(f"path {worktree} exists (git worktree remove {worktree}, or remove it by hand)")
@@ -325,12 +412,55 @@ def launch_child(
     directory = campaign_dir(worktree)
     launcher = directory / "launcher.md"
     try:
+        _exclude_handoff(worktree)
         slice_ops.write_pm_gitignore(worktree)
         directory.mkdir(parents=True, exist_ok=True)
-        launcher.write_bytes(prompt_bytes)
-    except OSError as exc:
+        launcher.write_bytes(launch.prompt_bytes)
+    except (OSError, PmError) as exc:
         raise PmError(f"child setup failed ({exc}); {_left_behind(branch, worktree)}") from exc
+    return launcher
 
+
+def _exclude_handoff(worktree: Path) -> None:
+    """Add `/HANDOFF.md` to the git exclude file `worktree` reads, unless a
+    `HANDOFF.md` or `/HANDOFF.md` line is already there, then verify with
+    `git check-ignore` that the worktree's root HANDOFF.md is ignored.
+
+    The child PM keeps a HANDOFF.md in its worktree root; untracked and not
+    ignored, it is a `??` status line, which fails floor fact 7 at every
+    `finalize`. In a linked worktree `.git` is a file, so the path comes from
+    git: there it is the main repository's `info/exclude`, shared by every
+    worktree and kept after the campaign. Hence the anchored line: an
+    unanchored one would hide a `HANDOFF.md` at any depth from the floor, in
+    every worktree, for good. A `.gitignore` negation (`!HANDOFF.md`)
+    outranks the exclude file, so the line alone proves nothing; the check
+    does.
+    """
+    path = Path(git_ops.git(worktree, "rev-parse", "--git-path", "info/exclude"))
+    if not path.is_absolute():
+        path = worktree / path
+    try:
+        existing = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        existing = ""
+    lines = existing.splitlines()
+    if "HANDOFF.md" not in lines and "/HANDOFF.md" not in lines:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        separator = "\n" if existing and not existing.endswith("\n") else ""
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{separator}/HANDOFF.md\n")
+    if git_ops.git_result(worktree, "check-ignore", "-q", "HANDOFF.md")[0] != 0:
+        raise PmError(
+            f"HANDOFF.md is not ignored in {worktree} even after the exclude line (an ignore rule overrides it); "
+            "a child PM's handoff would fail floor fact 7"
+        )
+
+
+def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
+    """Start the child's session, mark its server as this child's, write the
+    manifest, await readiness and inject the launch pointer."""
+    branch, worktree, session, socket = launch.branch, launch.worktree, launch.session, launch.socket
+    directory = campaign_dir(worktree)
     env = {
         "PM_TMUX_SOCKET": socket,
         "PM_CM_QUESTION_PATH": str(directory / "cm-question.md"),
@@ -340,46 +470,46 @@ def launch_child(
         "socket": socket,
         "session": session,
         "branch": branch,
-        "base": base_commit,
+        "base": launch.base_commit,
         "worktree": str(worktree),
         "launcher": str(launcher),
     }
     with _tmux_socket(socket):
         try:
-            # The child's private server is born here, and tmux copies the
-            # starting process's environment into that server's global
-            # environment, so a caller-exported token would be readable inside
-            # the child (`show-environment -g`) even though `start_session`
-            # unsets it in the session shell. Keep it out of the server.
-            with _scoped_environ(_RUN_TOKEN_ENV_VAR, None):
-                sessions.start_session(session, worktree, command, env)
+            sessions.start_session(session, worktree, launch.command, env)
         except PmError as exc:
             raise PmError(f"child session did not start ({exc}); {_left_behind(branch, worktree)}") from exc
-        # The session is live from here. The manifest is written first, so a
-        # manifest exists whenever a session does; any failure after this
-        # kills the whole private server, keeping the manifest for stop-child.
+        # The session is live from here. The server is marked as this child's
+        # before anything else (stop-child kills only a server carrying the
+        # mark), then the manifest is written; any failure after this kills
+        # the whole private server, keeping any manifest for stop-child.
         try:
+            sessions.set_server_environment(socket, _OWNER_ENV_VAR, str(worktree))
             manifest["launched_at"] = state_mod.utc_now_iso()
             manifest_path(worktree).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-            sessions.wait_until_ready(session, executable, expected_model_display=expected_model_display)
+            sessions.wait_until_ready(session, launch.executable, expected_model_display=launch.expected_model_display)
             sessions.send_prompt(session, prompts.render_child_launch_pointer(launcher))
         except BaseException as exc:
             # Best-effort cleanup that must never replace the failure it is
-            # cleaning up after.
+            # cleaning up after. The pane is captured first: it holds the
+            # dialog or error that made the launch fail.
+            pane_path = directory / "pane.txt"
             try:
-                sessions.kill_server(socket)
+                sessions.capture_to(session, pane_path)
+                pane_note = f"its pane was captured to {pane_path}"
+            except BaseException as capture_exc:
+                pane_note = f"its pane could not be captured to {pane_path} ({capture_exc})"
+            try:
+                remaining: list[str] | None = sessions.kill_server(socket)
             except BaseException:
-                pass
+                remaining = None
             if not isinstance(exc, Exception):
                 raise
+            killed = "was killed" if remaining == [] else "could not be confirmed killed"
             raise PmError(
-                f"child launch failed after its session started ({exc}); the tmux server {socket} was killed; "
-                f"{_left_behind(branch, worktree)}"
+                f"child launch failed after its session started ({exc}); {pane_note}; the tmux server {socket} "
+                f"{killed}; {_left_behind(branch, worktree)}"
             ) from exc
-
-    return LaunchChildOutcome(
-        session=session, socket=socket, worktree=worktree, launcher=launcher, branch=branch, base=base_commit
-    )
 
 
 # --- wait-child -----------------------------------------------------------------
@@ -412,14 +542,6 @@ def _result_status(path: Path) -> str | None:
         return None
     status = data.get("status") if isinstance(data, dict) else None
     return status if isinstance(status, str) else None
-
-
-def _question_text(path: Path) -> str | None:
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-    return "\n".join(lines[:_QUESTION_LINES])
 
 
 def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome:
@@ -472,18 +594,14 @@ def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome
     result_present = result_path.is_file()
     question_present = question_path.is_file()
     no_signal = bool(wait) and running and not result_present and not question_present and not dialog_markers["present"]
-    runs_error: str | None = None
-    try:
-        runs = read_child_runs(worktree)
-    except (PmError, OSError) as exc:
-        runs, runs_error = [], str(exc)
+    runs, runs_error = _runs_or_error(worktree)
     return WaitChildOutcome(
         session=session,
         running=running,
         result_present=result_present,
         result_status=_result_status(result_path) if result_present else None,
         question_present=question_present,
-        question_text=_question_text(question_path) if question_present else None,
+        question_text=slice_ops.read_question_head(question_path) if question_present else None,
         dialog_markers=dialog_markers,
         tail="\n".join(capture.splitlines()[-_TAIL_LINES:]),
         elapsed_seconds=elapsed_seconds,
@@ -547,13 +665,36 @@ class StopChildOutcome:
     # Set when the pane capture itself could not be written.
     pane_error: str | None
     reviewer_pgids: list[int]
+    # True when the re-probe after the kill found no server on the socket;
+    # otherwise `remaining` holds the sessions still listed there.
+    server_gone: bool
+    remaining: list[str]
     runs_error: str | None = None
+    # Set when the post-kill probe failed: the kill is then unconfirmed, and
+    # `server_gone` is False with `remaining` empty.
+    kill_error: str | None = None
 
 
 def stop_child(worktree: Path) -> StopChildOutcome:
     """Capture the child's full pane, report its recorded reviewers, and kill
     its private tmux server. Safe to re-run: with the session already gone,
     an existing `pane.txt` is kept rather than overwritten.
+
+    The manifest sits in the child's own worktree, so the server it names is
+    checked rather than trusted, before anything is captured or killed.
+    Ownership is proved by the launch-time server mark: a live server whose
+    `PM_CHILD_WORKTREE` is not this worktree (or is unset) is refused, which
+    covers a reused socket now hosting a different child's server. The mark
+    is `launch-child`'s `PM_CHILD_WORKTREE=<worktree>` in the server's global
+    environment (mechanical), so it belongs to the server, not to the child's
+    session: it outlives that session, and a dead child's orphaned `pm-*`
+    Developers can still be cleaned up. It guards against stale manifests and
+    reused sockets, not against a hostile child: every session on the server
+    can read and rewrite it (it is a worktree path, not a secret). A server with no sessions and no
+    mark is already gone, and the kill below is a no-op. After that, a
+    server hosting any session not named `campaign-*` or `pm-*` — an
+    operator's own, say — is refused too, and so is one that cannot be
+    listed or whose mark cannot be read.
 
     Reviewers the child commissioned run in their own process groups,
     outside its tmux server, so `kill-server` does not reach them; their
@@ -564,6 +705,19 @@ def stop_child(worktree: Path) -> StopChildOutcome:
     manifest = load_manifest(worktree)
     session = manifest["session"]
     socket = manifest["socket"]
+    listed = sessions.list_sessions_on(socket)
+    owner = sessions.server_environment(socket, _OWNER_ENV_VAR)
+    if (listed or owner is not None) and owner != str(worktree):
+        raise PmError(
+            f"tmux server {socket} was not launched for {worktree} (it carries "
+            f"{_OWNER_ENV_VAR}={owner if owner is not None else 'nothing'}); refusing to kill the server"
+        )
+    bystanders = [name for name in listed if not _OWNED_SESSION_RE.match(name)]
+    if bystanders:
+        raise PmError(
+            f"tmux server {socket} hosts sessions this child does not own: {', '.join(bystanders)}; "
+            "refusing to kill the server"
+        )
     pane_path = campaign_dir(worktree) / "pane.txt"
     pane_error: str | None = None
     with _tmux_socket(socket):
@@ -576,13 +730,16 @@ def stop_child(worktree: Path) -> StopChildOutcome:
                 sessions.capture_to(session, pane_path)
             except OSError as exc:
                 pane_error = str(exc)
-        runs_error: str | None = None
-        try:
-            runs = read_child_runs(worktree)
-        except (PmError, OSError) as exc:
-            runs, runs_error = [], str(exc)
-        pgids = sorted({pgid for run in runs for pgid in run.reviewer_pgids})
-        sessions.kill_server(socket)
+    runs, runs_error = _runs_or_error(worktree)
+    pgids = sorted({pgid for run in runs for pgid in run.reviewer_pgids})
+    kill_error: str | None = None
+    try:
+        remaining = sessions.kill_server(socket)
+    except PmError as exc:
+        # The reviewer groups above are already read; do not lose them.
+        kill_error = str(exc)
+        remaining = []
+    server_gone = kill_error is None and not remaining
     return StopChildOutcome(
         session=session,
         socket=socket,
@@ -591,5 +748,8 @@ def stop_child(worktree: Path) -> StopChildOutcome:
         pane_kept=pane_kept,
         pane_error=pane_error,
         reviewer_pgids=pgids,
+        server_gone=server_gone,
+        remaining=remaining,
         runs_error=runs_error,
+        kill_error=kill_error,
     )

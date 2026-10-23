@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -36,6 +37,11 @@ _TOKEN_ENV_VAR = "PM_RUN_TOKEN"
 # larger explicit --timeout.
 _REVIEW_DEFAULT_TIMEOUT_SECONDS = 3600.0
 
+# C0 control characters other than tab and newline: a question line keeps its
+# indentation, while an escape sequence or carriage return could repaint the
+# reader's terminal over the report's own lines.
+_QUESTION_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f]")
+
 
 def _positive_seconds(value: str) -> float:
     """argparse `type=` for `--wait`/`--timeout`: a finite, strictly
@@ -55,8 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     check_plan.add_argument("--plan", required=True)
     check_plan.add_argument(
         "--repo",
-        help="the repository root (not a subdirectory): directory-shaped entries are linted against it, "
-        "and a --policy file inside it protects itself by its path relative to it",
+        help="the repository, resolved to its toplevel as init does: directory-shaped entries are linted "
+        "against it, and a --policy file inside it protects itself by its path relative to it",
     )
     check_plan.add_argument(
         "--policy",
@@ -268,9 +274,9 @@ def build_parser() -> argparse.ArgumentParser:
     launch_child.add_argument(
         "--socket",
         metavar="NAME",
-        help="the child's private tmux server; non-blank, no whitespace, no '/', and hosting no session "
-        "(default pm-child-<b>-<6 hex>, "
-        "<b> the branch with every character outside [A-Za-z0-9_-] replaced by '-')",
+        help="the child's private tmux server; non-blank, no whitespace, no '/', not 'default', at most 64 "
+        "characters, and hosting no session (default pm-child-<b>-<6 hex>, <b> the branch with every "
+        "character outside [A-Za-z0-9_-] replaced by '-' and cut to 32 characters)",
     )
     launch_child.add_argument("--harness-command")
 
@@ -338,20 +344,36 @@ def _repo_from_cwd() -> Path:
     return slice_ops.repo_from_cwd(Path.cwd())
 
 
+def _load_policy(args: argparse.Namespace, repo: Path | None) -> tuple[dict | None, list[str] | None]:
+    """(policy, protected entries) from `--policy`, or (None, None) without it.
+    `repo` is what self-protection is resolved against; None skips it."""
+    if not args.policy:
+        return None, None
+    policy = plan_mod.load_policy(Path(args.policy).expanduser(), repo=repo)
+    return policy, policy["protected_paths"]
+
+
+def _print_protected_line(policy: dict | None, report: dict) -> None:
+    if policy is not None:
+        print(f"protected paths: {report['protected_count']} (from {policy['path']})")
+
+
 def _run_check_plan(args: argparse.Namespace) -> int:
     plan_path = Path(args.plan)
-    repo_path = Path(args.repo) if args.repo else None
-    policy = plan_mod.load_policy(Path(args.policy), repo=repo_path) if args.policy else None
-    protected = policy["protected_paths"] if policy is not None else None
+    # Resolved to the toplevel as init does, so a subdirectory finds the same
+    # repository and a policy file inside it protects itself the same way.
+    repo_path = git_ops.resolve_repo(Path(args.repo)) if args.repo else None
+    policy, protected = _load_policy(args, repo_path)
     report = plan_mod.plan_check_report(plan_path, repo=repo_path, protected=protected)
     for error in report["errors"]:
         print(f"ERROR: {error}")
     for warning in report["warnings"]:
         print(f"WARNING: {warning}")
+    if policy is not None and repo_path is None:
+        print("WARNING: --policy without --repo: the policy file is not checked for self-protection")
     gated = ", ".join(report["approval_gated"]) if report["approval_gated"] else "none"
     print(f"{report['slice_count']} slice(s); approval-gated: {gated}")
-    if policy is not None:
-        print(f"protected paths: {report['protected_count']} (from {policy['path']})")
+    _print_protected_line(policy, report)
     return 0 if not report["errors"] else 2
 
 
@@ -366,8 +388,7 @@ def _run_init(args: argparse.Namespace) -> int:
 
     # Loaded exactly once: init freezes these entries into run state, and
     # nothing reads the policy file again for the rest of the run.
-    policy = plan_mod.load_policy(Path(args.policy), repo=repo) if args.policy else None
-    protected = policy["protected_paths"] if policy is not None else None
+    policy, protected = _load_policy(args, repo)
     report = plan_mod.plan_check_report(plan_path, repo=repo, protected=protected)
     for error in report["errors"]:
         print(f"ERROR: {error}")
@@ -403,8 +424,7 @@ def _run_init(args: argparse.Namespace) -> int:
         print(
             f"  {entry['id']:<10} {plan_slice.title:<40} risk={entry['risk']:<9} status={entry['status'] or 'pending'}"
         )
-    if policy is not None:
-        print(f"protected paths: {report['protected_count']} (from {policy['path']})")
+    _print_protected_line(policy, report)
     print(f"PM_RUN_TOKEN={result.token}")
     print(
         "Keep this token out of Developer sessions — it authorizes PM state writes; "
@@ -605,6 +625,49 @@ def _run_start_slice(args: argparse.Namespace) -> int:
 # --- observe ------------------------------------------------------------------
 
 
+def _print_question(outcome) -> None:
+    """The open-question lines `observe` and `wait-child` share.
+
+    The text is written by the session being watched, so every line of it is
+    printed as `| <line>` between the fences, with C0 control characters
+    other than tab removed. The prefix lets the reader tell the Developer's
+    text from the report's own lines (a `--- end question ---` inside it is
+    still prefixed), and the stripped controls keep terminal escapes out of
+    the supervisor's context. This is presentation, not a trust boundary:
+    the text is still the watched session's words.
+    """
+    if not outcome.question_present:
+        print("question present: no")
+        return
+    print("question present: yes")
+    print("--- question ---")
+    if outcome.question_text is None:
+        print("(question file could not be read)")
+    else:
+        for line in _QUESTION_CONTROL_RE.sub("", outcome.question_text).splitlines():
+            print(f"| {line}")
+    print("--- end question ---")
+
+
+def _print_dialog_marker(outcome) -> None:
+    if outcome.dialog_markers["present"]:
+        # Named as a signal, not a verdict: no fact reads this, the supervisor
+        # decides what a marker means. Carries the matched literal for the
+        # same reason the send refusals do — a kind alone cannot be judged.
+        print(f"dialog marker: {sessions.dialog_marker_detail(outcome.dialog_markers)}")
+    else:
+        print("dialog marker: clear")
+
+
+def _print_no_signal_note(outcome, actions: str) -> None:
+    # Printed, never enforced — wait length is the supervisor's judgement call.
+    if outcome.no_signal:
+        print(
+            "note: this wait returned no signal. Re-asking at the same length cannot "
+            f"return anything a longer wait would not have. Either wait longer, or act: {actions}."
+        )
+
+
 def _run_observe(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
@@ -621,26 +684,9 @@ def _run_observe(args: argparse.Namespace) -> int:
     print(f"pane changed: {outcome.pane_changed}")
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
     print(f"result present: {outcome.result_present}{status_note}")
-    if outcome.question_present:
-        print("question present: yes")
-        print(outcome.question_text if outcome.question_text is not None else "(question file could not be read)")
-    else:
-        print("question present: no")
-    if outcome.dialog_markers["present"]:
-        # Named as a signal, not a verdict: no fact reads this, PM decides what
-        # a marker means. Carries the matched literal for the same reason the
-        # send refusals do — a kind alone cannot be judged.
-        print(f"dialog marker: {sessions.dialog_marker_detail(outcome.dialog_markers)}")
-    else:
-        print("dialog marker: clear")
-
-    # Printed, never enforced — length is the PM's judgement call.
-    if outcome.no_signal:
-        print(
-            "note: this wait returned no signal. Re-asking at the same length cannot "
-            "return anything a longer wait would not have. Either wait longer, or act: "
-            "send a nudge, finalize --steer, relaunch with start-slice, or stop."
-        )
+    _print_question(outcome)
+    _print_dialog_marker(outcome)
+    _print_no_signal_note(outcome, "send a nudge, finalize --steer, relaunch with start-slice, or stop")
 
     print("--- pane tail ---")
     print(outcome.tail)
@@ -934,22 +980,9 @@ def _run_wait_child(args: argparse.Namespace) -> int:
     print(f"session running: {outcome.running}")
     status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
     print(f"result present: {outcome.result_present}{status_note}")
-    if outcome.question_present:
-        print("question present: yes")
-        print(outcome.question_text if outcome.question_text is not None else "(question file could not be read)")
-    else:
-        print("question present: no")
-    if outcome.dialog_markers["present"]:
-        print(f"dialog marker: {sessions.dialog_marker_detail(outcome.dialog_markers)}")
-    else:
-        print("dialog marker: clear")
-    # Printed, never enforced — length is the CM's judgement call.
-    if outcome.no_signal:
-        print(
-            "note: this wait returned no signal. Re-asking at the same length cannot "
-            "return anything a longer wait would not have. Either wait longer, or act: "
-            "attach to the child's tmux server and read it, or stop-child."
-        )
+    _print_question(outcome)
+    _print_dialog_marker(outcome)
+    _print_no_signal_note(outcome, "attach to the child's tmux server and read it, or stop-child")
     if outcome.runs_error is not None:
         print(f"child runs: state root unavailable ({outcome.runs_error})")
     for run in outcome.runs:
@@ -985,9 +1018,16 @@ def _run_stop_child(args: argparse.Namespace) -> int:
     else:
         print(f"pane: {outcome.pane_path}")
     state = "was running" if outcome.was_running else "was not running"
-    print(f"stopped child: session={outcome.session} ({state}); killed tmux server {outcome.socket}")
+    if outcome.server_gone:
+        server = f"killed tmux server {outcome.socket}"
+    elif outcome.kill_error is not None:
+        server = f"tmux server {outcome.socket} could not be confirmed killed ({outcome.kill_error})"
+    else:
+        server = f"tmux server {outcome.socket} still has sessions: {', '.join(outcome.remaining)}"
+    print(f"stopped child: session={outcome.session} ({state}); {server}")
     print(f"reason: {args.reason}")
-    return 0
+    # Sessions still listed after the kill: the child is not stopped.
+    return 0 if outcome.server_gone else 2
 
 
 # --- notes ----------------------------------------------------------------

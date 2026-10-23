@@ -12,7 +12,7 @@ An earlier iteration of this system pursued a stronger claim — that *every* ac
 
 ## What This Repository Is
 
-An **autonomy system first**, with graduated use: from a single standalone code review, through user-supervised slice-by-slice implementation, up to autonomous execution of a complete implementation plan under a supervising Project Manager. The parts — the individual skills — are deliberately reusable on their own. The system is designed around one question: *how much useful, verified engineering outcome can a supervised autonomous run produce per unit of human attention and system complexity — while the highest-harm failures remain mechanically impossible and every acceptance remains accountable?*
+An **autonomy system first**, with graduated use: from a single standalone code review, through user-supervised slice-by-slice implementation, up to autonomous execution of a complete implementation plan under a supervising Project Manager — or, in campaign mode, of many small plans under a Campaign Manager inside an owner-approved brief. The parts — the individual skills — are deliberately reusable on their own. The system is designed around one question: *how much useful, verified engineering outcome can a supervised autonomous run produce per unit of human attention and system complexity — while the highest-harm failures remain mechanically impossible and every acceptance remains accountable?*
 
 Three commitments define the answer:
 
@@ -29,6 +29,8 @@ Three commitments define the answer:
 **Rung 1 — Assisted implementation (Mode A).** One agent session runs plan → implement → audit → review → commit against frozen slices, with the user supervising slice by slice, or — for straightforward plans with strong models — autonomously in one session with standing commit authorization. Gates here are in-session discipline, not external verification.
 
 **Rung 2 — Supervised autonomy (Mode B).** The Project Manager supervises from outside the implementing session: it keeps durable run state, launches a fresh implementing session per slice with a bounded account of accepted prior work, enforces the mechanical floor itself, assesses each completed slice from evidence at a depth proportional to its risk, commissions independent review when risk warrants it, steers fixable gaps back into the session under a bounded budget, and stops for a human on anything the plan or the floor reserves for one.
+
+**Rung 3 — Campaign autonomy (campaign mode).** A Campaign Manager, itself a PM seat, plans and runs many Mode B child runs against an owner-approved brief: it writes small node plans, each supervised by an ordinary child PM under the unchanged floor, and judges and merges what they deliver. The human approves the brief, the reserved decisions and the final acceptance; routine nodes ask the human nothing.
 
 Choosing a rung is a function of stakes, plan length, model strength, and available attention — not of user sophistication.
 
@@ -90,7 +92,7 @@ Controls scale with risk; the floor does not.
 
 ## Non-Goals
 
-- **Not a planner-free autopilot.** Nothing here invents or repairs plans mid-implementation: a plan is written before implementation and approved by a human — or, in campaign mode, written by a Campaign Manager inside a brief the human approved, with every target and tolerance the owner's. Plan quality is the ceiling on everything above it, and keeping planning human-approved is a feature.
+- **Not a planner-free autopilot.** Nothing here invents or repairs plans mid-implementation: a plan is written before implementation and approved by a human — or, in campaign mode, written by a Campaign Manager inside a brief the human approved, with every target and tolerance the owner's. Plan quality is the ceiling on everything above it, and keeping planning human-approved — at the plan, or in campaign mode at the brief — is a feature.
 - **Not a sandbox or container system.** Isolation, when needed, is the environment's job. Containment here is contractual and evidential, not OS-level.
 - **Not adversary-proof.** The floor covers the highest-harm failure shapes; the residual gap is documented, not papered over.
 - **Not tied to any vendor, harness, or model.** Harnesses are pluggable; every supported tool is eligible for any seat; factual enforcement differences are documented without becoming rankings.

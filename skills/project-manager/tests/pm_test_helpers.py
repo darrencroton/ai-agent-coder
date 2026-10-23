@@ -5,9 +5,20 @@ a temp git repo), a valid-minimal-plan writer (parameterizable per slice), an
 in-process CLI runner, a run-creation helper built on `state.create_run`, and
 the fake-harness script builders the tmux-gated modules share.
 
-Importing this module also confines every tmux call this suite makes — the
-production ones through `pm_lib.sessions` and any the tests issue directly —
-to a private tmux server. See `TEST_TMUX_SOCKET`.
+Importing this module also:
+
+- confines every tmux call this suite makes — the production ones through
+  `pm_lib.sessions` and any the tests issue directly — to a private tmux
+  server (see `TEST_TMUX_SOCKET`), and holds that server up with a
+  `keepalive-<pid>` session for the life of the process (see
+  `_start_keepalive_session`);
+- puts a directory of stub `codex`, `claude`, `copilot`, `opencode` and
+  `qwen` executables first on `PATH`, so a test that composes a real
+  harness command reaches a stub that refuses, never the real coding CLI
+  (see `REAL_CLI_GUARD_DIR`).
+
+The server, the stubs and the private ledger directory are removed when the
+process exits.
 """
 
 from __future__ import annotations
@@ -65,6 +76,23 @@ os.environ["PM_TMUX_SOCKET"] = TEST_TMUX_SOCKET
 TEST_LEDGER_DIR = tempfile.mkdtemp(prefix="pm-tests-ledger-")
 os.environ["PM_LEDGER_DIR"] = TEST_LEDGER_DIR
 
+# --- real coding CLI guard ---------------------------------------------------
+#
+# A scratch test once launched the real codex, with its full-autonomy flags,
+# because `--harness codex` composed a command whose executable was on PATH.
+# Advice not to do that can be missed; a stub first on PATH cannot. Each stub
+# prints a marker and exits 97, so an accidental launch fails at once and
+# says why. A test that replaces PATH wholesale has already left the real
+# CLIs out.
+REAL_CLI_GUARD_DIR = tempfile.mkdtemp(prefix="pm-tests-cli-guard-")
+for _name in ("codex", "claude", "copilot", "opencode", "qwen"):
+    _stub = Path(REAL_CLI_GUARD_DIR) / _name
+    _stub.write_text(
+        f"#!/bin/sh\necho 'pm tests: refusing to launch the real {_name}' >&2\nexit 97\n", encoding="utf-8"
+    )
+    _stub.chmod(0o755)
+os.environ["PATH"] = REAL_CLI_GUARD_DIR + os.pathsep + os.environ.get("PATH", "")
+
 
 def tmux_argv(*args: str) -> list[str]:
     """`tmux` argv pinned to this process's private server.
@@ -82,8 +110,9 @@ def tmux_argv(*args: str) -> list[str]:
 
 @atexit.register
 def _kill_test_tmux_server() -> None:
-    """Tear this process's private server down, and remove its private ledger
-    directory, when the process exits.
+    """Tear this process's private server down (keepalive session included),
+    and remove its private ledger and CLI-guard directories, when the process
+    exits.
 
     Always `-L`-scoped to the frozen socket, never a bare `tmux kill-server`.
     Best effort by construction: tmux may be absent (the tmux-gated tests
@@ -94,6 +123,45 @@ def _kill_test_tmux_server() -> None:
     except OSError:
         pass
     shutil.rmtree(TEST_LEDGER_DIR, ignore_errors=True)
+    shutil.rmtree(REAL_CLI_GUARD_DIR, ignore_errors=True)
+
+
+def _start_keepalive_session() -> None:
+    """Start a `keepalive-<pid>` session on this process's private server.
+
+    tmux exits a server when its last session ends, and under full-suite
+    load a fake harness that exits at once could be that last session: the
+    server vanished mid-module and later tests in it failed. One long-lived
+    session keeps it up until the `atexit` kill above. It polls this
+    process's pid rather than sleeping a fixed day: `atexit` does not run
+    when the process is killed or crashes, and the session then ends within
+    seconds of the process, taking the server with it once nothing else is
+    left there, rather than holding it for a day. The name is outside
+    `pm-*` and `campaign-*`, so no sweep or ownership rule a test exercises
+    can see it as PM's. Started without `PM_RUN_TOKEN`, since a new server's
+    global environment is copied from this process. Best effort: without
+    tmux the tmux-gated tests self-skip.
+    """
+    if shutil.which("tmux") is None:
+        return
+    with sessions_mod.scoped_environ("PM_RUN_TOKEN", None):
+        try:
+            subprocess.run(
+                tmux_argv(
+                    "new-session",
+                    "-d",
+                    "-s",
+                    f"keepalive-{os.getpid()}",
+                    f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 5; done",
+                ),
+                check=False,
+                capture_output=True,
+            )
+        except OSError:
+            pass
+
+
+_start_keepalive_session()
 
 
 # --- CLI-driving helpers -----------------------------------------------------

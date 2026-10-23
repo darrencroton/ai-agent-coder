@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+import uuid
 from typing import Any
 
 from . import PmError
@@ -117,6 +118,31 @@ def compose_command(
         command.extend([profile["session_id_flag"], session_id])
 
     return shlex.join(command)
+
+
+def launch_command(
+    harness: str | None, *, override: str | None, model: str | None, effort: str | None
+) -> tuple[str, str | None]:
+    """The command to launch and the model display name readiness must see.
+
+    One definition for every launcher (a slice's Developer, a campaign child).
+    An `override` that is not None is the command verbatim and skips the
+    inventory query, so the display name is None. Otherwise the command is
+    composed from the profile; claude gets a fresh session id (its
+    transcript-capture flag), and opencode with a model gets the display name
+    its inventory declares, which the readiness check matches against the
+    banner — a failed query raises rather than launching an unverified model.
+    """
+    if override is not None:
+        return override, None
+    expected_model_display: str | None = None
+    if harness == "opencode" and model:
+        identity = query_model_identity(harness, model)
+        if identity:
+            expected_model_display = identity["display_name"]
+    session_id = str(uuid.uuid4()) if harness == "claude" else None
+    command = compose_command(harness, model=model, effort=effort, session_id=session_id)
+    return command, expected_model_display
 
 
 def query_model_identity(harness: str, model: str) -> dict[str, Any] | None:

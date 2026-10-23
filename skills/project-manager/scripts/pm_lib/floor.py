@@ -208,7 +208,7 @@ def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | Non
     # No authorized entry can legitimately cover a protected file: check-plan
     # and init refuse an overlapping surface, and grant refuses a protected
     # path. A hit is therefore a planning bypass or a bug, and fails closed.
-    protected_hits = sorted(path for path in changed if git_ops.is_authorized_path(path, protected))
+    protected_hits = sorted(path for path in changed if git_ops.is_protected_path(path, protected))
     evidence["protected_files"] = protected_hits
     passed = not unauthorized and not protected_hits
     if passed:

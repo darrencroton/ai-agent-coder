@@ -224,6 +224,38 @@ class TestQueryModelIdentityOpencode(unittest.TestCase):
         self.assertIn("declares no effort variants", str(ctx.exception))
 
 
+class TestLaunchCommand(unittest.TestCase):
+    def test_override_is_returned_verbatim_without_an_inventory_query(self) -> None:
+        with mock.patch.object(profiles, "query_model_identity") as query:
+            result = profiles.launch_command("opencode", override="my-harness --flag", model="local/m", effort=None)
+        self.assertEqual(result, ("my-harness --flag", None))
+        query.assert_not_called()
+
+    def test_claude_command_carries_a_fresh_session_id(self) -> None:
+        first, display = profiles.launch_command("claude", override=None, model="opus", effort="high")
+        second, _ = profiles.launch_command("claude", override=None, model="opus", effort="high")
+        self.assertIsNone(display)
+        self.assertIn("--session-id", first)
+        self.assertNotEqual(first, second)
+
+    def test_opencode_with_a_model_returns_the_inventory_display_name(self) -> None:
+        identity = {"display_name": "Qwen 3.6 35B"}
+        with mock.patch.object(profiles, "query_model_identity", return_value=identity) as query:
+            command, display = profiles.launch_command("opencode", override=None, model="local/m", effort=None)
+        query.assert_called_once_with("opencode", "local/m")
+        self.assertEqual(command, profiles.compose_command("opencode", model="local/m"))
+        self.assertEqual(display, "Qwen 3.6 35B")
+
+    def test_other_harnesses_have_no_display_name_and_no_session_id(self) -> None:
+        with mock.patch.object(profiles, "query_model_identity") as query:
+            command, display = profiles.launch_command("codex", override=None, model="gpt-x", effort=None)
+            no_model = profiles.launch_command("opencode", override=None, model=None, effort=None)
+        query.assert_not_called()
+        self.assertEqual(command, profiles.compose_command("codex", model="gpt-x"))
+        self.assertIsNone(display)
+        self.assertEqual(no_model, (profiles.compose_command("opencode"), None))
+
+
 class TestParseReviewerTools(unittest.TestCase):
     def test_comma_separated_lowercased_stripped(self) -> None:
         self.assertEqual(profiles.parse_reviewer_tools(" Copilot , CODEX ,claude"), ("copilot", "codex", "claude"))

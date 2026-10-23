@@ -66,6 +66,24 @@ class TestSurfaceMatching(unittest.TestCase):
         self.assertEqual(git_ops.normalize_authorized_entry("README.md."), "README.md")
 
 
+class TestProtectedMatching(unittest.TestCase):
+    def test_plain_directory_entry_covers_its_subtree_and_itself_but_not_a_sibling_prefix(self) -> None:
+        protected = ["instruments"]
+        self.assertTrue(git_ops.is_protected_path("instruments/check.py", protected))
+        self.assertTrue(git_ops.is_protected_path("instruments", protected))
+        self.assertFalse(git_ops.is_protected_path("instrumentsx/a", protected))
+        # The authorized-surface matcher must never widen the same way.
+        self.assertFalse(git_ops.is_authorized_path("instruments/check.py", protected))
+
+    def test_slash_glob_and_exact_entries_behave_as_the_authorized_matcher(self) -> None:
+        self.assertTrue(git_ops.is_protected_path("src/deep/a.py", ["src/"]))
+        self.assertFalse(git_ops.is_protected_path("srcx/a.py", ["src/"]))
+        self.assertTrue(git_ops.is_protected_path("src/a.py", ["src/*.py"]))
+        self.assertFalse(git_ops.is_protected_path("src/deep/a.py", ["src/*.py"]))
+        self.assertTrue(git_ops.is_protected_path("policy.json", ["`policy.json` (the policy)"]))
+        self.assertFalse(git_ops.is_protected_path("policy.json.bak", ["policy.json"]))
+
+
 class TestStatusParsing(unittest.TestCase):
     def test_leading_space_status_code_preserved(self) -> None:
         # An unstaged modify: code is " M" (leading space is meaningful, not stripped).
@@ -138,6 +156,22 @@ class TestGitFacts(PmTestCase):
         self.assertEqual(between, {"protected/check.py", "src/check.py"})
         shown = git_ops.changed_files_between(self.repo, None, after_head, after_status)
         self.assertEqual(shown, {"protected/check.py", "src/check.py"})
+
+    def test_dirty_rename_reports_both_sides(self) -> None:
+        """The dirty-tree counterpart of the committed-rename test: plain
+        `git status` collapses an uncommitted `git mv` to its destination."""
+        (self.repo / "protected").mkdir()
+        (self.repo / "protected" / "check.py").write_text("print('instrument')\n" * 20, encoding="utf-8")
+        self._git("add", "protected/check.py")
+        self._git("commit", "-q", "-m", "add protected/check.py")
+        head = git_ops.git_head(self.repo)
+        (self.repo / "src").mkdir()
+        self._git("mv", "protected/check.py", "src/check.py")
+        status = git_ops.git_status_text(self.repo)
+
+        expected = {"protected/check.py", "src/check.py"}
+        self.assertEqual(git_ops.status_changed_files(status), expected)
+        self.assertEqual(git_ops.changed_files_between(self.repo, head, head, status), expected)
 
     def test_commit_is_descendant_true(self) -> None:
         before_head = git_ops.git_head(self.repo)

@@ -17,7 +17,7 @@ Your job is to tell a defective *plan* from a defective *change* — gate hard o
 
 Evidence rules: the Developer's narration is a pointer, never evidence. Assess from the diff, the commit, `validation.md`, review reports, and git state. Cite what you examined in every assessment. An imperfect `result.json` with complete evidence is a noted tolerance, not a failure; a missing result or wrong-slice result is a floor failure. A missing or thin `validation.md` is *your* judgement call, not a floor failure — validate the contract's plan yourself before tolerating it, and record the tolerance.
 
-In campaign mode a PM, the Campaign Manager, writes node plans under an owner-approved `brief.md`, which is the only source of that authority (see [references/campaign-mode.md](references/campaign-mode.md)); the charter above binds every PM in plan mode unchanged.
+In campaign mode a PM, the Campaign Manager, writes node plans under an owner-approved `brief.md`, which is the only source of that authority (see [references/campaign-mode.md](references/campaign-mode.md)); the charter above binds every PM in plan mode unchanged, and its prohibitions bind the Campaign Manager too, the planning prohibition excepted.
 
 ## The floor (mechanical, non-waivable)
 
@@ -45,7 +45,7 @@ Every exit from a submission — `finalize --accept`, `--steer`, `--stop`, and a
 
 Plans carry defects: prose superseded by a later revision but never deleted, a requirement contradicted by the plan's own binding conventions, a stated expectation no in-contract implementation can satisfy, a criterion that misnames a symbol the repository spells differently, a domain the plan declares but never bounds.
 
-Resolve a defect yourself where the plan's goals make one resolution natural and its impact stays within the slice or touches only a few slices: decide it and record it as a delegated plan decision in the assessment and in HANDOFF.md, so it reaches the final report and the human. Never edit the plan, widen the surface except by grant, or relax a floor fact. A delegated decision chooses between readings and never adds scope. Stop for anything serious, contested or cross-cutting, and whenever the floor or a plan gate needs a human; the list that follows defines serious, contested or cross-cutting.
+Resolve a defect yourself where the plan's goals make one resolution natural and its impact stays within the slice or touches only a few slices: decide it and record it as a delegated plan decision in the assessment and in HANDOFF.md, so it reaches the final report and the human. Never edit the plan, widen the surface except by grant, or relax a floor fact. A delegated decision chooses between readings and never adds scope. Stop for anything serious, contested or cross-cutting, and whenever the floor or a plan gate needs a human. Stop with the defect written up: the clauses that conflict, what you checked, and the amendment you recommend. The list that follows defines serious, contested or cross-cutting.
 
 Also stop for: ambiguity touching authorization, acceptance criteria, or risk flags, however confident your reading; conflicting goals; a fix needing new *semantic* authority the plan never granted, or a path that cannot meet the surface-grant rule (see *Surface grants*) — a path a grant can cover is not, on this ground alone, a stop; one plan section that keeps costing attempts; and two commissioned reviews reaching opposite conclusions about the same clause. "I find this clause unhelpful" is neither evidence nor a defect.
 

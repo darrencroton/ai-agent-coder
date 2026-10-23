@@ -420,6 +420,17 @@ class TestFactSurfaceProtectedPaths(FloorTestCase):
         self.assertEqual([fact.name for fact in report.facts], _FACT_NAMES)
         self.assertEqual([name for name, fact in facts.items() if not fact.passed], ["surface"])
 
+    def test_change_under_a_plain_directory_entry_fails_fact_5_naming_the_file(self) -> None:
+        # "src/vendor" has no trailing slash: an equality match would let this pass.
+        state, token, run_dir, slices = self._protected_run(files=["src/"], protected=["src/vendor"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit("src/vendor/deep/frozen.py")
+
+        surface = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.evidence["protected_files"], ["src/vendor/deep/frozen.py"])
+        self.assertEqual(surface.detail, "changed files include protected paths")
+
     def test_committed_rename_of_a_protected_file_into_the_surface_fails_naming_the_source(self) -> None:
         state, token, run_dir, slices = self._protected_run(files=["src/"], protected=["instruments/"])
         self._commit("instruments/check.py", "print('known good')\n" * 20)

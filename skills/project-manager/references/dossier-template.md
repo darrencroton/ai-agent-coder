@@ -35,7 +35,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 ## Allowed paths
 - <product path the campaign may change>
 - Node worktree parent: <absolute directory the owner has trusted in each harness>
-- Protected-paths policy file: <path in the product repository> at <pinned SHA> (the only list of protected paths; this brief never repeats them)
+- Protected-paths policy file: <path in the product repository> at <pinned SHA> (see [campaign-mode.md](campaign-mode.md) *Launching and watching a child*)
 - Git-ignored output directories: <product directories, or none>
 
 ## Reserved decision classes
@@ -96,8 +96,10 @@ validation/<node>/
   campaign/                     the worktree's .pm/campaign/ (launcher copy, manifest, questions and answers, pane captures, child-result.json)
   runs/<run-id>/                the worktree's .pm/runs/<run-id>/
   state/<run-id>/               the state root <worktree-git-dir>/pm/<run-id>/ (run.json, events.jsonl, the assessments)
-  status.txt                    git -C <worktree> status --porcelain, written first, before removal
-  diff.patch                    git -C <worktree> diff --cached --binary HEAD after git -C <worktree> add -A: staged, unstaged and new non-ignored files, binary-safe
+  staged.patch                  the worktree's staged changes (see campaign-mode.md *Cleanup* for the capture order)
+  status.txt                    the worktree's uncommitted-file list
+  diff.patch                    the worktree's uncommitted work, binary-safe
+  artifacts/                    the files an evidence node's receipt hashes
   receipt.md                    an evidence node's receipt
 ```
 
@@ -110,6 +112,6 @@ The receipt shape:
 - Configuration: <configuration>
 - Command: <command>
 - Outcome: pass | fail | error
-- Artifact hashes: <artifact>: <sha256>
+- Artifact hashes: <artifact>: <sha256> (a copy is in artifacts/), or <artifact>: not retained
 - Report: campaign-reports/<node>.md at <the commit that adds it>
 ```

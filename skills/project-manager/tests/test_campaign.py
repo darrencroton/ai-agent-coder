@@ -5,9 +5,11 @@ PM in its own git worktree and in a tmux session on a private socket. The
 child here is a fake shell harness passed through `--harness-command`; no
 real coding CLI is ever launched.
 
-Precondition refusals, manifest errors, names, the pointer template and
-`sessions.kill_server`'s argv need no tmux. Everything that drives a real
-pane is gated on tmux, runs its children on a dedicated socket
+Input refusals, manifest errors, names and the pointer template need no
+tmux (`sessions.kill_server` itself is tested in test_sessions). A refusal
+checked after the tmux
+precondition, and everything that drives a real pane or server, is gated on
+tmux and runs its children on a dedicated socket
 (`pm-tests-<pid>-child`, or a launch's own default socket) and kills that
 server in cleanup through `sessions.kill_server`, so no per-session reaping
 is needed. Worktrees, prompt files and the fake's records all sit under
@@ -103,6 +105,27 @@ class CampaignTestCase(PmTestCase):
     def assert_socket_untouched(self) -> None:
         self.assertEqual(os.environ.get("PM_TMUX_SOCKET"), TEST_TMUX_SOCKET)
 
+    def _write_child_runs(self) -> subprocess.Popen:
+        """A readable run recording a live reviewer process group, and an unreadable one."""
+        reviewer = subprocess.Popen(["sleep", "120"], start_new_session=True)
+        self.addCleanup(reviewer.wait)
+        self.addCleanup(reviewer.kill)
+        root = state_mod.state_root(self.worktree)
+        (root / "run-good").mkdir(parents=True)
+        (root / "run-good" / "run.json").write_text(
+            json.dumps(
+                {
+                    "status": "stopped",
+                    "stop_reason": "budget",
+                    "current_slice": {"id": "Slice 1", "reviewer_pids": [reviewer.pid]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / "run-bad").mkdir()
+        (root / "run-bad" / "run.json").write_text("{torn", encoding="utf-8")
+        return reviewer
+
 
 # --- pure helpers: no tmux, no git -------------------------------------------
 
@@ -122,11 +145,18 @@ class TestChildNames(unittest.TestCase):
         self.assertEqual(socket, "my-socket")
         self.assertTrue(session.startswith("campaign-"))
 
+    def test_a_long_branch_is_cut_to_32_characters_and_both_names_share_the_suffix(self) -> None:
+        session, socket = campaign.child_names("campaign/" + "n" * 80, "0a1b2c")
+        component = "campaign-" + "n" * 23
+        self.assertEqual(session, f"campaign-{component}-0a1b2c")
+        self.assertEqual(socket, f"pm-child-{component}-0a1b2c")
+
     def test_socket_name_rule(self) -> None:
-        for bad in ("", "   ", "a b", "a\tb", "a/b"):
+        for bad in ("", "   ", "a b", "a\tb", "a/b", "default", "a" * 65):
             with self.subTest(socket=bad), self.assertRaises(PmError):
                 campaign.check_socket_name(bad, what="--socket")
-        campaign.check_socket_name("pm-child-ok_1", what="--socket")
+        for good in ("pm-child-ok_1", "a" * 64, "default-2"):
+            campaign.check_socket_name(good, what="--socket")
 
 
 class TestChildLaunchPointer(unittest.TestCase):
@@ -189,26 +219,6 @@ class TestCampaignParsers(unittest.TestCase):
                 self.assertNotIn("--token", flags)
 
 
-class TestKillServer(unittest.TestCase):
-    def test_runs_the_socket_scoped_kill_with_the_given_socket_not_the_environment(self) -> None:
-        with (
-            mock.patch.dict(os.environ, {"PM_TMUX_SOCKET": "some-other-server"}),
-            mock.patch.object(sessions.subprocess, "run") as run,
-        ):
-            sessions.kill_server("pm-child-node-abcdef")
-        self.assertEqual(run.call_args.args[0], ["tmux", "-L", "pm-child-node-abcdef", "kill-server"])
-
-    def test_a_missing_tmux_binary_returns_normally(self) -> None:
-        with mock.patch.object(sessions.subprocess, "run", side_effect=FileNotFoundError("tmux")):
-            sessions.kill_server("pm-child-node-abcdef")
-
-    @unittest.skipUnless(_HAS_TMUX, "tmux is required")
-    def test_a_socket_with_no_server_returns_normally(self) -> None:
-        socket = f"{TEST_TMUX_SOCKET}-never-started"
-        self.assertNotEqual(_child_tmux(socket, "list-sessions").returncode, 0)
-        sessions.kill_server(socket)
-
-
 # --- refusals and manifest errors: no tmux needed ----------------------------
 
 
@@ -243,6 +253,15 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assertEqual(os.listdir(self.worktree), ["keep.txt"])
         self.assertEqual((self.worktree / "keep.txt").read_text(encoding="utf-8"), "mine\n")
 
+    def test_a_base_that_tracks_handoff_is_refused(self) -> None:
+        (self.repo / "HANDOFF.md").write_text("# Handoff\n", encoding="utf-8")
+        self._git("add", "HANDOFF.md")
+        self._git("commit", "-q", "-m", "track a handoff")
+        argv = self.launch_argv(self.harness)
+        argv[argv.index("--base") + 1] = "HEAD"
+        self.assert_refused(argv, "the base commit tracks HANDOFF.md")
+        self.assertFalse(self.worktree.exists())
+
     def test_an_unresolvable_base_is_refused(self) -> None:
         argv = self.launch_argv(self.harness)
         argv[argv.index("--base") + 1] = "no-such-ref"
@@ -263,7 +282,14 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assertFalse(self.worktree.exists())
 
     def test_a_bad_explicit_socket_is_refused(self) -> None:
-        for socket, fragment in (("a/b", "'/'"), ("a b", "whitespace"), ("", "non-blank"), ("  ", "non-blank")):
+        for socket, fragment in (
+            ("a/b", "'/'"),
+            ("a b", "whitespace"),
+            ("", "non-blank"),
+            ("  ", "non-blank"),
+            ("default", "must not be 'default'"),
+            ("a" * 65, "at most 64 characters"),
+        ):
             with self.subTest(socket=socket):
                 self.assert_refused(self.launch_argv(self.harness, socket=socket), fragment)
                 self.assertFalse(self.worktree.exists())
@@ -274,12 +300,14 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assert_refused(argv, "not supported")
         self.assertFalse(self.worktree.exists())
 
+    @unittest.skipUnless(_HAS_TMUX, "the tmux precondition is checked first")
     def test_an_executable_not_on_path_is_refused(self) -> None:
         argv = self.launch_argv(self.harness)
         argv[argv.index("--harness-command") + 1] = str(self.repo.parent / "no-such-harness")
         self.assert_refused(argv, "not found on PATH")
         self.assertFalse(self.worktree.exists())
 
+    @unittest.skipUnless(_HAS_TMUX, "the tmux precondition is checked first")
     def test_an_explicitly_blank_harness_command_is_refused_not_replaced(self) -> None:
         # `--harness fake` on purpose: were a blank override ever treated as
         # omitted again, this refuses as an unsupported harness rather than
@@ -300,11 +328,13 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assertFalse(target.exists())
 
     def test_a_composed_command_whose_executable_is_not_on_path_is_refused(self) -> None:
-        # PATH holds only git, which the earlier preconditions need, so the
-        # composed codex command cannot find its executable.
+        # PATH holds only git and a stand-in tmux, which the earlier
+        # preconditions need, so the composed codex command cannot find its
+        # executable.
         bin_dir = self.repo.parent / "bin-git-only"
         bin_dir.mkdir()
         (bin_dir / "git").symlink_to(shutil.which("git"))
+        write_fake_harness(bin_dir / "tmux", "exit 1")
         argv = self.launch_argv(self.harness)
         del argv[argv.index("--harness-command") : argv.index("--harness-command") + 2]
         argv[argv.index("--harness") + 1] = "codex"
@@ -323,20 +353,50 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assertFalse(self.worktree.exists())
         self.assertEqual(_child_tmux(socket, "has-session", "-t", "bystander").returncode, 0)
 
-    def test_a_failure_after_the_worktree_exists_names_the_branch_and_worktree(self) -> None:
-        seen: list[str | None] = []
+    def test_tmux_absent_is_refused_before_anything_is_created(self) -> None:
+        real_which = shutil.which
 
-        def failing_start(*_args) -> None:
-            seen.append(os.environ.get("PM_RUN_TOKEN"))
-            raise PmError("tmux start failed: boom")
+        def which(name: str, *args, **kwargs) -> str | None:
+            return None if name == "tmux" else real_which(name, *args, **kwargs)
 
-        with (
-            mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "caller-token"}),
-            mock.patch.object(campaign.sessions, "start_session", side_effect=failing_start),
-        ):
+        with mock.patch.object(campaign.shutil, "which", side_effect=which):
+            self.assert_refused(self.launch_argv(self.harness), "tmux is required to launch a child; install it")
+        self.assertFalse(self.worktree.exists())
+
+    @unittest.skipUnless(_HAS_TMUX, "the tmux precondition is checked first")
+    def test_a_socket_whose_server_cannot_be_listed_is_refused(self) -> None:
+        error = PmError(f"could not list sessions on tmux socket {CHILD_SOCKET!r}: File name too long")
+        with mock.patch.object(campaign.sessions, "list_sessions_on", side_effect=error):
+            self.assert_refused(self.launch_argv(self.harness), "File name too long")
+        self.assertFalse(self.worktree.exists())
+
+    @unittest.skipUnless(_HAS_TMUX, "the tmux precondition is checked first")
+    def test_a_failed_worktree_add_reports_what_git_left_behind(self) -> None:
+        real_git = campaign.git_ops.git
+
+        def git(repo: Path, *args: str) -> str:
+            if "worktree" not in args:
+                return real_git(repo, *args)
+            # A partial failure: the branch and the directory exist, then git fails.
+            real_git(repo, "branch", "node-1", self.base_commit)
+            self.worktree.mkdir()
+            raise PmError("simulated worktree failure")
+
+        with mock.patch.object(campaign.git_ops, "git", side_effect=git):
             code, out, err = self.run_cli(self.launch_argv(self.harness))
-            self.assertEqual(os.environ.get("PM_RUN_TOKEN"), "caller-token", "restored after a failed start")
-        self.assertEqual(seen, [None], "the token is absent while the child's server starts")
+        self.assertEqual(code, 2, out + err)
+        worktree = self.worktree.resolve()
+        self.assertIn(
+            "git worktree add failed: simulated worktree failure; left behind: branch node-1 exists "
+            f"(git branch -D node-1); path {worktree} exists (git worktree remove {worktree}, or remove it by hand)",
+            err,
+        )
+
+    @unittest.skipUnless(_HAS_TMUX, "the tmux precondition is checked first")
+    def test_a_failure_after_the_worktree_exists_names_the_branch_and_worktree(self) -> None:
+        failure = PmError("tmux start failed: boom")
+        with mock.patch.object(campaign.sessions, "start_session", side_effect=failure):
+            code, out, err = self.run_cli(self.launch_argv(self.harness))
         self.assertEqual(code, 2, out + err)
         self.assertIn("pm: error:", err)
         self.assertIn("boom", err)
@@ -346,6 +406,18 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assertIn("refs/heads/node-1", self.branches())
         self.assertFalse(campaign.manifest_path(self.worktree).exists(), "no session, so no manifest")
         self.assert_socket_untouched()
+
+    @unittest.skipUnless(_HAS_TMUX, "the tmux precondition is checked first")
+    def test_an_ignore_rule_overriding_the_handoff_exclusion_fails_setup_naming_the_leftovers(self) -> None:
+        (self.repo / ".gitignore").write_text("!HANDOFF.md\n", encoding="utf-8")
+        self._git("add", ".gitignore")
+        self._git("commit", "-q", "-m", "un-ignore handoffs")
+        argv = self.launch_argv(self.harness)
+        argv[argv.index("--base") + 1] = "HEAD"
+        code, out, err = self.run_cli(argv)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("HANDOFF.md is not ignored", err)
+        self.assertIn(f"branch node-1 and worktree {self.worktree.resolve()} are left behind", err)
 
 
 class TestManifestErrors(CampaignTestCase):
@@ -357,7 +429,10 @@ class TestManifestErrors(CampaignTestCase):
             ["answer-child", "--worktree", str(self.worktree), "--text", "A"],
             ["stop-child", "--worktree", str(self.worktree), "--reason", "test"],
         )
-        for content in (None, "{not json", '["a list"]', '{"socket": "a/b"}'):
+        # Every field present, so the socket rule is what refuses the last one.
+        slashed = {key: "x" for key in campaign._MANIFEST_FIELDS} | {"socket": "a/b"}
+        cases = ((None, ""), ("{not json", ""), ('["a list"]', ""), (json.dumps(slashed), "'/'"))
+        for content, fragment in cases:
             if content is not None:
                 manifest.parent.mkdir(parents=True, exist_ok=True)
                 manifest.write_text(content, encoding="utf-8")
@@ -367,6 +442,7 @@ class TestManifestErrors(CampaignTestCase):
                     self.assertEqual(code, 2, out + err)
                     self.assertIn("pm: error:", err)
                     self.assertIn(str(manifest), err)
+                    self.assertIn(fragment, err)
                     self.assert_socket_untouched()
 
     def _write_manifest(self, session: str) -> None:
@@ -412,6 +488,82 @@ class TestManifestErrors(CampaignTestCase):
         self.assertIn("is not the root of a git worktree", out)
         self.assertNotIn("child run ", out)
 
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required to host a bystander session")
+    def test_stop_child_refuses_a_server_hosting_a_bystander_and_kills_nothing(self) -> None:
+        self.worktree.mkdir()
+        self._write_manifest("campaign-node-1-000000")
+        started = _child_tmux(CHILD_SOCKET, "new-session", "-d", "-s", "bystander", "sleep 120")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        # The right mark, so the bystander rule is what refuses.
+        sessions.set_server_environment(CHILD_SOCKET, "PM_CHILD_WORKTREE", str(self.worktree.resolve()))
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(self.worktree), "--reason", "test"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(
+            f"tmux server {CHILD_SOCKET} hosts sessions this child does not own: bystander; "
+            "refusing to kill the server",
+            err,
+        )
+        self.assertEqual(_child_tmux(CHILD_SOCKET, "has-session", "-t", "bystander").returncode, 0)
+        self.assertFalse((campaign.campaign_dir(self.worktree) / "pane.txt").exists())
+        self.assert_socket_untouched()
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required to host another child's server")
+    def test_stop_child_refuses_a_server_launched_for_another_worktree_and_kills_nothing(self) -> None:
+        self.worktree.mkdir()
+        self._write_manifest("campaign-node-1-000000")
+        started = _child_tmux(CHILD_SOCKET, "new-session", "-d", "-s", "campaign-other-000000", "sleep 120")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        other = str(self.repo.parent / "other-wt")
+        sessions.set_server_environment(CHILD_SOCKET, "PM_CHILD_WORKTREE", other)
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(self.worktree), "--reason", "test"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(
+            f"tmux server {CHILD_SOCKET} was not launched for {self.worktree.resolve()} "
+            f"(it carries PM_CHILD_WORKTREE={other}); refusing to kill the server",
+            err,
+        )
+        self.assertEqual(_child_tmux(CHILD_SOCKET, "has-session", "-t", "campaign-other-000000").returncode, 0)
+        self.assertFalse((campaign.campaign_dir(self.worktree) / "pane.txt").exists())
+        self.assert_socket_untouched()
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required to host the marked server")
+    def test_stop_child_keeps_the_reviewer_groups_when_the_post_kill_probe_fails(self) -> None:
+        # The repository is the worktree here: only a git worktree has a state root to read runs from.
+        self.worktree = self.repo
+        self._write_manifest("campaign-node-1-000000")
+        reviewer = self._write_child_runs()
+        started = _child_tmux(CHILD_SOCKET, "new-session", "-d", "-s", "campaign-node-1-000000", "sleep 120")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        sessions.set_server_environment(CHILD_SOCKET, "PM_CHILD_WORKTREE", str(self.worktree.resolve()))
+        with mock.patch.object(campaign.sessions, "kill_server", side_effect=PmError("probe failed")):
+            code, out, err = self.run_cli(["stop-child", "--worktree", str(self.worktree), "--reason", "test"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"reviewer process groups the child recorded: {reviewer.pid};", out)
+        self.assertIn(f"tmux server {CHILD_SOCKET} could not be confirmed killed (probe failed)", out)
+        self.assertNotIn("killed tmux server", out)
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required for a pane to capture")
+    def test_wait_child_reports_a_pane_live_file_that_could_not_be_written(self) -> None:
+        self.worktree.mkdir()
+        self._write_manifest("campaign-node-1-000000")
+        started = _child_tmux(CHILD_SOCKET, "new-session", "-d", "-s", "campaign-node-1-000000", "sleep 120")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        # A directory where the file goes: the write raises IsADirectoryError.
+        (campaign.campaign_dir(self.worktree) / "pane-live.txt").mkdir()
+        code, out, err = self.run_cli(["wait-child", "--worktree", str(self.worktree)])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("pane-live: not written (", out)
+
+    @unittest.skipUnless(_HAS_TMUX, "stop-child lists the manifest's server first")
+    def test_stop_child_reports_a_pane_capture_that_could_not_be_written(self) -> None:
+        self.worktree.mkdir()
+        self._write_manifest("campaign-node-1-000000")
+        with mock.patch.object(campaign.sessions, "capture_to", side_effect=OSError("disk full")):
+            code, out, err = self.run_cli(["stop-child", "--worktree", str(self.worktree), "--reason", "test"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("pane: not captured (disk full)", out)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+
     def test_answer_child_refuses_with_no_live_session_leaving_the_files_unchanged(self) -> None:
         self.worktree.mkdir()
         self._write_manifest("campaign-node-1-000000")
@@ -423,6 +575,17 @@ class TestManifestErrors(CampaignTestCase):
         self.assertIn("no live child session", err)
         self.assertEqual(sorted(os.listdir(question.parent)), before)
         self.assert_socket_untouched()
+
+
+class TestExcludeHandoff(PmTestCase):
+    def test_handoff_is_listed_once_however_often_the_helper_runs(self) -> None:
+        # The main worktree: git names its exclude file by a relative path.
+        campaign._exclude_handoff(self.repo)
+        campaign._exclude_handoff(self.repo)
+        exclude = (self.repo / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+        # Anchored: only the root HANDOFF.md is hidden from the floor.
+        self.assertEqual(exclude.splitlines().count("/HANDOFF.md"), 1)
+        self.assertNotIn("HANDOFF.md", exclude.splitlines())
 
 
 # --- live children: tmux required ---------------------------------------------
@@ -457,27 +620,6 @@ class TestChildLifecycle(CampaignTestCase):
     def _input_lines(self) -> list[str]:
         path = self.records / "input"
         return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-
-    def _write_child_runs(self) -> subprocess.Popen:
-        """A readable run recording a live reviewer process group, and an unreadable one."""
-        reviewer = subprocess.Popen(["sleep", "120"], start_new_session=True)
-        self.addCleanup(reviewer.wait)
-        self.addCleanup(reviewer.kill)
-        root = state_mod.state_root(self.worktree)
-        (root / "run-good").mkdir(parents=True)
-        (root / "run-good" / "run.json").write_text(
-            json.dumps(
-                {
-                    "status": "stopped",
-                    "stop_reason": "budget",
-                    "current_slice": {"id": "Slice 1", "reviewer_pids": [reviewer.pid]},
-                }
-            ),
-            encoding="utf-8",
-        )
-        (root / "run-bad").mkdir()
-        (root / "run-bad" / "run.json").write_text("{torn", encoding="utf-8")
-        return reviewer
 
     def test_launch_question_answer_result_and_stop(self) -> None:
         trigger = self.repo.parent / "question-trigger"
@@ -518,6 +660,14 @@ class TestChildLifecycle(CampaignTestCase):
         self.assertIn(
             f"child launched: session={session} socket={CHILD_SOCKET} worktree={worktree} launcher={launcher}", out
         )
+        # The server carries launch-child's ownership mark, which stop-child verifies.
+        self.assertEqual(sessions.server_environment(CHILD_SOCKET, "PM_CHILD_WORKTREE"), str(worktree))
+        # HANDOFF.md is excluded in the file the linked worktree's git reads.
+        (worktree / "HANDOFF.md").write_text("# Handoff\n", encoding="utf-8")
+        status = subprocess.run(
+            ["git", "-C", str(worktree), "status", "--porcelain"], check=True, text=True, capture_output=True
+        )
+        self.assertEqual(status.stdout, "")
 
         # The session lives on the child's private server, not the caller's.
         self.assertEqual(_child_tmux(CHILD_SOCKET, "has-session", "-t", session).returncode, 0)
@@ -548,7 +698,8 @@ class TestChildLifecycle(CampaignTestCase):
         code, out, err = self.run_cli(["wait-child", "--worktree", str(worktree), "--wait", "30"])
         self.assertLess(time.monotonic() - start, 20.0)
         self.assertEqual(code, 0, err)
-        self.assertIn("question present: yes\n" + _QUESTION_TEXT, out)
+        fenced = "".join(f"| {line}\n" for line in _QUESTION_TEXT.splitlines())
+        self.assertIn("question present: yes\n--- question ---\n" + fenced + "--- end question ---\n", out)
         self.assertIn("result present: False", out)
         self.assertNotIn("note:", out)
         self.assert_socket_untouched()
@@ -607,6 +758,7 @@ class TestChildLifecycle(CampaignTestCase):
         code, out, err = self.run_cli(["stop-child", "--worktree", str(worktree), "--reason", "node judged"])
         self.assertEqual(code, 0, out + err)
         self.assertIn(f"reviewer process groups the child recorded: {reviewer.pid};", out)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
         self.assertIn("reason: node judged", out)
         pane = (directory / "pane.txt").read_text(encoding="utf-8")
         self.assertIn("FAKE_HARNESS_READY", pane)
@@ -650,10 +802,28 @@ class TestChildLifecycle(CampaignTestCase):
         self.assertIn(str(self.worktree.resolve()), err)
         self.assertNotEqual(_child_tmux(CHILD_SOCKET, "list-sessions").returncode, 0)
         self.assertTrue(campaign.manifest_path(self.worktree.resolve()).is_file())
+        pane_path = campaign.campaign_dir(self.worktree.resolve()) / "pane.txt"
+        self.assertIn(f"its pane was captured to {pane_path}", err)
+        self.assertIn("Do you trust the files in this folder?", pane_path.read_text(encoding="utf-8"))
         self.assert_socket_untouched()
         # The kept manifest lets stop-child run again.
         code, out, err = self.run_cli(["stop-child", "--worktree", str(self.worktree), "--reason", "failed launch"])
         self.assertEqual(code, 0, out + err)
+
+    def test_a_send_failure_after_the_manifest_is_written_kills_the_server_and_keeps_the_evidence(self) -> None:
+        harness = write_fake_harness(self.repo.parent / "fake-child.sh", "echo FAKE_HARNESS_READY\nexec cat -")
+        with mock.patch.object(campaign.sessions, "send_prompt", side_effect=PmError("send failed: boom")):
+            code, out, err = self.run_cli(self.launch_argv(harness))
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("boom", err)
+        self.assertIn("branch node-1", err)
+        self.assertNotEqual(_child_tmux(CHILD_SOCKET, "list-sessions").returncode, 0)
+        worktree = self.worktree.resolve()
+        self.assertTrue(campaign.manifest_path(worktree).is_file())
+        pane_path = campaign.campaign_dir(worktree) / "pane.txt"
+        self.assertIn(f"its pane was captured to {pane_path}", err)
+        self.assertIn("FAKE_HARNESS_READY", pane_path.read_text(encoding="utf-8"))
+        self.assert_socket_untouched()
 
     def test_wait_child_returns_on_a_marker_and_on_death_but_not_on_pane_change(self) -> None:
         churn, marker, clear, die = (self.repo.parent / name for name in ("churn", "marker", "clear", "die"))

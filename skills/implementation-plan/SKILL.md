@@ -244,7 +244,7 @@ Campaign child (include this paragraph only when a Campaign Manager launched thi
 - Nobody is present: confirm nothing with a human.
 - The plan is committed in the dossier at the path given, which meets the "plan committed" requirement; it is not in the product repository.
 - Skip the confirm step. After `check-plan` and the repo check, run `init` yourself with `--branch <branch>`, `--policy <protected-paths policy file, when given>`, `--run-tag <campaign tag>`, `--max-attempts <N>` and full model ids, and hold the token.
-- Keep HANDOFF.md as usual; it is archived with your run.
+- Keep HANDOFF.md as usual (launch-child has already excluded it in the worktree's git exclude file); it is archived with your run.
 - Resolve natural plan defects yourself, as the Plan defects paragraph below says.
 - A decision the Campaign Manager can give in a line (a reading the plan leaves genuinely open, a tolerance) goes to `.pm/campaign/cm-question.md` with the options and your recommendation; then wait for the one-line pointer to the answer.
 - A human gate, a floor failure you cannot steer within budget, an integrity stop, a dialog or an exhausted budget ends the run.

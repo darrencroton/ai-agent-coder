@@ -24,7 +24,6 @@ import shlex
 import shutil
 import signal
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +44,10 @@ _SLICE_ID_RE = re.compile(r"^Slice\s+(?P<number>\d+)$")
 _OBSERVE_POLL_SECONDS = 2.0
 _OBSERVE_TAIL_LINES = 40
 _OBSERVE_QUESTION_LINES = 40
+_OBSERVE_QUESTION_BYTES = 4096
+# How much of a question file is read at all: the caps above apply to the
+# excerpt, and this one keeps an oversized file out of memory.
+_QUESTION_READ_BYTES = 65536
 
 # Controller-owned notes.md tripwire: a hard cap kept as a non-fatal warning,
 # since a runaway notes file silently degrades every later Developer prompt.
@@ -617,7 +620,7 @@ def grant(repo: Path, run_dir: Path, token: str, *, slice_id: str, path: str, ev
         # making the dangerous-surface refusal below evadable. Checked before
         # that refusal, on `normalized`, so no glob or directory spelling can
         # survive to be shape-inspected as if it were a single file.
-        if normalized.endswith("/") or any(marker in normalized for marker in ("*", "?", "[")):
+        if normalized.endswith("/") or git_ops.has_glob(normalized):
             raise PmError(
                 f"grant refused: {normalized!r} is a directory or glob, and a grant authorizes one exact "
                 "file path. PM's evidence is about one discovered path, and a pattern authorizes files it "
@@ -648,8 +651,10 @@ def grant(repo: Path, run_dir: Path, token: str, *, slice_id: str, path: str, ev
         # above (invalid entry, glob or directory, dependency/license/whole-repo
         # shape, existing directory), which keep their own messages, and
         # before the already-authorized refusal, so a protected path is never
-        # reported as merely already authorized.
-        if git_ops.is_authorized_path(normalized, plan_mod.protected_paths(state)):
+        # reported as merely already authorized. `is_protected_path`, not
+        # `is_authorized_path`: a plain entry naming a directory protects its
+        # subtree, as the plan-time overlap check already treats it.
+        if git_ops.is_protected_path(normalized, plan_mod.protected_paths(state)):
             raise PmError(
                 f"grant refused: {normalized!r} is a protected path (policy frozen at init); no grant can reach it"
             )
@@ -918,21 +923,9 @@ def start_slice(
     launch_effort = effort or harness_block.get("effort")
     launch_model_tag = model_tag or harness_block.get("model_tag")
 
-    expected_model_display: str | None = None
-    if effective_override:
-        command = effective_override
-    else:
-        session_id = str(uuid.uuid4()) if harness_name == "claude" else None
-        if harness_name == "opencode" and launch_model:
-            identity = profiles.query_model_identity(harness_name, launch_model)
-            if identity:
-                expected_model_display = identity["display_name"]
-        command = profiles.compose_command(
-            harness_name,
-            model=launch_model,
-            effort=launch_effort,
-            session_id=session_id,
-        )
+    command, expected_model_display = profiles.launch_command(
+        harness_name, override=effective_override or None, model=launch_model, effort=launch_effort
+    )
 
     session_name = sessions.session_name(run_id, slice_number(plan_slice.slice_id), attempts)
     sessions.start_session(session_name, repo, command, env)
@@ -1051,9 +1044,40 @@ class ObserveOutcome:
     # time, not re-ask.
     no_signal: bool = False
     # An open `question.md` in the slice artifact directory: the Developer is
-    # waiting on `pm answer`. `question_text` is its first 40 lines.
+    # waiting on `pm answer`. `question_text` is `read_question_head`'s bounded excerpt.
     question_present: bool = False
     question_text: str | None = None
+
+
+def read_question_head(path: Path) -> str | None:
+    """The head of a question file for PM's context, or None when unreadable.
+
+    The file is Developer-written, so its size and line width are untrusted:
+    at most `_OBSERVE_QUESTION_LINES` lines and `_OBSERVE_QUESTION_BYTES`
+    bytes are returned, and a cut by either cap ends with a marker line stating
+    what was shown, so a truncated question cannot pass for a whole one. The
+    marker's line count is of the excerpt shown (a line cut by the byte cap
+    counts), `M` is the file's, and `K` is the excerpt's bytes. Only the
+    first `_QUESTION_READ_BYTES` of the file are read; past that `M` is a
+    lower bound and the marker says `of at least M lines`.
+    """
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_QUESTION_READ_BYTES + 1)
+    except OSError:
+        return None
+    read_whole = len(raw) <= _QUESTION_READ_BYTES
+    lines = raw[:_QUESTION_READ_BYTES].decode("utf-8", errors="replace").splitlines()
+    head = "\n".join(lines[:_OBSERVE_QUESTION_LINES])
+    if read_whole and len(lines) <= _OBSERVE_QUESTION_LINES and len(head.encode("utf-8")) <= _OBSERVE_QUESTION_BYTES:
+        return head
+    # `ignore` drops a character the byte cap split, never the whole excerpt.
+    shown = head.encode("utf-8")[:_OBSERVE_QUESTION_BYTES].decode("utf-8", errors="ignore")
+    total = f"{len(lines)}" if read_whole else f"at least {len(lines)}"
+    marker = (
+        f"[question truncated: showing {len(shown.splitlines())} of {total} lines, {len(shown.encode('utf-8'))} bytes]"
+    )
+    return f"{shown}\n{marker}"
 
 
 def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str | None = None) -> ObserveOutcome:
@@ -1133,13 +1157,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
             result_status = None
 
     question_present = question_path.is_file()
-    question_text: str | None = None
-    if question_present:
-        try:
-            question_lines = question_path.read_text(encoding="utf-8", errors="replace").splitlines()
-            question_text = "\n".join(question_lines[:_OBSERVE_QUESTION_LINES])
-        except OSError:
-            question_text = None
+    question_text = read_question_head(question_path) if question_present else None
 
     # Visible pane, not the scrollback `capture` above: an interactive dialog
     # is only actionable while it is on screen, and a dead session captures
@@ -1210,6 +1228,17 @@ def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> No
 # --- answer -------------------------------------------------------------------
 
 
+def _answer_paths(directory: Path, prefix: str) -> tuple[int, Path, Path, Path]:
+    """`(n, question, answer, archived question)` for the next answer in `directory`."""
+    number = len(list(directory.glob(f"{prefix}answer-*.md"))) + 1
+    return (
+        number,
+        directory / f"{prefix}question.md",
+        directory / f"{prefix}answer-{number}.md",
+        directory / f"{prefix}question-{number}.md",
+    )
+
+
 def deliver_answer(directory: Path, prefix: str, session: str, text: str) -> tuple[Path, Path, int]:
     """Deliver a supervisor's answer to the open question in `directory`.
 
@@ -1225,12 +1254,15 @@ def deliver_answer(directory: Path, prefix: str, session: str, text: str) -> tup
     the pointer is typed in the session's input line, so removing the file it
     names would leave a dangling pointer (the rule `finalize_steer` follows).
     On any other `PmError` from the send nothing was typed, so the question is
-    renamed back, the answer file is removed, and the error propagates.
+    linked back and the archived copy and answer file are removed, and the
+    error propagates. The restore uses link-then-unlink, as
+    `_restore_rotated_attempt` does, so a fresh `question.md` the Developer
+    wrote in the window is never overwritten: the archived copy then stays.
+    Whatever this cleanup could not undo is appended to the raised message
+    rather than swallowed, because a stranded file makes the next `answer`
+    fail on numbering.
     """
-    number = len(list(directory.glob(f"{prefix}answer-*.md"))) + 1
-    question_path = directory / f"{prefix}question.md"
-    answer_path = directory / f"{prefix}answer-{number}.md"
-    archived_path = directory / f"{prefix}question-{number}.md"
+    number, question_path, answer_path, archived_path = _answer_paths(directory, prefix)
     if archived_path.exists():
         raise PmError(f"{archived_path} already exists; the question and answer numbering disagree — read both by hand")
     try:
@@ -1249,16 +1281,25 @@ def deliver_answer(directory: Path, prefix: str, session: str, text: str) -> tup
         sessions.send_line(session, prompts.render_answer_pointer(answer_path))
     except TypedNotSubmitted:
         raise
-    except PmError:
-        # Best-effort: a failed cleanup must never mask the send failure.
+    except PmError as exc:
+        left_behind: list[str] = []
         try:
-            archived_path.rename(question_path)
-        except OSError:
-            pass
+            os.link(archived_path, question_path)
+        except FileExistsError:
+            left_behind.append(f"{archived_path} kept because a new {question_path} was written meanwhile")
+        except OSError as link_exc:
+            left_behind.append(f"{archived_path} could not be restored to {question_path}: {link_exc}")
+        else:
+            try:
+                archived_path.unlink()
+            except OSError as unlink_exc:
+                left_behind.append(f"{archived_path} could not be removed after the restore: {unlink_exc}")
         try:
             answer_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        except OSError as unlink_exc:
+            left_behind.append(f"{answer_path} could not be removed: {unlink_exc}")
+        if left_behind:
+            raise PmError(f"{exc}; left behind: {'; '.join(left_behind)}") from exc
         raise
     return answer_path, archived_path, number
 
@@ -1279,7 +1320,9 @@ def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome
     submission. The `answer` event's note carries the full answer verbatim
     and is the durable record; `answer-<n>.md` sits in the Developer-writable
     `.pm/` directory, so it is a delivery artifact, not a second source of
-    truth.
+    truth. A pointer typed but not submitted (`TypedNotSubmitted`) is recorded
+    the same way with `delivered` False before the error propagates, since
+    that answer would otherwise exist only in the Developer-writable file.
     """
     state = load_writable_state(run_dir, token)
     _refuse_if_budget_exhausted(state)
@@ -1302,7 +1345,23 @@ def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome
     if not session or not sessions.session_exists(session):
         raise PmError(f"no live session to answer for {slice_id} — relaunch with start-slice")
 
-    answer_path, archived_path, number = deliver_answer(artifact_dir, "", session, text)
+    # Named before the delivery: once the answer file exists the next free
+    # number has moved on, and the undelivered event below needs this one.
+    _number, _question, pending_answer, pending_archive = _answer_paths(artifact_dir, "")
+    try:
+        answer_path, archived_path, number = deliver_answer(artifact_dir, "", session, text)
+    except TypedNotSubmitted:
+        # The pointer is typed and names the answer file, but that file is
+        # Developer-writable; this event is the durable record.
+        state_mod.append_event(
+            run_dir,
+            "answer",
+            slice_id=slice_id,
+            note=text,
+            evidence=str(pending_answer),
+            data={"question": pending_archive.name, "delivered": False},
+        )
+        raise
     state_mod.append_event(
         run_dir,
         "answer",

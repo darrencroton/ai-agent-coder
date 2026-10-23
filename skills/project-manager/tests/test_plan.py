@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -581,7 +582,8 @@ class TestLoadPolicy(PlanTestCase):
         self.assertEqual(policy["protected_paths"], ["instruments/", "config/policy.json"])
 
     def test_policy_inside_repo_not_appended_when_an_entry_covers_it(self) -> None:
-        for entries in (["config/"], ["config/policy.json"], ["config/*.json"]):
+        # A plain directory entry protects its subtree, so it covers the file too.
+        for entries in (["config/"], ["config/policy.json"], ["config/*.json"], ["config"]):
             with self.subTest(entries=entries):
                 path = self.write_policy({"protected_paths": entries}, self.repo / "config" / "policy.json")
                 self.assertEqual(plan_mod.load_policy(path, repo=self.repo)["protected_paths"], entries)
@@ -591,6 +593,68 @@ class TestLoadPolicy(PlanTestCase):
         self.assertEqual(plan_mod.load_policy(outside, repo=self.repo)["protected_paths"], ["instruments/"])
         inside = self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "policy.json")
         self.assertEqual(plan_mod.load_policy(inside)["protected_paths"], ["instruments/"])
+
+    def test_symlinked_policy_file_refused_naming_the_link(self) -> None:
+        # Protection would land on the link's target, while a later node could
+        # re-point the tracked link itself.
+        target = self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "real-policy.json")
+        link = self.repo / "policy.json"
+        link.symlink_to(target)
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(link, repo=self.repo)
+        self.assertIn(str(link), str(ctx.exception))
+        self.assertIn("symbolic link", str(ctx.exception))
+
+    def test_policy_reached_through_a_symlinked_directory_inside_repo_is_refused(self) -> None:
+        # Protection would land on `real/policy.json`, while a later node could
+        # re-point the tracked `link` directory itself.
+        self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "real" / "policy.json")
+        (self.repo / "link").symlink_to(self.repo / "real")
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(self.repo / "link" / "policy.json", repo=self.repo)
+        self.assertIn("through a symlink inside the repository", str(ctx.exception))
+
+    def test_inner_link_is_refused_when_the_repo_is_passed_resolved_and_spelled_through_a_link(self) -> None:
+        # The CLI resolves the repository, so the spelled path must be measured
+        # from the ancestor that resolves to it, not from the repo as given.
+        self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "real" / "policy.json")
+        (self.repo / "link").symlink_to(self.repo / "real")
+        repo_link = self.repo.parent / "repo-link"
+        repo_link.symlink_to(self.repo)
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(repo_link / "link" / "policy.json", repo=self.repo.resolve())
+        self.assertIn("through a symlink inside the repository", str(ctx.exception))
+        self.assertIn("'link/policy.json' resolves to 'real/policy.json'", str(ctx.exception))
+
+    def test_inner_link_to_a_directory_outside_the_repo_is_refused(self) -> None:
+        self.write_policy({"protected_paths": ["instruments/"]}, self.repo.parent / "elsewhere" / "policy.json")
+        (self.repo / "link").symlink_to(self.repo.parent / "elsewhere")
+        for repo in (self.repo, self.repo.resolve()):
+            with self.subTest(repo=repo), self.assertRaises(PmError) as ctx:
+                plan_mod.load_policy(self.repo / "link" / "policy.json", repo=repo)
+            self.assertIn("resolves to outside the repository", str(ctx.exception))
+
+    def test_policy_in_a_repo_under_a_symlinked_parent_still_loads(self) -> None:
+        self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "policy.json")
+        repo_link = self.repo.parent / "repo-link"
+        repo_link.symlink_to(self.repo)
+        policy = plan_mod.load_policy(repo_link / "policy.json", repo=repo_link)
+        self.assertEqual(policy["protected_paths"], ["instruments/", "policy.json"])
+        # The CLI's shape: the repo resolved, the path spelled through the link.
+        policy = plan_mod.load_policy(repo_link / "policy.json", repo=self.repo.resolve())
+        self.assertEqual(policy["protected_paths"], ["instruments/", "policy.json"])
+
+    def test_policy_inside_repo_whose_name_is_a_glob_is_refused(self) -> None:
+        # The self-protection entry would be read as a pattern: `policy[1].json`
+        # matches `policy1.json`, not itself, and so would protect nothing.
+        path = self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "policy[1].json")
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(path, repo=self.repo)
+        self.assertIn("policy[1].json", str(ctx.exception))
+        self.assertIn("glob", str(ctx.exception))
+        # Outside the repository no self-protection entry is built, so the name is harmless.
+        outside = self.write_policy({"protected_paths": ["instruments/"]}, self.repo.parent / "policy[1].json")
+        self.assertEqual(plan_mod.load_policy(outside, repo=self.repo)["protected_paths"], ["instruments/"])
 
 
 class TestProtectedOverlap(unittest.TestCase):
@@ -646,6 +710,10 @@ class TestCheckPlanPolicy(PlanTestCase):
         path.write_text(json.dumps({"schema": 1, "protected_paths": entries}), encoding="utf-8")
         return path
 
+    def git_init(self) -> None:
+        """Make `self.repo` a git repository: `--repo` is resolved by git."""
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True, capture_output=True)
+
     def test_report_emits_overlap_error_beside_other_errors_and_warnings(self) -> None:
         path = self.write_plan(
             slices=[
@@ -695,12 +763,40 @@ class TestCheckPlanPolicy(PlanTestCase):
         self.assertIn(f"protected paths: 1 (from {policy_path.resolve()})", out)
 
     def test_cli_counts_self_protected_policy_inside_repo(self) -> None:
+        self.git_init()
         plan_path = self.write_plan(slices=[{"files": ["src/a.py"]}])
         policy_path = self.write_policy(["instruments/"], self.repo / "policy.json")
         argv = ["check-plan", "--plan", str(plan_path), "--repo", str(self.repo), "--policy", str(policy_path)]
         code, out, _err = self.run_cli(argv)
         self.assertEqual(code, 0)
         self.assertIn(f"protected paths: 2 (from {policy_path.resolve()})", out)
+        self.assertNotIn("WARNING:", out)
+
+    def test_cli_resolves_a_subdirectory_repo_to_its_toplevel_as_init_does(self) -> None:
+        self.git_init()
+        (self.repo / "subdir").mkdir()
+        plan_path = self.write_plan(slices=[{"files": ["src/a.py"]}])
+        policy_path = self.write_policy(["instruments/"], self.repo / "policy.json")
+        argv = [
+            "check-plan",
+            "--plan",
+            str(plan_path),
+            "--repo",
+            str(self.repo / "subdir"),
+            "--policy",
+            str(policy_path),
+        ]
+        code, out, _err = self.run_cli(argv)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"protected paths: 2 (from {policy_path.resolve()})", out)
+
+    def test_cli_policy_without_repo_warns_that_self_protection_is_unchecked(self) -> None:
+        plan_path = self.write_plan(slices=[{"files": ["src/a.py"]}])
+        policy_path = self.write_policy(["instruments/"], self.repo / "policy.json")
+        code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path), "--policy", str(policy_path)])
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING: --policy without --repo: the policy file is not checked for self-protection\n", out)
+        self.assertIn(f"protected paths: 1 (from {policy_path.resolve()})", out)
 
     def test_cli_malformed_policy_exits_2_naming_the_file(self) -> None:
         plan_path = self.write_plan()
