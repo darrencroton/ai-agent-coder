@@ -41,7 +41,7 @@ Each skill's `SKILL.md` is the source of truth for trigger conditions, workflow,
 | [`drift-audit`](skills/drift-audit/) | Answers one question: was the implementation authorized? Runs before any quality review. |
 | [`code-review`](skills/code-review/) | Quality review after drift audit passes: correctness, edge cases, tests, error handling, domain-specific risks. |
 | [`commit`](skills/commit/) | Stages by name, never skips hooks, writes a message listing every file with reasons. |
-| [`project-manager`](skills/project-manager/) | Supervises execution of an existing plan one slice at a time: durable run state, plan sanity check, fresh tmux-backed session per slice, mechanical floor, recorded assessments, commissioned independent reviews. |
+| [`project-manager`](skills/project-manager/) | Supervises execution of an existing plan one slice at a time: durable run state, plan sanity check, fresh tmux-backed session per slice, mechanical floor, recorded assessments, commissioned independent reviews — or, in campaign mode, plans and runs many such plans against an owner-approved brief. |
 | [`orchestrator`](skills/orchestrator/) | Delegates bounded read-only or read-write work through validated contracts, with session tracking and continuation. The Developer retains verification, gates, commits, and final responsibility. |
 | [`code-simplifier`](skills/code-simplifier/) | Behaviour-preserving clarity pass over working code. A separate cleanup step, not part of the default chain. |
 | [`style-guide`](skills/style-guide/) | Draft a project style guide from a portable baseline, audit code against it, or write code following it. `write` mode folds into `scoped-implementation` when available; not a gate anywhere. |
@@ -107,6 +107,7 @@ If the PM seat runs in Claude Code, consider installing the optional poll guard 
 | Risky or unfamiliar surfaces; you want a checkpoint between slices | Mode A — checkpointed |
 | Straightforward plan, strong models, fits in one session | Mode A — autonomous usage |
 | Long plan, unattended time, weaker or local models, or you want external verification and a durable audit trail | Mode B — Project Manager |
+| A goal met across many plans and days, with an owner-approved brief | Campaign mode — a Campaign Manager plans and runs many Mode B child runs ([`skills/project-manager/references/campaign-mode.md`](skills/project-manager/references/campaign-mode.md)) |
 
 ## Privacy and data flows
 
@@ -129,6 +130,12 @@ Run state, artifacts, transcripts, and review evidence stay on your machine. Wha
 - **PM seat** — in Mode B, the model that drives Project Manager's commands and judgement.
 - **Project Manager (PM)** — the accountable supervisor: the toolkit owns state, sessions, and the floor; the PM agent owns assessment, review depth, steering, and stop decisions.
 - **Run state** — authenticated state and PM-authored originals under the repo's git directory, mirrored with per-slice artifacts under `.pm/` in the target repo; the audit trail.
+- **Campaign mode** — a `project-manager` mode that turns an owner-approved goal into a validated outcome across many small plans and days: the Campaign Manager writes node plans inside the brief, runs each through an ordinary child PM in its own worktree and tmux session, and merges accepted change nodes one at a time. Contract and launcher: [`skills/project-manager/references/campaign-mode.md`](skills/project-manager/references/campaign-mode.md).
+- **Campaign Manager (CM)** — the `project-manager` seat in campaign mode. It plans, launches, answers, judges and stops child PMs and keeps the dossier; it never implements, never supervises a plan it wrote, and never changes the brief.
+- **Dossier and brief** — the dossier is the Campaign Manager's whole state: a git repository of its own, outside the product repository, laid out in [`skills/project-manager/references/dossier-template.md`](skills/project-manager/references/dossier-template.md). Its `brief.md` is the owner-approved, digest-pinned goal, targets, permitted paths, protected-paths policy file, reserved decision classes and budgets, and is the CM's only authority to plan.
+- **Node** — one unit of a campaign: a *change* node (a product change toward a target, merged once accepted), an *evidence* node (a measurement at a recorded product commit, never merged), or a *task* node (a read-only investigation run through `orchestrator`). Change and evidence nodes each run as a child PM on a small node plan.
+- **Protected path** — a path named in a protected-paths policy file, frozen into run state at `init`. A plan surface that reaches one is refused at `check-plan` and `init`, `grant` refuses it, and floor fact 5 fails on a change to it (a rename counts on both sides). Contract: `project-manager`'s `references/run-state.md`.
+- **Question** — a one-line decision a session asks its supervisor through a file, answered without ending the session: a Developer asks PM (`pm answer`), and a child PM asks the Campaign Manager (`answer-child`).
 
 ## License
 

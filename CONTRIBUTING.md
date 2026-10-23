@@ -21,6 +21,9 @@ Each contract lives in exactly one place; everything else points at it. Before e
 | PM charter, floor facts, and always-stop rules | `skills/project-manager/SKILL.md` → "Charter", "The floor", "Always stop" |
 | PM trust model and known limits | `skills/project-manager/README.md` → "Trust model, honestly" |
 | Run-state layout and authority model | `skills/project-manager/references/run-state.md` |
+| Protected-paths policy file contract | `skills/project-manager/references/run-state.md` |
+| Campaign-mode operating contract and the campaign launcher | `skills/project-manager/references/campaign-mode.md` |
+| Dossier layout and templates | `skills/project-manager/references/dossier-template.md` |
 | Developer and Reviewer prompt contracts | `skills/project-manager/references/developer-prompt.md`, `…/reviewer-prompt.md` |
 | Harness profile table | `skills/project-manager/scripts/pm_lib/profiles.py` |
 | Delegate request contract and access-mode semantics | `skills/orchestrator/references/delegate-contract.md` |
