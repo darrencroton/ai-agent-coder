@@ -127,6 +127,18 @@ A campaign is accepted on a final evidence node at the final integration head, a
 - plan versions per node, and nodes per target;
 - spend and wall time.
 
+### First campaign: the scratch test
+
+Stage 1 is a scratch campaign before any real one. The real-model run is the owner's, in a fresh CM session, never a Developer's: three nested model seats and a human go/no-go do not fit a Developer's tool timeouts. The model-free half, a fake child PM against the four child commands and a protected instrument, is the README's [Verify campaign mode](../README.md#verify-campaign-mode-no-real-model-2-minutes) trial; this subsection does not repeat it.
+
+- **Setup:** a scratch product repository and a dossier, with `max_parallel: 1` and two targets. T1 is a function with a stated output, measured by an instrument that an owner-approved node builds and a committed policy file then protects. T2 is the suite passing at the final head.
+- **Nodes:** N1, a change node for T1, then its merge and the ratchet. Kill the CM after the merge and before N2 launches, and restart it from the dossier alone, so reconcile is the only recovery. N2 is an evidence node at the new integration head, the ratchet and the final-head evidence T2 needs: its report is copied into `validation/<node>/` and its branch is never merged.
+- **Questions:** the child asks the CM at most once per node in the scratch test, by design, so a second question is a finding about the plan or the launcher.
+- **Trust:** confirm that a new worktree under the trusted parent launches without a trust dialog; a dialog is a question for the owner and fails the launch (*Launching and watching a child*).
+- **Fault injections:** a node plan whose surface reaches `instruments/` must be refused by `check-plan --policy`; an edit to `brief.md` must be caught by the digest at reconcile, before anything launches.
+- **No-go:** a child that cannot run unattended to completion, or a restart that loses or repeats work.
+- **Measures:** the retrospective list in *Acceptance and retrospective*, recorded as written there.
+
 ## Worktrees and parallelism
 
 Run serially first, with `max_parallel: 1` in `brief.md`. Going parallel is launching a second child before waiting on the first, under disjoint surfaces, with exclusive resources respected and merges still one at a time; the per-child tmux sockets and per-run ledgers already hold.

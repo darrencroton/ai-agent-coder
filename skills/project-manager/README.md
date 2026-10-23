@@ -216,6 +216,38 @@ python3 $PM status --report                # then read .pm/runs/<id>/run-report.
 
 You should see the floor pass 7/7, the acceptance land with an assessment, a run report you can read end-to-end, and the run's ledger file under `../trial-ledger/<host>/`. End the trial with `python3 $PM stop --reason cleanup`, which kills only this run's own sessions (it matches the run's id, never the `pm-` prefix), and then `tmux -L pm-trial kill-server` to remove the private tmux server.
 
+## Verify campaign mode (no real model, ~2 minutes)
+
+The model-free half of stage 1 in [references/campaign-mode.md](references/campaign-mode.md) *First campaign: the scratch test*; the child PM is a fake. From an empty scratch directory:
+
+```sh
+git init -q -b main product && cd product
+mkdir instruments && echo 'print("T1")' > instruments/check_t1.py   # any content; the trial never runs it
+echo '{"schema": 1, "protected_paths": ["instruments/"]}' > campaign-policy.json
+git add -A && git commit -q -m "instrument and policy"
+{ echo '## Slice 1: edit the instrument'   # a node plan whose surface reaches the instrument
+  for s in "Intended Change" "Explicit Non-Goals" "Validation Plan" "Rollback Path"; do printf '### %s\n- n/a\n' "$s"; done
+  printf '### Acceptance Criteria\n- [ ] edited\n### Authorized Surface\n- Files allowed to change:\n  - instruments/check_t1.py\n'
+  printf '### Risk Flags\n- Risky surfaces touched: none\n- Approval needed before implementation: no\n- Difficulty: easy\n'; } > ../node-plan.md
+cat > ../fake-child.sh <<'FAKE'
+echo "fake child PM"; sleep 3; echo "T1 first, or T2? I suggest T1." > "$PM_CM_QUESTION_PATH"
+until [ -e "${PM_CM_QUESTION_PATH%/*}/cm-answer-1.md" ]; do sleep 1; done
+echo '{"status":"complete","run_id":null,"summary":"fake child done"}' > "$PM_CHILD_RESULT_PATH"
+sleep 3600
+FAKE
+PM=<path-to>/skills/project-manager/scripts/pm.py
+python3 $PM check-plan --plan ../node-plan.md --repo . --policy campaign-policy.json   # expect: exit 2, ERROR ... reaches protected path 'instruments/'
+launch=$(python3 $PM launch-child --repo . --base main --branch campaign/t/n1 --worktree ../n1 --prompt-file ../node-plan.md --harness fake --harness-command "sh $PWD/../fake-child.sh")
+echo "$launch"; SOCK=$(echo "$launch" | sed 's/.*socket=\([^ ]*\).*/\1/')   # the socket, from the launch line; tmux -L $SOCK attach to watch
+python3 $PM wait-child --worktree ../n1 --wait 30      # expect: question present: yes
+python3 $PM answer-child --worktree ../n1 --text "T1 first."
+python3 $PM wait-child --worktree ../n1 --wait 30      # expect: result present: True (status=complete)
+python3 $PM stop-child --worktree ../n1 --reason "trial done"
+tmux -L $SOCK ls                                       # expect: no server running
+```
+
+The policy file protects itself too, so `check-plan` reports `protected paths: 2`. Remove the scratch directory by hand; the node branch and worktree live in its `product` repository.
+
 ## Maintainer map
 
 `scripts/pm.py` (entry) → `pm_lib/`: `cli` (parsing/dispatch) · `plan` (parser, lint, risk derivation) · `state` (lite-2 authenticated state, events, report) · `git_ops` (facts + surface matching) · `floor` (the seven facts) · `sessions` (all tmux contact + interactive-dialog markers) · `profiles` (harness table) · `slice_ops` (command orchestration) · `review` (PM-commissioned reviewers) · `judgments` (signed Developer/reviewer ratings and panel comparisons) · `code_metrics` (line and complexity deltas stored at accept, via code-health) · `ledger` (per-window rows and the per-run ledger file) · `leaderboard` (reads every per-run file into the markdown leaderboard, and retags a finished run's files) · `prompts` (template rendering) · `campaign` (child PM launch, watch, answer and stop). Tests in `tests/` use fake harnesses via `--harness-command`; tmux-dependent tests skip when tmux is absent. `pm_test_helpers` owns the shared fixtures — `PlanTestCase` (plain temp directory), `PmTestCase` (adds a git repo), `TmuxRunTestCase` (adds the session reaper and `init`/wait helpers), and the fake-harness builders — and pins `PM_TMUX_SOCKET` and `PM_LEDGER_DIR` so each test process drives its own tmux server and writes its own ledger. Modules are independent and safe to run in parallel.
