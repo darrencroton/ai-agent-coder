@@ -11,9 +11,7 @@ uninitialised read, malformed table, misspelt word, unformatted file — so
 no reviewer attention should be spent on them, and no reviewer's opinion is
 needed to settle them.
 
-This skill exists because LLM reviewers are measurably bad at this class. Across
-five supervised runs of one plan, **11 of ~14 non-code-correctness findings were
-mechanical**, and both commissioned reviewers missed every one of them while
+This skill exists because LLM reviewers tend to miss this class while
 correctly finding subtle semantic defects. Lint is the cheap deterministic floor
 under review, not a replacement for it.
 
@@ -60,8 +58,8 @@ These are load-bearing. Do not work around them.
    `config/markdownlint.jsonc` supply defect-focused defaults only when the
    project has none. Both exist because the tools' own defaults are broader than
    this rule allows — ruff's default set flags import ordering and rewrites
-   `config = dict(...)` to a literal, which on one calibration repo was the
-   documented convention of the project being linted. Shellcheck is capped at
+   `config = dict(...)` to a literal, which may be a project's documented
+   convention. Shellcheck is capped at
    `--severity=info` for the same reason, dropping only its presentational
    `style` tier; a project's `.shellcheckrc` still selects which rules apply and
    shellcheck honours it regardless of that flag. If a plan mandates
@@ -159,15 +157,3 @@ judgement above the floor, where a PM can grant a reasoned tolerance. Making it
 non-waivable would also let a linter release that adds one rule hard-block an
 unrelated run with no discretion available. Mandatory to run and recorded in the
 assessment is the correct strength; unwaivable is not.
-
-## Adding a tool
-
-Append one `Tool(...)` entry to `TOOLS` in `scripts/lint.py`: extensions,
-binary, argv builder, output parser, install recipes per package manager, and
-`default=False` if it needs project-specific configuration. Then add a parser
-test to `tests/test_lint.py` using output captured from the real tool. Nothing
-else changes — selection, differential comparison, coverage, and reporting are
-all driven off that table.
-
-Tests: `python3 -m unittest discover -s <skill-dir>/tests -p 'test_*.py'`. They
-require no linter binary; each parser is tested against captured real output.

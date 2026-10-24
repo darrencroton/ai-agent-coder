@@ -32,10 +32,13 @@ cross-check on the child's own completion file, never as a fact.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shlex
 import shutil
+import signal
+import subprocess
 import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -238,6 +241,12 @@ class _ChildLaunch:
     expected_model_display: str | None
     session: str
     socket: str
+    setup: Path | None
+
+
+# A worktree setup script that has not finished in this long is hung, and a
+# hung setup would otherwise hang the Campaign Manager's launch forever.
+SETUP_TIMEOUT_SECONDS = 600
 
 
 def _left_behind(branch: str, worktree: Path) -> str:
@@ -259,6 +268,7 @@ def launch_child(
     effort: str | None = None,
     socket: str | None = None,
     harness_command: str | None = None,
+    setup: Path | None = None,
 ) -> LaunchChildOutcome:
     """Create the node branch and worktree, then launch a child PM in tmux.
 
@@ -267,7 +277,11 @@ def launch_child(
     `git worktree add -b <branch> <worktree> <base commit>`, `/HANDOFF.md` in
     the git exclude file the worktree reads (verified with `git
     check-ignore`), the self-ignoring `.pm/.gitignore`, `.pm/campaign/` and
-    a byte copy of the prompt file as `launcher.md`; then the session starts
+    a byte copy of the prompt file as `launcher.md`; then `setup`, when
+    given, runs as `sh <setup>` inside the new worktree with its output kept
+    in `.pm/campaign/setup.log`, so a product's git-ignored scaffolding (data
+    links, a virtualenv link) is in place before any session starts there,
+    and a non-zero exit or a hang fails the launch; then the session starts
     as `start_slice` starts a Developer's, its server is marked as this
     child's (`PM_CHILD_WORKTREE`), the manifest is written, readiness is
     awaited, and the one-line child launch pointer is injected.
@@ -290,8 +304,10 @@ def launch_child(
         effort=effort,
         socket=socket,
         harness_command=harness_command,
+        setup=setup,
     )
     launcher = _create_node_worktree(launch)
+    _run_worktree_setup(launch)
     _start_child_session(launch, launcher)
     return LaunchChildOutcome(
         session=launch.session,
@@ -315,6 +331,7 @@ def _check_launch_preconditions(
     effort: str | None,
     socket: str | None,
     harness_command: str | None,
+    setup: Path | None = None,
 ) -> _ChildLaunch:
     """Every refusal `launch_child` makes before anything is created: the
     inputs first, then the environment (tmux, the harness executable, the
@@ -345,6 +362,15 @@ def _check_launch_preconditions(
         raise PmError(f"prompt file could not be read: {prompt_file} ({exc})") from exc
     if not prompt_text.strip():
         raise PmError(f"prompt file is blank: {prompt_file}")
+    if setup is not None:
+        setup = setup.expanduser()
+        try:
+            setup_text = setup.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PmError(f"setup script could not be read: {setup} ({exc})") from exc
+        if not setup_text.strip():
+            raise PmError(f"setup script is blank: {setup}")
+        setup = setup.resolve()
     # `is not None`, not truthiness: an explicit blank override is refused as
     # a blank command below rather than silently replaced by the composed one.
     if harness_command is None and harness not in profiles.SUPPORTED_HARNESSES:
@@ -391,6 +417,7 @@ def _check_launch_preconditions(
         expected_model_display=expected_model_display,
         session=session,
         socket=socket,
+        setup=setup,
     )
 
 
@@ -419,6 +446,99 @@ def _create_node_worktree(launch: _ChildLaunch) -> Path:
     except (OSError, PmError) as exc:
         raise PmError(f"child setup failed ({exc}); {_left_behind(branch, worktree)}") from exc
     return launcher
+
+
+def _run_worktree_setup(launch: _ChildLaunch) -> None:
+    """Run the launch's setup script, if any, inside the new worktree.
+
+    `sh <script>` with the worktree as its working directory, the caller's
+    environment less `PM_RUN_TOKEN`, and its own process group; its stdout
+    and stderr go straight to `.pm/campaign/setup.log`, so the wait depends
+    on the shell exiting and never on a pipe closing, and a log that cannot
+    be opened fails the launch before the script runs, because the log is
+    the only evidence of what ran. On a timeout (`SETUP_TIMEOUT_SECONDS`),
+    or any interruption of the wait, everything still in the script's
+    process group is killed before the error propagates; a process that left
+    the group is outside this reach, and the message says so. A non-zero
+    exit, a timeout, a failure to run at all, or a worktree the script left
+    dirty outside `.pm/` (an untracked or modified file a child's own
+    clean-worktree check would refuse) fails the launch before any session
+    exists, naming the branch and worktree left behind. A job the script
+    leaves running in the background after exiting 0 is not killed and is
+    outside the dirty check, so a setup script must wait for everything it
+    starts.
+    """
+    if launch.setup is None:
+        return
+    worktree, script = launch.worktree, launch.setup
+    log = campaign_dir(worktree) / "setup.log"
+    left_behind = _left_behind(launch.branch, worktree)
+    env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
+    try:
+        handle = log.open("w", encoding="utf-8")
+    except OSError as exc:
+        raise PmError(f"worktree setup log could not be opened at {log} ({exc}); {left_behind}") from exc
+    with handle:
+        try:
+            process = subprocess.Popen(
+                ["sh", str(script)],
+                cwd=worktree,
+                env=env,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise PmError(f"worktree setup {script} could not run ({exc}); {left_behind}") from exc
+        try:
+            returncode = _wait_for_setup(process)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process.pid)
+            process.wait()
+            raise PmError(
+                f"worktree setup {script} did not finish in {SETUP_TIMEOUT_SECONDS}s; everything still in its process "
+                f"group was killed, and a process that left the group may still be running (output in {log}); "
+                f"{left_behind}"
+            ) from None
+        except BaseException:
+            # An interrupt or any other failure of the wait: never leave the
+            # script's group running behind a launcher that has gone.
+            _kill_process_group(process.pid)
+            process.wait()
+            raise
+    if returncode != 0:
+        tail = _log_tail(log)
+        detail = f": {' | '.join(tail)}" if tail else ""
+        raise PmError(f"worktree setup {script} exited {returncode}{detail} (full output in {log}); {left_behind}")
+    try:
+        dirty = git_ops.meaningful_status_lines(git_ops.git_status_text(worktree))
+    except PmError as exc:
+        raise PmError(f"worktree setup ran but git status failed afterwards ({exc}); {left_behind}") from exc
+    if dirty:
+        raise PmError(
+            f"worktree setup {script} left the worktree dirty outside .pm/ ({'; '.join(dirty)}); a child PM refuses to "
+            f"start on a dirty worktree, so setup must create only git-ignored files; {left_behind}"
+        )
+
+
+def _wait_for_setup(process: subprocess.Popen) -> int:
+    """Wait for the setup shell to exit; separate so a test can interrupt the wait."""
+    return process.wait(timeout=SETUP_TIMEOUT_SECONDS)
+
+
+def _kill_process_group(pid: int) -> None:
+    """Kill the process group `pid` leads; a group already gone is not an error."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _log_tail(log: Path, lines: int = 3) -> list[str]:
+    try:
+        return log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-lines:]
+    except OSError:
+        return []
 
 
 def _exclude_handoff(worktree: Path) -> None:

@@ -279,6 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
         "character outside [A-Za-z0-9_-] replaced by '-' and cut to 32 characters)",
     )
     launch_child.add_argument("--harness-command")
+    launch_child.add_argument(
+        "--setup",
+        metavar="FILE",
+        help="a shell script run as `sh FILE` inside the new worktree after it is created and before the child's "
+        "session starts (output in .pm/campaign/setup.log); a non-zero exit or a hang fails the launch",
+    )
 
     wait_child = subparsers.add_parser(
         "wait-child", help="Show evidence of a child PM's progress; a wait returns early on a signal"
@@ -965,6 +971,7 @@ def _run_launch_child(args: argparse.Namespace) -> int:
         effort=args.effort,
         socket=args.socket,
         harness_command=args.harness_command,
+        setup=Path(args.setup) if args.setup else None,
     )
     print(
         f"child launched: session={outcome.session} socket={outcome.socket} "

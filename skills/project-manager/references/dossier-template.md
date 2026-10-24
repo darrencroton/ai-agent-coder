@@ -7,6 +7,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 ```text
 <dossier>/                      a git repository of its own, outside the product repository
   brief.md                      the owner's brief
+  setup.sh                      the owner's worktree setup script, when brief.md's Worktree setup names one
   work.md                       now, and the node table
   evidence.md                   findings, one entry each
   decisions.md                  decisions, one entry each
@@ -35,11 +36,14 @@ The layout of a campaign dossier and a template for each of its files. This is a
 ## Allowed paths
 - <product path the campaign may change>
 - Node worktree parent: <absolute directory the owner has trusted in each harness>
-- Protected-paths policy file: <path in the product repository> at <pinned SHA> (see [campaign-mode.md](campaign-mode.md) *Launching and watching a child*)
+- Protected-paths policy file: <path in the product repository>, SHA-256 <digest of the file, from shasum -a 256> (see [campaign-mode.md](campaign-mode.md) *Launching and watching a child*)
 - Git-ignored output directories: <product directories, or none>
 
 ## Reserved decision classes
 - <class>: <what the class covers>
+
+## Worktree setup
+- <none, or: setup.sh in this dossier, SHA-256 <digest of the file, from shasum -a 256>, run by launch-child --setup in every node worktree before its session starts; what it links or creates, all of it git-ignored and none of it a product change>
 
 ## Budgets
 - Node budget per target: <N>

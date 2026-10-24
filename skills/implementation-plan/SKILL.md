@@ -147,7 +147,7 @@ Under Mode B, a single path discovered outside the surface is not a dead end: `p
 
 ## Execution Modes
 
-The same plan file serves two run modes — Mode A (one agent session, checkpointed by default or autonomous as an alternate usage) and Mode B (supervised autonomy under `project-manager`) — but not every plan feature binds in both. The mode-binding rules for batches, the approval flag, and independent audit are stated once, in "Machine-Consumed Fields" above; this section covers only what is genuinely comparative between the two modes:
+The same plan file serves two run modes — Mode A (a human-managed run in one agent session, checkpointed or autonomous per its launcher's `Supervision:` line) and Mode B (a PM-managed run under `project-manager`) — but not every plan feature binds in both. In campaign mode (Mode C) a Campaign Manager writes node plans with this skill and runs each in Mode B, so a node plan is an ordinary Mode B plan. The mode-binding rules for batches, the approval flag, and independent audit are stated once, in "Machine-Consumed Fields" above; this section covers only what is genuinely comparative between the two modes:
 
 - **Atomic slices** are safe everywhere — they are the unit both modes gate on.
 - **The approval flag's stop differs by mode**: an explicit `yes` stops an autonomous Mode A run for human review, and stops Mode B until the operator records approval. See "Machine-Consumed Fields" for the exact-`no` rule and what counts as a planning defect.
@@ -161,77 +161,51 @@ The same plan file serves two run modes — Mode A (one agent session, checkpoin
 - Do not put dependency manifests, lockfiles, or license files in the authorized surface of a slice that runs unattended. Runtime dependency/license stops are heuristic, not diff inspection, so the plan is the real control: isolate such changes into their own slice and mark it `Approval needed before implementation: yes`.
 - If discovery shows the planned surface is too broad, recommend a smaller first slice.
 - If the repository state is unclear or dirty in relevant files, call that out before finalising the plan.
-- Include final `Next Chat Prompts` using the formats below: one Mode A launcher and one Mode B launcher, so the user can choose how to run the plan. Set the plan file path and Mode A slice selection, and reference the plan file rather than pasting receipts so each launcher stays lean.
+- Include final `Next Chat Prompts` using the formats below: one Mode A launcher and one Mode B launcher, so the user can choose how to run the plan. Set the plan file path, the Mode A scope and the recommended `Supervision:` value, and reference the plan file rather than pasting receipts so each launcher stays lean.
 
 ## Next Chat Prompt Format
 
-End the plan with two copyable launchers for the next chat: the most suitable Mode A launcher, followed by the Mode B launcher. The skill chain uses the same skills in every mode (`scoped-implementation`, `drift-audit`, `code-review`, `commit`, with `orchestrator` for read-only Reviewer delegation and `handoff` at boundaries); the modes differ in who holds the gates, when handoff happens, and ordering — Mode A reviews before the commit, while Mode B commits the slice first and PM commissions reviews against the committed diff before accepting.
+End the plan with two copyable launchers for the next chat: the Mode A launcher, then the Mode B launcher. The skill chain uses the same skills in every mode (`scoped-implementation`, `drift-audit`, `code-review`, `commit`, with `orchestrator` for read-only Reviewer delegation and `handoff` at boundaries); the modes differ in who holds the gates, when handoff happens, and ordering — Mode A reviews before the commit, while Mode B commits the slice first and PM commissions reviews against the committed diff before accepting. The Mode C (campaign) launcher is not plan-generated; its only copy is in `project-manager`'s `references/campaign-mode.md`.
 
-Choose the appropriate Mode A launcher for the plan, then include Mode B as an alternative:
+- **Mode A — human-managed plan.** One agent session acts as the Developer over the slices in scope; the human holds the gates. Its `Supervision:` line selects one of two usages, and the plan recommends one:
+  - *Checkpointed* (default) — when slices are risky, touch flagged surfaces, or you want a checkpoint between them. You stay in the loop, approve before approval-flagged slices, review findings, and approve each commit. One slice (or a few tightly-coupled slices) per chat, then a handoff to the next session.
+  - *Autonomous* — the same session runs over all remaining slices, for when the plan is straightforward, the selected models are suitable, the work fits one session, and you do not want to stand up an external supervisor. The launcher is standing authorization to commit each slice that clears every gate; the gates are promises kept in-session, not externally verified, and you assess at the end.
+- **Mode B — PM-managed plan.** The alternative when the plan is long, the run is unattended, models are weaker or cheaper, or you want external verification with a durable audit trail. Include the launcher below — this file is its only copy — with the plan file and repository paths filled in. Every slice must remain independently gateable because PM ignores batches, and the plan should pass `check-plan` cleanly.
 
-- **Mode A, checkpointed (default)** — when slices are risky, touch flagged surfaces, or you want a checkpoint between them. You stay in the loop, approve before risky slices, review findings, and approve each commit. One slice (or a few tightly-coupled slices) per chat, then a handoff to the next session.
-- **Mode A, autonomous session (alternate usage)** — the same Developer session runs in a loop over all remaining slices, for when the plan is straightforward, the selected models are suitable, the work fits one session, and the user does not want to stand up an external supervisor. The Developer prefers a read-only Reviewer for the hostile drift-audit skill and independent code-review pass, recovers from findings itself, and commits each slice that clears all gates. If the launcher omits Reviewer configuration, the Developer self-audits and records that provenance explicitly. You assess at the end.
-- **Mode B (Supervised autonomy)** — an alternative when the plan is long, the run is unattended, models are weaker or cheaper, or the user wants external verification with a durable audit trail. Include the launcher below — this file is its only copy — with the plan file and repository paths filled in. Every slice must remain independently gateable because PM ignores batches, and the plan should pass `check-plan` cleanly.
+Every launcher keeps two non-negotiables: a slice whose Risk Flags mark approval-needed pauses a checkpointed Mode A run and stops an autonomous Mode A or Mode B run, and each slice reports its authorization-gate result before quality review.
 
-Every launcher keeps two non-negotiables: a slice whose Risk Flags mark approval-needed pauses (checkpointed Mode A) or stops the run (autonomous Mode A and Mode B), and each slice reports its authorization-gate result before quality review.
-
-### Mode A — Assisted run (default, checkpointed)
+### Mode A — Human-managed plan
 
 ```md
 Plan file: <path>
-Slices or batch this session: <e.g. Slice 2, Slices 2–3, or Batch A>
+Scope: <Slice 2, Slices 2–3, Batch A, or: all remaining slices, in plan order>
+Supervision: <checkpointed — I am present: ask me before coding an approval-flagged slice and before each commit | autonomous — I am not present: this is standing authorization to commit each slice that clears every gate; end the run on anything that needs me>
 Reviewers (optional): drift auditor <harness> <full model id> <effort>; code reviewers <harness> <full model id> <effort>; …
 
-Read the full plan file first. If a selected slice or batch receipt is incomplete or the plan state is unclear, stop and tell me before coding.
+Read the full plan file first. If a slice or batch receipt in scope is incomplete or the plan state is unclear, stop and tell me before coding.
 
 Work on the current feature branch for this plan; if none exists, create one and tell me the name.
 
-Use orchestrator as the controlling skill. Act as the Developer: keep implementation, validation, Git operations, and commits local. Use a read-only Reviewer (the reviewers above, when given) only for investigation, evidence gathering, the hostile drift-audit skill, and an independent code-review skill pass. If no Reviewer is configured or available, perform Developer self-audit and record that provenance explicitly.
+Use orchestrator as the controlling skill. Act as the Developer: keep implementation, validation, Git operations, and commits local. Use a read-only Reviewer (the reviewers above, when given) only for investigation, evidence gathering, the hostile drift-audit skill, and an independent code-review skill pass. If no Reviewer is configured or available, perform Developer self-audit on a default slice and record that provenance explicitly; for a slice whose Risk Flags say `Independent audit required: yes`, stop and report instead of self-auditing.
 
-For each selected slice or batch, in plan order:
+For each slice or batch in scope, in plan order:
 1. Restate the frozen contract (authorized surface + non-goals) from the plan.
-2. If any included slice's Risk Flags mark approval-needed, stop and get my approval before coding.
+2. If any included slice's Risk Flags mark approval-needed, stop before coding: checkpointed, get my approval; autonomous, end the run and report — never self-approve a slice the plan gated for a human.
 3. apply the scoped-implementation skill against the selected contract.
 4. apply the drift-audit skill using a read-only Reviewer when available; otherwise perform Developer self-audit. Report the authorization gate result and who performed it before any quality review.
-5. If the gate passes: for a broad or structural change, first run the code-health skill differentially against the slice's starting commit and supply its report as review evidence. Then apply the code-review skill using the code reviewers when available, in parallel if there are several; otherwise perform Developer self-audit through the code-review skill. Record who performed it. If the drift gate fails, fix the drift and re-audit.
-6. Collect every finding from the current audit or review round before fixing, surface them to me, fix them as one batch, then re-run the relevant gate. If consecutive reviews return only minor findings and have clearly converged, record residuals in the slice summary and proceed.
-7. Ask me before committing. On my approval, commit the selected slice or batch with the commit skill.
+5. If the gate fails, fix the drift inside the contract and re-audit; if it cannot be fixed inside the contract, stop and report.
+6. On a passing gate: for a broad or structural change, first run the code-health skill differentially against the slice's starting commit and supply its report as review evidence. Then apply the code-review skill using the code reviewers when available, in parallel if there are several; otherwise perform Developer self-audit through the code-review skill. Record who performed it.
+7. Collect every finding from the current audit or review round before fixing (checkpointed, surface them to me first), record them in the slice summary, fix them as one batch, then re-run the relevant gate. If consecutive reviews return only minor findings and have clearly converged, record residuals in the slice summary and proceed.
+8. Commit with the commit skill: checkpointed, ask me first; autonomous, commit a slice that has passed validation, the drift-audit gate and the code-review gate — and only such a slice.
 
-After the selected slice(s) or batch are committed, use the handoff skill to record state, audit provenance (Reviewer tool/label or Developer self-audit and fallback context), and the next slice or batch to resume from. Do not continue past the selected scope.
+Stop early on: a blocker, an unapproved scope change, a gate or validation failure unfixable inside the contract, or context pressure. When the scope is done, or on any stop with slices remaining, use the handoff skill to record state, audit provenance (Reviewer tool/label or Developer self-audit and fallback context), and the next slice or batch to resume from. Do not continue past the scope.
 
-Confirm before starting: plan file read, selected slice(s) or batch, branch, and the first slice. Then begin.
+When the scope was all remaining slices and the plan is complete, use the report skill instead to write a final report covering slices committed, gate results and audit provenance per slice, validation, and every residual or post-plan consideration left for me to assess. Do not lose a non-blocking observation merely because it did not belong in the frozen plan.
+
+Confirm before starting: plan file read, scope, supervision, branch, and the first slice. Then begin.
 ```
 
-### Mode A — Autonomous session (alternate usage)
-
-```md
-Plan file: <path>
-Scope: all remaining slices, in plan order.
-Reviewers (optional): drift auditor <harness> <full model id> <effort>; code reviewers <harness> <full model id> <effort>; …
-
-Read the full plan file first. If the plan is incomplete or its state is unclear, stop and report instead of improvising.
-
-Act as the Developer per the orchestrator skill. You own the full run — implement, validate, gate, recover, commit, and make the accept/reject call. Prefer a read-only Reviewer (the reviewers above, when given) for investigation, evidence gathering, the hostile drift-audit skill, and an independent code-review skill pass. Keep implementation, test execution, Git operations, and commits local. If no Reviewer is configured or available, perform Developer self-audit on default slices and record that provenance and fallback context explicitly.
-
-Setup: work on the current feature branch for this plan; if none exists, create one and report the name.
-
-For each slice or approved batch, in plan order:
-1. Restate the frozen contract (authorized surface + non-goals).
-2. If any included slice's Risk Flags mark approval-needed, STOP the run and report — do not self-approve a slice the plan gated for a human.
-3. apply the scoped-implementation skill against the selected contract.
-4. apply the drift-audit skill using a read-only Reviewer when available; otherwise perform Developer self-audit. Record the authorization gate result and who performed it.
-5. If the gate fails, fix the drift inside the contract and re-audit. If it can't be fixed inside the contract, STOP and report.
-6. On a passing gate: for a broad or structural change, first run the code-health skill differentially against the slice's starting commit and supply its report as review evidence. Then apply the code-review skill using the code reviewers when available, in parallel if there are several; otherwise perform Developer self-audit through the code-review skill. Record who performed it. Collect every finding before fixing, fix them as one batch, then re-run the relevant gate. If consecutive reviews return only minor findings and have clearly converged, record residuals in the slice summary and proceed.
-7. When the slice passes validation, the drift-audit gate, and the code-review gate, use the commit skill. This prompt is explicit approval to commit each slice that has cleared all three gates — and only those.
-
-Stop the run early on: an approval-gated slice, a blocker, an unapproved scope change, a gate/validation failure unfixable inside the contract, or context pressure. On any stop, use the handoff skill to record current state and the next slice or batch to resume from.
-
-When all slices are complete, use the report skill to write a final report covering slices committed, gate results and audit provenance per slice, validation, and every residual or post-plan consideration left for me to assess. Identify each Reviewer tool/label used and every Developer self-audit with its fallback context. Do not lose a non-blocking observation merely because it did not belong in the frozen plan.
-
-Confirm before starting: plan file read, branch name, the ordered slice list you'll execute, and the first slice. Then begin.
-```
-
-### Mode B — Supervised autonomy (alternative)
+### Mode B — PM-managed plan
 
 ```md
 Plan file: <path>
@@ -240,7 +214,7 @@ Developer: <harness> <full model id> <effort>   (model and effort may be "per pl
 Drift auditor: <harness> <full model id> <effort>
 Code reviewers: <harness> <full model id> <effort>; <harness> <full model id> <effort>
 Run tag (optional): <tag>
-Campaign child (include this paragraph only when a Campaign Manager launched this run; delete it otherwise):
+Campaign child (include this paragraph only when a Campaign Manager launched this run; delete it otherwise; the contract it serves is project-manager's references/campaign-mode.md):
 - Nobody is present: confirm nothing with a human.
 - The plan is committed in the dossier at the path given, which meets the "plan committed" requirement; it is not in the product repository.
 - Skip the confirm step. After `check-plan` and the repo check, run `init` yourself with `--branch <branch>`, `--policy <protected-paths policy file, when given>`, `--run-tag <campaign tag>`, `--max-attempts <N>` and full model ids, and hold the token.

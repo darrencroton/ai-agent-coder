@@ -36,16 +36,16 @@ Never:
 When all of the following are true, populate `Resume Prompt` using the full next-chat launcher below — not the generic resume prompt:
 
 - an implementation plan file exists and was the source of the current work
-- you just finished implementing one or more slices or a named batch from that plan
-- you are stopping at a slice or batch boundary so the user can review before the next session begins (i.e. you are **not** running all remaining slices autonomously without user checkpoints)
+- you worked on one or more slices or a named batch from that plan, finished or interrupted
+- the plan is not complete: you are stopping at a slice or batch boundary for the user to review, or an autonomous session is ending early
 
 Build the resume prompt from the Mode A launcher in `implementation-plan`'s `SKILL.md` → "Next Chat Prompt Format" — that file is the single source for launcher text; do not reproduce a stale copy from memory. Copy the launcher, then make exactly these handoff-specific modifications:
 
-1. Set `Plan file:` and set `Slices or batch this session:` to the next unstarted slice, slice range, or named batch.
+1. Set `Plan file:`; set `Scope:` to start at the first slice not yet committed, including one left in progress (as that slice, a slice range, a named batch, or all remaining slices); keep the `Supervision:` line the session ran under, except set it to checkpointed when the first slice in scope is approval-flagged, since only a present human can approve it.
 2. Extend the "Read the full plan file first" line to require reading **both** the plan file **and** `HANDOFF.md`, stating that the handoff is part of the run contract and records what has been committed and what remains.
 3. Add `HANDOFF.md read` to the final "Confirm before starting" list.
 
-For all other handoffs — including autonomous Mode A full-plan runs, Mode B/PM runs (PM's run state and `run-report.md` under the repo's git directory are the continuation record), and non-plan work — omit the Resume Prompt section entirely.
+For all other handoffs — a completed Mode A plan, Mode B runs (the PM's own `HANDOFF.md` and the Mode B launcher resume them), campaign mode (Mode C: the dossier's `work.md` and the campaign launcher resume the Campaign Manager; a stopped child PM is never resumed), and non-plan work — omit the Resume Prompt section entirely.
 
 ## Template
 
@@ -97,7 +97,7 @@ Use this structure. For Quick Mode, omit sections that do not apply.
 - The exact first thing the next agent should do.
 
 ## Resume Prompt
-*(Only when handing off at a slice or batch boundary with user checkpoints between sessions — build it as described in the Plan Workflow Handoff section above. Omit this section for all other handoffs.)*
+*(Only when handing off an unfinished Mode A plan run — build it as described in the Plan Workflow Handoff section above. Omit this section for all other handoffs.)*
 ```
 
 ## Next Action Standard

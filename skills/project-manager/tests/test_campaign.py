@@ -54,6 +54,16 @@ _QUESTION_TEXT = "Which node order?\nA: data first\nB: model first\nRecommendati
 _RESULT_JSON = '{"status": "complete", "run_id": null, "summary": "fake child finished"}'
 
 
+def _alive(pid: int) -> bool:
+    """Whether `pid` is still executing: gone, or a zombie awaiting its reaper, counts as dead."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], text=True, capture_output=True, check=False).stdout
+    return bool(state.strip()) and not state.strip().startswith("Z")
+
+
 def _child_tmux(socket: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["tmux", "-L", socket, *args], check=False, text=True, capture_output=True)
 
@@ -196,6 +206,7 @@ class TestCampaignParsers(unittest.TestCase):
             "--effort",
             "--socket",
             "--harness-command",
+            "--setup",
         },
         "wait-child": {"--worktree", "--wait"},
         "answer-child": {"--worktree", "--text"},
@@ -404,6 +415,121 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         self.assertIn(str(self.worktree.resolve()), err)
         self.assertTrue(self.worktree.is_dir())
         self.assertIn("refs/heads/node-1", self.branches())
+        self.assertFalse(campaign.manifest_path(self.worktree).exists(), "no session, so no manifest")
+        self.assert_socket_untouched()
+
+    def test_a_blank_or_unreadable_setup_script_is_refused_before_anything_is_created(self) -> None:
+        blank = self.repo.parent / "setup-blank.sh"
+        blank.write_text("\n", encoding="utf-8")
+        self.assert_refused(self.launch_argv(self.harness) + ["--setup", str(blank)], "setup script is blank")
+        self.assert_refused(
+            self.launch_argv(self.harness) + ["--setup", str(self.repo.parent / "absent.sh")],
+            "setup script could not be read",
+        )
+
+    def _commit_ignoring(self, *patterns: str) -> None:
+        (self.repo / ".gitignore").write_text("".join(f"{p}\n" for p in patterns), encoding="utf-8")
+        self._git("add", ".gitignore")
+        self._git("commit", "-q", "-m", "ignore scaffolding")
+
+    def _setup_argv(self, script: Path) -> list[str]:
+        argv = self.launch_argv(self.harness) + ["--setup", str(script)]
+        argv[argv.index("--base") + 1] = "HEAD"
+        return argv
+
+    def test_a_setup_script_runs_in_the_new_worktree_before_the_session_starts(self) -> None:
+        self._commit_ignoring("setup-cwd.txt", "link.md")
+        script = self.repo.parent / "setup.sh"
+        script.write_text(
+            'pwd -P > setup-cwd.txt\necho scaffolded\nln -s "$PWD/README.md" link.md\n'
+            'if [ -n "${PM_RUN_TOKEN+x}" ]; then echo token-leaked >&2; fi\n',
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "caller-token-must-not-leak"}),
+            mock.patch.object(campaign, "_start_child_session") as start,
+        ):
+            code, out, err = self.run_cli(self._setup_argv(script))
+        self.assertEqual(code, 0, out + err)
+        worktree = self.worktree.resolve()
+        start.assert_called_once()
+        self.assertEqual((worktree / "setup-cwd.txt").read_text(encoding="utf-8").strip(), str(worktree))
+        self.assertTrue((worktree / "link.md").is_symlink())
+        log = (campaign.campaign_dir(worktree) / "setup.log").read_text(encoding="utf-8")
+        self.assertIn("scaffolded", log)
+        self.assertNotIn("token-leaked", log)
+
+    def test_a_setup_script_that_dirties_the_worktree_fails_the_launch(self) -> None:
+        script = self.repo.parent / "setup-dirty.sh"
+        script.write_text("echo stray > stray.txt\n", encoding="utf-8")
+        with mock.patch.object(campaign.sessions, "start_session") as start:
+            code, out, err = self.run_cli(self._setup_argv(script))
+        self.assertEqual(code, 2, out + err)
+        start.assert_not_called()
+        self.assertIn("left the worktree dirty outside .pm/", err)
+        self.assertIn("stray.txt", err)
+        self.assertIn(f"branch node-1 and worktree {self.worktree.resolve()} are left behind", err)
+
+    def test_a_hung_setup_script_is_killed_with_everything_it_started(self) -> None:
+        pid_file = self.repo.parent / "sleeper.pid"
+        script = self.repo.parent / "setup-hang.sh"
+        script.write_text(f'sleep 300 &\necho $! > "{pid_file}"\nwait\n', encoding="utf-8")
+        with (
+            mock.patch.object(campaign, "SETUP_TIMEOUT_SECONDS", 1),
+            mock.patch.object(campaign.sessions, "start_session") as start,
+        ):
+            code, out, err = self.run_cli(self._setup_argv(script))
+        self.assertEqual(code, 2, out + err)
+        start.assert_not_called()
+        self.assertIn("did not finish in 1s", err)
+        self.assertIn("process group was killed", err)
+        sleeper = int(pid_file.read_text(encoding="utf-8").strip())
+        self.assertTrue(self._wait_for(lambda: not _alive(sleeper)), "the script's own child must be dead too")
+        self.assertTrue((campaign.campaign_dir(self.worktree.resolve()) / "setup.log").is_file())
+
+    def test_an_interrupted_setup_wait_kills_the_script_group_and_re_raises(self) -> None:
+        pid_file = self.repo.parent / "sleeper.pid"
+        script = self.repo.parent / "setup-hang.sh"
+        script.write_text(f'sleep 300 &\necho $! > "{pid_file}"\nwait\n', encoding="utf-8")
+
+        def interrupt(process: subprocess.Popen) -> int:
+            # The shell creates the file before `echo` fills it: wait for a pid, not a path.
+            self.assertTrue(self._wait_for(lambda: pid_file.exists() and pid_file.read_text(encoding="utf-8").strip()))
+            raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(campaign, "_wait_for_setup", side_effect=interrupt),
+            mock.patch.object(campaign.sessions, "start_session") as start,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            campaign.launch_child(
+                repo=self.repo,
+                base="HEAD",
+                branch="node-1",
+                worktree=self.worktree,
+                prompt_file=self.prompt_file,
+                harness="fake",
+                harness_command=str(self.harness),
+                socket=CHILD_SOCKET,
+                setup=script,
+            )
+        start.assert_not_called()
+        sleeper = int(pid_file.read_text(encoding="utf-8").strip())
+        self.assertTrue(self._wait_for(lambda: not _alive(sleeper)), "the interrupted script's child must be dead")
+
+    def test_a_failing_setup_script_fails_the_launch_before_any_session_and_names_the_leftovers(self) -> None:
+        script = self.repo.parent / "setup-fail.sh"
+        script.write_text("echo partial > partial.txt\necho 'no data volume' >&2\nexit 3\n", encoding="utf-8")
+        with mock.patch.object(campaign.sessions, "start_session") as start:
+            code, out, err = self.run_cli(self._setup_argv(script))
+        self.assertEqual(code, 2, out + err)
+        start.assert_not_called()
+        self.assertIn("worktree setup", err)
+        self.assertIn("exited 3", err)
+        self.assertIn("no data volume", err)
+        self.assertIn(f"branch node-1 and worktree {self.worktree.resolve()} are left behind", err)
+        self.assertTrue((self.worktree / "partial.txt").is_file())
+        self.assertIn("no data volume", (campaign.campaign_dir(self.worktree.resolve()) / "setup.log").read_text())
         self.assertFalse(campaign.manifest_path(self.worktree).exists(), "no session, so no manifest")
         self.assert_socket_untouched()
 

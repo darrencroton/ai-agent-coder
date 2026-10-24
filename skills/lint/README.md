@@ -192,6 +192,15 @@ report the gap; the human installs it once.
 `install` without `--yes` prints the exact commands and exits without running
 them.
 
+## Adding a tool
+
+Append one `Tool(...)` entry to `TOOLS` in `scripts/lint.py`: extensions,
+binary, argv builder, output parser, install recipes per package manager, and
+`default=False` if it needs project-specific configuration. Then add a parser
+test to `tests/test_lint.py` using output captured from the real tool. Nothing
+else changes — selection, differential comparison, coverage, and reporting are
+all driven off that table.
+
 ## Tests
 
 ```bash
@@ -199,9 +208,8 @@ python3 -m unittest discover -s skills/lint/tests -p 'test_*.py'
 ```
 
 No linter binary required — each parser is tested against output
-captured from the real tool. The suite pins the bugs found during
-implementation: symlink resolution on both sides of `_rel` (the macOS
-`/var` → `/private/var` case that silently broke every signature match),
-count-based rather than set-based signature comparison, untracked files being in
-scope, absolute mode scoping to the tracked tree, and the optional severity token
-in `markdownlint-cli2` output.
+captured from the real tool. The suite covers symlink resolution on both sides
+of `_rel` (the macOS `/var` → `/private/var` case), count-based rather than
+set-based signature comparison, untracked files being in scope, absolute mode
+scoping to the tracked tree, and the optional severity token in
+`markdownlint-cli2` output.

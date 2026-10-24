@@ -16,7 +16,7 @@ codex exec <prompt> [-m <model>] [-c model_reasoning_effort="<effort>"] -c sandb
 
 The read-only sandbox is the strongest mechanical read-only boundary among the current profiles. This is an enforcement fact, not a suitability ranking. The same no-edit, no-mutation, no-commit, and no-redelegation prompt applies.
 
-That boundary holds only while approvals cannot escalate out of the sandbox, so the launcher pins `approval_policy="never"` rather than inheriting the caller's policy. Under an `on-request` policy — a caller policy the harness inherited before this was pinned, and a common setting in a personal `~/.codex/config.toml` — a delegate whose command is blocked by the sandbox may request escalated permissions, and an automated approvals reviewer can grant them with no human present. Verified against codex-cli 0.145.0: under `on-request` a `read-only` delegate escalated and wrote a file outside the repository; under `never` the same command was refused and the sandbox held.
+That boundary holds only while approvals cannot escalate out of the sandbox, so the launcher pins `approval_policy="never"` rather than inheriting the caller's policy. Under an `on-request` policy — a common setting in a personal `~/.codex/config.toml` — a delegate whose command is blocked by the sandbox may request escalated permissions, and an automated approvals reviewer can grant them with no human present. Verified against codex-cli 0.145.0: under `on-request` a `read-only` delegate escalated and wrote a file outside the repository; under `never` the same command was refused and the sandbox held.
 
 ## Read-write delegate launch
 
