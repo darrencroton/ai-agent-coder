@@ -23,6 +23,7 @@ from . import git_ops
 from . import judgments
 from . import leaderboard, ledger
 from . import plan as plan_mod
+from . import preflight
 from . import review as review_mod
 from . import sessions
 from . import slice_ops
@@ -305,6 +306,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stop_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree")
     stop_child.add_argument("--reason", required=True)
+
+    preflight_parser = subparsers.add_parser(
+        "campaign-preflight",
+        help="Check a campaign dossier and product repository before any session exists: the mechanical half of reconcile",
+    )
+    preflight_parser.add_argument(
+        "--dossier", required=True, metavar="PATH", help="the dossier repository holding brief.md"
+    )
+    preflight_parser.add_argument("--repo", required=True, metavar="PATH", help="the product repository")
+    preflight_parser.add_argument("--integration-branch", required=True, metavar="NAME")
+    preflight_parser.add_argument("--worktree", metavar="PATH", help="the integration checkout, when one exists")
+    preflight_parser.add_argument(
+        "--digest", metavar="HEX", help="the owner's SHA-256 of brief.md; the CM always passes it"
+    )
+    preflight_parser.add_argument(
+        "--harness",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="a seat's harness to look for on PATH; repeatable",
+    )
 
     # Reads only the ledger directory: no run, no token, so the post-command
     # ledger hook never fires for it.
@@ -980,6 +1002,32 @@ def _run_launch_child(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_campaign_preflight(args: argparse.Namespace) -> int:
+    checks = preflight.campaign_preflight(
+        dossier=Path(args.dossier),
+        repo=Path(args.repo),
+        integration_branch=args.integration_branch,
+        worktree=Path(args.worktree) if args.worktree else None,
+        digest=args.digest,
+        harnesses=tuple(args.harness),
+    )
+    for check in checks:
+        if check.passed is None:
+            print(f"note  {check.name}")
+        elif check.passed:
+            print(f"ok    {check.name}")
+        else:
+            print(f"FAIL  {check.name}")
+            print(f"      -> {check.detail}")
+    failed = [check for check in checks if check.passed is False]
+    if failed:
+        print(f"campaign preflight: {len(failed)} check(s) failed; every failure is a question to the owner")
+        return 1
+    compared = any(check.name == "brief.md matches the owner's digest" for check in checks)
+    print("campaign preflight: all checks passed" + ("" if compared else "; no owner digest was compared"))
+    return 0
+
+
 def _run_wait_child(args: argparse.Namespace) -> int:
     outcome = campaign.wait_child(Path(args.worktree), wait=args.wait)
     if args.wait:
@@ -1126,6 +1174,7 @@ _HANDLERS = {
     "wait-child": _run_wait_child,
     "answer-child": _run_answer_child,
     "stop-child": _run_stop_child,
+    "campaign-preflight": _run_campaign_preflight,
 }
 
 

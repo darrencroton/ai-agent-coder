@@ -1,6 +1,6 @@
 # Campaign Dossier Template
 
-The layout of a campaign dossier and a template for each of its files. This is a template only: the rules that govern every file (who writes it, when, and what the Campaign Manager does with it) are in [campaign-mode.md](campaign-mode.md), and nothing here restates them.
+The layout of a campaign dossier and a template for each of its files. This is a template only: the rules that govern every file (who writes it, when, and what the Campaign Manager does with it) are in [campaign-mode.md](campaign-mode.md), and nothing here restates them. Keep the backticked pin lines in the shape shown (the campaign base, the node worktree parent, the policy file and `setup.sh` with their SHA-256 digests): `campaign-preflight` reads them.
 
 ## Layout
 
@@ -31,19 +31,20 @@ The layout of a campaign dossier and a template for each of its files. This is a
 | T1 | <stated, checkable condition> | <allowed deviation> | <instrument, or the evidence node that measures it> |
 
 ## Pinned references
+- Campaign base: `<integration branch's starting branch>` at `<SHA>`
 - <reference>: <repository or path> at <SHA>
 
 ## Allowed paths
 - <product path the campaign may change>
-- Node worktree parent: <absolute directory the owner has trusted in each harness>
-- Protected-paths policy file: <path in the product repository>, SHA-256 <digest of the file, from shasum -a 256> (see [campaign-mode.md](campaign-mode.md) *Launching and watching a child*)
+- Node worktree parent: `<absolute directory the owner has trusted in each harness>`
+- Protected-paths policy file: `<path in the product repository>`, SHA-256 `<digest of the file, from shasum -a 256>` (see [campaign-mode.md](campaign-mode.md) *Launching and watching a child*)
 - Git-ignored output directories: <product directories, or none>
 
 ## Reserved decision classes
 - <class>: <what the class covers>
 
 ## Worktree setup
-- <none, or: setup.sh in this dossier, SHA-256 <digest of the file, from shasum -a 256>, run by launch-child --setup in every node worktree before its session starts; what it links or creates, all of it git-ignored and none of it a product change>
+- <none, or: `setup.sh` in this dossier, SHA-256 `<digest of the file, from shasum -a 256>`, run by launch-child --setup in every node worktree before its session starts; what it links or creates, all of it git-ignored and none of it a product change>
 
 ## Budgets
 - Node budget per target: <N>

@@ -55,6 +55,15 @@ def current_branch(repo: Path) -> str | None:
     return branch
 
 
+def git_bytes(repo: Path, *args: str) -> bytes | None:
+    """Run git and return its raw stdout bytes, or None when it fails: for
+    content that is hashed, where text decoding would alter the bytes."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
 def git_status_text(repo: Path) -> str:
     # Deliberately not the git() helper above: that strips stdout, and
     # `status --short` output is positional — a leading space on the first

@@ -470,9 +470,21 @@ def _run_worktree_setup(launch: _ChildLaunch) -> None:
     """
     if launch.setup is None:
         return
-    worktree, script = launch.worktree, launch.setup
-    log = campaign_dir(worktree) / "setup.log"
-    left_behind = _left_behind(launch.branch, worktree)
+    run_setup_script(
+        launch.setup,
+        launch.worktree,
+        log=campaign_dir(launch.worktree) / "setup.log",
+        left_behind=_left_behind(launch.branch, launch.worktree),
+    )
+
+
+def run_setup_script(script: Path, worktree: Path, *, log: Path, left_behind: str) -> None:
+    """Run `sh <script>` inside `worktree` as `_run_worktree_setup` describes:
+    output to `log`, own process group, no `PM_RUN_TOKEN`, killed on timeout
+    or interruption, and a failure, a timeout or a dirty worktree afterwards
+    raises `PmError` ending in `left_behind`. `campaign-preflight` runs the
+    same code in a throwaway worktree, so what it checks is what a launch
+    will do."""
     env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
     try:
         handle = log.open("w", encoding="utf-8")
@@ -507,7 +519,7 @@ def _run_worktree_setup(launch: _ChildLaunch) -> None:
             process.wait()
             raise
     if returncode != 0:
-        tail = _log_tail(log)
+        tail = log_tail(log)
         detail = f": {' | '.join(tail)}" if tail else ""
         raise PmError(f"worktree setup {script} exited {returncode}{detail} (full output in {log}); {left_behind}")
     try:
@@ -534,7 +546,7 @@ def _kill_process_group(pid: int) -> None:
         pass
 
 
-def _log_tail(log: Path, lines: int = 3) -> list[str]:
+def log_tail(log: Path, lines: int = 3) -> list[str]:
     try:
         return log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-lines:]
     except OSError:
