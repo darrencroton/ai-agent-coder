@@ -28,6 +28,7 @@ from . import git_ops
 from . import plan as plan_mod
 from . import profiles
 from . import prompts
+from . import sandbox
 from . import slice_ops
 from . import state as state_mod
 
@@ -38,14 +39,26 @@ _STDERR_TAIL_CHARS = 4000
 
 
 def compose_reviewer_command(
-    tool: str, prompt: str, *, model: str | None = None, effort: str | None = None, repo: Path
+    tool: str,
+    prompt: str,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+    repo: Path,
+    sandboxed: bool = False,
 ) -> list[str]:
     """Compose a one-shot reviewer invocation for `tool`. Unsupported tool
     names, and a non-default `effort` for qwen (whose tested one-shot command
     has no effort/reasoning flag), fail closed with `PmError` rather than
     silently dropping the request. opencode takes effort as `--variant`; note
     this is the one-shot `opencode run` only, so it does NOT apply to the
-    Developer seat's interactive TUI (see profiles.py)."""
+    Developer seat's interactive TUI (see profiles.py).
+
+    `sandboxed` is true when the reviewer will run inside an `srt` sandbox,
+    where no harness can start a sandbox of its own (nesting fails with exit
+    71): Codex then runs at `danger-full-access`, Qwen without `--sandbox`,
+    and Claude with its sandbox setting off. The OS boundary replaces the
+    harness's; Copilot and OpenCode commands are the same either way."""
     repo_str = str(repo)
 
     if tool == "codex":
@@ -59,11 +72,14 @@ def compose_reviewer_command(
         # The sandbox is set through its config key to match the orchestrator's
         # codex profile, which must use the config form because `codex exec resume`
         # rejects `--sandbox`. Full rationale and the verifying evidence:
-        # skills/orchestrator/references/codex.md.
+        # skills/orchestrator/references/codex.md. Inside `srt` the read-only
+        # sandbox cannot start and fails every tool call, so the OS sandbox
+        # around the reviewer is the boundary instead.
+        sandbox_mode = "danger-full-access" if sandboxed else "read-only"
         command.extend(
             [
                 "-c",
-                'sandbox_mode="read-only"',
+                f'sandbox_mode="{sandbox_mode}"',
                 "-c",
                 'approval_policy="never"',
                 "--skip-git-repo-check",
@@ -80,6 +96,10 @@ def compose_reviewer_command(
         if effort:
             command.extend(["--effort", effort])
         command.extend(["--permission-mode", "plan", "--output-format", "text", "--add-dir", repo_str])
+        # Claude Code's own sandbox cannot start inside `srt`; switch it off
+        # for this launch rather than let it fall back silently.
+        if sandboxed:
+            command.extend(["--settings", '{"sandbox":{"enabled":false}}'])
         return command
 
     if tool == "copilot":
@@ -113,7 +133,10 @@ def compose_reviewer_command(
         # --yolo for the same reason the Developer seat carries it: without it
         # qwen gates every tool call on a confirmation a one-shot run cannot
         # answer, and the reviewer hangs until --timeout.
-        command.extend(["--yolo", "--sandbox", "--output-format", "text"])
+        command.append("--yolo")
+        if not sandboxed:
+            command.append("--sandbox")
+        command.extend(["--output-format", "text"])
         return command
 
     raise PmError(
@@ -122,11 +145,19 @@ def compose_reviewer_command(
 
 
 def _build_reviewer_command(
-    tool: str, prompt: str, *, model: str | None, effort: str | None, repo: Path, reviewer_command_override: str | None
+    tool: str,
+    prompt: str,
+    *,
+    model: str | None,
+    effort: str | None,
+    repo: Path,
+    reviewer_command_override: str | None,
+    sandboxed: bool = False,
 ) -> list[str]:
+    # An override is run verbatim: `sandboxed` shapes only a composed command.
     if reviewer_command_override:
         return shlex.split(reviewer_command_override) + [prompt]
-    return compose_reviewer_command(tool, prompt, model=model, effort=effort, repo=repo)
+    return compose_reviewer_command(tool, prompt, model=model, effort=effort, repo=repo, sandboxed=sandboxed)
 
 
 def _resolve_tool(state: dict[str, Any], tool_arg: str | None, *, has_override: bool) -> str:
@@ -395,6 +426,11 @@ def run_review(
         )
     )
     origin_event = _commission_origin(run_dir, slice_id)
+    # The reviewer runs inside a sandbox either way: inherited, when this PM
+    # already runs under `srt` (a campaign child), or wrapped at launch below,
+    # when the run records a sandbox of its own (Mode B).
+    sandbox_block = state.get("sandbox")
+    sandboxed = sandbox.inside_sandbox() or bool(sandbox_block)
     prompt_text = prompts.render_reviewer_prompt(
         # Never handed to a drift audit itself: a second audit of the same
         # commit must stay independent of the first one's verdict.
@@ -414,6 +450,7 @@ def run_review(
         authorized_surface=sections.get("Authorized Surface", "").rstrip(),
         explicit_non_goals=sections.get("Explicit Non-Goals", "").rstrip(),
         risk_flags=sections.get("Risk Flags", "").rstrip(),
+        sandboxed=sandboxed,
     )
 
     # Checked here, not in compose_reviewer_command, which stays pure and
@@ -438,6 +475,7 @@ def run_review(
         effort=resolved_effort,
         repo=repo,
         reviewer_command_override=reviewer_command,
+        sandboxed=sandboxed,
     )
 
     report_relative = f"{slice_ops.slice_relative_dir(slice_id)}/review-{seq}-{skill}-{resolved_tool}.md"
@@ -457,11 +495,32 @@ def run_review(
     # alone, and SKILL.md forbids it in any Reviewer session.
     reviewer_env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
 
+    # A run that records a sandbox, commissioned from outside one, runs its
+    # reviewer under `srt` with the host-written reviewer policy: read-only on
+    # the repository and with no route to the Developer server. Applied here,
+    # at launch, so nothing recorded about the commission sees the wrap. `srt`
+    # starts in this new session as its group leader and the reviewer shares
+    # that group, so the timeout's killpg below still reaches every process.
+    popen_command = command
+    if sandbox_block and not sandbox.inside_sandbox():
+        control_text = sandbox_block.get("control_dir") if isinstance(sandbox_block, dict) else None
+        if not isinstance(control_text, str) or not control_text:
+            raise PmError("this run records a sandbox without a control directory; refusing to run the reviewer")
+        control = Path(control_text)
+        policy_path = control / "reviewer-policy.json"
+        tmpdir = sandbox.read_record(control).get("tmpdir")
+        if not policy_path.is_file() or not isinstance(tmpdir, str) or not tmpdir:
+            raise PmError(
+                f"this run records a sandbox but its control directory {control} has no reviewer policy "
+                "or no temp dir in its record; refusing to run the reviewer outside the sandbox"
+            )
+        popen_command = sandbox.wrap_command(policy_path, command, tmpdir=tmpdir)
+
     with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:
         process = subprocess.Popen(
             # stdin=DEVNULL: `codex exec` blocks on inherited stdin ("Reading
             # additional input from stdin...") and the hang looks like a slow model.
-            command,
+            popen_command,
             cwd=str(repo),
             stdout=stdout_handle,
             stderr=stderr_handle,

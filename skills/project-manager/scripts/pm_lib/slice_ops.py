@@ -34,6 +34,7 @@ from . import git_ops
 from . import plan as plan_mod
 from . import profiles
 from . import prompts
+from . import sandbox
 from . import sessions
 from . import state as state_mod
 from .floor import FloorReport, evaluate_floor
@@ -891,6 +892,9 @@ def start_slice(
 
     result_path = artifact_dir / "result.json"
     question_path = artifact_dir / "question.md"
+    # Inside a sandbox: inherited, when this PM already runs under `srt` (a
+    # campaign child), or the run's own sandboxed server (Mode B).
+    sandboxed = sandbox.inside_sandbox() or bool(state.get("sandbox"))
     prompt_text = prompts.render_developer_prompt(
         plan_slice,
         plan_path=plan_path,
@@ -900,6 +904,7 @@ def start_slice(
         before_head=before_head,
         granted_surface=plan_mod.slice_grants(state, plan_slice.slice_id),
         question_path=question_path,
+        sandboxed=sandboxed,
     )
     prompt_path = artifact_dir / "prompt.md"
     prompt_path.write_text(prompt_text, encoding="utf-8")
@@ -921,7 +926,11 @@ def start_slice(
     launch_model_tag = model_tag or harness_block.get("model_tag")
 
     command, expected_model_display = profiles.launch_command(
-        harness_name, override=effective_override or None, model=launch_model, effort=launch_effort
+        harness_name,
+        override=effective_override or None,
+        model=launch_model,
+        effort=launch_effort,
+        sandboxed=sandboxed,
     )
 
     session_name = sessions.session_name(run_id, slice_number(plan_slice.slice_id), attempts)

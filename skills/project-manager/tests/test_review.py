@@ -36,12 +36,20 @@ _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from pm_test_helpers import PmTestCase
+from pm_test_helpers import (
+    SANDBOX_TEST_SOCKET_PREFIX,
+    PmTestCase,
+    minimal_base_policy,
+    register_sandbox_socket,
+    requires_srt,
+)
 
 from pm_lib import PmError
 from pm_lib import cli
 from pm_lib import profiles
 from pm_lib import review as review_mod
+from pm_lib import sandbox as sandbox_mod
+from pm_lib import sessions as sessions_mod
 from pm_lib import slice_ops
 from pm_lib import state as state_mod
 from pm_lib import prompts
@@ -247,6 +255,48 @@ class TestComposeReviewerCommand(unittest.TestCase):
 # --- reviewer prompt rendering -----------------------------------------------
 
 
+class TestComposeReviewerCommandSandboxed(unittest.TestCase):
+    """Inside an `srt` sandbox no harness can start a sandbox of its own
+    (nesting fails with exit 71), so the sandboxed variants turn each one
+    off; `sandboxed=False` is exactly today's command for every tool."""
+
+    def _both(self, tool: str, **kwargs) -> tuple[list[str], list[str], list[str]]:
+        default = review_mod.compose_reviewer_command(tool, "PROMPT", repo=Path("/repo"), **kwargs)
+        plain = review_mod.compose_reviewer_command(tool, "PROMPT", repo=Path("/repo"), sandboxed=False, **kwargs)
+        sandboxed = review_mod.compose_reviewer_command(tool, "PROMPT", repo=Path("/repo"), sandboxed=True, **kwargs)
+        return default, plain, sandboxed
+
+    def test_codex_runs_at_full_access_instead_of_read_only(self) -> None:
+        default, plain, sandboxed = self._both("codex", model="gpt-5", effort="high")
+        self.assertEqual(plain, default)
+        self.assertIn('sandbox_mode="danger-full-access"', sandboxed)
+        self.assertFalse(any("read-only" in part for part in sandboxed), sandboxed)
+        expected = [
+            'sandbox_mode="danger-full-access"' if part == 'sandbox_mode="read-only"' else part for part in plain
+        ]
+        self.assertEqual(sandboxed, expected)
+
+    def test_qwen_omits_its_sandbox_flag(self) -> None:
+        default, plain, sandboxed = self._both("qwen", model="qwen/m")
+        self.assertEqual(plain, default)
+        self.assertIn("--sandbox", plain)
+        self.assertNotIn("--sandbox", sandboxed)
+        self.assertEqual(sandboxed, [part for part in plain if part != "--sandbox"])
+
+    def test_claude_ends_with_its_sandbox_turned_off(self) -> None:
+        default, plain, sandboxed = self._both("claude", model="opus", effort="high")
+        self.assertEqual(plain, default)
+        self.assertEqual(sandboxed[-2:], ["--settings", '{"sandbox":{"enabled":false}}'])
+        self.assertEqual(sandboxed[:-2], plain)
+
+    def test_copilot_and_opencode_are_unchanged_either_way(self) -> None:
+        for tool, kwargs in (("copilot", {"model": "gpt-5", "effort": "low"}), ("opencode", {"model": "p/m"})):
+            with self.subTest(tool=tool):
+                default, plain, sandboxed = self._both(tool, **kwargs)
+                self.assertEqual(plain, default)
+                self.assertEqual(sandboxed, default)
+
+
 class TestRenderReviewerPrompt(unittest.TestCase):
     def _render(self, **overrides) -> str:
         fields = dict(
@@ -292,6 +342,25 @@ class TestRenderReviewerPrompt(unittest.TestCase):
         # No leftover unresolved placeholder field names.
         for field in ("skill_name", "repo", "slice_id", "before_head", "reviewed_head", "diff_path"):
             self.assertNotIn("{" + field + "}", rendered)
+
+    def test_sandboxed_review_adds_only_the_sandbox_paragraph(self) -> None:
+        plain = self._render()
+        sandboxed = self._render(sandboxed=True)
+        template = prompts.load_template(prompts._DEFAULT_REVIEWER_REFERENCE_PATH)
+        match = re.search(r"^\[sandboxed\]\n(.*?)\n\[/sandboxed\]$", template, re.S | re.M)
+        self.assertIsNotNone(match, "the reviewer template must carry a [sandboxed] paragraph")
+        paragraph = match.group(1)
+        self.assertNotIn(paragraph, plain)
+        self.assertEqual(sandboxed.replace(paragraph + "\n\n", "", 1), plain)
+        self.assertNotIn("[sandboxed]", sandboxed)
+        for phrase in (
+            "Operation not permitted",
+            "$TMPDIR",
+            "the hosts the operator listed",
+            "`git push`",
+            "a boundary, not a bug to work around",
+        ):
+            self.assertIn(phrase, paragraph)
 
     def test_absent_adjudications_render_as_the_literal_none(self) -> None:
         rendered = self._render()
@@ -1660,6 +1729,263 @@ class TestResolveToolOverride(ReviewCommandTestCase):
         self.assertEqual(review_mod._resolve_tool(reloaded, None, has_override=False), "opencode")
         # An explicit --tool arg still wins over both.
         self.assertEqual(review_mod._resolve_tool(reloaded, "codex", has_override=False), "codex")
+
+
+# --- reviewers inside a sandbox ------------------------------------------------
+
+
+class SandboxedReviewTestCase(ReviewCommandTestCase):
+    """A reviewer runs inside an `srt` sandbox when the PM already does
+    (`SANDBOX_RUNTIME=1`, a campaign child: inherited, unwrapped) or when the
+    run records a sandbox (Mode B: wrapped in its own `srt` under the
+    control directory's reviewer policy). A composed `codex` reviewer is
+    driven through a fake `codex` on PATH, so the composed argv is visible."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.bin_dir = self.repo.parent / "bin"
+        self.bin_dir.mkdir()
+        _write_fake_reviewer(
+            self.bin_dir / "codex",
+            'echo "SANDBOX_RUNTIME=${SANDBOX_RUNTIME:-unset}"\n'
+            'echo "ARG0=codex"\n'
+            'echo "ARG=$1"\n'
+            "shift 2\n"
+            'for arg in "$@"; do echo "ARG=$arg"; done',
+        )
+
+    def _environ(self, *, sandbox_runtime: bool) -> dict[str, str]:
+        env = {key: value for key, value in os.environ.items() if key != "SANDBOX_RUNTIME"}
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        if sandbox_runtime:
+            env["SANDBOX_RUNTIME"] = "1"
+        return env
+
+    def _ready_run(self) -> tuple[str, Path]:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+        return token, run_dir
+
+    def _record_sandbox(self, token: str, run_dir: Path, *, socket: str, tmpdir: Path, policy: dict | None = None):
+        """What Slice 4's `init --sandbox` will leave: the run's `sandbox`
+        block, and a control directory holding the reviewer policy and the
+        record naming the run's temp dir. Returns the control directory."""
+        common = self.repo / ".git"
+        control = sandbox_mod.control_dir(common, socket)
+        control.mkdir(parents=True)
+        (control / "reviewer-policy.json").write_text(json.dumps(policy or {}), encoding="utf-8")
+        sandbox_mod.write_record(control, worktree=str(self.repo), socket=socket, tmpdir=str(tmpdir))
+        state = state_mod.load_state(run_dir, token)
+        state["sandbox"] = {
+            "policy": str(self.repo.parent / "sandbox.json"),
+            "policy_sha256": "0" * 64,
+            "socket": socket,
+            "control_dir": str(control),
+        }
+        state_mod.save_state(run_dir, state, token)
+        return control
+
+    def _review(self, token: str, *, sandbox_runtime: bool, extra: list[str] | None = None):
+        """Commission one review; returns (code, out, err, reviewer argv as
+        launched or None). `review` resolves the repository from the cwd, so
+        the composed `-C` path is the real one (`/private/var/...` on macOS)."""
+        argv = [
+            "review",
+            "--slice",
+            "Slice 1",
+            "--skill",
+            "code-review",
+            "--token",
+            token,
+            *(extra or ["--tool", "codex"]),
+        ]
+        with (
+            mock.patch.dict(os.environ, self._environ(sandbox_runtime=sandbox_runtime), clear=True),
+            mock.patch.object(review_mod.subprocess, "Popen", wraps=subprocess.Popen) as popen,
+        ):
+            code, out, err = self.run_cli_in_repo(argv)
+        launched = [call.args[0] for call in popen.call_args_list if call.kwargs.get("start_new_session")]
+        self.assertLessEqual(len(launched), 1, launched)
+        return code, out, err, (launched[0] if launched else None)
+
+    def _only_review(self, token: str, run_dir: Path) -> tuple[dict, str, str]:
+        """The one recorded review, its report text, and its persisted prompt."""
+        reviews = state_mod.load_state(run_dir, token)["slices"][0]["reviews"]
+        self.assertEqual(len(reviews), 1)
+        artifact = Path(reviews[0]["artifact"])
+        prompt = artifact.with_name(artifact.name[: -len(".md")] + "-prompt.md")
+        original_prompt = run_dir / "slices" / "slice-001" / prompt.name
+        return reviews[0], artifact.read_text(encoding="utf-8"), original_prompt.read_text(encoding="utf-8")
+
+    def assert_identity_unchanged(self, review: dict) -> None:
+        """What the ledger reads from a composed codex commission, whatever
+        ran it: no wrap or variant reaches the recorded identity."""
+        self.assertEqual(
+            {key: review[key] for key in ("tool", "model", "effort", "command_override")},
+            {"tool": "codex", "model": None, "effort": "default", "command_override": False},
+        )
+
+
+class TestReviewInsideSandbox(SandboxedReviewTestCase):
+    def test_inherited_sandbox_runs_the_sandboxed_variant_unwrapped(self) -> None:
+        token, run_dir = self._ready_run()
+        code, _out, err, launched = self._review(token, sandbox_runtime=True)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(launched[0], "codex", launched)
+        self.assertIn('sandbox_mode="danger-full-access"', launched)
+        review, report, prompt = self._only_review(token, run_dir)
+        self.assertIn("SANDBOX_RUNTIME=1", report)
+        self.assertIn('ARG=sandbox_mode="danger-full-access"', report)
+        self.assertNotIn("read-only", report)
+        self.assertIn("Sandbox: this review runs inside an OS sandbox", prompt)
+        self.assert_identity_unchanged(review)
+
+    def test_inherited_sandbox_wins_over_a_recorded_one(self) -> None:
+        """Already inside `srt`, a second one cannot start: no wrap."""
+        token, run_dir = self._ready_run()
+        self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=self.repo.parent / "tmp")
+        code, _out, err, launched = self._review(token, sandbox_runtime=True)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(launched[0], "codex", launched)
+        self.assertIn('sandbox_mode="danger-full-access"', launched)
+
+    def test_neither_runs_todays_command(self) -> None:
+        token, run_dir = self._ready_run()
+        code, _out, err, launched = self._review(token, sandbox_runtime=False)
+        self.assertEqual(code, 0, err)
+        _review, report, prompt = self._only_review(token, run_dir)
+        self.assertEqual(launched, review_mod.compose_reviewer_command("codex", prompt, repo=self.repo.resolve()))
+        self.assertIn('ARG=sandbox_mode="read-only"', report)
+        self.assertIn("SANDBOX_RUNTIME=unset", report)
+        self.assertNotIn("Sandbox:", prompt)
+        self.assert_identity_unchanged(_review)
+
+    def test_recorded_sandbox_wraps_the_reviewer_in_srt_under_the_reviewer_policy(self) -> None:
+        """A fake `srt` stands in for the real one (CI has none): what is
+        asserted is the argv `review` launches."""
+        _write_fake_reviewer(
+            self.bin_dir / "srt", 'for arg in "$@"; do printf \'SRT_ARG=%s\\n\' "$arg" | head -n 1; done'
+        )
+        token, run_dir = self._ready_run()
+        tmpdir = self.repo.parent / "run-tmp"
+        control = self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=tmpdir)
+        code, _out, err, launched = self._review(token, sandbox_runtime=False)
+        self.assertEqual(code, 0, err)
+        review, report, prompt = self._only_review(token, run_dir)
+        policy = control / "reviewer-policy.json"
+        self.assertEqual(launched[:5], ["srt", "-s", str(policy), "env", f"TMPDIR={tmpdir}"])
+        composed = review_mod.compose_reviewer_command("codex", prompt, repo=self.repo.resolve(), sandboxed=True)
+        self.assertEqual(launched, sandbox_mod.wrap_command(policy, composed, tmpdir=tmpdir))
+        self.assertIn("SRT_ARG=codex", report)
+        self.assertIn('SRT_ARG=sandbox_mode="danger-full-access"', report)
+        self.assertIn("Sandbox: this review runs inside an OS sandbox", prompt)
+        self.assert_identity_unchanged(review)
+
+    def test_recorded_sandbox_without_a_reviewer_policy_refuses_before_launching(self) -> None:
+        token, run_dir = self._ready_run()
+        control = self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=self.repo.parent / "tmp")
+        (control / "reviewer-policy.json").unlink()
+        code, _out, err, launched = self._review(token, sandbox_runtime=False)
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to run the reviewer outside the sandbox", err)
+        self.assertIsNone(launched)
+
+
+@requires_srt
+class TestReviewWrappedInRealSrt(SandboxedReviewTestCase):
+    """The wrap with a real `srt`, on a plain tmux server standing in for the
+    run's Developer server."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.socket = register_sandbox_socket(
+            f"{SANDBOX_TEST_SOCKET_PREFIX}-review-{self.id().rsplit('.', 1)[-1][-12:]}"
+        )
+        self.addCleanup(sessions_mod.kill_server, self.socket)
+        subprocess.run(["tmux", "-L", self.socket, "new-session", "-d", "-s", "keep", "sleep 600"], check=True)
+        self.tmpdir = sandbox_mod.make_tmpdir(self.socket)
+        self.addCleanup(sandbox_mod.remove_tmpdir, self.tmpdir)
+
+    def _sandboxed_run(self) -> tuple[str, Path]:
+        token, run_dir = self._ready_run()
+        common = self.repo / ".git"
+        policy = sandbox_mod.derive_reviewer_policy(
+            minimal_base_policy(),
+            worktree=self.repo,
+            tmpdir=self.tmpdir,
+            control_root=sandbox_mod.control_root(common),
+        )
+        self._record_sandbox(token, run_dir, socket=self.socket, tmpdir=self.tmpdir, policy=policy)
+        return token, run_dir
+
+    def test_wrapped_reviewer_reads_the_repository_and_diff_but_writes_nothing_and_reaches_no_server(self) -> None:
+        token, run_dir = self._sandboxed_run()
+        host_listing = subprocess.run(["tmux", "-L", self.socket, "list-sessions"], capture_output=True, text=True)
+        self.assertEqual(host_listing.returncode, 0, "the host must reach the server, or 'could not' proves nothing")
+        leak = self.repo / "reviewer-leak"
+        fake = _write_fake_reviewer(
+            self.repo.parent / "fake_sandboxed_reviewer.sh",
+            "diff=$(printf '%s\\n' \"$1\" | sed -n 's/^Pinned diff file: //p')\n"
+            f"if cat '{self.repo}/README.md' >/dev/null 2>&1; then echo READ_REPO=ok; else echo READ_REPO=denied; fi\n"
+            'if test -n "$diff" && cat "$diff" >/dev/null 2>&1; then echo READ_DIFF=ok; else echo READ_DIFF=denied; fi\n'
+            f"if touch '{leak}' 2>/dev/null; then echo WRITE_REPO=ok; else echo WRITE_REPO=denied; fi\n"
+            f"if tmux -L '{self.socket}' list-sessions >/dev/null 2>&1; then echo TMUX=ok; else echo TMUX=denied; fi\n"
+            'echo "TMPDIR=$TMPDIR"\n'
+            'echo "SANDBOX_RUNTIME=${SANDBOX_RUNTIME:-unset}"',
+        )
+        code, _out, err, launched = self._review(
+            token, sandbox_runtime=False, extra=["--tool", "faketool", "--reviewer-command", str(fake)]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(launched[0], "srt")
+        review, report, _prompt = self._only_review(token, run_dir)
+        self.assertIn("READ_REPO=ok", report)
+        self.assertIn("READ_DIFF=ok", report)
+        self.assertIn("WRITE_REPO=denied", report)
+        self.assertIn("TMUX=denied", report)
+        self.assertIn(f"TMPDIR={self.tmpdir}", report)
+        self.assertIn("SANDBOX_RUNTIME=1", report)
+        self.assertFalse(leak.exists())
+        # An override stays an override under the wrap.
+        self.assertTrue(review["command_override"])
+
+    def test_a_timed_out_wrapped_reviewer_leaves_no_process_behind(self) -> None:
+        """`srt` is the process-group leader `review` started and the reviewer
+        shares its group, so the timeout's killpg reaches the whole tree."""
+        token, run_dir = self._sandboxed_run()
+        marker = 40000 + os.getpid() % 10000
+        pattern = f"^sleep {marker}$"
+        self.addCleanup(subprocess.run, ["pkill", "-f", pattern], check=False)
+        fake = _write_fake_reviewer(
+            self.repo.parent / "fake_hanging_reviewer.sh",
+            f"sleep {marker} &\n"
+            f"'{sys.executable}' -c 'import os; print(\"PGID=%d\" % os.getpgid(0), flush=True)'\n"
+            "echo STARTED\n"
+            f"sleep {marker + 1}",
+        )
+        self.addCleanup(subprocess.run, ["pkill", "-f", f"^sleep {marker + 1}$"], check=False)
+        code, out, err, launched = self._review(
+            token,
+            sandbox_runtime=False,
+            extra=["--tool", "faketool", "--reviewer-command", str(fake), "--timeout", "5"],
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("timed out", err.lower())
+        self.assertEqual(launched[0], "srt")
+        match = _LAUNCH_RE.search(out)
+        self.assertIsNotNone(match, out)
+        pgid = int(match.group(1))
+        report = Path(match.group(2)).read_text(encoding="utf-8")
+        self.assertIn("STARTED", report, "the background sleep must have started before the timeout")
+        self.assertIn(f"PGID={pgid}", report, "the reviewer must share the group `srt` leads")
+
+        def survivors() -> str:
+            found = subprocess.run(["pgrep", "-f", f"^sleep ({marker}|{marker + 1})$"], capture_output=True, text=True)
+            return found.stdout.strip()
+
+        self.assertTrue(self._wait_for(lambda: not survivors(), timeout=10.0), survivors())
 
 
 if __name__ == "__main__":

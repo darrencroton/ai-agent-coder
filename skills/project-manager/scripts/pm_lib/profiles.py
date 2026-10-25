@@ -26,17 +26,25 @@ SUPPORTED_HARNESSES: tuple[str, ...] = ("codex", "claude", "copilot", "opencode"
 # Developer seat runs unattended, so any residual approval prompt is a silent
 # stall. Containment is the operator's sandbox around the whole run, not the
 # harness's own permission mode.
+#
+# `sandboxed_args` are appended when the seat runs inside an `srt` sandbox. A
+# Seatbelt-sandboxed process cannot apply a second sandbox profile (exit 71),
+# so a harness's own sandbox is switched off there rather than left to fail;
+# Codex additionally wants a shared app-server daemon whose lock the sandbox
+# cannot take, which `--no-daemon` avoids.
 HARNESS_PROFILES: dict[str, dict[str, Any]] = {
     "codex": {
         "base_command": ["codex", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"],
         "model_flag": "-m",
         "effort_config_key": "model_reasoning_effort",
+        "sandboxed_args": ["--no-daemon"],
     },
     "claude": {
         "base_command": ["claude", "--permission-mode", "bypassPermissions"],
         "model_flag": "--model",
         "effort_flag": "--effort",
         "session_id_flag": "--session-id",
+        "sandboxed_args": ["--settings", '{"sandbox":{"enabled":false}}'],
     },
     "copilot": {
         # --allow-all is --allow-all-tools plus paths and URLs.
@@ -98,6 +106,7 @@ def compose_command(
     model: str | None = None,
     effort: str | None = None,
     session_id: str | None = None,
+    sandboxed: bool = False,
 ) -> str:
     """Compose one harness's launch command from the profile table.
 
@@ -105,6 +114,10 @@ def compose_command(
     flag). Passing it for a different harness is silently a no-op rather than
     an error: the caller composes per-slice, and not every harness has an
     equivalent flag.
+
+    ``sandboxed`` appends the profile's ``sandboxed_args``, last, when the
+    seat will run inside an `srt` sandbox; a profile without them is
+    unchanged.
     """
     profile = HARNESS_PROFILES.get(harness)
     if profile is None:
@@ -117,11 +130,19 @@ def compose_command(
     if harness == "claude" and session_id:
         command.extend([profile["session_id_flag"], session_id])
 
+    if sandboxed:
+        command.extend(profile.get("sandboxed_args", ()))
+
     return shlex.join(command)
 
 
 def launch_command(
-    harness: str | None, *, override: str | None, model: str | None, effort: str | None
+    harness: str | None,
+    *,
+    override: str | None,
+    model: str | None,
+    effort: str | None,
+    sandboxed: bool = False,
 ) -> tuple[str, str | None]:
     """The command to launch and the model display name readiness must see.
 
@@ -132,6 +153,7 @@ def launch_command(
     transcript-capture flag), and opencode with a model gets the display name
     its inventory declares, which the readiness check matches against the
     banner — a failed query raises rather than launching an unverified model.
+    `sandboxed` reaches `compose_command` only: an override is never edited.
     """
     if override is not None:
         return override, None
@@ -141,7 +163,7 @@ def launch_command(
         if identity:
             expected_model_display = identity["display_name"]
     session_id = str(uuid.uuid4()) if harness == "claude" else None
-    command = compose_command(harness, model=model, effort=effort, session_id=session_id)
+    command = compose_command(harness, model=model, effort=effort, session_id=session_id, sandboxed=sandboxed)
     return command, expected_model_display
 
 

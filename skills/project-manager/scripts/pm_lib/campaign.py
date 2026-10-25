@@ -487,7 +487,7 @@ def _check_launch_preconditions(
     if shutil.which("tmux") is None:
         raise PmError("tmux is required to launch a child; install it")
     command, expected_model_display = profiles.launch_command(
-        harness, override=harness_command, model=model, effort=effort
+        harness, override=harness_command, model=model, effort=effort, sandboxed=sandbox is not None
     )
     try:
         argv = shlex.split(command)

@@ -42,6 +42,10 @@ Frozen contract the change must satisfy:
 - Risk flags:
 {risk_flags}
 
+[sandboxed]
+Sandbox: this review runs inside an OS sandbox the operator configured. Writes outside the repository and `$TMPDIR` fail with "Operation not permitted", and the repository itself may be unwritable too; the network reaches only the hosts the operator listed; `git push`, `git stash`, `git tag`, `git worktree`, `git gc` and other branches are unavailable. A denied operation is a boundary, not a bug to work around: say what it kept you from checking and continue the review with what you can read.
+[/sandboxed]
+
 Rules:
 - Judge the pinned diff and the repository state at the reviewed commit, not any later or uncommitted work.
 - The frozen contract can itself be defective. Report that per the embedded skill's contract-defect rule, addressed to PM, rather than as a finding against the implementer. Surface the conflict; do not settle it.

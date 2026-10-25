@@ -1762,6 +1762,78 @@ class TestStop(SliceOpsTestCase):
         self.assertIn(session, out)
 
 
+# --- a launch inside a sandbox -----------------------------------------------
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestSandboxedLaunch(SliceOpsTestCase):
+    """A Developer inside an `srt` sandbox, inherited (`SANDBOX_RUNTIME=1`) or
+    from a sandbox the run records, launches the Codex profile with
+    `--no-daemon` and reads the sandbox paragraph in `prompt.md`. The session
+    start is intercepted: what is under test is the command and the prompt
+    `start-slice` composes, not a real Codex."""
+
+    def _start(self, *, sandbox_runtime: bool, record_sandbox: bool) -> tuple[str, str]:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        code, out, err = self.run_cli_in_repo(
+            ["init", "--repo", str(self.repo), "--plan", str(plan_path), "--harness", "codex"]
+        )
+        self.assertEqual(code, 0, err)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        if record_sandbox:
+            # The block Slice 4's `init --sandbox` records; start-slice only
+            # asks whether one is there.
+            state = state_mod.load_state(run_dir, token)
+            state["sandbox"] = {
+                "policy": "/p.json",
+                "policy_sha256": "0" * 64,
+                "socket": "pm-run-x",
+                "control_dir": "/c",
+            }
+            state_mod.save_state(run_dir, state, token)
+
+        class _Launched(Exception):
+            pass
+
+        commands: list[str] = []
+
+        def _capture(session_name, repo, command, env):
+            commands.append(command)
+            raise _Launched
+
+        environ = {key: value for key, value in os.environ.items() if key != "SANDBOX_RUNTIME"}
+        if sandbox_runtime:
+            environ["SANDBOX_RUNTIME"] = "1"
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(sessions, "start_session", _capture),
+            self.assertRaises(_Launched),
+        ):
+            self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(len(commands), 1)
+        prompt = (slice_ops.slice_artifact_dir(self.repo, run_id, "Slice 1") / "prompt.md").read_text(encoding="utf-8")
+        return commands[0], prompt
+
+    def test_inherited_sandbox_launches_codex_with_no_daemon_and_the_paragraph(self) -> None:
+        command, prompt = self._start(sandbox_runtime=True, record_sandbox=False)
+        self.assertEqual(shlex.split(command)[-1], "--no-daemon")
+        self.assertIn("Sandbox: this session runs inside an OS sandbox", prompt)
+        self.assertNotIn("[sandboxed]", prompt)
+
+    def test_recorded_sandbox_launches_codex_with_no_daemon_and_the_paragraph(self) -> None:
+        command, prompt = self._start(sandbox_runtime=False, record_sandbox=True)
+        self.assertEqual(shlex.split(command)[-1], "--no-daemon")
+        self.assertIn("Sandbox: this session runs inside an OS sandbox", prompt)
+
+    def test_unsandboxed_launch_has_neither(self) -> None:
+        command, prompt = self._start(sandbox_runtime=False, record_sandbox=False)
+        self.assertEqual(command, "codex --no-alt-screen --dangerously-bypass-approvals-and-sandbox")
+        self.assertNotIn("--no-daemon", command)
+        self.assertNotIn("Sandbox:", prompt)
+        self.assertNotIn("[sandboxed]", prompt)
+
+
 # --- the origin event precedes the state save --------------------------------
 
 

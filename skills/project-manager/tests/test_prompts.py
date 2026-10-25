@@ -9,7 +9,9 @@ loader tests build their own templates instead.
 
 from __future__ import annotations
 
+import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -294,6 +296,83 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
             "additions (paths PM authorized mid-run on recorded repository evidence; `none` if there are none):\nnone",
             without_grant,
         )
+
+    def _render_both(self, **kwargs) -> tuple[str, str]:
+        paths = dict(
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/.pm/runs/run-a/slices/slice-003"),
+            notes_path=Path("/repo/.pm/runs/run-a/notes.md"),
+            result_path=Path("/repo/.pm/runs/run-a/slices/slice-003/result.json"),
+        )
+        plain = prompts.render_developer_prompt(_make_plan_slice(3), **paths, **kwargs)
+        sandboxed = prompts.render_developer_prompt(_make_plan_slice(3), **paths, sandboxed=True, **kwargs)
+        return plain, sandboxed
+
+    def test_sandboxed_render_adds_only_the_sandbox_paragraph(self) -> None:
+        """The paragraph's wording lives in the template between marker
+        lines; an unsandboxed render drops the block whole and a sandboxed one
+        drops only the markers, so the two differ by exactly that paragraph."""
+        plain, sandboxed = self._render_both()
+        match = re.search(r"^\[sandboxed\]\n(.*?)\n\[/sandboxed\]$", prompts.load_template(), re.S | re.M)
+        self.assertIsNotNone(match, "the developer template must carry a [sandboxed] paragraph")
+        paragraph = match.group(1)
+        self.assertIn(paragraph, sandboxed)
+        self.assertNotIn(paragraph, plain)
+        self.assertEqual(sandboxed.replace(paragraph + "\n\n", "", 1), plain)
+        for rendered in (plain, sandboxed):
+            self.assertNotIn("[sandboxed]", rendered)
+            self.assertNotIn("[/sandboxed]", rendered)
+        self.assertNotIn("\n\n\n", plain)
+        # What the operator's boundary denies, named for the session.
+        for phrase in (
+            "Operation not permitted",
+            "$TMPDIR",
+            "the hosts the operator listed",
+            "`git push`",
+            "`git stash`",
+            "`git tag`",
+            "`git worktree`",
+            "`git gc`",
+            "a boundary, not a bug to work around",
+        ):
+            self.assertIn(phrase, paragraph)
+
+    def test_unsandboxed_render_is_the_default(self) -> None:
+        plain, _ = self._render_both()
+        default = prompts.render_developer_prompt(
+            _make_plan_slice(3),
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/.pm/runs/run-a/slices/slice-003"),
+            notes_path=Path("/repo/.pm/runs/run-a/notes.md"),
+            result_path=Path("/repo/.pm/runs/run-a/slices/slice-003/result.json"),
+        )
+        self.assertEqual(plain, default)
+
+    def test_sandboxed_render_of_a_template_without_the_paragraph_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "developer-prompt.md"
+            reference.write_text("# T\n\n```md\nSlice {slice_id}.\n```\n", encoding="utf-8")
+            plain = prompts.render_developer_prompt(
+                _make_plan_slice(3),
+                plan_path=Path("/p"),
+                artifact_dir=Path("/a"),
+                notes_path=Path("/n"),
+                result_path=Path("/r"),
+                reference_path=reference,
+            )
+            self.assertEqual(plain, "Slice Slice 3.")
+            with self.assertRaises(PmError) as ctx:
+                prompts.render_developer_prompt(
+                    _make_plan_slice(3),
+                    plan_path=Path("/p"),
+                    artifact_dir=Path("/a"),
+                    notes_path=Path("/n"),
+                    result_path=Path("/r"),
+                    reference_path=reference,
+                    sandboxed=True,
+                )
+        self.assertIn("[sandboxed]", str(ctx.exception))
+        self.assertIn(str(reference), str(ctx.exception))
 
     def test_missing_placeholder_field_raises_pm_error(self) -> None:
         import tempfile

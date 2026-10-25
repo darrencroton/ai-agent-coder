@@ -32,6 +32,12 @@ _DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parents[3]
 _MD_FENCE_RE = re.compile(r"```md\n(?P<body>.*?)\n```", re.DOTALL)
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\((?P<target>[^)]+)\)")
 _HEADING_RE = re.compile(r"^#{1,6} .*$", re.MULTILINE)
+# The paragraph of a prompt template that renders only for a seat inside an
+# `srt` sandbox: the lines between a `[sandboxed]` and a `[/sandboxed]` line,
+# plus the blank line after. Unsandboxed, the whole block is removed, so the
+# render is exactly the template without it; sandboxed, only the two marker
+# lines are. The wording stays in the template, like every other prompt line.
+_SANDBOX_BLOCK_RE = re.compile(r"^\[sandboxed\]\n(?P<body>.*?)\n\[/sandboxed\]\n\n", re.DOTALL | re.MULTILINE)
 
 _STEER_MESSAGE_HEADING = "## Steer Message Template"
 _LAUNCH_POINTER_HEADING = "## Launch Pointer"
@@ -122,6 +128,7 @@ def render_developer_prompt(
     question_path: Path | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
+    sandboxed: bool = False,
 ) -> str:
     """Render the Developer prompt for one slice launch.
 
@@ -142,8 +149,16 @@ def render_developer_prompt(
     `question_path` is where the Developer writes a question for PM; it
     defaults to `question.md` in `artifact_dir`, the path `start_slice` also
     exports as `PM_QUESTION_PATH`.
+
+    `sandboxed` keeps the template's `[sandboxed]` paragraph (what an `srt`
+    sandbox denies the session); otherwise it is removed. A sandboxed render
+    of a template without one raises `PmError` rather than silently omitting
+    the boundary the session runs inside.
     """
-    template = load_template(reference_path)
+    template_path = reference_path or _DEFAULT_REFERENCE_PATH
+    template, found = _SANDBOX_BLOCK_RE.subn(r"\g<body>\n\n" if sandboxed else "", load_template(template_path))
+    if sandboxed and not found:
+        raise PmError(f"developer prompt template has no [sandboxed] paragraph for a sandboxed launch: {template_path}")
     sections = plan_slice.sections
     lint_script = (skills_root or _DEFAULT_SKILLS_ROOT) / "lint" / "scripts" / "lint.py"
     fields: dict[str, Any] = {
@@ -166,7 +181,7 @@ def render_developer_prompt(
         "validation_plan": sections.get("Validation Plan", "").rstrip(),
         "rollback_path": sections.get("Rollback Path", "").rstrip(),
     }
-    return _render(template, reference_path or _DEFAULT_REFERENCE_PATH, "developer prompt", **fields)
+    return _render(template, template_path, "developer prompt", **fields)
 
 
 def render_launch_pointer(prompt_path: Path, *, reference_path: Path | None = None) -> str:
@@ -309,6 +324,7 @@ def render_reviewer_prompt(
     pm_surface_grants: list[dict[str, Any]] | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
+    sandboxed: bool = False,
 ) -> str:
     """Render the Reviewer prompt for one commissioned review.
 
@@ -328,8 +344,14 @@ def render_reviewer_prompt(
     slice, or None for the template's literal `none`. Rendered through the
     same `_render_grant_lines` helper `render_developer_prompt` uses, so the
     Developer and the Reviewer read one identical list of what was granted.
+
+    `sandboxed` keeps the template's `[sandboxed]` paragraph, as for
+    `render_developer_prompt`, and raises the same way when it is missing.
     """
-    template = load_template(reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH)
+    template_path = reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH
+    template, found = _SANDBOX_BLOCK_RE.subn(r"\g<body>\n\n" if sandboxed else "", load_template(template_path))
+    if sandboxed and not found:
+        raise PmError(f"reviewer prompt template has no [sandboxed] paragraph for a sandboxed review: {template_path}")
     skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root)
     changed_files_text = "\n".join(f"  - {path}" for path in changed_files) if changed_files else "  - (none)"
     fields: dict[str, Any] = {
@@ -351,4 +373,4 @@ def render_reviewer_prompt(
         "risk_flags": risk_flags,
         "skill_bundle": skill_bundle,
     }
-    return _render(template, reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH, "reviewer prompt", **fields)
+    return _render(template, template_path, "reviewer prompt", **fields)
