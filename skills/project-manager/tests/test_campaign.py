@@ -1250,6 +1250,14 @@ class TestSandboxLaunchHostRefusals(SandboxLaunchTestCase):
         self.assertEqual((control / "record.json").read_text(encoding="utf-8"), "another child's\n")
         self.assertFalse(self.sandbox_tmpdir(CHILD_SOCKET).exists())
 
+    def test_an_unsandboxed_launch_refuses_an_existing_control_dir_for_its_socket(self) -> None:
+        control = self.control_dir(CHILD_SOCKET)
+        control.mkdir(parents=True)
+        (control / "record.json").write_text("an earlier child's\n", encoding="utf-8")
+        self.argv = self.launch_argv(self.harness)
+        self.assert_refused_creating_nothing(f"sandbox control dir already exists: {control}", "remove it by hand")
+        self.assertEqual((control / "record.json").read_text(encoding="utf-8"), "an earlier child's\n")
+
     def test_an_existing_temp_dir_is_refused_and_left_intact(self) -> None:
         tmpdir = self.sandbox_tmpdir(CHILD_SOCKET)
         tmpdir.mkdir()
@@ -1413,6 +1421,42 @@ class TestStopChildSandboxTeardown(SandboxLaunchTestCase):
         self.assertEqual(code, 2, out)
         self.assertIn(f"rm -rf {self.control}\n", out)
 
+    def test_a_temp_dir_left_after_the_control_dir_is_gone_exits_2(self) -> None:
+        shutil.rmtree(self.control)
+        code, out = self.stop()
+        self.assertEqual(code, 2, out)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+        self.assertIn(f"sandbox temp dir {self.tmpdir} remains, but no record names it", out)
+        self.assertIn(f"rm -rf {self.tmpdir}\n", out)
+        self.assertIn(f"sandbox control dir already gone: {self.control}\n", out)
+        self.assertIn(f"sandbox: not torn down (sandbox temp dir {self.tmpdir} was left in place)\n", out)
+        self.assertTrue(self.tmpdir.is_dir())
+        # Once it is removed, the re-run reports both gone and exits 0.
+        shutil.rmtree(self.tmpdir)
+        code, out = self.stop()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"sandbox temp dir already gone: {self.tmpdir}\n", out)
+
+    def test_an_unsandboxed_child_meeting_a_leftover_record_is_refused_naming_the_remedy(self) -> None:
+        manifest = json.loads(campaign.manifest_path(self.child).read_text(encoding="utf-8"))
+        del manifest["sandbox"]
+        campaign.manifest_path(self.child).write_text(json.dumps(manifest), encoding="utf-8")
+        other = str(self.repo.parent / "earlier-wt")
+        sandbox.write_record(self.control, worktree=other, socket=CHILD_SOCKET, tmpdir=str(self.tmpdir), srt_pid=None)
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(self.child), "--reason", "test"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"names worktree {other!r}", err)
+        self.assertIn("this child's manifest records no sandbox", err)
+        self.assertIn(f"rm -rf {self.control}) and re-run stop-child", err)
+        self.assertEqual(_child_tmux(CHILD_SOCKET, "has-session", "-t", self.session).returncode, 0)
+        # A sandboxed manifest's refusal names no such remedy: the record may be its own server's.
+        manifest["sandbox"] = {"policy": "x", "policy_sha256": "0" * 64, "socket": CHILD_SOCKET, "control_dir": "/x"}
+        campaign.manifest_path(self.child).write_text(json.dumps(manifest), encoding="utf-8")
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(self.child), "--reason", "test"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("refusing to kill the server\n", err)
+        self.assertNotIn("rm -rf", err)
+
     def test_a_record_less_control_dir_still_requires_the_server_mark(self) -> None:
         sessions.set_server_environment(CHILD_SOCKET, "PM_CHILD_WORKTREE", str(self.repo.parent / "other-wt"))
         code, out, err = self.run_cli(["stop-child", "--worktree", str(self.child), "--reason", "test"])
@@ -1468,6 +1512,70 @@ class TestStopChildSocketNamesTheSandboxRefuses(CampaignTestCase):
                 campaign.stop_child(child)
             self.assertIn("invalid tmux socket name for a sandbox", str(raised.exception))
             fakes["kill_server"].assert_not_called()
+
+
+class TestStopChildTempDirLookup(CampaignTestCase):
+    """The conventional sandbox temp path is looked up only for a sandboxed
+    child with no record, and a lookup that fails keeps the stop outcome."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.child = make_linked_worktree(self.repo, self.worktree, "node-1").resolve()
+        directory = campaign.campaign_dir(self.child)
+        directory.mkdir(parents=True)
+        self.manifest = {
+            "socket": CHILD_SOCKET,
+            "session": "campaign-node-1-000000",
+            "branch": "node-1",
+            "base": self.base_commit,
+            "worktree": str(self.child),
+            "launcher": str(directory / "launcher.md"),
+            "launched_at": "2026-10-25T00:00:00Z",
+        }
+
+    def stop_with_no_usable_temp_dir(self) -> tuple[campaign.StopChildOutcome, mock.MagicMock, mock.MagicMock]:
+        campaign.manifest_path(self.child).write_text(json.dumps(self.manifest), encoding="utf-8")
+        tmux = dict.fromkeys(
+            ("list_sessions_on", "server_environment", "session_exists", "capture_to", "kill_server"), mock.DEFAULT
+        )
+        failure = FileNotFoundError("No usable temporary directory found")
+        with (
+            mock.patch.multiple(campaign.sessions, **tmux) as fakes,
+            mock.patch.object(campaign.tempfile, "gettempdir", side_effect=failure) as gettempdir,
+        ):
+            fakes["list_sessions_on"].return_value = [self.manifest["session"]]
+            fakes["server_environment"].return_value = str(self.child)
+            fakes["session_exists"].return_value = True
+            fakes["kill_server"].return_value = []
+            outcome = campaign.stop_child(self.child)
+        return outcome, gettempdir, fakes["kill_server"]
+
+    def test_an_unsandboxed_stop_never_looks_up_the_temp_dir(self) -> None:
+        outcome, gettempdir, kill_server = self.stop_with_no_usable_temp_dir()
+        gettempdir.assert_not_called()
+        kill_server.assert_called_once_with(CHILD_SOCKET)
+        self.assertTrue(outcome.server_gone)
+        self.assertTrue(outcome.sandbox_stopped)
+        self.assertEqual(outcome.sandbox_notes, [])
+
+    def test_a_failed_lookup_is_a_reported_sandbox_error_and_the_stop_outcome_is_kept(self) -> None:
+        # A sandboxed manifest whose control directory is already gone.
+        self.manifest["sandbox"] = {
+            "policy": "x",
+            "policy_sha256": "0" * 64,
+            "socket": CHILD_SOCKET,
+            "control_dir": "/x",
+        }
+        outcome, gettempdir, kill_server = self.stop_with_no_usable_temp_dir()
+        gettempdir.assert_called()
+        kill_server.assert_called_once_with(CHILD_SOCKET)
+        self.assertTrue(outcome.server_gone)
+        self.assertFalse(outcome.sandbox_stopped)
+        self.assertIn("no temp directory is usable (No usable temporary directory found)", outcome.sandbox_error)
+        self.assertIn(f"sandbox control dir already gone: {self.control_path()}", outcome.sandbox_notes)
+
+    def control_path(self) -> Path:
+        return sandbox.control_dir(Path(os.path.realpath(self.repo / ".git")), CHILD_SOCKET)
 
 
 _SANDBOX_SOCKET_NUMBERS = iter(range(1, 1000))

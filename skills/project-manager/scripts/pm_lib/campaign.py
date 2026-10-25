@@ -399,8 +399,9 @@ def _check_launch_preconditions(
     """Every refusal `launch_child` makes before anything is created: the
     inputs first (the dossier brief's sandbox pin and the base policy among
     them), then the environment (tmux, the harness executable, the socket's
-    server and, for a sandboxed launch, `srt`, the platform and the control
-    and temp directories)."""
+    server, for a sandboxed launch `srt` and the platform, the socket's
+    sandbox control directory for every launch, and for a sandboxed launch
+    its temp directory)."""
     repo = git_ops.resolve_repo(repo)
     returncode, stdout, stderr = git_ops.git_result(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
     if returncode != 0 or not stdout.strip():
@@ -511,7 +512,6 @@ def _check_launch_preconditions(
             "(omit --socket, or name one with no server)"
         )
     srt_version: str | None = None
-    control_dir: Path | None = None
     if base_policy is not None:
         # `check_binaries` refuses first when srt is absent.
         sandbox_mod.check_binaries(base_policy)
@@ -522,13 +522,27 @@ def _check_launch_preconditions(
         # start a sandboxed one beside it.
         if sessions.server_running(socket, timeout=sandbox_mod.START_DEADLINE_SECONDS):
             raise PmError(f"a tmux server already answers on socket {socket!r}; a sandboxed child needs a new one")
-        common = Path(git_ops.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    # A control directory for the socket, left by an earlier sandboxed child,
+    # is refused for an unsandboxed launch too: stop-child would take this
+    # child for a sandboxed one and check it against that record. A socket
+    # name the sandbox refuses can have none, and only a sandboxed launch
+    # needs one.
+    common = Path(git_ops.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    control_dir: Path | None
+    try:
         control_dir = sandbox_mod.control_dir(common, socket)
-        if os.path.lexists(control_dir):
-            raise PmError(
-                f"sandbox control dir already exists: {control_dir}; stop-child of the child on socket {socket} "
-                "removes it, or remove it by hand once no server runs there"
-            )
+    except PmError:
+        if base_policy is not None:
+            raise
+        control_dir = None
+    if control_dir is not None and os.path.lexists(control_dir):
+        raise PmError(
+            f"sandbox control dir already exists: {control_dir}; stop-child of the child on socket {socket} "
+            "removes it, or remove it by hand once no server runs there"
+        )
+    if base_policy is None:
+        control_dir = None
+    else:
         tmpdir = Path(tempfile.gettempdir()) / f"{sandbox_mod.TMPDIR_PREFIX}{socket}"
         if os.path.lexists(tmpdir):
             raise PmError(f"sandbox temp dir already exists: {tmpdir}; another child may own socket {socket}")
@@ -1201,9 +1215,16 @@ def stop_child(worktree: Path) -> StopChildOutcome:
                 # ownership proof, and nothing is removed.
                 record_error = str(exc)
             if record is not None and (record.get("worktree") != str(worktree) or record.get("socket") != socket):
+                remedy = ""
+                if "sandbox" not in manifest:
+                    remedy = (
+                        f"; this child's manifest records no sandbox, so {control} is left by an earlier sandboxed "
+                        f"child on socket {socket}: once no server of that child runs there, remove it by hand "
+                        f"(rm -rf {shlex.quote(str(control))}) and re-run stop-child"
+                    )
                 raise PmError(
                     f"the sandbox record in {control} names worktree {record.get('worktree')!r} on socket "
-                    f"{record.get('socket')!r}, not {worktree} on {socket}; refusing to kill the server"
+                    f"{record.get('socket')!r}, not {worktree} on {socket}; refusing to kill the server{remedy}"
                 )
     listed = sessions.list_sessions_on(socket)
     owner = sessions.server_environment(socket, _OWNER_ENV_VAR)
@@ -1242,8 +1263,12 @@ def stop_child(worktree: Path) -> StopChildOutcome:
     server_gone = kill_error is None and not remaining
     sandbox_notes: list[str] = []
     sandbox_error: str | None = None
-    # Where `sandbox.make_tmpdir` puts the temp dir, for when no record names it.
-    tmpdir = Path(os.path.realpath(tempfile.gettempdir())) / f"{sandbox_mod.TMPDIR_PREFIX}{socket}"
+
+    def conventional_tmpdir() -> Path:
+        """Where `sandbox.make_tmpdir` puts the temp dir, for when no record
+        names it; OSError when no temp directory is usable."""
+        return Path(os.path.realpath(tempfile.gettempdir())) / f"{sandbox_mod.TMPDIR_PREFIX}{socket}"
+
     if record is not None and control is not None:
         if not server_gone:
             sandbox_error = (
@@ -1262,21 +1287,32 @@ def stop_child(worktree: Path) -> StopChildOutcome:
             f"sandbox control dir {control} left in place: {record_error}; once no server runs on socket {socket}, "
             f"remove it by hand: rm -rf {shlex.quote(str(control))}"
         )
-        if os.path.lexists(tmpdir):
-            sandbox_notes.append(
-                f"sandbox temp dir {tmpdir} left in place: no record names it; once no child runs on socket "
-                f"{socket}, remove it by hand: rm -rf {shlex.quote(str(tmpdir))}"
-            )
+        try:
+            tmpdir = conventional_tmpdir()
+        except OSError as exc:
+            sandbox_notes.append(f"sandbox temp dir not looked for: no temp directory is usable ({exc})")
+        else:
+            if os.path.lexists(tmpdir):
+                sandbox_notes.append(
+                    f"sandbox temp dir {tmpdir} left in place: no record names it; once no child runs on socket "
+                    f"{socket}, remove it by hand: rm -rf {shlex.quote(str(tmpdir))}"
+                )
         sandbox_error = f"no readable sandbox record in {control}, so nothing of the sandbox was removed"
     elif sandboxed and control is not None:
         # An earlier stop removed the control directory and its record.
-        if os.path.lexists(tmpdir):
-            sandbox_notes.append(
-                f"sandbox temp dir {tmpdir} remains, but no record names it; remove it by hand once no child runs "
-                f"on socket {socket}"
-            )
+        try:
+            tmpdir = conventional_tmpdir()
+        except OSError as exc:
+            sandbox_error = f"the sandbox temp dir could not be looked for: no temp directory is usable ({exc})"
         else:
-            sandbox_notes.append(f"sandbox temp dir already gone: {tmpdir}")
+            if os.path.lexists(tmpdir):
+                sandbox_notes.append(
+                    f"sandbox temp dir {tmpdir} remains, but no record names it; remove it by hand once no child "
+                    f"runs on socket {socket}: rm -rf {shlex.quote(str(tmpdir))}"
+                )
+                sandbox_error = f"sandbox temp dir {tmpdir} was left in place"
+            else:
+                sandbox_notes.append(f"sandbox temp dir already gone: {tmpdir}")
         sandbox_notes.append(f"sandbox control dir already gone: {control}")
     return StopChildOutcome(
         session=session,
