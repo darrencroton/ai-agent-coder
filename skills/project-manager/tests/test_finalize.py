@@ -35,6 +35,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from pm_test_helpers import (
     UNAVAILABLE_DEVELOPER,
     PmTestCase,
+    SandboxedRunTestCase,
     TmuxRunTestCase,
     commit_and_result_script,
     current_origin_index,
@@ -43,6 +44,7 @@ from pm_test_helpers import (
     judge_reviews,
     parse_init_output,
     rate_reviews,
+    requires_srt,
     result_heredoc,
     result_only_script,
     stdin_draining_idle_script,
@@ -53,6 +55,7 @@ from pm_test_helpers import (
 from pm_lib import PmError
 from pm_lib import cli
 from pm_lib import code_metrics
+from pm_lib import sandbox as sandbox_mod
 from pm_lib import judgments
 from pm_lib import TypedNotSubmitted
 from pm_lib import sessions
@@ -153,6 +156,43 @@ class FinalizeTestCase(TmuxRunTestCase):
                     proc.wait(timeout=5)
                 except Exception:
                     pass
+
+
+# --- the accept that completes a sandboxed run --------------------------------
+
+
+@requires_srt
+class TestSandboxedAcceptCompletesTheRun(SandboxedRunTestCase):
+    def test_accepting_the_last_slice_tears_the_sandbox_down(self) -> None:
+        """The fake Developer commits inside the sandbox; the accept that
+        completes the run leaves no server, temp dir or control dir."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0)
+        )
+        run_id, token, socket, run_dir = self._init_sandboxed(plan_path, harness)
+        control = sandbox_mod.control_dir((self.repo / ".git").resolve(), socket)
+        tmpdir = Path(sandbox_mod.read_record(control)["tmpdir"])
+        with self.on_socket(socket):
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(self._wait_for_result(run_id, token))
+            judge_current_developer(self, token, run_dir)
+            code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ACCEPTED Slice 1", out)
+        self.assertIn(f"sandbox: removed sandbox control dir {control}", out)
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["slices"][0]["commit"], self._git("rev-parse", "HEAD").stdout.strip())
+        self.assertFalse(sessions.server_running(socket))
+        self.assertFalse(os.path.lexists(tmpdir))
+        self.assertFalse(os.path.lexists(control))
+        self.assertFalse(os.path.lexists(control.parent))
+        kinds = [event["kind"] for event in state_mod.read_events(run_dir)]
+        self.assertEqual(kinds.count("sandbox-stopped"), 1)
+        self.assertLess(kinds.index("complete"), kinds.index("sandbox-stopped"))
 
 
 # --- full end-to-end acceptance ----------------------------------------------

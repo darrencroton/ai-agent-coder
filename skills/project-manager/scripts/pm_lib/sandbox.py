@@ -19,7 +19,10 @@ was started with. This module is the toolkit's one seam onto that mechanism:
   (`start_server`, `verify_server`, `stop_server`), and a one-shot command
   wrapped the same way (`wrap_command`);
 - a campaign brief's sandbox pin, which `launch-child` and
-  `campaign-preflight` both read (`find_brief`, `brief_sandbox_pin`).
+  `campaign-preflight` both read (`find_brief`, `brief_sandbox_pin`);
+- a Mode B run's server: the socket every command of a sandboxed run must
+  be pointed at (`require_run_socket`), the server `start-slice` ensures
+  (`ensure_run_server`) and the run end's teardown (`teardown_run`).
 
 Paths in a policy are judged as `srt` resolves them: `~` and `~/` expanded,
 symbolic links followed. A pattern entry (a string holding `*`, `?`, `[` or
@@ -51,6 +54,7 @@ the inherited environment beyond removing `PM_RUN_TOKEN`. macOS only.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import platform
@@ -69,6 +73,7 @@ from . import PmError
 from . import git_ops
 from . import ledger
 from . import sessions
+from . import state as state_mod
 
 SRT_MISSING = "srt is required for a sandboxed run; install @anthropic-ai/sandbox-runtime"
 SSL_CERT_FILE = Path("/etc/ssl/cert.pem")
@@ -80,6 +85,13 @@ PROBE_FILE_NAME = "sandbox-probe"
 BRIEF_NAME = "brief.md"
 # The base policy's file name in a campaign dossier, beside `brief.md`.
 DOSSIER_POLICY_NAME = "sandbox.json"
+# A Mode B run's socket is this prefix and the run id; its control directory
+# holds these files beside the record.
+RUN_SOCKET_PREFIX = "pm-run-"
+POLICY_NAME = "policy.json"
+REVIEWER_POLICY_NAME = "reviewer-policy.json"
+ATTACH_POLICY_NAME = "attach-policy.json"
+SRT_LOG_NAME = "srt.log"
 
 START_DEADLINE_SECONDS = 10.0
 PROBE_TIMEOUT_SECONDS = 10.0
@@ -1045,6 +1057,199 @@ def stop_server(*, socket: str, record: dict[str, Any]) -> tuple[list[str], list
             raise PmError(f"could not remove sandbox control dir {control}: {exc}") from exc
         notes.append(f"removed sandbox control dir {control}")
     return remaining, notes
+
+
+# --- A Mode B run's server -------------------------------------------------------
+
+
+def _run_sandbox(state: dict[str, Any], repo: Path) -> tuple[dict[str, Any], str, Path]:
+    """(the run's `sandbox` block, its socket, its control dir) from MAC-checked
+    run state. PmError when the block is malformed, or when its control dir
+    is not `<repo's common git dir>/pm-sandbox/<socket>`: the location every
+    derived policy denies, which is what makes its files the host's."""
+    block = state.get("sandbox")
+    socket = block.get("socket") if isinstance(block, dict) else None
+    control_text = block.get("control_dir") if isinstance(block, dict) else None
+    if not isinstance(socket, str) or not isinstance(control_text, str):
+        raise PmError(f"this run's sandbox record in run state is malformed: {block!r}")
+    expected = control_dir(_common_dir_of(repo), socket)
+    control = Path(control_text)
+    if not _same(_real(control), _real(expected)):
+        raise PmError(
+            f"this run's sandbox control dir {control} is not {expected}, the only place a host-written one can be"
+        )
+    return block, socket, control
+
+
+def require_run_socket(state: dict[str, Any]) -> None:
+    """PmError when the run records a sandbox and `PM_TMUX_SOCKET` (as
+    `sessions.tmux_argv` reads it) is unset or names another server; the
+    message gives the export line. Every tmux call of a run goes through
+    `PM_TMUX_SOCKET`, so without this a sandboxed run's command could reach
+    the operator's default, unsandboxed server. Nothing for an unsandboxed
+    run."""
+    block = state.get("sandbox")
+    if not block:
+        return
+    socket = block.get("socket") if isinstance(block, dict) else None
+    if not isinstance(socket, str) or not socket:
+        raise PmError(f"this run's sandbox record in run state names no socket: {block!r}")
+    current = os.environ.get("PM_TMUX_SOCKET", "").strip()
+    if current == socket:
+        return
+    found = f"PM_TMUX_SOCKET is {current!r}" if current else "PM_TMUX_SOCKET is unset"
+    raise PmError(
+        f"this run's Developer server is sandboxed on tmux socket {socket!r}, but {found}; run "
+        f"`export PM_TMUX_SOCKET={socket}` and retry"
+    )
+
+
+def _policy_sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise PmError(f"sandbox policy could not be read: {path} ({exc})") from exc
+
+
+def ensure_run_server(state: dict[str, Any], *, repo: Path) -> bool:
+    """Make sure the sandboxed server of the Mode B run `state` describes is
+    up on its socket before `start-slice` creates a session there; return
+    True when this call started it, False when it was already running.
+
+    A running server is accepted only when its global environment carries
+    `SANDBOX_RUNTIME=1` and its pid is the record's `server_pid`: anything
+    else on the socket is refused, never joined or killed. With no server,
+    the base policy file is re-read and refused unless its SHA-256 is still
+    the one `init` recorded; the effective policy is re-derived from it
+    (`pm_inside` false, the plan's directory readable) and rewritten, the
+    server started and verified, and the record updated with its pids. The
+    temp dir is recreated when it has gone (a reboot can clear it).
+
+    On any failure after `start_server` returned, the server is killed and
+    `srt` waited for before the error propagates; the control and temp
+    directories are the run's and stay, and the record keeps its last pids,
+    so the next `start-slice` starts afresh. PmError for every refusal.
+    """
+    block, socket, control = _run_sandbox(state, repo)
+    record = read_record(control)
+    if record.get("socket") != socket:
+        raise PmError(
+            f"the sandbox record {control / RECORD_NAME} names socket {record.get('socket')!r}, not {socket!r}"
+        )
+
+    if sessions.server_running(socket, timeout=START_DEADLINE_SECONDS):
+        value = sessions.server_environment(socket, "SANDBOX_RUNTIME")
+        if value != "1":
+            raise PmError(
+                f"a tmux server answers on this run's socket {socket!r} without SANDBOX_RUNTIME=1 (found {value!r}):"
+                f" it is not this run's sandboxed server; refusing to start a session there (stop it with"
+                f" `tmux -L {socket} kill-server` once you know whose it is)"
+            )
+        pid = _server_pid(socket, timeout=PROBE_TIMEOUT_SECONDS)
+        if record.get("server_pid") != pid:
+            raise PmError(
+                f"the sandboxed tmux server on socket {socket!r} has pid {pid}, but this run's record names"
+                f" {record.get('server_pid')!r}: it is not the server this run started; refusing to start a session there"
+            )
+        return False
+
+    policy_text = block.get("policy")
+    recorded_sha256 = block.get("policy_sha256")
+    if not isinstance(policy_text, str) or not isinstance(recorded_sha256, str):
+        raise PmError(f"this run's sandbox record in run state is malformed: {block!r}")
+    policy_file = Path(policy_text)
+    if _policy_sha256(policy_file) != recorded_sha256:
+        raise PmError(
+            f"sandbox policy {policy_file} no longer has the SHA-256 this run recorded ({recorded_sha256}); refusing"
+            " to start the server under a policy the run was not initialised with"
+        )
+    base, _warnings = load_base_policy(policy_file)
+    # The policy the server runs under must be the one hashed.
+    if _policy_sha256(policy_file) != recorded_sha256:
+        raise PmError(f"sandbox policy {policy_file} changed while it was being read; retry")
+
+    tmpdir_text = record.get("tmpdir")
+    if not isinstance(tmpdir_text, str) or not tmpdir_text:
+        raise PmError(f"the sandbox record {control / RECORD_NAME} names no temp dir")
+    tmpdir = Path(tmpdir_text)
+    _check_tmpdir(tmpdir)
+    if not os.path.lexists(tmpdir) and make_tmpdir(socket) != _real(tmpdir):
+        raise PmError(f"the sandbox temp dir was recreated somewhere other than the record's {tmpdir}")
+
+    plan_dir = Path(state["plan"]["path"]).parent
+    policy = derive_policy(
+        base,
+        worktree=repo,
+        branch=state["branch"],
+        socket=socket,
+        tmpdir=tmpdir,
+        control_root=control.parent,
+        pm_inside=False,
+        extra_read=[plan_dir],
+    )
+    check_binaries(policy)
+    version = srt_version()
+    policy_path = control / POLICY_NAME
+    staging = control / f"{POLICY_NAME}.tmp"
+    staging.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+    os.replace(staging, policy_path)
+
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    srt_pid, server_pid = start_server(
+        socket=socket, policy_path=policy_path, worktree=repo, tmpdir=tmpdir, log_path=control / SRT_LOG_NAME
+    )
+    try:
+        verify_server(socket=socket, worktree=repo)
+        fields = {key: value for key, value in record.items() if key != "control"}
+        fields.update(srt_pid=srt_pid, server_pid=server_pid, started_at=started_at, srt_version=version)
+        write_record(control, **fields)
+    except BaseException as exc:
+        # Cleanup must never replace the failure it is cleaning up after.
+        try:
+            sessions.kill_server(socket)
+            deadline = time.monotonic() + SRT_EXIT_WAIT_SECONDS
+            while _pid_alive(srt_pid) and time.monotonic() < deadline:
+                time.sleep(POLL_SECONDS)
+            left = f"srt still running: {srt_pid}" if _pid_alive(srt_pid) else "the server was killed"
+        except BaseException as cleanup_exc:
+            left = f"killing the server failed too ({cleanup_exc}): check tmux -L {socket}"
+        exc.add_note(f"sandboxed server on socket {socket!r} did not come up verified; {left}")
+        raise
+    return True
+
+
+def teardown_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[str] | None:
+    """The run end of a sandboxed Mode B run: `stop_server` with the run's
+    record, then a `sandbox-stopped` event; returns the notes for the caller
+    to print (the remaining sessions among them when any are left), or None
+    for an unsandboxed run.
+
+    A control dir already removed (an earlier teardown) is torn down again
+    from what `init` created: the socket's server, if one answers, and the
+    temp dir `make_tmpdir` names, so a repeated teardown reports both as
+    gone rather than failing. The control root `<common git dir>/pm-sandbox`
+    is removed as well when nothing else is left in it. PmError from
+    `stop_server`, before it kills anything, for a malformed record.
+    """
+    if not state.get("sandbox"):
+        return None
+    _block, socket, control = _run_sandbox(state, repo)
+    if os.path.lexists(control / RECORD_NAME):
+        record = read_record(control)
+    else:
+        conventional = Path(tempfile.gettempdir()) / f"{TMPDIR_PREFIX}{socket}"
+        record = {"srt_pid": None, "tmpdir": str(conventional), "control": str(control)}
+    remaining, notes = stop_server(socket=socket, record=record)
+    if remaining:
+        notes.append(f"sessions still listed on socket {socket}: {', '.join(remaining)}")
+    # The control root goes too once it holds no other server's directory;
+    # `rmdir` refuses a non-empty one, so another run's is never touched.
+    try:
+        control.parent.rmdir()
+    except OSError:
+        pass
+    state_mod.append_event(run_dir, "sandbox-stopped", note="; ".join(notes), data={"socket": socket})
+    return notes
 
 
 # --- A campaign brief's pin ----------------------------------------------------

@@ -652,6 +652,40 @@ class TestRunReportHeader(PlanTestCase):
         text = self._header(policy={})
         self.assertIn("- Attempt budget: 10 per slice", text)
 
+    def test_header_names_a_recorded_sandbox_in_the_status_line_form_and_nothing_otherwise(self) -> None:
+        sandbox = {
+            "policy": "/ops/sandbox.json",
+            "policy_sha256": "b" * 64,
+            "socket": "pm-run-20260729T000000Z-abcdef",
+            "control_dir": "/repo/.git/pm-sandbox/pm-run-20260729T000000Z-abcdef",
+        }
+        text = self._header(sandbox=sandbox)
+        self.assertIn(
+            "- Plan: /plan.md (sha256 aaaaaaaaaaaa…)\n"
+            f"- sandbox: /ops/sandbox.json (sha256 {'b' * 12}) socket pm-run-20260729T000000Z-abcdef\n",
+            text,
+        )
+        self.assertNotIn("sandbox", self._header().lower())
+
+
+class TestSandboxKeyRoundTrip(PmTestCase):
+    def test_a_recorded_sandbox_block_survives_a_verified_save_and_load(self) -> None:
+        """The optional `sandbox` key is MAC-covered like the rest of run state:
+        a verified load returns it unchanged, and editing it is tampering."""
+        plan_path = self.repo.parent / "plan.md"
+        self.write_plan(plan_path)
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        block = {"policy": "/p.json", "policy_sha256": "0" * 64, "socket": "pm-run-x", "control_dir": "/c"}
+        state["sandbox"] = block
+        state_mod.save_state(run_dir, state, token)
+        self.assertEqual(state_mod.load_state(run_dir, token)["sandbox"], block)
+
+        raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        raw["sandbox"]["socket"] = "pm-run-elsewhere"
+        (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaises(IntegrityError):
+            state_mod.load_state(run_dir, token)
+
 
 class TestRunReportSurfaceGrants(PlanTestCase):
     def _report(self, slices: list[dict]) -> str:

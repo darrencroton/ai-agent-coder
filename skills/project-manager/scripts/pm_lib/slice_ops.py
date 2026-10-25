@@ -19,10 +19,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import signal
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -309,6 +311,8 @@ class InitResult:
     state: dict[str, Any]
     slices: list[plan_mod.PlanSlice]
     branch: str
+    # What `sandbox.load_base_policy` warned about, for the caller to print.
+    sandbox_warnings: list[str] = field(default_factory=list)
 
 
 def init_run(
@@ -329,6 +333,7 @@ def init_run(
     model_tag: str | None,
     run_tag: str | None,
     policy: dict[str, Any] | None = None,
+    sandbox_policy: Path | None = None,
 ) -> InitResult:
     """Preflight, branch setup, and state/artifact creation for `init`.
 
@@ -339,9 +344,45 @@ def init_run(
     `policy` is `plan.load_policy`'s result (or None): its protected entries
     and source digest are frozen into run state here, and the policy file is
     never read again for the rest of the run.
+
+    `sandbox_policy`, an `srt` base policy, makes the run sandboxed (Mode B,
+    see `sandbox`): the policy is validated, `srt` required and the three
+    derived policies computed before anything is created, so a refusal
+    leaves no run directory, control directory or temp dir. The run's socket
+    is `pm-run-<run id>`; its control directory
+    `<common git dir>/pm-sandbox/<socket>/` receives `policy.json` (the PM
+    outside, the plan's directory readable), `reviewer-policy.json`,
+    `attach-policy.json` and the record (no pids yet), the temp dir is
+    created, and run state gains the MAC-protected `sandbox` block. The
+    server is not started here: `start-slice` starts it. A failure after the
+    run directory exists removes the control and temp directories this call
+    created and leaves the run directory, whose token was never printed.
     """
     if not _executable_exists("tmux"):
         raise PmError("tmux is required to run PM; install it before running init")
+
+    sandbox_base: dict[str, Any] | None = None
+    sandbox_warnings: list[str] = []
+    if sandbox_policy is not None:
+        sandbox_policy = sandbox_policy.expanduser()
+
+        def policy_digest() -> str:
+            try:
+                return hashlib.sha256(sandbox_policy.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise PmError(f"sandbox policy could not be read: {sandbox_policy} ({exc})") from exc
+
+        policy_sha256 = policy_digest()
+        sandbox_base, sandbox_warnings = sandbox.load_base_policy(sandbox_policy)
+        # The policy every later server start re-checks must be the one hashed.
+        if policy_digest() != policy_sha256:
+            raise PmError(f"sandbox policy {sandbox_policy} changed while it was being read; run init again")
+        sandbox_policy = sandbox_policy.resolve()
+        # `check_binaries` refuses first when srt is absent.
+        sandbox.check_binaries(sandbox_base)
+        srt_version = sandbox.srt_version()
+        if platform.system() != "Darwin":
+            raise PmError("sandboxing is implemented for macOS only")
 
     if harness_command is None and harness not in profiles.SUPPORTED_HARNESSES:
         supported = ", ".join(profiles.SUPPORTED_HARNESSES)
@@ -404,6 +445,39 @@ def init_run(
         "protected_paths_source": {"path": policy["path"], "sha256": policy["sha256"]} if policy else None,
     }
 
+    # The run id is chosen here, before anything exists, because a sandboxed
+    # run's socket, control directory and temp dir are named after it.
+    root = state_mod.state_root(repo)
+    run_id = state_mod.new_run_id({child.name for child in root.iterdir() if child.is_dir()} if root.exists() else ())
+    derived: dict[str, dict[str, Any]] = {}
+    if sandbox_base is not None:
+        socket = f"{sandbox.RUN_SOCKET_PREFIX}{run_id}"
+        common = Path(git_ops.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+        control = sandbox.control_dir(common, socket)
+        planned_tmpdir = Path(tempfile.gettempdir()) / f"{sandbox.TMPDIR_PREFIX}{socket}"
+        for path, what in ((control, "control dir"), (planned_tmpdir, "temp dir")):
+            if os.path.lexists(path):
+                raise PmError(f"sandbox {what} already exists: {path}; another run may own socket {socket}")
+        control_root = control.parent  # <common git dir>/pm-sandbox, which every policy denies
+        derived[sandbox.POLICY_NAME] = sandbox.derive_policy(
+            sandbox_base,
+            worktree=repo,
+            branch=resolved_branch,
+            socket=socket,
+            tmpdir=planned_tmpdir,
+            control_root=control_root,
+            pm_inside=False,
+            extra_read=[plan_path.parent],
+        )
+        derived[sandbox.REVIEWER_POLICY_NAME] = sandbox.derive_reviewer_policy(
+            sandbox_base, worktree=repo, tmpdir=planned_tmpdir, control_root=control_root, extra_read=[plan_path.parent]
+        )
+        derived[sandbox.ATTACH_POLICY_NAME] = sandbox.derive_attach_policy(
+            sandbox_base, socket=socket, control_root=control_root
+        )
+        sandbox.check_binaries(derived[sandbox.POLICY_NAME])
+        sandbox.check_binaries(derived[sandbox.REVIEWER_POLICY_NAME])
+
     state, token, run_dir = state_mod.create_run(
         repo,
         plan_path=plan_path,
@@ -414,20 +488,82 @@ def init_run(
         reviewer=reviewer_block,
         policy=policy_block,
         slices=entries,
+        run_id=run_id,
         run_tag=run_tag,
     )
 
+    if sandbox_base is not None:
+        # What this call created, and so may remove on failure.
+        control_created = False
+        tmpdir: Path | None = None
+        try:
+            try:
+                control.mkdir(parents=True)
+            except FileExistsError:
+                raise PmError(f"sandbox control dir already exists: {control}; another run created it") from None
+            control_created = True
+            tmpdir = sandbox.make_tmpdir(socket)
+            for name, content in derived.items():
+                (control / name).write_text(json.dumps(content, indent=2) + "\n", encoding="utf-8")
+            sandbox.write_record(
+                control,
+                worktree=str(repo),
+                branch=resolved_branch,
+                socket=socket,
+                tmpdir=str(tmpdir),
+                policy=str(sandbox_policy),
+                policy_sha256=policy_sha256,
+                srt_version=srt_version,
+                srt_pid=None,
+                server_pid=None,
+                started_at=None,
+            )
+            state["sandbox"] = {
+                "policy": str(sandbox_policy),
+                "policy_sha256": policy_sha256,
+                "socket": socket,
+                "control_dir": str(control),
+            }
+            state_mod.save_state(run_dir, state, token)
+        except BaseException as exc:
+            # Cleanup must never replace the failure it is cleaning up after.
+            removed: list[str] = []
+            try:
+                if tmpdir is not None and sandbox.remove_tmpdir(tmpdir):
+                    removed.append(str(tmpdir))
+                if control_created and os.path.lexists(control):
+                    shutil.rmtree(control)
+                    removed.append(str(control))
+            except BaseException as cleanup_exc:
+                removed.append(f"(cleanup failed: {cleanup_exc})")
+            left = (
+                f"sandboxed init failed after creating run directory {run_dir}, which is unusable (its token was "
+                f"never printed); removed: {', '.join(removed) or 'nothing'}"
+            )
+            if not isinstance(exc, Exception):
+                # An interrupt propagates as itself, carrying what was removed.
+                exc.add_note(left)
+                raise
+            raise PmError(f"{exc}; {left}") from exc
+
     write_pm_gitignore(repo)
     (run_artifact_dir(repo, state["run_id"]) / "slices").mkdir(parents=True, exist_ok=True)
-    state_mod.append_event(
-        run_dir,
-        "init",
-        note=f"harness={harness} branch={resolved_branch} slices={len(slices)} "
-        f"protected={len(policy_block['protected_paths'])}",
+    note = (
+        f"harness={harness} branch={resolved_branch} slices={len(slices)} "
+        f"protected={len(policy_block['protected_paths'])}"
     )
+    if sandbox_base is not None:
+        note += f" sandbox={socket}"
+    state_mod.append_event(run_dir, "init", note=note)
 
     return InitResult(
-        run_id=state["run_id"], run_dir=run_dir, token=token, state=state, slices=slices, branch=resolved_branch
+        run_id=state["run_id"],
+        run_dir=run_dir,
+        token=token,
+        state=state,
+        slices=slices,
+        branch=resolved_branch,
+        sandbox_warnings=sandbox_warnings,
     )
 
 
@@ -482,6 +618,8 @@ def status(repo: Path, run_dir: Path, token: str | None = None) -> StatusResult:
     # commands, so a tampered state should surface here, not one command
     # later. Tokenless (human) reads stay unverified, as documented.
     state = state_mod.load_state(run_dir, token)
+    # A sandboxed run's session lives on its own server only.
+    sandbox.require_run_socket(state)
     plan_error: str | None = None
     slices: list[plan_mod.PlanSlice] | None = None
     try:
@@ -699,6 +837,10 @@ class StartSliceOutcome:
     reaped: list[str] = field(default_factory=list)
     message: str = ""
     notes_warning: str | None = None
+    # A sandboxed run: whether this launch started the server, and what the
+    # all-complete teardown did (None when no teardown ran).
+    server_started: bool = False
+    sandbox_notes: list[str] | None = None
 
 
 def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> list[str]:
@@ -764,6 +906,7 @@ def start_slice(
     risk: str | None = None,
 ) -> StartSliceOutcome:
     state = load_writable_state(run_dir, token)
+    sandbox.require_run_socket(state)
     run_id = state["run_id"]
     plan_path = Path(state["plan"]["path"])
 
@@ -793,13 +936,18 @@ def start_slice(
             # The run ends with a final state write and report regeneration,
             # so an all-attested run reaches completion here rather than
             # idling as "active" forever.
+            sandbox_notes: list[str] | None = None
             if state.get("status") != "complete":
                 state["status"] = "complete"
                 state["stop_reason"] = None
                 state_mod.save_state(run_dir, state, token)
                 state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
-                regenerate_report(repo, run_dir, state)
-            return StartSliceOutcome(kind="all_complete")
+                # The run end takes a sandboxed run's server down with it.
+                try:
+                    sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
+                finally:
+                    regenerate_report(repo, run_dir, state)
+            return StartSliceOutcome(kind="all_complete", sandbox_notes=sandbox_notes)
 
     assert plan_slice is not None
     approved_ids = frozenset((state.get("approvals") or {}).keys())
@@ -857,6 +1005,14 @@ def start_slice(
         _require_judged(repo, run_dir, token, state, plan_slice.slice_id, ratcheted=risk is not None)
     else:
         attempts = 0
+
+    # A sandboxed run's server comes up (or is proven to be this run's) before
+    # anything of the launch is rotated, reaped or written.
+    run_socket: str | None = None
+    server_started = False
+    if state.get("sandbox"):
+        server_started = sandbox.ensure_run_server(state, repo=repo)
+        run_socket = state["sandbox"]["socket"]
 
     artifact_dir = slice_artifact_dir(repo, run_id, plan_slice.slice_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -934,7 +1090,12 @@ def start_slice(
     )
 
     session_name = sessions.session_name(run_id, slice_number(plan_slice.slice_id), attempts)
-    sessions.start_session(session_name, repo, command, env)
+    if run_socket is None:
+        sessions.start_session(session_name, repo, command, env)
+    else:
+        # Through the server, never a bare new-session: with no server
+        # answering it fails instead of starting an unsandboxed one.
+        sessions.start_session_via_server(run_socket, session_name, repo, command, env)
     launch_executable = shlex.split(command)[0] if command.strip() else ""
     # The session is live from here but is not recorded in `current_slice`
     # until `save_state` succeeds, so anything that raises anywhere in between
@@ -1028,6 +1189,7 @@ def start_slice(
         session=session_name,
         reaped=reaped,
         notes_warning=notes_warning,
+        server_started=server_started,
     )
 
 
@@ -1640,6 +1802,8 @@ class AcceptOutcome:
     assessment_path: Path | None = None
     message: str = ""
     code_warning: str | None = None
+    # What the run-end sandbox teardown did (None when none ran).
+    sandbox_notes: list[str] | None = None
 
 
 def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, risk: str | None = None) -> AcceptOutcome:
@@ -1658,6 +1822,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         )
 
     state = load_writable_state(run_dir, token)
+    sandbox.require_run_socket(state)
     _refuse_if_budget_exhausted(state)
     current = state.get("current_slice")
     if not current:
@@ -1757,9 +1922,14 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
 
     state_mod.save_state(run_dir, state, token)
     state_mod.append_event(run_dir, "accept", slice_id=slice_id, note=first_line, evidence=str(assessment_original))
-    if run_complete:
-        state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
-    regenerate_report(repo, run_dir, state)
+    sandbox_notes: list[str] | None = None
+    try:
+        if run_complete:
+            state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
+            # The run end takes a sandboxed run's server down with it.
+            sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
+    finally:
+        regenerate_report(repo, run_dir, state)
 
     return AcceptOutcome(
         kind="accepted",
@@ -1769,6 +1939,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         message=f"{slice_id} accepted",
         pane_path=artifact_dir / "pane.txt",
         code_warning=code_warning,
+        sandbox_notes=sandbox_notes,
     )
 
 
@@ -2080,6 +2251,8 @@ def _kill_reviewer_pgid(pgid: int) -> None:
 class StopOutcome:
     run_id: str
     killed: list[str]
+    # What the sandbox teardown did (None for an unsandboxed run).
+    sandbox_notes: list[str] | None = None
 
 
 def stop(
@@ -2091,6 +2264,7 @@ def stop(
     slice_status: str | None = None,
 ) -> StopOutcome:
     state = load_writable_state(run_dir, token)
+    sandbox.require_run_socket(state)
     run_id = state["run_id"]
     current = state.get("current_slice")
 
@@ -2131,8 +2305,12 @@ def stop(
         # ledger reads it from the event, never from the mutable entry.
         data={"slice_status": applied_status} if applied_status else None,
     )
-    regenerate_report(repo, run_dir, state)
-    return StopOutcome(run_id=run_id, killed=killed)
+    # The run end takes a sandboxed run's server down with it.
+    try:
+        sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
+    finally:
+        regenerate_report(repo, run_dir, state)
+    return StopOutcome(run_id=run_id, killed=killed, sandbox_notes=sandbox_notes)
 
 
 def stop_scavenge_sweep(*, run_id: str | None) -> list[str]:

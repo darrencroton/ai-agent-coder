@@ -25,6 +25,7 @@ from . import leaderboard, ledger
 from . import plan as plan_mod
 from . import preflight
 from . import review as review_mod
+from . import sandbox
 from . import sessions
 from . import slice_ops
 from . import state as state_mod
@@ -102,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="a protected-paths policy file (as for check-plan): its entries are frozen into run state, any "
         "authorized entry reaching one refuses init, grant refuses one, and floor fact 5 fails on one",
+    )
+    init.add_argument(
+        "--sandbox",
+        metavar="FILE",
+        help="an srt base policy (macOS): the run's Developers run on a private tmux server under srt, on "
+        "socket pm-run-<run id>, and its reviewers under srt too; export PM_TMUX_SOCKET as init prints it",
     )
 
     status = subparsers.add_parser("status", help="Show run status")
@@ -455,8 +462,11 @@ def _run_init(args: argparse.Namespace) -> int:
         model_tag=model_tag,
         run_tag=run_tag,
         policy=policy,
+        sandbox_policy=Path(args.sandbox) if args.sandbox else None,
     )
 
+    for warning in result.sandbox_warnings:
+        print(f"WARNING: {warning}")
     print(f"run id: {result.run_id}")
     print(f"state dir: {result.run_dir}")
     print(f"branch: {result.branch}")
@@ -466,7 +476,13 @@ def _run_init(args: argparse.Namespace) -> int:
             f"  {entry['id']:<10} {plan_slice.title:<40} risk={entry['risk']:<9} status={entry['status'] or 'pending'}"
         )
     _print_protected_line(policy, report)
+    sandbox_block = result.state.get("sandbox")
+    if sandbox_block:
+        print(f"sandbox: control dir {sandbox_block['control_dir']}")
     print(f"PM_RUN_TOKEN={result.token}")
+    if sandbox_block:
+        # Every later command of this run refuses without it.
+        print(f"export PM_TMUX_SOCKET={sandbox_block['socket']}")
     print(
         "Keep this token out of Developer sessions — it authorizes PM state writes; "
         "the operator or PM agent should hold it, never the harness being supervised."
@@ -500,6 +516,12 @@ def _run_status(args: argparse.Namespace) -> int:
     print(f"branch: {state['branch']}")
     plan_info = state.get("plan") or {}
     print(f"plan: {plan_info.get('path')}  sha256: {(plan_info.get('sha256') or '')[:12]}…")
+    sandbox_block = state.get("sandbox")
+    if isinstance(sandbox_block, dict):
+        print(
+            f"sandbox: {sandbox_block.get('policy')} (sha256 {(sandbox_block.get('policy_sha256') or '')[:12]}) "
+            f"socket {sandbox_block.get('socket')}"
+        )
     print(f"stop reason: {state.get('stop_reason')}")
 
     # Same derivation the report uses, so run time never needs events.jsonl
@@ -641,6 +663,8 @@ def _run_start_slice(args: argparse.Namespace) -> int:
 
     if outcome.kind == "all_complete":
         print("all slices complete")
+        for note in outcome.sandbox_notes or []:
+            print(f"sandbox: {note}")
         return 0
     if outcome.kind == "blocked":
         print(f"{outcome.slice_id} is not eligible:")
@@ -655,6 +679,8 @@ def _run_start_slice(args: argparse.Namespace) -> int:
         return 2
 
     verb = "relaunched" if outcome.kind == "relaunched" else "launched"
+    if outcome.server_started:
+        print(f"sandbox: started the run's sandboxed tmux server on socket {os.environ.get('PM_TMUX_SOCKET')}")
     print(f"{verb} {outcome.slice_id} (attempt {outcome.attempt}) in tmux session {outcome.session}")
     if outcome.reaped:
         print(f"reaped stale sessions: {', '.join(outcome.reaped)}")
@@ -712,6 +738,7 @@ def _print_no_signal_note(outcome, actions: str) -> None:
 def _run_observe(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
+    sandbox.require_run_socket(state_mod.load_state(run_dir))
     outcome = slice_ops.observe(repo, run_dir, wait=args.wait, token=_resolve_token(args))
 
     if not outcome.has_current_slice:
@@ -741,6 +768,7 @@ def _run_send(args: argparse.Namespace) -> int:
     token = _require_token(args)
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
+    sandbox.require_run_socket(state_mod.load_state(run_dir))
     slice_ops.send(repo, run_dir, token, text=args.text, reason=args.reason)
     print(f"sent: {args.text!r} ({args.reason})")
     return 0
@@ -753,6 +781,7 @@ def _run_answer(args: argparse.Namespace) -> int:
     token = _require_token(args)
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
+    sandbox.require_run_socket(state_mod.load_state(run_dir))
     outcome = slice_ops.answer(repo, run_dir, token, text=args.text)
     print(f"answered {outcome.slice_id}: {outcome.answer_path}")
     print(f"question archived: {outcome.question_archived_path}")
@@ -810,6 +839,9 @@ def _run_finalize(args: argparse.Namespace) -> int:
     token = _require_token(args)
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
+    # Every finalize form drives the run's tmux server, so a sandboxed run's
+    # socket must be the one exported.
+    sandbox.require_run_socket(state_mod.load_state(run_dir))
 
     # `is not None`, not truthiness: `--accept ""` is a decision that was
     # made and typed badly, not an absent one. Under truthiness it fell
@@ -828,6 +860,8 @@ def _run_finalize(args: argparse.Namespace) -> int:
                 print(f"pm: code metrics: {outcome.code_warning}", file=sys.stderr)
             print(f"ACCEPTED {outcome.slice_id}")
             print(f"assessment: {outcome.assessment_path}")
+            for note in outcome.sandbox_notes or []:
+                print(f"sandbox: {note}")
             return 0
         print(f"pm: refused: {outcome.message}", file=sys.stderr)
         return 1
@@ -967,6 +1001,19 @@ def _run_stop(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
 
     if args.scavenge:
+        # A readable sandboxed run with the wrong socket is refused here, and
+        # never falls through to the sweep below: that sweep would reach
+        # whichever server PM_TMUX_SOCKET names, not the run's.
+        try:
+            readable = state_mod.load_state(state_mod.resolve_run_dir(repo, args.run))
+        except PmError:
+            readable = None
+        if readable is not None:
+            try:
+                sandbox.require_run_socket(readable)
+            except PmError as exc:
+                print(f"pm: scavenge: refused ({exc}); nothing was swept", file=sys.stderr)
+                return 2
         try:
             token = _require_token(args)
             run_dir = state_mod.resolve_run_dir(repo, args.run)
@@ -978,16 +1025,31 @@ def _run_stop(args: argparse.Namespace) -> int:
             extra_killed = slice_ops.stop_scavenge_sweep(run_id=outcome.run_id)
             all_killed = outcome.killed + [name for name in extra_killed if name not in outcome.killed]
             print(f"stopped run {outcome.run_id}; killed sessions: {all_killed}")
+            for note in outcome.sandbox_notes or []:
+                print(f"sandbox: {note}")
             return 0
         except PmError as exc:
             killed = slice_ops.stop_scavenge_sweep(run_id=args.run)
             print(f"pm: scavenge: state unavailable ({exc}); swept sessions: {killed}")
+            # A sandboxed run's server is named after its id, so it can be
+            # found without state; a name tmux cannot take is no run's.
+            if args.run and re.fullmatch(r"[A-Za-z0-9._-]+", args.run):
+                socket = f"{sandbox.RUN_SOCKET_PREFIX}{args.run}"
+                try:
+                    if sessions.server_running(socket, timeout=sandbox.START_DEADLINE_SECONDS):
+                        remaining = sessions.kill_server(socket)
+                        killed_note = "killed" if remaining == [] else f"still lists sessions: {', '.join(remaining)}"
+                        print(f"pm: scavenge: sandboxed tmux server {socket} {killed_note}")
+                except PmError as server_exc:
+                    print(f"pm: scavenge: could not check tmux server {socket}: {server_exc}")
             return 0
 
     token = _require_token(args)
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     outcome = slice_ops.stop(repo, run_dir, token, reason=args.reason, slice_status=args.slice_status)
     print(f"stopped run {outcome.run_id}; killed sessions: {outcome.killed}")
+    for note in outcome.sandbox_notes or []:
+        print(f"sandbox: {note}")
     return 0
 
 

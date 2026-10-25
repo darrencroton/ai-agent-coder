@@ -269,6 +269,9 @@ def create_run(
         "slices": slices,
         "approvals": {},
         "stop_reason": None,
+        # Optional, added by `init --sandbox` (Mode B) and absent otherwise:
+        # "sandbox": {"policy", "policy_sha256", "socket": "pm-run-<run id>",
+        # "control_dir": "<common git dir>/pm-sandbox/<socket>"}.
     }
     _validate_shape(state)
 
@@ -600,6 +603,13 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     if state.get("run_tag") is not None:
         lines.append(f"- Run tag: {state['run_tag']}")
     lines.append(f"- Plan: {plan_info.get('path')} (sha256 {plan_sha}…)")
+    sandbox_info = state.get("sandbox")
+    if isinstance(sandbox_info, dict):
+        # The same line `status` prints for a sandboxed run.
+        lines.append(
+            f"- sandbox: {sandbox_info.get('policy')} (sha256 {(sandbox_info.get('policy_sha256') or '')[:12]}) "
+            f"socket {sandbox_info.get('socket')}"
+        )
     lines.append(
         f"- Harness: {harness_info.get('name')} model={harness_info.get('model')} effort={harness_info.get('effort')}"
     )

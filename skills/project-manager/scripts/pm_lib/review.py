@@ -359,6 +359,8 @@ def run_review(
     running the reviewer unwrapped.
     """
     state = slice_ops.load_writable_state(run_dir, token)
+    # Like every other command of a sandboxed run: never against another server.
+    sandbox.require_run_socket(state)
     current = state.get("current_slice")
     if not current or current.get("id") != slice_id:
         raise PmError(

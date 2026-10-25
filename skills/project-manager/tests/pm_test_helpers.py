@@ -35,9 +35,11 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterator
+from unittest import mock
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -188,6 +190,16 @@ def register_sandbox_socket(socket: str) -> str:
     this process's own servers."""
     if not socket.startswith(SANDBOX_TEST_SOCKET_PREFIX):
         raise ValueError(f"not a sandbox test socket of this process: {socket!r}")
+    if socket not in _SANDBOX_TEST_SOCKETS:
+        _SANDBOX_TEST_SOCKETS.append(socket)
+    return socket
+
+
+def register_run_socket(run_id: str) -> str:
+    """Record the `pm-run-<run_id>` socket of a sandboxed Mode B run a test of
+    this process just created for the `atexit` sweep below, and return it.
+    The run id's random nonce is what keeps the name this process's own."""
+    socket = f"pm-run-{run_id}"
     if socket not in _SANDBOX_TEST_SOCKETS:
         _SANDBOX_TEST_SOCKETS.append(socket)
     return socket
@@ -411,6 +423,30 @@ def sandbox_probe_child_script(*, out: Path, leak: Path, control_probe: Path, in
             f'if [ -n "${{PM_RUN_TOKEN+x}}" ]; then echo token=set; else echo token=unset; fi >> "{out}"',
             f'echo done >> "{out}"',
             "exec cat -",
+        ]
+    )
+
+
+def sandbox_probe_developer_script(*, leak: Path, git_dir: Path, tail: str = "exec cat -") -> str:
+    """A fake Developer for a sandboxed Mode B run: comes up ready, then
+    records to `$PM_SLICE_ARTIFACT_DIR/sandbox-probe.txt`, one `key=value`
+    line each, the exit status of `touch` on `leak` (beside the repository)
+    and whether it exists afterwards, the exit status of `mkdir` on
+    `<git_dir>/pm/x` (the state root) and whether that exists, and its
+    `$TMPDIR`; `done` last. Then `tail` runs (by default it drains stdin, so
+    the launch pointer is read)."""
+    out = '"$PM_SLICE_ARTIFACT_DIR/sandbox-probe.txt"'
+    state_probe = git_dir / "pm" / "x"
+    return "\n".join(
+        [
+            _READY,
+            f'touch "{leak}" 2>/dev/null; echo "leak_rc=$?" >> {out}',
+            f'if [ -e "{leak}" ]; then echo leak_exists=yes; else echo leak_exists=no; fi >> {out}',
+            f'mkdir "{state_probe}" 2>/dev/null; echo "state_rc=$?" >> {out}',
+            f'if [ -e "{state_probe}" ]; then echo state_exists=yes; else echo state_exists=no; fi >> {out}',
+            f'echo "tmpdir=$TMPDIR" >> {out}',
+            f"echo done >> {out}",
+            tail,
         ]
     )
 
@@ -876,3 +912,92 @@ class TmuxRunTestCase(PmTestCase):
         if extra:
             argv += extra
         return self.run_cli_in_repo(argv)
+
+
+class SandboxedRunTestCase(TmuxRunTestCase):
+    """`TmuxRunTestCase` plus a sandboxed Mode B run (`init --sandbox`).
+
+    A test that only needs what `init` records runs without `srt`: when it
+    is absent (CI), `_init_sandboxed` stands in for its binary checks, its
+    version and the platform check, and nothing starts a sandboxed server.
+    Tests that do start one are `requires_srt`. Every run's socket is
+    registered for the `atexit` sweep, and each test's cleanup kills its
+    server and removes its temp dir when the test left them.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.base_policy = write_base_policy(self.repo.parent / "sandbox.json")
+
+    @contextmanager
+    def _srt_stand_in(self) -> Iterator[None]:
+        """Nothing with `srt` installed; otherwise its checks pass by stand-in."""
+        if HAS_SRT:
+            yield
+            return
+        from pm_lib import sandbox as sandbox_mod
+        from pm_lib import slice_ops
+
+        with (
+            mock.patch.object(sandbox_mod, "check_binaries"),
+            mock.patch.object(sandbox_mod, "srt_version", return_value="0.0.0-stand-in"),
+            mock.patch.object(slice_ops.platform, "system", return_value="Darwin"),
+        ):
+            yield
+
+    def _init_sandboxed(
+        self, plan_path: Path, harness_script: Path, *, extra: list[str] | None = None
+    ) -> tuple[str, str, str, Path]:
+        """`init --sandbox` on this test's base policy; asserts success and
+        returns (run id, token, socket, run dir)."""
+        with self._srt_stand_in():
+            code, out, err = self._init(
+                plan_path, harness_script, extra=["--sandbox", str(self.base_policy), *(extra or [])]
+            )
+        self.assertEqual(code, 0, err)
+        run_id, token = parse_init_output(out)
+        socket = register_run_socket(run_id)
+        self.addCleanup(self._clean_run_sandbox, socket)
+        self.init_out = out
+        return run_id, token, socket, state_mod.resolve_run_dir(self.repo, run_id)
+
+    def _clean_run_sandbox(self, socket: str) -> None:
+        try:
+            sessions_mod.kill_server(socket)
+        except Exception:
+            pass
+        shutil.rmtree(Path(tempfile.gettempdir()) / f"pm-sandbox-{socket}", ignore_errors=True)
+
+    @staticmethod
+    def on_socket(socket: str | None):
+        """`PM_TMUX_SOCKET` set to `socket` (unset for None) for a `with` block."""
+        environ = {key: value for key, value in os.environ.items() if key != "PM_TMUX_SOCKET"}
+        if socket is not None:
+            environ["PM_TMUX_SOCKET"] = socket
+        return mock.patch.dict(os.environ, environ, clear=True)
+
+    @contextmanager
+    def no_tmux(self) -> Iterator[list[list[str]]]:
+        """Fail any tmux call made inside the block (it is recorded, then
+        refused, so a regression cannot reach a real server); yields the
+        record of attempted calls."""
+        attempted: list[list[str]] = []
+        real_run, real_popen = subprocess.run, subprocess.Popen
+
+        def is_tmux(argv) -> bool:
+            return isinstance(argv, (list, tuple)) and bool(argv) and os.path.basename(str(argv[0])) == "tmux"
+
+        def run(argv, *args, **kwargs):
+            if is_tmux(argv):
+                attempted.append(list(argv))
+                raise AssertionError(f"unexpected tmux call: {argv}")
+            return real_run(argv, *args, **kwargs)
+
+        def popen(argv, *args, **kwargs):
+            if is_tmux(argv):
+                attempted.append(list(argv))
+                raise AssertionError(f"unexpected tmux call: {argv}")
+            return real_popen(argv, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "run", run), mock.patch.object(subprocess, "Popen", popen):
+            yield attempted

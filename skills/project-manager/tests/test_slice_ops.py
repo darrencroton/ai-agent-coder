@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -36,24 +37,31 @@ from pm_test_helpers import (
     UNAVAILABLE_DEVELOPER,
     PlanTestCase,
     PmTestCase,
+    SandboxedRunTestCase,
     TmuxRunTestCase,
     commit_and_result_script,
     idle_script,
     judge_current_developer,
+    minimal_base_policy,
     parse_init_output,
     question_then_result_script,
+    requires_srt,
     result_only_script,
+    sandbox_probe_developer_script,
     stdin_draining_idle_script,
     trigger_gated_churn_script,
     trigger_gated_credential_prompt_script,
     trigger_gated_exit_script,
     trigger_gated_result_script,
+    tmux_argv,
+    write_base_policy,
     write_fake_harness,
 )
 
 from pm_lib import PmError, TypedNotSubmitted
 from pm_lib import cli
 from pm_lib import plan as plan_mod
+from pm_lib import sandbox as sandbox_mod
 from pm_lib import sessions
 from pm_lib import slice_ops
 from pm_lib import state as state_mod
@@ -1805,9 +1813,15 @@ class TestSandboxedLaunch(SliceOpsTestCase):
         environ = {key: value for key, value in os.environ.items() if key != "SANDBOX_RUNTIME"}
         if sandbox_runtime:
             environ["SANDBOX_RUNTIME"] = "1"
+        if record_sandbox:
+            # A recorded sandbox needs its socket exported (Slice 4), and its
+            # session starts through the server, which is stood in for here.
+            environ["PM_TMUX_SOCKET"] = "pm-run-x"
         with (
             mock.patch.dict(os.environ, environ, clear=True),
             mock.patch.object(sessions, "start_session", _capture),
+            mock.patch.object(sandbox_mod, "ensure_run_server", return_value=False),
+            mock.patch.object(sessions, "start_session_via_server", lambda _socket, *args: _capture(*args)),
             self.assertRaises(_Launched),
         ):
             self.run_cli_in_repo(["start-slice", "--token", token])
@@ -1832,6 +1846,339 @@ class TestSandboxedLaunch(SliceOpsTestCase):
         self.assertNotIn("--no-daemon", command)
         self.assertNotIn("Sandbox:", prompt)
         self.assertNotIn("[sandboxed]", prompt)
+
+
+# --- a sandboxed Mode B run (init --sandbox) ---------------------------------
+
+
+class _SandboxedRun(SandboxedRunTestCase):
+    """A sandboxed run on a one-slice plan, set up in each test."""
+
+    def _sandboxed_run(self, script: str | None = None, *, extra: list[str] | None = None) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", script or idle_script(sleep_seconds=30.0))
+        self.run_id, self.token, self.socket, self.run_dir = self._init_sandboxed(plan_path, harness, extra=extra)
+        self.common = (self.repo / ".git").resolve()
+        self.control = sandbox_mod.control_dir(self.common, self.socket)
+        self.tmpdir = Path(sandbox_mod.read_record(self.control)["tmpdir"])
+
+    def _events(self, kind: str) -> list[dict]:
+        return [event for event in state_mod.read_events(self.run_dir) if event["kind"] == kind]
+
+    def assert_torn_down(self) -> None:
+        """No server on the run's socket, no temp dir, no control dir, and
+        one `sandbox-stopped` event."""
+        self.assertFalse(sessions.server_running(self.socket))
+        self.assertFalse(os.path.lexists(self.tmpdir))
+        self.assertFalse(os.path.lexists(self.control))
+        # The control root holds no other run's directory here, so it goes too.
+        self.assertFalse(os.path.lexists(self.control.parent))
+        self.assertEqual(len(self._events("sandbox-stopped")), 1)
+
+
+class TestInitSandbox(_SandboxedRun):
+    def test_init_records_the_sandbox_writes_the_control_dir_and_prints_the_export_line(self) -> None:
+        self._sandboxed_run()
+        self.assertEqual(self.socket, f"pm-run-{self.run_id}")
+        state = state_mod.load_state(self.run_dir, self.token)  # MAC-verified
+        self.assertEqual(
+            state["sandbox"],
+            {
+                "policy": str(self.base_policy.resolve()),
+                "policy_sha256": hashlib.sha256(self.base_policy.read_bytes()).hexdigest(),
+                "socket": self.socket,
+                "control_dir": str(self.control),
+            },
+        )
+
+        policy = json.loads((self.control / sandbox_mod.POLICY_NAME).read_text(encoding="utf-8"))
+        self.assertIn({"path": str(self.repo.resolve()), "literal": True}, policy["filesystem"]["allowWrite"])
+        self.assertIn({"path": str(self.common / "pm"), "literal": True}, policy["filesystem"]["denyWrite"])
+        self.assertIn(
+            {"path": str(self._plan_path().resolve().parent), "literal": True}, policy["filesystem"]["allowRead"]
+        )
+        reviewer = json.loads((self.control / sandbox_mod.REVIEWER_POLICY_NAME).read_text(encoding="utf-8"))
+        self.assertNotIn({"path": str(self.repo.resolve()), "literal": True}, reviewer["filesystem"]["allowWrite"])
+        attach = json.loads((self.control / sandbox_mod.ATTACH_POLICY_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(attach["filesystem"]["allowWrite"], [])
+
+        record = sandbox_mod.read_record(self.control)
+        self.assertEqual((record["socket"], record["worktree"]), (self.socket, str(self.repo.resolve())))
+        self.assertIsNone(record["srt_pid"])
+        self.assertIsNone(record["server_pid"])
+        self.assertTrue(self.tmpdir.is_dir())
+        self.assertEqual(self.tmpdir.name, f"{sandbox_mod.TMPDIR_PREFIX}{self.socket}")
+
+        lines = self.init_out.splitlines()
+        token_line = next(index for index, line in enumerate(lines) if line.startswith("PM_RUN_TOKEN="))
+        self.assertEqual(lines[token_line + 1], f"export PM_TMUX_SOCKET={self.socket}")
+        # init does not start the server.
+        self.assertFalse(sessions.server_running(self.socket))
+
+    def test_init_without_sandbox_records_no_sandbox_and_prints_nothing_new(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        code, out, err = self._init(plan_path, harness)
+        self.assertEqual(code, 0, err)
+        run_id, token = parse_init_output(out)
+        state = state_mod.load_state(state_mod.resolve_run_dir(self.repo, run_id), token)
+        self.assertNotIn("sandbox", state)
+        self.assertNotIn("PM_TMUX_SOCKET", out)
+        self.assertNotIn("sandbox", out)
+        self.assertFalse((self.repo / ".git" / sandbox_mod.CONTROL_ROOT_NAME).exists())
+
+    def _init_refused(self, plan_path: Path, harness: Path) -> str:
+        """`init --sandbox` that must refuse creating nothing: no run
+        directory, no control directory, and no temp dir (asserted on the
+        call that would create one, since the shared temp directory holds
+        other test processes' run temp dirs). Returns stderr."""
+        with mock.patch.object(sandbox_mod, "make_tmpdir", wraps=sandbox_mod.make_tmpdir) as make_tmpdir:
+            code, _out, err = self._init(plan_path, harness, extra=["--sandbox", str(self.base_policy)])
+        self.assertEqual(code, 2, err)
+        make_tmpdir.assert_not_called()
+        state_root = self.repo / ".git" / "pm"
+        self.assertEqual([path for path in state_root.iterdir() if path.is_dir()] if state_root.exists() else [], [])
+        self.assertFalse((self.repo / ".git" / sandbox_mod.CONTROL_ROOT_NAME).exists())
+        return err
+
+    def test_init_sandbox_refuses_without_srt_creating_nothing(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        real_which = shutil.which
+        with mock.patch.object(
+            sandbox_mod.shutil,
+            "which",
+            side_effect=lambda name, *a, **k: None if name == "srt" else real_which(name, *a, **k),
+        ):
+            err = self._init_refused(plan_path, harness)
+        self.assertIn(sandbox_mod.SRT_MISSING, err)
+
+    def test_init_sandbox_refuses_an_invalid_policy_creating_nothing(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        policy = minimal_base_policy()
+        policy["network"]["allowAllUnixSockets"] = True
+        write_base_policy(self.base_policy, policy)
+        with self._srt_stand_in():
+            err = self._init_refused(plan_path, harness)
+        self.assertIn(str(self.base_policy), err)
+        self.assertIn("allowAllUnixSockets", err)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestRunSocketRefusals(_SandboxedRun):
+    """Every tmux-reaching command of a sandboxed run refuses, before any tmux
+    call, unless `PM_TMUX_SOCKET` names the run's socket."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._sandboxed_run()
+
+    def _assert_refused(self, argv: list[str], *, socket: str | None = "pm-run-another") -> str:
+        before = (self.run_dir / "run.json").read_bytes()
+        with self.on_socket(socket), self.no_tmux() as attempted:
+            code, out, err = self.run_cli_in_repo(argv)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"export PM_TMUX_SOCKET={self.socket}", err)
+        self.assertEqual(attempted, [])
+        self.assertEqual((self.run_dir / "run.json").read_bytes(), before)
+        return err
+
+    def test_start_slice_refuses_with_the_socket_unset_or_another_and_launches_nothing(self) -> None:
+        self.assertIn(
+            "PM_TMUX_SOCKET is unset", self._assert_refused(["start-slice", "--token", self.token], socket=None)
+        )
+        self.assertIn("'pm-run-another'", self._assert_refused(["start-slice", "--token", self.token]))
+        self.assertIsNone(state_mod.load_state(self.run_dir, self.token)["current_slice"])
+        self.assertFalse(sessions.server_running(self.socket))
+        self.assertEqual(sessions.sessions_for_run(self.run_id), [])
+
+    def test_status_refuses(self) -> None:
+        self._assert_refused(["status"])
+
+    def test_observe_refuses(self) -> None:
+        self._assert_refused(["observe"])
+
+    def test_send_refuses(self) -> None:
+        self._assert_refused(["send", "--text", "nudge", "--reason", "test", "--token", self.token])
+
+    def test_answer_refuses(self) -> None:
+        self._assert_refused(["answer", "--text", "an answer", "--token", self.token])
+
+    def test_finalize_refuses(self) -> None:
+        self._assert_refused(["finalize", "--token", self.token])
+
+    def test_review_refuses(self) -> None:
+        self._assert_refused(
+            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "codex", "--token", self.token]
+        )
+
+    def test_stop_refuses(self) -> None:
+        self._assert_refused(["stop", "--reason", "operator stop", "--token", self.token])
+        self.assertEqual(state_mod.load_state(self.run_dir, self.token)["status"], "active")
+
+    def test_the_right_socket_passes_status_and_prints_the_sandbox_line(self) -> None:
+        with self.on_socket(self.socket):
+            code, out, err = self.run_cli_in_repo(["status"])
+        self.assertEqual(code, 0, err)
+        sha = hashlib.sha256(self.base_policy.read_bytes()).hexdigest()
+        line = f"sandbox: {self.base_policy.resolve()} (sha256 {sha[:12]}) socket {self.socket}"
+        self.assertIn(line, out.splitlines())
+        with self.on_socket(self.socket):
+            code, _out, err = self.run_cli_in_repo(["status", "--report"])
+        self.assertEqual(code, 0, err)
+        report = (self.run_dir / "run-report.md").read_text(encoding="utf-8")
+        self.assertIn(f"- {line}\n", report)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestUnsandboxedRunUnchanged(SliceOpsTestCase):
+    def test_status_prints_no_sandbox_line_and_stop_appends_no_sandbox_event(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        _state, token, run_dir = self.make_run(plan_path=plan_path, branch="pm-work")
+        code, out, err = self.run_cli_in_repo(["status"])
+        self.assertEqual(code, 0, err)
+        self.assertFalse(any(line.startswith("sandbox:") for line in out.splitlines()))
+        code, out, err = self.run_cli_in_repo(["stop", "--reason", "done", "--token", token])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, f"stopped run {_state['run_id']}; killed sessions: []\n")
+        self.assertEqual([e for e in state_mod.read_events(run_dir) if e["kind"] == "sandbox-stopped"], [])
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestSandboxedServerRefusals(_SandboxedRun):
+    """Refusals that need no `srt`: nothing is started."""
+
+    def test_a_server_on_the_run_socket_without_sandbox_runtime_is_refused_and_left_alone(self) -> None:
+        self._sandboxed_run()
+        with sessions.scoped_environ("PM_RUN_TOKEN", None):
+            subprocess.run(["tmux", "-L", self.socket, "new-session", "-d", "-s", "plain", "sleep 600"], check=True)
+        start_session = mock.Mock(side_effect=AssertionError("bare start_session"))
+        via_server = mock.Mock(side_effect=AssertionError("no session may start"))
+        with (
+            self.on_socket(self.socket),
+            mock.patch.object(sessions, "start_session", start_session),
+            mock.patch.object(sessions, "start_session_via_server", via_server),
+        ):
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("without SANDBOX_RUNTIME=1", err)
+        start_session.assert_not_called()
+        via_server.assert_not_called()
+        self.assertEqual(sessions.list_sessions_on(self.socket), ["plain"])
+        self.assertIsNone(state_mod.load_state(self.run_dir, self.token)["current_slice"])
+
+    def test_a_changed_base_policy_is_refused_before_any_server_starts(self) -> None:
+        self._sandboxed_run()
+        policy = minimal_base_policy()
+        policy["network"]["allowedDomains"] = ["example.com"]
+        write_base_policy(self.base_policy, policy)
+        with self.on_socket(self.socket), mock.patch.object(sandbox_mod, "start_server") as start_server:
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("no longer has the SHA-256 this run recorded", err)
+        start_server.assert_not_called()
+        self.assertFalse(sessions.server_running(self.socket))
+        self.assertIsNone(state_mod.load_state(self.run_dir, self.token)["current_slice"])
+
+
+@requires_srt
+class TestSandboxedDeveloperLaunch(_SandboxedRun):
+    def test_start_slice_starts_the_server_launches_through_it_and_a_relaunch_reuses_it(self) -> None:
+        leak = self.repo.parent / "leak"
+        self._sandboxed_run(sandbox_probe_developer_script(leak=leak, git_dir=self.repo / ".git"))
+        start_session = mock.Mock(side_effect=AssertionError("bare start_session on a sandboxed run"))
+        with self.on_socket(self.socket), mock.patch.object(sessions, "start_session", start_session):
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+        self.assertEqual(code, 0, out + err)
+        start_session.assert_not_called()
+        self.assertIn(f"sandbox: started the run's sandboxed tmux server on socket {self.socket}", out)
+        self.assertEqual(sessions.server_environment(self.socket, "SANDBOX_RUNTIME"), "1")
+        state = state_mod.load_state(self.run_dir, self.token)
+        self.assertIn(state["current_slice"]["tmux_session"], sessions.list_sessions_on(self.socket))
+
+        probe = Path(state["current_slice"]["artifact_dir"]) / "sandbox-probe.txt"
+        self.assertTrue(self._wait_for(lambda: probe.is_file() and "done" in probe.read_text(encoding="utf-8")))
+        facts = dict(line.split("=", 1) for line in probe.read_text(encoding="utf-8").splitlines() if "=" in line)
+        record = sandbox_mod.read_record(self.control)
+        self.assertNotEqual(facts["leak_rc"], "0")
+        self.assertEqual(facts["leak_exists"], "no")
+        self.assertNotEqual(facts["state_rc"], "0")
+        self.assertEqual(facts["state_exists"], "no")
+        self.assertEqual(facts["tmpdir"], record["tmpdir"])
+        self.assertIsInstance(record["srt_pid"], int)
+        self.assertIsInstance(record["server_pid"], int)
+
+        judge_current_developer(self, self.token, self.run_dir)
+        with self.on_socket(self.socket), mock.patch.object(sessions, "start_session", start_session):
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("relaunched Slice 1 (attempt 1)", out)
+        self.assertNotIn("sandbox: started", out)
+        start_session.assert_not_called()
+        relaunched = sandbox_mod.read_record(self.control)
+        self.assertEqual((relaunched["srt_pid"], relaunched["server_pid"]), (record["srt_pid"], record["server_pid"]))
+
+    def test_stop_tears_the_server_and_its_directories_down(self) -> None:
+        self._sandboxed_run()
+        with self.on_socket(self.socket):
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(sessions.server_running(self.socket))
+            code, out, err = self.run_cli_in_repo(["stop", "--reason", "operator stop", "--token", self.token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"sandbox: removed sandbox temp dir {self.tmpdir}", out)
+        self.assertIn(f"sandbox: removed sandbox control dir {self.control}", out)
+        self.assert_torn_down()
+        self.assertEqual(state_mod.load_state(self.run_dir, self.token)["status"], "stopped")
+
+
+class TestSandboxedRunEnds(_SandboxedRun):
+    def test_start_slice_on_an_all_attested_run_tears_the_sandbox_down(self) -> None:
+        self._sandboxed_run(extra=["--attest", "Slice 1"])
+        with self.on_socket(self.socket), mock.patch.object(sessions, "start_session_via_server") as via_server:
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("all slices complete", out)
+        via_server.assert_not_called()
+        self.assert_torn_down()
+        self.assertEqual(state_mod.load_state(self.run_dir, self.token)["status"], "complete")
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+    def test_scavenge_with_unreadable_state_kills_the_run_server_and_reports_it(self) -> None:
+        self._sandboxed_run()
+        # A plain server stands in for the sandboxed one: without state, the
+        # sweep finds the run's server by its name alone.
+        with sessions.scoped_environ("PM_RUN_TOKEN", None):
+            subprocess.run(["tmux", "-L", self.socket, "new-session", "-d", "-s", "keep", "sleep 600"], check=True)
+        shutil.rmtree(self.run_dir)
+        with self.on_socket(self.socket):
+            code, out, err = self.run_cli_in_repo(["stop", "--reason", "emergency", "--scavenge", "--run", self.run_id])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("state unavailable", out)
+        self.assertIn(f"pm: scavenge: sandboxed tmux server {self.socket} killed", out)
+        self.assertFalse(sessions.server_running(self.socket))
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+    def test_scavenge_on_a_readable_run_with_the_wrong_socket_refuses_and_sweeps_nothing(self) -> None:
+        self._sandboxed_run()
+        # A session of this run's name on the suite's own server: the
+        # ambient sweep would kill it.
+        decoy = sessions.session_name(self.run_id, 1, 0)
+        self._sessions_to_reap.append(decoy)
+        subprocess.run(tmux_argv("new-session", "-d", "-s", decoy, "sleep 600"), check=True)
+        with self.no_tmux() as attempted:
+            code, out, err = self.run_cli_in_repo(
+                ["stop", "--reason", "emergency", "--scavenge", "--run", self.run_id, "--token", self.token]
+            )
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("pm: scavenge: refused", err)
+        self.assertIn(f"export PM_TMUX_SOCKET={self.socket}", err)
+        self.assertIn("nothing was swept", err)
+        self.assertEqual(attempted, [])
+        self.assertTrue(sessions.session_exists(decoy))
+        self.assertEqual(state_mod.load_state(self.run_dir, self.token)["status"], "active")
+        self.assertTrue(self.control.is_dir())
 
 
 # --- the origin event precedes the state save --------------------------------
