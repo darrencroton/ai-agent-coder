@@ -1,7 +1,9 @@
 """tmux session lifecycle: launch, readiness, injection, capture, liveness.
 
 This module owns *all* tmux and harness-process contact — no other module in
-this package shells out to tmux. It never judges anything beyond the
+this package shells out to tmux, with two exceptions in `sandbox`: the
+sandboxed server itself, which `srt` wraps, and the `display-message` that
+reads that server's pid. It never judges anything beyond the
 interactive-dialog marker scan (`scan_dialog_markers`), which is pure text parsing
 guarding PM's own keystrokes in `send_prompt`/`send_line` and reported as a
 signal by `observe`. It is not a floor fact: whether a visible message means
@@ -226,10 +228,11 @@ def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -
 
     Env values are shell-quoted. The Developer session's environment must
     never carry the PM run capability token — asserted defensively for the
-    explicit map here, AND stripped from the inherited environment: a tmux
-    session inherits the server's (ultimately the controller's) environment,
-    so an exported PM_RUN_TOKEN would otherwise be visible inside every
-    Developer session. The `unset` runs in the session's own shell first.
+    explicit map in `_new_session_args`, AND stripped from the inherited
+    environment: a tmux session inherits the server's (ultimately the
+    controller's) environment, so an exported PM_RUN_TOKEN would otherwise
+    be visible inside every Developer session. The `unset` runs in the
+    session's own shell first.
 
     That `unset` does not reach the server's *global* environment, which tmux
     seeds from the process that starts a new server: an exported token would
@@ -499,19 +502,22 @@ def list_sessions_on(socket: str) -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def server_running(socket: str) -> bool:
+def server_running(socket: str, timeout: float | None = None) -> bool:
     """Whether a server answers on `socket`, with or without sessions:
     `tmux -L <socket> display-message -p '#{pid}'` succeeds.
 
     `list_sessions_on` cannot tell an empty server from no server (both list
     nothing), which is why this asks the server for its pid instead. False
     on tmux's no-server replies (see `_no_server`); any other failure,
-    including a missing tmux binary, raises PmError, because the check could
-    not look. The socket is the argument, never `PM_TMUX_SOCKET`.
+    including a missing tmux binary or, with `timeout` (seconds), no reply in
+    time, raises PmError, because the check could not look. The socket is
+    the argument, never `PM_TMUX_SOCKET`.
     """
     argv = ["tmux", "-L", socket, "display-message", "-p", "#{pid}"]
     try:
-        result = subprocess.run(argv, check=False, text=True, capture_output=True)
+        result = subprocess.run(argv, check=False, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise PmError(f"could not probe tmux socket {socket!r}: no reply within {timeout:g} s") from None
     except OSError as exc:
         raise PmError(f"could not probe tmux socket {socket!r}: tmux not found ({exc})") from exc
     if result.returncode == 0:
@@ -522,22 +528,34 @@ def server_running(socket: str) -> bool:
     raise PmError(f"could not probe tmux socket {socket!r}: {detail or 'tmux failed'}")
 
 
-def run_shell(socket: str, command: str) -> tuple[int, str]:
+def run_shell(socket: str, command: str, timeout: float | None = None) -> tuple[int, str]:
     """`tmux -L <socket> run-shell <command>`: run the shell `command` as a
     job of the server on `socket`, in that server's environment and under
     whatever restrictions the server runs with. Returns `(returncode,
-    output)`, stdout and stderr together.
+    output)`, stdout and stderr together, decoded as UTF-8 with any invalid
+    byte replaced.
 
     tmux expands formats in a `run-shell` command, so every `#` is doubled
     first: `command` runs as written, never as `#{...}` expansions. On tmux
     3.5a the return code is the command's own exit status. Against a socket
     with no server it is non-zero and no server is started (`run-shell`
-    never starts one). Raises PmError only when tmux itself cannot be run.
-    The socket is the argument, never `PM_TMUX_SOCKET`.
+    never starts one). Raises PmError only when tmux itself cannot be run
+    or, with `timeout` (seconds), when it has not returned in time. The
+    socket is the argument, never `PM_TMUX_SOCKET`.
     """
     argv = ["tmux", "-L", socket, "run-shell", command.replace("#", "##")]
     try:
-        result = subprocess.run(argv, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        result = subprocess.run(
+            argv,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise PmError(f"command on tmux socket {socket!r} did not return within {timeout:g} s") from None
     except OSError as exc:
         raise PmError(f"could not run a command on tmux socket {socket!r}: tmux not found ({exc})") from exc
     return result.returncode, result.stdout or ""

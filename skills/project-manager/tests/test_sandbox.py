@@ -2,7 +2,9 @@
 the server-scoped `sessions` helpers they rest on.
 
 Policy loading, derivation, the binaries check, the record, the temp dir and
-`wrap_command` run without `srt`. The `sessions` helpers run with tmux alone.
+`wrap_command` run without `srt`, and so do the start deadline and the
+teardown's record checks, against a fake `srt` (and a fake `tmux` where the
+probe itself is under test). The `sessions` helpers run with tmux alone.
 Everything that starts a real sandboxed server is gated on `srt`, `tmux` and
 macOS (`requires_srt`), and each such test drives a `<TEST_TMUX_SOCKET>-sb*`
 socket of its own, never the suite's shared server.
@@ -35,6 +37,7 @@ from pm_test_helpers import (  # noqa: E402
     PmTestCase,
     make_linked_worktree,
     minimal_base_policy,
+    register_sandbox_socket,
     requires_srt,
     write_base_policy,
     write_fake_harness,
@@ -50,8 +53,9 @@ _SOCKET_NUMBERS = itertools.count(1)
 
 
 def _sandbox_socket() -> str:
-    """A fresh `<TEST_TMUX_SOCKET>-sb<N>` socket for one test."""
-    return f"{TEST_TMUX_SOCKET}-sb{next(_SOCKET_NUMBERS)}"
+    """A fresh `<TEST_TMUX_SOCKET>-sb<N>` socket for one test, registered
+    for the helpers' `atexit` sweep."""
+    return register_sandbox_socket(f"{TEST_TMUX_SOCKET}-sb{next(_SOCKET_NUMBERS)}")
 
 
 def _real(path: Path | str) -> Path:
@@ -65,6 +69,19 @@ def _literal(path: Path | str) -> dict:
 def _socket_grant(socket: str) -> str:
     path = sessions.socket_path(socket)
     return str(_real(path.parent) / path.name)
+
+
+def _case_variant(test: unittest.TestCase, path: Path | str) -> str:
+    """`path` with its letters' case swapped; skips `test` unless that
+    spelling names the same file (a case-insensitive volume)."""
+    variant = str(path).swapcase()
+    if variant == str(path) or not os.path.exists(variant) or not os.path.samefile(variant, path):
+        test.skipTest(f"{path} is not on a case-insensitive volume")
+    return variant
+
+
+# A NUL, a control character and a lone surrogate, each inside a path.
+_BAD_PATHS = ("/tmp/a\x00b", "/tmp/a\x1bb", "/tmp/a\ud800b")
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -170,6 +187,43 @@ class TestLoadBasePolicy(TempDirTestCase):
             directory = self.tmp / f"tmux-{os.getuid()}"
             self.assertRefused(self._write(self._policy_with_write(str(directory))), "the tmux socket directory")
 
+    def test_a_case_variant_of_each_protected_target_is_refused(self) -> None:
+        # srt enforces a grant spelled with other letter case on a
+        # case-insensitive volume, so the refusal judges identity.
+        directory = sessions.socket_path("x").parent
+        if not directory.is_dir():
+            self.skipTest(f"the tmux socket directory {directory} does not exist")
+        cases = (
+            (Path.home(), "the home directory"),
+            (sandbox.toolkit_root(), "the toolkit checkout"),
+            (_real(directory), "the tmux socket directory"),
+        )
+        for target, fragment in cases:
+            with self.subTest(target=target):
+                variant = _case_variant(self, target)
+                for entry in (variant, _literal(variant)):
+                    self.assertRefused(self._write(self._policy_with_write(entry)), fragment)
+
+    def test_a_write_entry_holding_a_nul_control_or_surrogate_character_is_refused(self) -> None:
+        for text in _BAD_PATHS:
+            for entry in (text, _literal(text)):
+                with self.subTest(entry=entry):
+                    self.assertRefused(self._write(self._policy_with_write(entry)), "lone-surrogate character")
+
+    def test_a_policy_path_no_file_can_have_is_refused(self) -> None:
+        for name in ("a\x00b.json", "a\ud800b.json"):
+            with self.subTest(name=name):
+                with self.assertRaises(PmError) as ctx:
+                    sandbox.load_base_policy(self.tmp / name)
+                self.assertIn("unreadable", str(ctx.exception))
+
+    def test_a_non_list_allow_unix_sockets_is_refused(self) -> None:
+        for value in (None, "/var/run/x.sock", {"path": "/var/run/x.sock"}):
+            with self.subTest(value=value):
+                policy = minimal_base_policy()
+                policy["network"]["allowUnixSockets"] = value
+                self.assertRefused(self._write(policy), "network.allowUnixSockets is not a list")
+
     def test_weaker_network_isolation_and_local_binding_each_warn(self) -> None:
         policy = minimal_base_policy()
         policy["enableWeakerNetworkIsolation"] = True
@@ -243,16 +297,16 @@ class TestDerivePolicy(DerivationTestCase):
             policy["filesystem"]["allowWrite"],
             [
                 "~/.codex/sessions",
-                str(self.worktree),
-                str(self.git_dir),
-                str(self.common / "objects"),
+                _literal(self.worktree),
+                _literal(self.git_dir),
+                _literal(self.common / "objects"),
                 _literal(heads / "node" / "x"),
                 _literal(heads / "node" / "x.lock"),
                 _literal(logs / "node" / "x"),
                 _literal(logs / "node" / "x.lock"),
                 _literal(self.common / "packed-refs.lock"),
-                _socket_grant(self.socket),
-                str(self.tmpdir),
+                _literal(_socket_grant(self.socket)),
+                _literal(self.tmpdir),
             ],
         )
         self.assertEqual(
@@ -263,7 +317,7 @@ class TestDerivePolicy(DerivationTestCase):
     def test_the_state_root_deny_is_mode_b_only_and_the_ledger_grant_mode_c_only(self) -> None:
         outside = self.derive(pm_inside=False)
         inside = self.derive(pm_inside=True)
-        ledger_grant = str(_real(ledger.ledger_dir()))
+        ledger_grant = _literal(_real(ledger.ledger_dir()))
         self.assertIn(_literal(self.git_dir / "pm"), outside["filesystem"]["denyWrite"])
         self.assertNotIn(ledger_grant, outside["filesystem"]["allowWrite"])
         self.assertNotIn(_literal(self.git_dir / "pm"), inside["filesystem"]["denyWrite"])
@@ -277,7 +331,7 @@ class TestDerivePolicy(DerivationTestCase):
         repo = _real(self.repo)
         self.assertEqual(
             policy["filesystem"]["allowWrite"],
-            [str(repo), str(repo / ".git"), _socket_grant(self.socket), str(self.tmpdir)],
+            [_literal(repo), _literal(repo / ".git"), _literal(_socket_grant(self.socket)), _literal(self.tmpdir)],
         )
         self.assertEqual(policy["filesystem"]["denyWrite"], [*self.always_denies(), _literal(repo / ".git" / "pm")])
 
@@ -287,7 +341,13 @@ class TestDerivePolicy(DerivationTestCase):
         policy = self.derive(base, extra_read=[extra])
         self.assertEqual(
             policy["filesystem"]["allowRead"],
-            ["/opt/data", str(self.worktree), str(self.common), str(sandbox.toolkit_root()), str(extra)],
+            [
+                "/opt/data",
+                _literal(self.worktree),
+                _literal(self.common),
+                _literal(sandbox.toolkit_root()),
+                _literal(extra),
+            ],
         )
         self.assertEqual(policy["network"]["allowUnixSockets"], [_socket_grant(self.socket)])
         self.assertIs(policy["allowPty"], True)
@@ -303,7 +363,8 @@ class TestDerivePolicy(DerivationTestCase):
         grant = _socket_grant(self.socket)
         self.assertEqual(Path(grant).name, self.socket)
         self.assertEqual(Path(grant).parent, _real(sessions.socket_path(self.socket).parent))
-        self.assertIn(grant, policy["filesystem"]["allowWrite"])
+        self.assertIn(_literal(grant), policy["filesystem"]["allowWrite"])
+        # allowUnixSockets takes plain strings, compiled by srt as a subpath.
         self.assertIn(grant, policy["network"]["allowUnixSockets"])
 
     def test_the_base_is_not_mutated(self) -> None:
@@ -336,6 +397,69 @@ class TestDerivePolicy(DerivationTestCase):
                         base, worktree=self.worktree, tmpdir=self.tmpdir, control_root=self.control_root
                     )
 
+    def test_a_worktree_path_with_glob_characters_gets_literal_entries_only(self) -> None:
+        # srt reads any string holding * ? [ ] as a pattern too, so a plain
+        # grant of `wt[1]` would also grant a sibling `wt1`.
+        worktree = _real(make_linked_worktree(self.repo, self.repo.parent / "wt[1]", "node/glob"))
+        git_dir = sandbox.git_ops.worktree_git_dir(worktree)  # git names it `wt-1`
+        policy = self.derive(worktree=worktree, branch="node/glob", extra_read=[self.repo.parent / "launch*"])
+        for key in ("allowWrite", "allowRead", "denyWrite"):
+            for entry in policy["filesystem"][key]:
+                with self.subTest(key=key, entry=entry):
+                    self.assertIsInstance(entry, dict)
+                    self.assertIs(entry["literal"], True)
+        self.assertEqual(policy["filesystem"]["allowWrite"][:2], [_literal(worktree), _literal(git_dir)])
+        self.assertEqual(policy["filesystem"]["allowRead"][0], _literal(worktree))
+        reviewer = sandbox.derive_reviewer_policy(
+            minimal_base_policy(), worktree=worktree, tmpdir=self.tmpdir, control_root=self.control_root
+        )
+        for key in ("allowWrite", "allowRead", "denyWrite"):
+            for entry in reviewer["filesystem"][key]:
+                with self.subTest(policy="reviewer", key=key, entry=entry):
+                    self.assertIs(entry["literal"], True)
+
+    def test_a_case_variant_of_the_repository_is_refused(self) -> None:
+        cases = (
+            (_case_variant(self, self.worktree), "is the worktree"),
+            (_case_variant(self, self.worktree) + "/src", "is inside the worktree"),
+            (_case_variant(self, self.repo.parent), "is an ancestor of the worktree"),
+            (_case_variant(self, self.common), "is the common git dir"),
+        )
+        for entry, fragment in cases:
+            with self.subTest(entry=entry):
+                base = minimal_base_policy()
+                base["filesystem"]["allowWrite"] = [entry]
+                with self.assertRaises(PmError) as ctx:
+                    self.derive(base)
+                self.assertIn(fragment, str(ctx.exception))
+                with self.assertRaises(PmError):
+                    sandbox.derive_reviewer_policy(
+                        base, worktree=self.worktree, tmpdir=self.tmpdir, control_root=self.control_root
+                    )
+
+    def test_a_malformed_base_raises_pm_error_from_every_derivation(self) -> None:
+        bases = []
+        for value in (None, "/var/run/x.sock", {"path": "/var/run/x.sock"}):
+            base = minimal_base_policy()
+            base["network"]["allowUnixSockets"] = value
+            bases.append(base)
+        for text in _BAD_PATHS:
+            base = minimal_base_policy()
+            base["filesystem"]["allowWrite"] = [text]
+            bases.append(base)
+        for base in bases:
+            with self.subTest(base=base):
+                with self.assertRaises(PmError):
+                    self.derive(base)
+                with self.assertRaises(PmError):
+                    sandbox.derive_reviewer_policy(
+                        base, worktree=self.worktree, tmpdir=self.tmpdir, control_root=self.control_root
+                    )
+                if base["filesystem"]["allowWrite"]:
+                    continue  # the attach policy carries no write grant
+                with self.assertRaises(PmError):
+                    sandbox.derive_attach_policy(base, socket=self.socket, control_root=self.control_root)
+
 
 class TestDeriveReviewerAndAttachPolicies(DerivationTestCase):
     def test_the_reviewer_writes_only_its_temp_dir_and_reaches_no_tmux_socket(self) -> None:
@@ -345,11 +469,11 @@ class TestDeriveReviewerAndAttachPolicies(DerivationTestCase):
         policy = sandbox.derive_reviewer_policy(
             base, worktree=self.worktree, tmpdir=self.tmpdir, control_root=self.control_root, extra_read=[extra]
         )
-        self.assertEqual(policy["filesystem"]["allowWrite"], ["~/.codex/sessions", str(self.tmpdir)])
+        self.assertEqual(policy["filesystem"]["allowWrite"], ["~/.codex/sessions", _literal(self.tmpdir)])
         self.assertEqual(policy["filesystem"]["denyWrite"], [*self.always_denies(), *self.escape_denies()])
         self.assertEqual(
             policy["filesystem"]["allowRead"],
-            [str(self.worktree), str(self.common), str(sandbox.toolkit_root()), str(extra)],
+            [_literal(self.worktree), _literal(self.common), _literal(sandbox.toolkit_root()), _literal(extra)],
         )
         self.assertIs(policy["allowPty"], True)
         self.assertNotIn("allowUnixSockets", policy["network"])
@@ -451,6 +575,26 @@ class TestCheckBinaries(TempDirTestCase):
                     sandbox.check_binaries(self._policy(entry))
                 self.assertIn("the node that runs srt", str(ctx.exception))
 
+    def test_a_case_variant_of_the_srt_package_or_node_is_refused(self) -> None:
+        cases = (
+            (_case_variant(self, self.package), "srt's installation"),
+            (_case_variant(self, self.package / "dist"), "srt's installation"),
+            (_case_variant(self, self.node), "the node that runs srt"),
+            (_case_variant(self, self.node.parent), "the node that runs srt"),
+        )
+        for entry, fragment in cases:
+            with self.subTest(entry=entry):
+                with self.assertRaises(PmError) as ctx:
+                    sandbox.check_binaries(self._policy(entry))
+                self.assertIn(fragment, str(ctx.exception))
+
+    def test_a_write_entry_holding_a_nul_control_or_surrogate_character_is_refused(self) -> None:
+        for text in _BAD_PATHS:
+            with self.subTest(text=text):
+                with self.assertRaises(PmError) as ctx:
+                    sandbox.check_binaries(self._policy(text))
+                self.assertIn("lone-surrogate character", str(ctx.exception))
+
     def test_a_missing_srt_is_refused_with_the_install_hint(self) -> None:
         with mock.patch.object(sandbox.shutil, "which", return_value=None):
             with self.assertRaises(PmError) as ctx:
@@ -493,7 +637,7 @@ class TestControlDirAndRecord(TempDirTestCase):
         }
         path = sandbox.write_record(control, **fields)
         self.assertEqual(path, control / "record.json")
-        self.assertEqual(sandbox.read_record(control), fields)
+        self.assertEqual(sandbox.read_record(control), {**fields, "control": str(control)})
 
     def test_a_missing_or_malformed_record_is_refused(self) -> None:
         control = self.tmp / "control"
@@ -612,6 +756,224 @@ class TestWrapCommandAndDetection(unittest.TestCase):
         popen.assert_not_called()
 
 
+# --- the server lifecycle without srt -------------------------------------------------
+
+
+def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class TestStartServerDeadline(TempDirTestCase):
+    """`start_server` against a fake `srt` (a process group holding one
+    long-lived child) and, where the probe itself is under test, a fake
+    `tmux`, both first on PATH."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.child_pid_file = self.tmp / "child.pid"
+        self.started = self.tmp / "started"
+        write_fake_harness(
+            self.bin / "srt",
+            "\n".join(
+                [
+                    f'sleep 60 & echo $! > "{self.child_pid_file}"',
+                    f'touch "{self.started}"',
+                    "echo 'fake srt: waiting'",
+                    "wait",
+                ]
+            ),
+        )
+        self.log = self.tmp / "srt.log"
+        for patcher in (
+            mock.patch.dict(os.environ, {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}"}),
+            mock.patch.object(sandbox.platform, "system", return_value="Darwin"),
+            mock.patch.object(sandbox, "START_DEADLINE_SECONDS", 1.0),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_tmux(self, after_start: str) -> None:
+        """A `tmux` that reports no server until the fake srt has started,
+        then runs `after_start`."""
+        write_fake_harness(
+            self.bin / "tmux",
+            "\n".join(
+                [
+                    f'if [ -e "{self.started}" ]; then {after_start}; fi',
+                    "echo 'no server running on /tmp/fake' >&2",
+                    "exit 1",
+                ]
+            ),
+        )
+
+    def start(self) -> str:
+        started_before = dict(sandbox._STARTED)
+        began = time.monotonic()
+        with self.assertRaises(PmError) as ctx:
+            sandbox.start_server(
+                socket="pm-run-x",
+                policy_path=self.tmp / "p.json",
+                worktree=self.tmp,
+                tmpdir=self.tmp,
+                log_path=self.log,
+            )
+        self.assertLess(time.monotonic() - began, 1.0 + 3.0)
+        message = str(ctx.exception)
+        self.assertIn("fake srt: waiting", message)  # the log is quoted
+        child = int(self.child_pid_file.read_text(encoding="utf-8"))
+        self.assertTrue(_wait_gone(child), "the process group was not killed")
+        self.assertEqual(sandbox._STARTED, started_before)
+        return message
+
+    def test_a_server_that_never_answers_fails_at_the_deadline(self) -> None:
+        self.fake_tmux(":")
+        self.assertIn("the server did not answer within 1 s", self.start())
+
+    def test_a_hung_probe_expires_at_the_deadline(self) -> None:
+        # `exec`, so the timeout's kill reaches the process holding the pipe.
+        self.fake_tmux("exec sleep 30")
+        message = self.start()
+        self.assertIn("the server did not answer within 1 s", message)
+        self.assertIn("no reply within", message)
+
+    def test_an_answer_after_the_deadline_is_refused(self) -> None:
+        calls: list[float | None] = []
+
+        def late_server_running(socket: str, timeout: float | None = None) -> bool:
+            calls.append(timeout)
+            if len(calls) == 1:
+                return False  # the pre-start check
+            time.sleep(1.2)
+            return True
+
+        with (
+            mock.patch.object(sandbox.sessions, "server_running", side_effect=late_server_running),
+            mock.patch.object(sandbox, "_server_pid", return_value=4242),
+        ):
+            self.assertIn("the server did not answer within 1 s", self.start())
+        self.assertTrue(all(timeout is not None and timeout <= 10.0 for timeout in calls[1:]), calls)
+
+
+# Marks a field `TestStopServerRecord.record` leaves out.
+_ABSENT = object()
+
+
+class TestStopServerRecord(TempDirTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.object(tempfile, "tempdir", str(self.tmp))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.socket = "pm-run-x"
+        self.tmpdir = sandbox.make_tmpdir(self.socket)
+        self.control = sandbox.control_dir(self.tmp / "common", self.socket)
+        self.control.mkdir(parents=True)
+
+    def record(self, **overrides) -> dict:
+        record = {"srt_pid": None, "tmpdir": str(self.tmpdir), "control": str(self.control)}
+        record.update(overrides)
+        return {key: value for key, value in record.items() if value is not _ABSENT}
+
+    def test_the_recorded_control_dir_is_used_without_the_worktree(self) -> None:
+        record = self.record(worktree=str(self.tmp / "gone"))
+        with (
+            mock.patch.object(sandbox.sessions, "kill_server", return_value=[]),
+            mock.patch.object(sandbox, "_common_dir_of", side_effect=AssertionError("git was asked")),
+        ):
+            remaining, notes = sandbox.stop_server(socket=self.socket, record=record)
+        self.assertEqual(remaining, [])
+        self.assertIn(f"removed sandbox control dir {self.control}", notes)
+        self.assertFalse(self.control.exists())
+        self.assertFalse(self.tmpdir.exists())
+
+    def test_a_srt_that_outlives_the_wait_is_noted(self) -> None:
+        with (
+            mock.patch.object(sandbox.sessions, "kill_server", return_value=[]),
+            mock.patch.object(sandbox, "_pid_alive", return_value=True),
+            mock.patch.object(sandbox, "SRT_EXIT_WAIT_SECONDS", 0.2),
+        ):
+            _remaining, notes = sandbox.stop_server(socket=self.socket, record=self.record(srt_pid=999999))
+        self.assertIn("srt still running: 999999", notes)
+        self.assertIn(f"removed sandbox temp dir {self.tmpdir}", notes)
+
+    def test_a_missing_or_malformed_field_is_refused_before_anything_is_stopped(self) -> None:
+        cases = (
+            (self.record(srt_pid=_ABSENT), "srt_pid"),
+            (self.record(srt_pid="123"), "srt_pid"),
+            (self.record(srt_pid=True), "srt_pid"),
+            (self.record(srt_pid=-1), "srt_pid"),
+            (self.record(tmpdir=_ABSENT), "tmpdir is missing"),
+            (self.record(tmpdir=7), "tmpdir is not a path"),
+            (self.record(tmpdir=str(self.tmp / "elsewhere")), "refusing to remove"),
+            (self.record(control="pm-sandbox/pm-run-x"), "refusing to remove sandbox control dir"),
+            (self.record(control=str(self.tmp / "pm-sandbox" / "other")), "refusing to remove sandbox control dir"),
+            (self.record(control=str(self.tmp / "elsewhere" / "pm-run-x")), "refusing to remove sandbox control dir"),
+            (self.record(control="/x/pm-sandbox/a\x00b"), "control is not a path"),
+            (self.record(control=_ABSENT), "neither control nor worktree"),
+            (self.record(control=_ABSENT, worktree=["w"]), "worktree is not a path"),
+            ([], "not an object"),
+        )
+        for record, fragment in cases:
+            with self.subTest(record=record):
+                with mock.patch.object(sandbox.sessions, "kill_server") as kill:
+                    with self.assertRaises(PmError) as ctx:
+                        sandbox.stop_server(socket=self.socket, record=record)
+                self.assertIn(fragment, str(ctx.exception))
+                kill.assert_not_called()
+                self.assertTrue(self.tmpdir.is_dir())
+                self.assertTrue(self.control.is_dir())
+
+
+class TestVerifyServerNegativeProbeCleanup(unittest.TestCase):
+    def test_a_failed_kill_is_appended_to_the_probe_error_not_raised_in_its_place(self) -> None:
+        with (
+            mock.patch.object(sandbox.sessions, "server_environment", return_value="1"),
+            mock.patch.object(sandbox.sessions, "run_shell", return_value=(0, "")),
+            mock.patch.object(sandbox.sessions, "kill_server", side_effect=PmError("could not kill: boom")),
+        ):
+            with self.assertRaises(PmError) as ctx:
+                sandbox.verify_server(socket=f"{TEST_TMUX_SOCKET}-sb-unconfined", worktree=Path("/w"))
+        message = str(ctx.exception)
+        self.assertIn("negative probe failed", message)
+        self.assertIn("killing the server failed too: could not kill: boom", message)
+        self.assertNotIn("the server was killed", message)
+
+
+class TestSocketNamesAtTheEntryPoints(TempDirTestCase):
+    def test_an_unusable_socket_name_is_refused_before_tmux_is_reached(self) -> None:
+        entry_points = (
+            lambda socket: sandbox.start_server(
+                socket=socket, policy_path=Path("/p"), worktree=Path("/w"), tmpdir=Path("/t"), log_path=Path("/l")
+            ),
+            lambda socket: sandbox.verify_server(socket=socket, worktree=Path("/w")),
+            lambda socket: sandbox.stop_server(socket=socket, record={}),
+            lambda socket: sandbox.control_dir(self.tmp, socket),
+            lambda socket: sandbox.make_tmpdir(socket),
+        )
+        with (
+            mock.patch.object(sandbox.sessions, "server_running") as running,
+            mock.patch.object(sandbox.sessions, "server_environment") as environment,
+            mock.patch.object(sandbox.sessions, "kill_server") as kill,
+            mock.patch.object(sandbox.subprocess, "Popen") as popen,
+        ):
+            for socket in ("", "..", "a/b", "a\x00b", "a\x1bb", "a\ud800b"):
+                for entry_point in entry_points:
+                    with self.subTest(socket=socket), self.assertRaises(PmError) as ctx:
+                        entry_point(socket)
+                    self.assertIn("invalid tmux socket name", str(ctx.exception))
+        for double in (running, environment, kill, popen):
+            double.assert_not_called()
+
+
 # --- sessions helpers ----------------------------------------------------------------
 
 
@@ -640,9 +1002,22 @@ class TestServerRunning(unittest.TestCase):
             with self.assertRaises(PmError):
                 sessions.server_running("pm-run-x")
 
+    def test_a_timeout_bounds_the_probe(self) -> None:
+        reply = subprocess.CompletedProcess([], 0, "1\n", "")
+        with mock.patch.object(sessions.subprocess, "run", return_value=reply) as run:
+            sessions.server_running("pm-run-x")
+            self.assertIsNone(run.call_args.kwargs["timeout"])
+            sessions.server_running("pm-run-x", timeout=2.5)
+            self.assertEqual(run.call_args.kwargs["timeout"], 2.5)
+        expired = subprocess.TimeoutExpired(["tmux"], 0.5)
+        with mock.patch.object(sessions.subprocess, "run", side_effect=expired):
+            with self.assertRaises(PmError) as ctx:
+                sessions.server_running("pm-run-x", timeout=0.5)
+        self.assertIn("no reply within 0.5 s", str(ctx.exception))
+
     @unittest.skipUnless(_HAS_TMUX, "tmux is required")
     def test_a_never_started_socket_has_no_server(self) -> None:
-        self.assertFalse(sessions.server_running(f"{TEST_TMUX_SOCKET}-sb-never"))
+        self.assertFalse(sessions.server_running(register_sandbox_socket(f"{TEST_TMUX_SOCKET}-sb-never")))
 
 
 class TestRunShell(unittest.TestCase):
@@ -657,9 +1032,25 @@ class TestRunShell(unittest.TestCase):
             with self.assertRaises(PmError):
                 sessions.run_shell("pm-run-x", "true")
 
+    def test_a_timeout_bounds_the_command(self) -> None:
+        expired = subprocess.TimeoutExpired(["tmux"], 0.5)
+        with mock.patch.object(sessions.subprocess, "run", side_effect=expired) as run:
+            with self.assertRaises(PmError) as ctx:
+                sessions.run_shell("pm-run-x", "sleep 9", timeout=0.5)
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
+        self.assertIn("did not return within 0.5 s", str(ctx.exception))
+
+    def test_output_that_is_not_utf_8_is_replaced_not_raised(self) -> None:
+        # A tmux client printing a raw 0xff byte; the real tmux 3.5a escapes
+        # job output (see the live test below), so a fake prints it here.
+        with tempfile.TemporaryDirectory() as directory:
+            write_fake_harness(Path(directory) / "tmux", "printf 'a\\377b\\n'")
+            with mock.patch.dict(os.environ, {"PATH": f"{directory}{os.pathsep}{os.environ['PATH']}"}):
+                self.assertEqual(sessions.run_shell("pm-run-x", "true"), (0, "a�b\n"))
+
     @unittest.skipUnless(_HAS_TMUX, "tmux is required")
     def test_a_socket_with_no_server_fails_and_starts_none(self) -> None:
-        socket = f"{TEST_TMUX_SOCKET}-sb-noserver"
+        socket = register_sandbox_socket(f"{TEST_TMUX_SOCKET}-sb-noserver")
         self.addCleanup(sessions.kill_server, socket)
         returncode, output = sessions.run_shell(socket, "true")
         self.assertNotEqual(returncode, 0)
@@ -668,12 +1059,22 @@ class TestRunShell(unittest.TestCase):
 
     @unittest.skipUnless(_HAS_TMUX, "tmux is required")
     def test_runs_on_a_live_server_with_its_exit_status_and_literal_hashes(self) -> None:
-        socket = f"{TEST_TMUX_SOCKET}-sb-plain"
+        socket = register_sandbox_socket(f"{TEST_TMUX_SOCKET}-sb-plain")
         self.addCleanup(sessions.kill_server, socket)
         with sessions.scoped_environ("PM_TMUX_SOCKET", socket):
             sessions.start_session("pm-test-sbplain-s01a0", Path(tempfile.gettempdir()), "sleep 15", {})
         self.assertEqual(sessions.run_shell(socket, "echo 'a#b #{pid}'"), (0, "a#b #{pid}\n"))
         self.assertNotEqual(sessions.run_shell(socket, "exit 3")[0], 0)
+        # tmux 3.5a writes a non-UTF-8 job byte as the escape `\377`; either
+        # way run_shell returns rather than raising.
+        returncode, output = sessions.run_shell(socket, "printf '\\377'")
+        self.assertEqual(returncode, 0)
+        self.assertIn(output.strip(), ("\\377", "�"))
+        began = time.monotonic()
+        with self.assertRaises(PmError) as ctx:
+            sessions.run_shell(socket, "sleep 5", timeout=0.5)
+        self.assertLess(time.monotonic() - began, 3.0)
+        self.assertIn("did not return within 0.5 s", str(ctx.exception))
 
 
 class TestStartSessionViaServer(unittest.TestCase):
@@ -719,7 +1120,7 @@ class TestStartSessionViaServer(unittest.TestCase):
 
     @unittest.skipUnless(_HAS_TMUX, "tmux is required")
     def test_a_socket_with_no_server_raises_and_leaves_no_server(self) -> None:
-        socket = f"{TEST_TMUX_SOCKET}-sb-via-none"
+        socket = register_sandbox_socket(f"{TEST_TMUX_SOCKET}-sb-via-none")
         self.addCleanup(sessions.kill_server, socket)
         with self.assertRaises(PmError):
             sessions.start_session_via_server(socket, "pm-test-via-s01a0", Path(tempfile.gettempdir()), "sleep 5", {})
@@ -735,10 +1136,12 @@ class SandboxServerTestCase(PmTestCase):
     """A linked worktree, its temp and control directories, and an effective
     policy written to the control directory, on a socket of this test's own."""
 
+    worktree_name = "wt"
+
     def setUp(self) -> None:
         super().setUp()
         self.branch = "node/sb"
-        self.worktree = _real(make_linked_worktree(self.repo, self.repo.parent / "wt", self.branch))
+        self.worktree = _real(make_linked_worktree(self.repo, self.repo.parent / self.worktree_name, self.branch))
         self.common = _real(self.repo / ".git")
         self.socket = _sandbox_socket()
         self.addCleanup(self._kill_server)
@@ -790,6 +1193,17 @@ class SandboxServerTestCase(PmTestCase):
                 return True
             time.sleep(0.1)
         return predicate()
+
+    def run_in_pane(self, *lines: str) -> list[str]:
+        """Run shell `lines` in a session started through the server (each
+        may append to "$OUT"); return what they wrote, once done."""
+        out = self.worktree / "pane-out.txt"  # the worktree is all a pane can write
+        script = write_fake_harness(
+            self.repo.parent / "pane.sh", "\n".join([f'OUT="{out}"', *lines, 'echo done >> "$OUT"', "sleep 15"])
+        )
+        sessions.start_session_via_server(self.socket, "pm-test-sbpane-s01a0", self.worktree, str(script), {})
+        self.assertTrue(self.wait_for(lambda: out.is_file() and "done" in out.read_text(encoding="utf-8")))
+        return out.read_text(encoding="utf-8").splitlines()
 
 
 class TestSandboxedServer(SandboxServerTestCase):
@@ -881,6 +1295,57 @@ class TestSandboxedServer(SandboxServerTestCase):
         self.assertIn("srt.log ends:", message)
         self.assertFalse(sessions.server_running(self.socket))
 
+    def test_a_pane_cannot_write_the_common_config_or_hooks(self) -> None:
+        # The escape denies are the assumption whose failure would be worst:
+        # a writable config or hook runs code in the host's next git command.
+        config = self.common / "config"
+        before = config.read_bytes()
+        hook = self.common / "hooks" / "post-checkout"
+        self.start(self.write_policy())
+        sandbox.verify_server(socket=self.socket, worktree=self.worktree)
+        lines = self.run_in_pane(
+            f'echo "[x]" >> "{config}" 2>/dev/null; echo "config_rc=$?" >> "$OUT"',
+            f'touch "{hook}" 2>/dev/null; echo "hooks_rc=$?" >> "$OUT"',
+        )
+        self.assertNotIn("config_rc=0", lines)
+        self.assertNotIn("hooks_rc=0", lines)
+        self.assertIn("done", lines)
+        self.assertEqual(config.read_bytes(), before)
+        self.assertFalse(hook.exists())
+
+    def test_the_config_deny_holds_in_a_plain_checkout_whose_git_dir_is_granted(self) -> None:
+        # Here the whole git dir is granted, and `allowGitConfig` drops srt's
+        # own cwd-anchored `.git/config` deny, so only the toolkit's deny
+        # stands between a pane and the config.
+        config = self.common / "config"
+        before = config.read_bytes()
+        base = minimal_base_policy()
+        base["filesystem"]["allowGitConfig"] = True
+        policy = sandbox.derive_policy(
+            base,
+            worktree=self.repo,
+            branch="main",
+            socket=self.socket,
+            tmpdir=self.tmpdir,
+            control_root=sandbox.control_root(self.common),
+            pm_inside=False,
+        )
+        policy_path = self.control / "plain-policy.json"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+        self.srt_pid, _server_pid = sandbox.start_server(
+            socket=self.socket,
+            policy_path=policy_path,
+            worktree=self.repo,
+            tmpdir=self.tmpdir,
+            log_path=self.control / "srt.log",
+        )
+        sandbox.verify_server(socket=self.socket, worktree=self.repo)
+        returncode, _output = sessions.run_shell(self.socket, f'echo "[x]" >> "{config}"')
+        self.assertNotEqual(returncode, 0)
+        self.assertEqual(config.read_bytes(), before)
+        returncode, _output = sessions.run_shell(self.socket, f'touch "{_real(self.repo)}/inside"')
+        self.assertEqual(returncode, 0)  # the git dir's own checkout is writable
+
     def test_a_policy_denying_the_probe_directory_fails_the_positive_probe(self) -> None:
         (self.worktree / ".pm").mkdir()
         base = minimal_base_policy()
@@ -890,6 +1355,23 @@ class TestSandboxedServer(SandboxServerTestCase):
             sandbox.verify_server(socket=self.socket, worktree=self.worktree)
         self.assertIn("positive probe", str(ctx.exception))
         self.assertFalse((self.worktree / ".pm" / "sandbox-probe").exists())
+
+
+class TestSandboxedServerAtAGlobPath(SandboxServerTestCase):
+    worktree_name = "wt[1]"
+
+    def test_a_sibling_matching_the_worktree_as_a_pattern_stays_unwritable(self) -> None:
+        sibling = self.repo.parent / "wt1"
+        sibling.write_text("original\n", encoding="utf-8")
+        self.start(self.write_policy())
+        sandbox.verify_server(socket=self.socket, worktree=self.worktree)
+        lines = self.run_in_pane(
+            f'echo x >> "{sibling}" 2>/dev/null; echo "sibling_rc=$?" >> "$OUT"',
+            f'touch "{self.worktree}/inside"; echo "inside_rc=$?" >> "$OUT"',
+        )
+        self.assertIn("inside_rc=0", lines)
+        self.assertNotIn("sibling_rc=0", lines)
+        self.assertEqual(sibling.read_text(encoding="utf-8"), "original\n")
 
 
 @requires_srt

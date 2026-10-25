@@ -23,7 +23,16 @@ Paths in a policy are judged as `srt` resolves them: `~` and `~/` expanded,
 symbolic links followed. A pattern entry (a string holding `*`, `?`, `[` or
 `]`) is judged by the directory its fixed prefix names, as though it granted
 that whole directory, which fails toward refusing. An entry written as
-`{"path": ..., "literal": true}` is never a pattern.
+`{"path": ..., "literal": true}` is never a pattern, so every filesystem entry
+the toolkit derives itself is written that way: a worktree under `work[1]`
+must not also grant `work1`. Base-policy entries stay as the operator wrote
+them.
+
+A grant is compared with a protected path by file identity (`st_dev`,
+`st_ino`), not by spelling: on a case-insensitive volume `/users/me` is
+`/Users/me`, and `srt` enforces it as such. A path that does not exist yet is
+judged by its deepest existing ancestor plus the components below it, as
+spelled.
 
 The socket path is granted under its real directory: `srt` resolves a path
 only when it exists, the socket does not exist when `srt` starts, and
@@ -76,6 +85,9 @@ _SHARED_TMP_DENIES = ("/tmp/claude", "/private/tmp/claude")
 # `srt`'s other implicit write grants, denied for the write-less attach client.
 _IMPLICIT_GRANT_DENIES = ("~/.npm/_logs", "~/.claude/debug")
 _PATTERN_SPLIT = re.compile(r"[*?\[\]]")
+# A NUL, a control character or a lone surrogate: none names a usable path,
+# and each breaks a later step (realpath, the OS call, a printed message).
+_BAD_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 
 # `srt` processes this process started, by pid. The server outlives
 # `start_server`, so its `Popen` is kept here rather than dropped while still
@@ -94,17 +106,23 @@ def toolkit_root() -> Path:
 def _entry_text(entry: Any) -> tuple[str, bool]:
     """(path text, is literal) for a policy path entry: a string, or the
     `{"path": ..., "literal": true}` object `srt` accepts in its four
-    filesystem lists. ValueError for anything else."""
+    filesystem lists. ValueError, its text completing "entry <entry> ...",
+    for anything else and for a path holding a NUL, control or
+    lone-surrogate character."""
     if isinstance(entry, str):
-        return entry, False
-    if (
+        text, literal = entry, False
+    elif (
         isinstance(entry, dict)
         and set(entry) == {"path", "literal"}
         and entry["literal"] is True
         and isinstance(entry["path"], str)
     ):
-        return entry["path"], True
-    raise ValueError(f"not a path entry: {entry!r}")
+        text, literal = entry["path"], True
+    else:
+        raise ValueError("is neither a path nor a {path, literal: true} object")
+    if _BAD_PATH_CHARS.search(text):
+        raise ValueError("holds a NUL, control or lone-surrogate character")
+    return text, literal
 
 
 def _expand_tilde(text: str) -> str:
@@ -135,14 +153,45 @@ def _resolve_entry(entry: Any) -> Path:
     return Path(os.path.realpath(expanded))
 
 
+def _write_grant(entry: Any) -> tuple[str, Path]:
+    """(path text, resolved path) of a write entry. ValueError, its text
+    completing "entry <entry> ...", when the entry is malformed or cannot be
+    resolved."""
+    text, _literal_entry = _entry_text(entry)
+    try:
+        return text, _resolve_entry(entry)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot be resolved ({exc})") from None
+
+
+def _anchor(path: Path) -> tuple[tuple[int, int] | None, tuple[str, ...]]:
+    """`path`'s identity: (`st_dev`, `st_ino`) of its deepest existing
+    ancestor (itself, when it exists) and the components below that, as
+    spelled. Two spellings of one file have the same identity."""
+    for candidate in (path, *path.parents):
+        try:
+            status = os.stat(candidate)
+        except OSError:
+            continue
+        return (status.st_dev, status.st_ino), path.parts[len(candidate.parts) :]
+    return None, path.parts
+
+
+def _same(a: Path, b: Path) -> bool:
+    """Whether two absolute paths name the same file (see `_anchor`)."""
+    return a == b or _anchor(a) == _anchor(b)
+
+
 def _relation(grant: Path, target: Path) -> str | None:
-    """How a resolved write grant stands to `target`: "is", "is an ancestor
-    of", "is inside", or None when the two are unrelated."""
-    if grant == target:
+    """How a resolved write grant stands to `target`, by identity (see
+    `_anchor`): "is", "is an ancestor of", "is inside", or None when the
+    two are unrelated."""
+    grant_identity, target_identity = _anchor(grant), _anchor(target)
+    if grant == target or grant_identity == target_identity:
         return "is"
-    if grant in target.parents:
+    if any(_anchor(parent) == grant_identity for parent in target.parents):
         return "is an ancestor of"
-    if target in grant.parents:
+    if any(_anchor(parent) == target_identity for parent in grant.parents):
         return "is inside"
     return None
 
@@ -182,11 +231,14 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     """Load the operator's base policy; return `(policy, warnings)`.
 
     PmError, naming the file and the reason, for: an unreadable or non-JSON
-    file; a top level that is not an object holding `network` and
-    `filesystem` objects; `network.allowAllUnixSockets`, `allowAppleEvents`
-    or `filesystem.disabled` set (each defeats the boundary outright); an
-    `allowWrite` entry that is not a path entry, is relative, or resolves to
-    `/`, the home directory, `toolkit_root()` or the tmux socket directory.
+    file, or a path that cannot name one; a top level that is not an object
+    holding `network` and `filesystem` objects; `network.allowAllUnixSockets`,
+    `allowAppleEvents` or `filesystem.disabled` set (each defeats the
+    boundary outright); a `network.allowUnixSockets` that is not a list; an
+    `allowWrite` entry that is not a path entry, holds a NUL, control or
+    lone-surrogate character, is relative, or is the same file as `/`, the
+    home directory, `toolkit_root()` or the tmux socket directory, however
+    spelled.
 
     `warnings` holds one line for `enableWeakerNetworkIsolation` and one for
     `network.allowLocalBinding`, when set, each naming what the option opens;
@@ -194,13 +246,14 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     it never mutates it, and `srt` applies its own schema check on top.
     """
     path = Path(path)
+    label = repr(str(path)) if _BAD_PATH_CHARS.search(str(path)) else str(path)
 
     def refuse(reason: str) -> PmError:
-        return PmError(f"sandbox policy {path}: {reason}")
+        return PmError(f"sandbox policy {label}: {reason}")
 
     try:
         text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+    except (OSError, ValueError) as exc:  # ValueError, UnicodeError among them: a path no file can have
         raise refuse(f"unreadable ({exc})") from exc
     try:
         policy = json.loads(text)
@@ -219,6 +272,8 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
         raise refuse("allowAppleEvents is set: Apple Events let a sandboxed process drive applications on the host")
     if filesystem.get("disabled"):
         raise refuse("filesystem.disabled is set: it turns filesystem confinement off")
+    if "allowUnixSockets" in network and not isinstance(network["allowUnixSockets"], list):
+        raise refuse("network.allowUnixSockets is not a list")
 
     entries = filesystem.get("allowWrite", [])
     if not isinstance(entries, list):
@@ -232,16 +287,17 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     for entry in entries:
         try:
             text_entry, _literal_entry = _entry_text(entry)
-        except ValueError:
-            raise refuse(f"allowWrite entry {entry!r} is neither a path nor a {{path, literal: true}} object") from None
-        if not _is_absolute_entry(text_entry):
-            raise refuse(
-                f"allowWrite entry {text_entry!r} is relative: it would resolve against the server's working directory"
-            )
-        resolved = _resolve_entry(entry)
-        for target, label in forbidden:
-            if resolved == target:
-                raise refuse(f"allowWrite entry {text_entry!r} resolves to {label} ({target})")
+            if not _is_absolute_entry(text_entry):
+                raise refuse(
+                    f"allowWrite entry {text_entry!r} is relative: it would resolve against the server's working"
+                    " directory"
+                )
+            text_entry, resolved = _write_grant(entry)
+        except ValueError as exc:
+            raise refuse(f"allowWrite entry {entry!r} {exc}") from None
+        for target, name in forbidden:
+            if _same(resolved, target):
+                raise refuse(f"allowWrite entry {text_entry!r} resolves to {name} ({target})")
 
     warnings: list[str] = []
     if policy.get("enableWeakerNetworkIsolation"):
@@ -273,13 +329,13 @@ def _common_dir_of(worktree: Path) -> Path:
 def _refuse_repository_grants(base: dict[str, Any], worktree: Path, common: Path) -> None:
     """PmError when a base write grant is, contains or lies inside the
     worktree or the common git dir: the toolkit grants exactly what a run
-    needs there, and such an entry would reach the reviewer policy too."""
+    needs there, and such an entry would reach the reviewer policy too.
+    Judged by identity (see `_relation`)."""
     for entry in _write_entries(base):
         try:
-            text, _literal_entry = _entry_text(entry)
+            text, resolved = _write_grant(entry)
         except ValueError as exc:
-            raise PmError(f"sandbox policy: allowWrite {exc}") from None
-        resolved = _resolve_entry(entry)
+            raise PmError(f"sandbox policy: allowWrite entry {entry!r} {exc}") from None
         for target, label in ((worktree, "the worktree"), (common, "the common git dir")):
             relation = _relation(resolved, target)
             if relation:
@@ -292,12 +348,14 @@ def _refuse_repository_grants(base: dict[str, Any], worktree: Path, common: Path
 def _with_lists(base: dict[str, Any]) -> dict[str, Any]:
     """A deep copy of `base` whose `network.allowedDomains`,
     `network.deniedDomains` and four filesystem lists exist (`srt` requires
-    the first four)."""
+    the first four); PmError when one of them, or a present
+    `network.allowUnixSockets`, is not a list."""
     policy = copy.deepcopy(base)
     network = policy.setdefault("network", {})
     filesystem = policy.setdefault("filesystem", {})
     if not isinstance(network, dict) or not isinstance(filesystem, dict):
         raise PmError("sandbox policy: network and filesystem must be objects")
+    _check_unix_sockets(network)
     for section, keys in (
         (network, ("allowedDomains", "deniedDomains")),
         (filesystem, ("denyRead", "allowRead", "allowWrite", "denyWrite")),
@@ -306,6 +364,11 @@ def _with_lists(base: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(section.setdefault(key, []), list):
                 raise PmError(f"sandbox policy: {key} is not a list")
     return policy
+
+
+def _check_unix_sockets(network: dict[str, Any]) -> None:
+    if "allowUnixSockets" in network and not isinstance(network["allowUnixSockets"], list):
+        raise PmError("sandbox policy: network.allowUnixSockets is not a list")
 
 
 def _repository_denies(worktree: Path, git_dir: Path, common: Path, control_root: Path) -> list[dict[str, Any]]:
@@ -331,8 +394,8 @@ def _repository_denies(worktree: Path, git_dir: Path, common: Path, control_root
     return denies
 
 
-def _repository_reads(worktree: Path, common: Path, extra_read: Iterable[Path | str]) -> list[str]:
-    return [str(worktree), str(common), str(toolkit_root()), *(str(path) for path in extra_read)]
+def _repository_reads(worktree: Path, common: Path, extra_read: Iterable[Path | str]) -> list[dict[str, Any]]:
+    return [_literal(worktree), _literal(common), _literal(toolkit_root()), *(_literal(path) for path in extra_read)]
 
 
 def derive_policy(
@@ -357,7 +420,8 @@ def derive_policy(
     ranks above every grant, gains `_repository_denies` and, when the PM runs
     outside (Mode B), the state root `<git dir>/pm`. Reads gain the
     worktree, the common dir, the toolkit checkout and `extra_read`; the
-    socket becomes reachable and `allowPty` is set.
+    socket becomes reachable and `allowPty` is set. Every filesystem entry
+    added here is a literal entry (see the module docstring).
 
     PmError when a base write grant reaches into the repository (see
     `_refuse_repository_grants`).
@@ -370,19 +434,19 @@ def derive_policy(
     policy = _with_lists(base)
     filesystem = policy["filesystem"]
     allow_write = filesystem["allowWrite"]
-    allow_write += [str(worktree), str(git_dir)]
+    allow_write += [_literal(worktree), _literal(git_dir)]
     if git_dir != common:
         allow_write += [
-            str(common / "objects"),
+            _literal(common / "objects"),
             _literal(common / "refs" / "heads" / branch),
             _literal(common / "refs" / "heads" / f"{branch}.lock"),
             _literal(common / "logs" / "refs" / "heads" / branch),
             _literal(common / "logs" / "refs" / "heads" / f"{branch}.lock"),
             _literal(common / "packed-refs.lock"),
         ]
-    allow_write += [socket_grant, str(_real(tmpdir))]
+    allow_write += [_literal(socket_grant), _literal(_real(tmpdir))]
     if pm_inside:
-        allow_write.append(str(_real(ledger.ledger_dir())))
+        allow_write.append(_literal(_real(ledger.ledger_dir())))
 
     filesystem["denyWrite"] += _repository_denies(worktree, git_dir, common, _real(control_root))
     if not pm_inside:
@@ -412,7 +476,7 @@ def derive_reviewer_policy(
 
     policy = _with_lists(base)
     filesystem = policy["filesystem"]
-    filesystem["allowWrite"].append(str(_real(tmpdir)))
+    filesystem["allowWrite"].append(_literal(_real(tmpdir)))
     filesystem["denyWrite"] += _repository_denies(worktree, git_dir, common, _real(control_root))
     filesystem["allowRead"] += _repository_reads(worktree, common, extra_read)
     policy["allowPty"] = True
@@ -426,6 +490,9 @@ def derive_attach_policy(base: dict[str, Any], *, socket: str, control_root: Pat
     attached client run a command (`detach-client -E`); under this policy
     that command can write nothing. `base` is not mutated."""
     network = copy.deepcopy(base.get("network") or {})
+    if not isinstance(network, dict):
+        raise PmError("sandbox policy: network must be an object")
+    _check_unix_sockets(network)
     for key in ("allowedDomains", "deniedDomains"):
         network.setdefault(key, [])
     network.setdefault("allowUnixSockets", []).append(_socket_grant(socket))
@@ -479,7 +546,7 @@ def check_binaries(policy: dict[str, Any]) -> None:
     """PmError when `srt` is absent, or when any write grant of `policy` is,
     contains or lies inside `srt`'s package directory, or is or contains the
     real `node` that runs it: `srt` documents a writable installation as a
-    way to run code on the host."""
+    way to run code on the host. Judged by identity (see `_relation`)."""
     package = srt_package_root()
     node = shutil.which("node")
     if node is None:
@@ -487,18 +554,17 @@ def check_binaries(policy: dict[str, Any]) -> None:
     node_real = _real(node)
     for entry in _write_entries(policy):
         try:
-            text, _literal_entry = _entry_text(entry)
+            text, resolved = _write_grant(entry)
         except ValueError as exc:
-            raise PmError(f"sandbox policy: allowWrite {exc}") from None
-        resolved = _resolve_entry(entry)
+            raise PmError(f"sandbox policy: allowWrite entry {entry!r} {exc}") from None
         relation = _relation(resolved, package)
         if relation:
             raise PmError(
                 f"sandbox write grant {text!r} {relation} srt's installation ({package}): a sandbox that can"
                 " write srt can run code on the host"
             )
-        if resolved == node_real or resolved in node_real.parents:
-            relation = "is" if resolved == node_real else "is an ancestor of"
+        relation = _relation(resolved, node_real)
+        if relation in ("is", "is an ancestor of"):
             raise PmError(
                 f"sandbox write grant {text!r} {relation} the node that runs srt ({node_real}): a sandbox that"
                 " can write it can run code on the host"
@@ -523,7 +589,16 @@ def wrap_command(policy_path: Path | str, argv: list[str], *, tmpdir: Path | str
 
 
 def _check_socket_name(socket: str) -> None:
-    if not socket or "/" in socket or socket in {".", ".."}:
+    """PmError unless `socket` can name one path component: not empty, `.`
+    or `..`, and free of `/` and of NUL, control and lone-surrogate
+    characters."""
+    if (
+        not isinstance(socket, str)
+        or not socket
+        or "/" in socket
+        or socket in {".", ".."}
+        or _BAD_PATH_CHARS.search(socket)
+    ):
         raise PmError(f"invalid tmux socket name for a sandbox: {socket!r}")
 
 
@@ -543,14 +618,17 @@ def write_record(control: Path | str, **fields: Any) -> Path:
 
     The record names the worktree, branch, socket, temp dir, base policy and
     its SHA-256, the `srt` version, the `srt` and server pids and the start
-    time. Nothing inside the sandbox can write beneath the control root, so
-    a record found there was written by the host.
+    time; `control`, the real path of `control` itself, is added here, so
+    `stop_server` finds the directory without the worktree. Nothing inside
+    the sandbox can write beneath the control root, so a record found there
+    was written by the host.
     """
     control = Path(control)
     control.mkdir(parents=True, exist_ok=True)
+    record = {**fields, "control": str(_real(control))}
     target = control / RECORD_NAME
     staging = control / f"{RECORD_NAME}.tmp"
-    staging.write_text(json.dumps(fields, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    staging.write_text(json.dumps(record, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     os.replace(staging, target)
     return target
 
@@ -588,16 +666,20 @@ def make_tmpdir(socket: str) -> Path:
     return _real(path)
 
 
+def _check_tmpdir_location(path: Path) -> None:
+    if not path.name.startswith(TMPDIR_PREFIX) or _real(path.parent) != _real(tempfile.gettempdir()):
+        raise PmError(
+            f"refusing to remove {path}: not a {TMPDIR_PREFIX}* directory directly under {tempfile.gettempdir()}"
+        )
+
+
 def remove_tmpdir(path: Path | str) -> bool:
     """Remove a sandbox temp dir recursively; True when removed, False when
     already gone. PmError, removing nothing, unless its name starts with
     `pm-sandbox-` and its parent is `tempfile.gettempdir()`, or when it is
     not a directory."""
     path = Path(path)
-    if not path.name.startswith(TMPDIR_PREFIX) or _real(path.parent) != _real(tempfile.gettempdir()):
-        raise PmError(
-            f"refusing to remove {path}: not a {TMPDIR_PREFIX}* directory directly under {tempfile.gettempdir()}"
-        )
+    _check_tmpdir_location(path)
     if not os.path.lexists(path):
         return False
     if path.is_symlink() or not path.is_dir():
@@ -612,10 +694,14 @@ def remove_tmpdir(path: Path | str) -> bool:
 # --- The server -------------------------------------------------------------------
 
 
-def _server_pid(socket: str) -> int:
+def _server_pid(socket: str, timeout: float | None = None) -> int:
     argv = ["tmux", "-L", socket, "display-message", "-p", "#{pid}"]
     try:
-        result = subprocess.run(argv, check=False, text=True, capture_output=True)
+        result = subprocess.run(argv, check=False, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise PmError(
+            f"could not read the server pid on tmux socket {socket!r}: no reply within {timeout:g} s"
+        ) from None
     except OSError as exc:
         raise PmError(f"could not read the server pid on tmux socket {socket!r}: {exc}") from exc
     reply = result.stdout.strip()
@@ -642,7 +728,7 @@ def _kill_group(process: subprocess.Popen) -> None:
     except (ProcessLookupError, PermissionError):
         pass
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=SRT_EXIT_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
         pass
 
@@ -658,15 +744,21 @@ def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path
     of its own, and with `PM_RUN_TOKEN` removed from its environment (tmux
     seeds the server's global environment from it).
 
-    PmError, before anything starts, off macOS or when a server already
-    answers on `socket`. The server must answer within 10 s (polled every
-    0.1 s); when `srt` exits first, the deadline passes or the probe cannot
-    look, the process group is killed and the PmError quotes the log's last
-    three lines. No retry and no fallback to an unsandboxed server.
+    PmError, before anything starts, for an invalid socket name, off macOS
+    or when a server already answers on `socket`. The server must answer
+    within 10 s (polled every 0.1 s, each probe bounded by the time left, and
+    an answer after the deadline refused); when `srt` exits first, the
+    deadline passes or the probe cannot look, the process group is killed
+    and the PmError quotes the log's last three lines. No retry and no
+    fallback to an unsandboxed server.
     """
+    _check_socket_name(socket)
     if platform.system() != "Darwin":
         raise PmError("sandboxing is implemented for macOS only")
-    if sessions.server_running(socket):
+    # This host-side probe is also what creates the tmux socket directory
+    # (mode 0700) when it is absent; the sandboxed server cannot create it,
+    # so the probe must run before srt starts.
+    if sessions.server_running(socket, timeout=START_DEADLINE_SECONDS):
         raise PmError(f"a tmux server already answers on socket {socket!r}; refusing to start a sandboxed one")
     if shutil.which("srt") is None:
         raise PmError(SRT_MISSING)
@@ -688,22 +780,30 @@ def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path
         raise PmError(f"could not start srt for socket {socket!r}: {exc}") from exc
 
     deadline = time.monotonic() + START_DEADLINE_SECONDS
+    late = f"the server did not answer within {START_DEADLINE_SECONDS:g} s"
     while True:
         returncode = process.poll()
         if returncode is not None:
             failure = f"srt exited with status {returncode} before the server answered"
             break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            failure = late
+            break
         try:
-            if sessions.server_running(socket):
-                server_pid = _server_pid(socket)
-                _STARTED[process.pid] = process
-                return process.pid, server_pid
+            answered = sessions.server_running(socket, timeout=remaining)
+            if answered:
+                server_pid = _server_pid(socket, timeout=max(deadline - time.monotonic(), START_POLL_SECONDS))
         except PmError as exc:
-            failure = str(exc)
+            # A probe bounded by the time left fails as the deadline passes.
+            failure = f"{late} (last probe: {exc})" if time.monotonic() >= deadline else str(exc)
             break
         if time.monotonic() >= deadline:
-            failure = f"the server did not answer within {START_DEADLINE_SECONDS:g} s"
+            failure = late
             break
+        if answered:
+            _STARTED[process.pid] = process
+            return process.pid, server_pid
         time.sleep(START_POLL_SECONDS)
     _kill_group(process)
     raise PmError(
@@ -719,12 +819,16 @@ def verify_server(*, socket: str, worktree: Path) -> None:
     2. the negative probe: a `run-shell` touch of `<socket dir>/<socket>.probe`
        must fail and leave no file (it succeeds on any unsandboxed server).
        When it does not, the file is removed, the server is killed, and the
-       error names the probe;
+       error names the probe; a failure of either cleanup step is appended
+       to that error, never raised in its place;
     3. the positive probe: a `run-shell` touch of `<worktree>/.pm/sandbox-probe`
        must succeed and leave the file, which is then removed, so a policy
        that does not grant the worktree is caught here. The host creates
        `<worktree>/.pm` first when it is absent (and removes it again).
+
+    PmError at once for an invalid socket name.
     """
+    _check_socket_name(socket)
     value = sessions.server_environment(socket, "SANDBOX_RUNTIME")
     if value != "1":
         raise PmError(
@@ -739,13 +843,20 @@ def verify_server(*, socket: str, worktree: Path) -> None:
         raise PmError(f"could not clear the negative probe file {outside}: {exc}") from exc
     returncode, output = sessions.run_shell(socket, f"touch {shlex.quote(str(outside))}")
     if returncode == 0 or os.path.lexists(outside):
+        cleanup: list[str] = []
         try:
             outside.unlink(missing_ok=True)
-        finally:
+        except OSError as exc:
+            cleanup.append(f"removing {outside} failed too: {exc}")
+        try:
             sessions.kill_server(socket)
+        except PmError as exc:
+            cleanup.append(f"killing the server failed too: {exc}")
+        else:
+            cleanup.append("the server was killed")
         raise PmError(
             f"negative probe failed: the server on socket {socket!r} could create {outside}, outside any sandbox"
-            " grant, so it is not confined; the server was killed"
+            f" grant, so it is not confined; {'; '.join(cleanup)}"
         )
 
     probe_dir = Path(worktree) / PROBE_DIR_NAME
@@ -791,6 +902,46 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _teardown_targets(socket: str, record: dict[str, Any]) -> tuple[int | None, str, Path]:
+    """(`srt` pid or None, temp dir, control dir) from `record`, each checked
+    so that `stop_server` refuses before it kills or removes anything."""
+
+    def malformed(reason: str) -> PmError:
+        return PmError(f"the sandbox record for socket {socket!r} is malformed: {reason}")
+
+    def path_field(name: str) -> str | None:
+        value = record.get(name)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value or _BAD_PATH_CHARS.search(value):
+            raise malformed(f"{name} is not a path: {value!r}")
+        return value
+
+    if not isinstance(record, dict):
+        raise malformed("it is not an object")
+    srt_pid = record.get("srt_pid", "missing")
+    if not (srt_pid is None or (type(srt_pid) is int and srt_pid > 0)):
+        raise malformed(f"srt_pid is not a pid or null: {srt_pid!r}")
+    tmpdir = path_field("tmpdir")
+    if tmpdir is None:
+        raise malformed("tmpdir is missing")
+    _check_tmpdir_location(Path(tmpdir))
+
+    control_text = path_field("control")
+    if control_text is not None:
+        control = Path(control_text)
+        if not control.is_absolute() or control.name != socket or control.parent.name != CONTROL_ROOT_NAME:
+            raise PmError(
+                f"refusing to remove sandbox control dir {control}: the record for socket {socket!r} must name an"
+                f" absolute <common dir>/{CONTROL_ROOT_NAME}/{socket}"
+            )
+        return srt_pid, tmpdir, control
+    worktree = path_field("worktree")
+    if worktree is None:
+        raise malformed("it names neither control nor worktree")
+    return srt_pid, tmpdir, control_dir(_common_dir_of(Path(worktree)), socket)
+
+
 def stop_server(*, socket: str, record: dict[str, Any]) -> tuple[list[str], list[str]]:
     """Tear down the server `record` describes; return `(remaining, notes)`.
 
@@ -798,29 +949,33 @@ def stop_server(*, socket: str, record: dict[str, Any]) -> tuple[list[str], list
     its proxy); `remaining` is what it reports still listed. Then: up to 5 s
     for `record["srt_pid"]` to exit (`srt still running: <pid>` when it does
     not); the record's temp dir removed through `remove_tmpdir`; the control
-    directory, derived from the record's worktree's common git dir and
-    `socket`, removed. `notes` holds one line per step's outcome, removals
-    and already-gone directories included, for the caller to print.
+    directory removed. That directory is `record["control"]`, which must be
+    an absolute `.../pm-sandbox/<socket>`; only a record without it falls
+    back to deriving it from the record's worktree's common git dir.
+    `notes` holds one line per step's outcome, removals and already-gone
+    directories included, for the caller to print.
+
+    PmError, before anything is killed or removed, for an invalid socket
+    name or a missing or malformed `srt_pid`, `tmpdir`, `control` or (in the
+    fallback) `worktree`.
     """
+    _check_socket_name(socket)
+    srt_pid, tmpdir, control = _teardown_targets(socket, record)
     remaining = sessions.kill_server(socket)
     notes: list[str] = []
 
-    srt_pid = record.get("srt_pid")
-    if isinstance(srt_pid, int) and srt_pid > 0:
+    if srt_pid is not None:
         deadline = time.monotonic() + SRT_EXIT_WAIT_SECONDS
         while _pid_alive(srt_pid) and time.monotonic() < deadline:
-            time.sleep(0.1)
+            time.sleep(START_POLL_SECONDS)
         if _pid_alive(srt_pid):
             notes.append(f"srt still running: {srt_pid}")
 
-    tmpdir = record.get("tmpdir")
-    if tmpdir:
-        if remove_tmpdir(tmpdir):
-            notes.append(f"removed sandbox temp dir {tmpdir}")
-        else:
-            notes.append(f"sandbox temp dir already gone: {tmpdir}")
+    if remove_tmpdir(tmpdir):
+        notes.append(f"removed sandbox temp dir {tmpdir}")
+    else:
+        notes.append(f"sandbox temp dir already gone: {tmpdir}")
 
-    control = control_dir(_common_dir_of(Path(record["worktree"])), socket)
     if control.is_dir() and not control.is_symlink():
         try:
             shutil.rmtree(control)

@@ -178,6 +178,33 @@ _start_keepalive_session()
 HAS_SRT = shutil.which("srt") is not None and shutil.which("tmux") is not None and sys.platform == "darwin"
 requires_srt = unittest.skipUnless(HAS_SRT, "srt, tmux and macOS are required to start a sandboxed tmux server")
 
+SANDBOX_TEST_SOCKET_PREFIX = f"{TEST_TMUX_SOCKET}-sb"
+_SANDBOX_TEST_SOCKETS: list[str] = []
+
+
+def register_sandbox_socket(socket: str) -> str:
+    """Record a `<TEST_TMUX_SOCKET>-sb*` socket for the `atexit` sweep below
+    and return it. Refuses any other name, so the sweep can only ever reach
+    this process's own servers."""
+    if not socket.startswith(SANDBOX_TEST_SOCKET_PREFIX):
+        raise ValueError(f"not a sandbox test socket of this process: {socket!r}")
+    if socket not in _SANDBOX_TEST_SOCKETS:
+        _SANDBOX_TEST_SOCKETS.append(socket)
+    return socket
+
+
+@atexit.register
+def _kill_sandbox_test_servers() -> None:
+    """Kill every registered sandbox test server still up when the process
+    exits: a test killed mid-run, or a cleanup that raised, would otherwise
+    leave one (and its `srt`) behind. Registered after
+    `_kill_test_tmux_server`, so it runs first. Best effort, like that hook."""
+    for socket in _SANDBOX_TEST_SOCKETS:
+        try:
+            sessions_mod.kill_server(socket)
+        except Exception:
+            pass
+
 
 def minimal_base_policy() -> dict:
     """The smallest base policy `load_base_policy` and `srt` both accept:
