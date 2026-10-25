@@ -168,6 +168,44 @@ def _start_keepalive_session() -> None:
 _start_keepalive_session()
 
 
+# --- sandbox fixtures ---------------------------------------------------------
+#
+# Shared by the modules that exercise `pm_lib.sandbox`. Tests that start a real
+# sandboxed server need `srt`, `tmux` and macOS (CI runs Linux without `srt`),
+# and each uses a `<TEST_TMUX_SOCKET>-sb*` socket of its own, never the suite's
+# shared server: a sandboxed server's policy names exactly one socket.
+
+HAS_SRT = shutil.which("srt") is not None and shutil.which("tmux") is not None and sys.platform == "darwin"
+requires_srt = unittest.skipUnless(HAS_SRT, "srt, tmux and macOS are required to start a sandboxed tmux server")
+
+
+def minimal_base_policy() -> dict:
+    """The smallest base policy `load_base_policy` and `srt` both accept:
+    no domains, no reads denied, no writes granted."""
+    return {
+        "network": {"allowedDomains": [], "deniedDomains": []},
+        "filesystem": {"denyRead": [], "allowWrite": [], "denyWrite": []},
+    }
+
+
+def write_base_policy(path: Path, policy: dict | None = None) -> Path:
+    """Write `policy` (default `minimal_base_policy()`) as JSON at `path`."""
+    path.write_text(json.dumps(minimal_base_policy() if policy is None else policy), encoding="utf-8")
+    return path
+
+
+def make_linked_worktree(repo: Path, path: Path, branch: str) -> Path:
+    """`git worktree add -b <branch> <path>` from `repo`; returns `path`.
+    The worktree's `.git` is a file, as for a campaign node's worktree."""
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", branch, str(path)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return path
+
+
 # --- CLI-driving helpers -----------------------------------------------------
 
 _RUN_ID_RE = re.compile(r"^run id:\s*(?P<run_id>\S+)", re.MULTILINE)

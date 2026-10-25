@@ -237,15 +237,52 @@ def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -
     the `new-session` call itself runs with the token removed from this
     process's environment.
     """
-    if "PM_RUN_TOKEN" in env:
-        raise PmError("session environment must never contain PM_RUN_TOKEN")
+    args = _new_session_args(session, repo, command, env)
     if not shutil.which("tmux"):
         raise PmError("tmux is required for runtime execution")
+    with scoped_environ("PM_RUN_TOKEN", None):
+        _tmux_or_raise(args, "tmux start failed")
+
+
+def _new_session_args(session: str, repo: Path, command: str, env: dict[str, str]) -> list[str]:
+    """The `new-session` arguments `start_session` and
+    `start_session_via_server` both issue: the session's shell runs
+    `unset PM_RUN_TOKEN; <env-prefix> <command>`, with env values
+    shell-quoted. Refuses an explicit PM_RUN_TOKEN in `env`."""
+    if "PM_RUN_TOKEN" in env:
+        raise PmError("session environment must never contain PM_RUN_TOKEN")
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
     payload = f"{env_prefix} {command}".strip() if env_prefix else command
     shell_command = f"unset PM_RUN_TOKEN; {payload}"
+    return ["new-session", "-d", "-s", session, "-c", str(repo), shell_command]
+
+
+def start_session_via_server(socket: str, session: str, repo: Path, command: str, env: dict[str, str]) -> None:
+    """`start_session`'s `new-session`, issued *through* the server on
+    `socket`: `tmux -L <socket> run-shell '<tmux -L <socket> new-session ...>'`.
+
+    The `new-session` client then runs inside that server, as one of its
+    jobs, so the session is created there and nowhere else: `run-shell`
+    against a socket with no server fails and starts nothing, where a bare
+    `new-session` would start a fresh server. That is the property a
+    sandboxed server needs, since a replacement started by a host client
+    would be unsandboxed. A bare `new-session` is never issued here.
+
+    The session's shell command and the `PM_RUN_TOKEN` handling are exactly
+    `start_session`'s (see `_new_session_args`); the run-shell client also
+    runs with the token removed from this process's environment. The socket
+    is the argument, never `PM_TMUX_SOCKET` (see `kill_server`). PmError
+    when `run-shell` fails, quoting what tmux or the job printed.
+    """
+    args = _new_session_args(session, repo, command, env)
+    if not shutil.which("tmux"):
+        raise PmError("tmux is required for runtime execution")
     with scoped_environ("PM_RUN_TOKEN", None):
-        _tmux_or_raise(["new-session", "-d", "-s", session, "-c", str(repo), shell_command], "tmux start failed")
+        returncode, output = run_shell(socket, shlex.join(["tmux", "-L", socket, *args]))
+    if returncode != 0:
+        detail = output.strip()
+        message = f"tmux start through the server on socket {socket!r} failed"
+        raise PmError(f"{message}: {detail}" if detail else message)
 
 
 def _pane_capture(session: str, *, visible: bool, required: bool = False) -> str | None:
@@ -460,6 +497,50 @@ def list_sessions_on(socket: str) -> list[str]:
             return []
         raise PmError(f"could not list sessions on tmux socket {socket!r}: {detail or 'tmux failed'}")
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def server_running(socket: str) -> bool:
+    """Whether a server answers on `socket`, with or without sessions:
+    `tmux -L <socket> display-message -p '#{pid}'` succeeds.
+
+    `list_sessions_on` cannot tell an empty server from no server (both list
+    nothing), which is why this asks the server for its pid instead. False
+    on tmux's no-server replies (see `_no_server`); any other failure,
+    including a missing tmux binary, raises PmError, because the check could
+    not look. The socket is the argument, never `PM_TMUX_SOCKET`.
+    """
+    argv = ["tmux", "-L", socket, "display-message", "-p", "#{pid}"]
+    try:
+        result = subprocess.run(argv, check=False, text=True, capture_output=True)
+    except OSError as exc:
+        raise PmError(f"could not probe tmux socket {socket!r}: tmux not found ({exc})") from exc
+    if result.returncode == 0:
+        return True
+    detail = (result.stderr or result.stdout or "").strip()
+    if _no_server(detail):
+        return False
+    raise PmError(f"could not probe tmux socket {socket!r}: {detail or 'tmux failed'}")
+
+
+def run_shell(socket: str, command: str) -> tuple[int, str]:
+    """`tmux -L <socket> run-shell <command>`: run the shell `command` as a
+    job of the server on `socket`, in that server's environment and under
+    whatever restrictions the server runs with. Returns `(returncode,
+    output)`, stdout and stderr together.
+
+    tmux expands formats in a `run-shell` command, so every `#` is doubled
+    first: `command` runs as written, never as `#{...}` expansions. On tmux
+    3.5a the return code is the command's own exit status. Against a socket
+    with no server it is non-zero and no server is started (`run-shell`
+    never starts one). Raises PmError only when tmux itself cannot be run.
+    The socket is the argument, never `PM_TMUX_SOCKET`.
+    """
+    argv = ["tmux", "-L", socket, "run-shell", command.replace("#", "##")]
+    try:
+        result = subprocess.run(argv, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as exc:
+        raise PmError(f"could not run a command on tmux socket {socket!r}: tmux not found ({exc})") from exc
+    return result.returncode, result.stdout or ""
 
 
 def set_server_environment(socket: str, name: str, value: str) -> None:
