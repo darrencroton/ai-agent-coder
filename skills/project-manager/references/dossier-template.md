@@ -15,6 +15,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
   nodes/<node>/policy.json      the committed per-child protected-paths policy file
   nodes/<node>/launcher.md      the filled Mode B launcher the child is launched from
   validation/<node>/            one directory per node: its archived run and, for an evidence node, its receipt
+  retrospective.md              the campaign's retrospective, written at acceptance
 ```
 
 ## `brief.md`
@@ -90,7 +91,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 - Actor: <CM | owner>
 - Decision: <what was decided>
 - Grounds: <the evidence it rests on>
-- Permission used: <the brief.md section and line that permits it>
+- Permission used: <the brief.md section and line that permits it; the owner ruling already recorded here (D<n>); or, for a CM decision, *Reading a defective plan* and the brief clause read>
 ```
 
 ## `validation/`

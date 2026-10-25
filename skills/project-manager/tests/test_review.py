@@ -793,6 +793,43 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
         events = state_mod.read_events(run_dir)
         self.assertFalse(any(e["kind"] == "review" for e in events))
 
+    def test_exit_zero_with_an_empty_report_is_a_failed_review(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+
+        # Exits 0 having written only whitespace to stdout, as a reviewer that
+        # died mid-investigation can.
+        fake = _write_fake_reviewer(
+            self.repo.parent / "fake_reviewer_empty.sh",
+            'echo "gave up" 1>&2\necho "  "\nexit 0',
+        )
+
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("empty report", err)
+
+        reloaded = state_mod.load_state(run_dir, token)
+        self.assertEqual(reloaded["slices"][0].get("reviews") or [], [])
+        failed = [e for e in state_mod.read_events(run_dir) if e["kind"] == "review-failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["data"]["reason"], "empty report")
+
     def test_a_failed_commissions_prompt_survives_its_retry(self) -> None:
         """The whole point of persisting the prompt is auditing what a reviewer
         was told — including one that failed. A failed commission records no

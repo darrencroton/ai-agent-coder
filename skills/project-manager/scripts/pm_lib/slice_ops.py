@@ -904,8 +904,6 @@ def start_slice(
     prompt_path = artifact_dir / "prompt.md"
     prompt_path.write_text(prompt_text, encoding="utf-8")
 
-    tmp_dir = artifact_dir / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
     env = {
         "PM_SLICE_ARTIFACT_DIR": str(artifact_dir),
         "PM_PLAN_PATH": str(plan_path),
@@ -913,7 +911,6 @@ def start_slice(
         "PM_NOTES_PATH": str(slice_notes_path),
         "PM_RESULT_PATH": str(result_path),
         "PM_QUESTION_PATH": str(question_path),
-        "TMPDIR": str(tmp_dir),
     }
 
     harness_block = state.get("harness") or {}

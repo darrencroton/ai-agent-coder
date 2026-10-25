@@ -157,6 +157,28 @@ class PlanSlice:
         return self._risk_flag("Risky surfaces touched") == "none"
 
     @property
+    def risk_reasons(self) -> list[str]:
+        """The flag lines that raise the slice's risk; empty when it is standard.
+
+        The risky-surfaces line quotes the value as read and normalised, so
+        prose after `none` (which reads as touched) is visible to the operator. A long
+        value is cut for display only; the derivation sees all of it.
+        """
+        reasons = []
+        if self.approval_needed is True:
+            reasons.append("Approval needed before implementation: yes")
+        if self.independent_audit_required:
+            reasons.append("Independent audit required: yes")
+        if not self.risky_surfaces_clear:
+            value = self._risk_flag("Risky surfaces touched")
+            if value is None:
+                reasons.append("Risky surfaces touched: line missing")
+            else:
+                shown = value if len(value) <= 60 else value[:60] + "..."
+                reasons.append(f"Risky surfaces touched: {shown!r}")
+        return reasons
+
+    @property
     def plan_risk(self) -> str:
         """Mechanical, immutable risk derivation.
 
@@ -166,9 +188,7 @@ class PlanSlice:
         derivation happens once, at parse time; later stages record it in
         state and may only raise it, never lower it.
         """
-        if self.approval_needed is True or self.independent_audit_required or not self.risky_surfaces_clear:
-            return "elevated"
-        return "standard"
+        return "elevated" if self.risk_reasons else "standard"
 
 
 def plan_digest(path: Path) -> str:
@@ -523,6 +543,7 @@ def plan_check_report(path: Path, repo: Path | None = None, protected: list[str]
     errors: list[str] = []
     warnings: list[str] = []
     approval_gated: list[str] = []
+    slice_risks: list[dict[str, Any]] = []
 
     masked_text, unclosed_fence = mask_fenced_blocks(text)
     if unclosed_fence:
@@ -593,6 +614,11 @@ def plan_check_report(path: Path, repo: Path | None = None, protected: list[str]
             )
         elif approval:
             approval_gated.append(plan_slice.slice_id)
+        # Shown before `init` freezes it: a slice's risk decides which reviews
+        # are mandatory, and a misread flag is otherwise invisible until then.
+        slice_risks.append(
+            {"slice": plan_slice.slice_id, "risk": plan_slice.plan_risk, "reasons": plan_slice.risk_reasons}
+        )
         if plan_slice.difficulty is None:
             errors.append(f"{prefix}: 'Difficulty:' must be exactly one of easy, moderate, hard")
         if plan_slice.criteria_total == 0:
@@ -610,6 +636,7 @@ def plan_check_report(path: Path, repo: Path | None = None, protected: list[str]
         "errors": errors,
         "warnings": warnings,
         "approval_gated": approval_gated,
+        "slice_risks": slice_risks,
         "protected_count": len(protected or []),
     }
 

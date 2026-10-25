@@ -14,6 +14,7 @@ import argparse
 import math
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -399,10 +400,17 @@ def _run_check_plan(args: argparse.Namespace) -> int:
         print(f"WARNING: {warning}")
     if policy is not None and repo_path is None:
         print("WARNING: --policy without --repo: the policy file is not checked for self-protection")
+    if report["errors"]:
+        # As `init` does: errors and warnings, then out, so a clean-looking
+        # summary never follows an ERROR line.
+        return 2
+    for item in report["slice_risks"]:
+        why = f" ({'; '.join(item['reasons'])})" if item["reasons"] else ""
+        print(f"{item['slice']}: risk {item['risk']}{why}")
     gated = ", ".join(report["approval_gated"]) if report["approval_gated"] else "none"
     print(f"{report['slice_count']} slice(s); approval-gated: {gated}")
     _print_protected_line(policy, report)
-    return 0 if not report["errors"] else 2
+    return 0
 
 
 # --- init ----------------------------------------------------------------
@@ -999,6 +1007,9 @@ def _run_launch_child(args: argparse.Namespace) -> int:
         f"child launched: session={outcome.session} socket={outcome.socket} "
         f"worktree={outcome.worktree} launcher={outcome.launcher}"
     )
+    # `-t` is the point: a bare `attach` lands on the most recent session,
+    # usually a Developer rather than the child PM.
+    print(f"watch: tmux -L {shlex.quote(outcome.socket)} attach -t {shlex.quote(outcome.session)}")
     return 0
 
 

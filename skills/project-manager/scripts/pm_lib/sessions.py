@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import time
 from contextlib import contextmanager
@@ -357,10 +358,49 @@ def force_stop(session: str) -> None:
         _run_tmux("kill-session", "-t", session)
 
 
+def socket_path(socket: str) -> Path:
+    """Where tmux puts the `-L <socket>` server's socket file:
+    `$TMUX_TMPDIR` (or `/tmp`) `/tmux-<uid>/<socket>`."""
+    return Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}" / socket
+
+
+def _socket_identity(socket: str) -> tuple[int, int] | None:
+    """(st_dev, st_ino) of the socket file for `socket`, or None when there is
+    no socket inode at that path."""
+    try:
+        info = socket_path(socket).lstat()
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino) if stat.S_ISSOCK(info.st_mode) else None
+
+
+def _remove_socket_file(socket: str, identity: tuple[int, int]) -> None:
+    """Remove the dead server's socket file, best effort.
+
+    tmux never unlinks a `-L` socket file (verified on tmux 3.5a: not on
+    `kill-server`, not when the last session ends), so every private server
+    PM or its test suite starts would otherwise leave a stale file in
+    `tmux-<uid>/` for good. Only called once the re-probe says no server
+    runs on `socket`, and only when the inode is still the one seen before
+    the kill: a server started under the same name in between keeps its
+    socket (bar the instant between that check and the unlink, which the
+    unique per-child and per-test socket names make moot). A file that is
+    already gone, or cannot be removed, is not an error: the kill is what
+    mattered.
+    """
+    if _socket_identity(socket) != identity:
+        return
+    try:
+        socket_path(socket).unlink()
+    except OSError:
+        pass
+
+
 def kill_server(socket: str) -> list[str]:
     """`tmux -L <socket> kill-server`: end the named private server and every
     session on it; returns the sessions still listed on `socket` afterwards,
-    so `[]` means no server remains.
+    so `[]` means no server remains, and the dead server's socket file is
+    then removed, best effort (see `_remove_socket_file`).
 
     The socket is the argument, never `PM_TMUX_SOCKET`: a campaign child's
     server is named in its manifest, and the caller's own override must not
@@ -374,13 +414,17 @@ def kill_server(socket: str) -> list[str]:
     run the kill (a PermissionError, say) raises PmError, because nothing was
     killed or probed and `[]` would claim a server gone.
     """
+    identity = _socket_identity(socket)
     try:
         subprocess.run(["tmux", "-L", socket, "kill-server"], check=False, text=True, capture_output=True)
     except FileNotFoundError:
         return []
     except OSError as exc:
         raise PmError(f"could not kill the tmux server on socket {socket!r}: {exc}") from exc
-    return list_sessions_on(socket)
+    remaining = list_sessions_on(socket)
+    if not remaining and identity is not None:
+        _remove_socket_file(socket, identity)
+    return remaining
 
 
 def _no_server(detail: str) -> bool:

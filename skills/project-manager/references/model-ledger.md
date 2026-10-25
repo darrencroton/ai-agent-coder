@@ -36,7 +36,7 @@ Nothing below needs a command of its own; it happens inside the commands you alr
 | `init` | the repository name, the run tag, the default Developer model and tag |
 | `start-slice` | the submission's identity on the launch or relaunch event; attempt counts |
 | `send`, `finalize --steer` | nudges and steers, counted per window |
-| `review` | the review's identity, its report and hash; a timeout or non-zero exit is a `review-failed` entry |
+| `review` | the review's identity, its report and hash; a timeout, non-zero exit or empty report is a `review-failed` entry |
 | `finalize --accept` | the outcome, the decision time, and the code metrics of the accepted range (net lines by category and kind, Python cyclomatic complexity before and after) |
 | `finalize --stop --cause …`, budget exhaustion | the outcome and its cause |
 | every command that carries the run token | the run's ledger file is regenerated from signed state |

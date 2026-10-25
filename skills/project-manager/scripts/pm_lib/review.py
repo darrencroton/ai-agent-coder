@@ -525,7 +525,8 @@ def run_review(
         # `reviewer_pids` before killing the group; that is PM's choice, not
         # the reviewer's failure. Decided before the filter below removes
         # the pgid, and only for failed exits: a reviewer that exited 0 is
-        # recorded as a review whatever `reviewer_pids` holds.
+        # recorded as a review (or, with an empty report, failed on that
+        # ground below) whatever `reviewer_pids` holds.
         if failed:
             reaped = current is None or pgid not in (current.get("reviewer_pids") or [])
         if current is not None and current.get("reviewer_pids"):
@@ -534,13 +535,20 @@ def run_review(
     if reaped:
         raise PmError(f"reviewer was reaped by a PM decision (process group {pgid}); not recorded as a failure")
 
-    if failed:
-        reason = "timeout" if timed_out else f"exit {returncode}"
-        note = (
-            f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed"
-            if timed_out
-            else f"{skill} via {resolved_tool} exited {returncode}"
-        )
+    # A reviewer that exits 0 having written nothing (one died mid-investigation
+    # in the shakedown) is a failed review, not a blank one that would satisfy
+    # the freshness check; it is read like a non-zero exit, via its stderr.
+    empty = not failed and not report_original.read_text(encoding="utf-8", errors="replace").strip()
+    if failed or empty:
+        if timed_out:
+            reason = "timeout"
+            note = f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed"
+        elif failed:
+            reason = f"exit {returncode}"
+            note = f"{skill} via {resolved_tool} exited {returncode}"
+        else:
+            reason = "empty report"
+            note = f"{skill} via {resolved_tool} exited 0 with an empty report"
         state_mod.append_event(
             run_dir,
             "review-failed",
@@ -568,6 +576,12 @@ def run_review(
     if returncode != 0:
         stderr_tail = _tail(stderr_path)
         raise PmError(f"reviewer command failed (exit {returncode}): {stderr_tail}")
+
+    if empty:
+        raise PmError(
+            f"reviewer exited 0 but wrote an empty report; its stderr is at {stderr_path}: "
+            "read it, then re-commission the review"
+        )
 
     report_original = slice_ops.mirror_artifact(repo, run_dir, run_id, report_relative)
     sha256 = slice_ops.sha256_file(report_original)

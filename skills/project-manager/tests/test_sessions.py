@@ -803,9 +803,13 @@ class TestKillServerResult(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"PM_TMUX_SOCKET": "some-other-server"}),
             mock.patch.object(sessions.subprocess, "run", side_effect=results) as run,
+            mock.patch.object(sessions, "_socket_identity", return_value=(1, 2)),
+            mock.patch.object(sessions, "_remove_socket_file") as remove,
         ):
             self.assertEqual(sessions.kill_server("pm-child-node-abcdef"), ["pm-x-s01a0"])
         self.assertEqual(run.call_args_list[0].args[0], ["tmux", "-L", "pm-child-node-abcdef", "kill-server"])
+        # Sessions remain, so the socket file (if any) is the live server's.
+        remove.assert_not_called()
 
     def test_a_missing_tmux_binary_means_no_server_remains(self) -> None:
         with mock.patch.object(sessions.subprocess, "run", side_effect=FileNotFoundError("tmux")):
@@ -832,6 +836,19 @@ class TestKillServerResult(unittest.TestCase):
     @unittest.skipUnless(_HAS_TMUX, "tmux is required")
     def test_a_never_started_socket_has_no_server_remaining(self) -> None:
         self.assertEqual(sessions.kill_server(f"{TEST_TMUX_SOCKET}-kill-never-started"), [])
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required")
+    def test_a_confirmed_kill_removes_the_socket_file_tmux_leaves_behind(self) -> None:
+        # tmux 3.5a never unlinks a `-L` socket file, so without this every
+        # private server PM starts leaves a stale file in tmux-<uid>/.
+        socket = f"{TEST_TMUX_SOCKET}-unlink"
+        self.addCleanup(sessions.kill_server, socket)
+        with sessions.scoped_environ("PM_TMUX_SOCKET", socket):
+            sessions.start_session("pm-test-unlink-s01a0", Path(tempfile.gettempdir()), "bash -c 'sleep 15'", {})
+        path = sessions.socket_path(socket)
+        self.assertTrue(path.is_socket(), path)
+        self.assertEqual(sessions.kill_server(socket), [])
+        self.assertFalse(path.exists(), path)
 
 
 class TestServerEnvironment(unittest.TestCase):

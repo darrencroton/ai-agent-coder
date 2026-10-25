@@ -100,8 +100,9 @@ def tmux_argv(*args: str) -> list[str]:
     Built here from the frozen `TEST_TMUX_SOCKET` rather than delegating to
     `sessions.tmux_argv`, which reads the mutable `PM_TMUX_SOCKET` at call
     time. A test that cleared or repointed that variable would otherwise send
-    these calls — including the teardown `kill-server` below — to the caller's
-    default tmux server. That is not a theoretical failure: an earlier
+    these calls to the caller's default tmux server (the teardown below goes
+    through `sessions.kill_server`, which takes the socket as an argument for
+    the same reason). That is not a theoretical failure: an earlier
     isolation attempt here did exactly that (via `TMUX_TMPDIR`, which tmux
     ignores when `$TMUX` is set) and destroyed a live operator's sessions.
     """
@@ -114,13 +115,16 @@ def _kill_test_tmux_server() -> None:
     and remove its private ledger and CLI-guard directories, when the process
     exits.
 
-    Always `-L`-scoped to the frozen socket, never a bare `tmux kill-server`.
-    Best effort by construction: tmux may be absent (the tmux-gated tests
-    self-skip, but this still runs) or the server may already be gone.
+    Always `-L`-scoped to the frozen socket, never a bare `tmux kill-server`:
+    `sessions.kill_server` takes the socket as its argument and never reads
+    `PM_TMUX_SOCKET`, and it also removes the dead server's socket file,
+    which tmux itself never does. Best effort by construction: tmux may be
+    absent (the tmux-gated tests self-skip, but this still runs) or the
+    server may already be gone.
     """
     try:
-        subprocess.run(tmux_argv("kill-server"), check=False, capture_output=True)
-    except OSError:
+        sessions_mod.kill_server(TEST_TMUX_SOCKET)
+    except Exception:
         pass
     shutil.rmtree(TEST_LEDGER_DIR, ignore_errors=True)
     shutil.rmtree(REAL_CLI_GUARD_DIR, ignore_errors=True)

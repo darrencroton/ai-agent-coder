@@ -746,13 +746,16 @@ class TestCheckPlanPolicy(PlanTestCase):
                 report = plan_mod.plan_check_report(path, protected=protected)
                 self.assertEqual(report, baseline)
 
-    def test_cli_exits_2_on_overlap_and_prints_protected_line(self) -> None:
+    def test_cli_exits_2_on_overlap_and_prints_nothing_after_the_errors(self) -> None:
         plan_path = self.write_plan(slices=[{"files": ["instruments/check.py"]}])
         policy_path = self.write_policy(["instruments/"])
         code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path), "--policy", str(policy_path)])
         self.assertEqual(code, 2)
         self.assertIn("ERROR: Slice 1 (Slice 1 title): authorized entry 'instruments/check.py' reaches", out)
-        self.assertIn(f"protected paths: 1 (from {policy_path.resolve()})", out)
+        # Warnings still print, as at init; no summary or protected-paths line follows the errors.
+        self.assertIn("WARNING: --policy without --repo", out)
+        self.assertNotIn("slice(s)", out)
+        self.assertNotIn("protected paths:", out)
 
     def test_cli_exits_0_on_clean_plan_and_prints_protected_line(self) -> None:
         plan_path = self.write_plan(slices=[{"files": ["src/a.py"]}])
@@ -822,7 +825,13 @@ class TestCheckPlanPolicy(PlanTestCase):
         plan_path = self.write_plan(slices=[{"files": ["instruments/check.py"]}])
         code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path)])
         self.assertEqual(code, 0)
-        self.assertEqual(out, "1 slice(s); approval-gated: none\n")
+        self.assertEqual(out, "Slice 1: risk standard\n1 slice(s); approval-gated: none\n")
+
+    def test_cli_prints_elevated_risk_with_its_reason(self) -> None:
+        plan_path = self.write_plan(slices=[{"risky": "none. The slice adds one report"}])
+        code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path)])
+        self.assertEqual(code, 0)
+        self.assertIn("Slice 1: risk elevated (Risky surfaces touched: 'none. the slice adds one report')\n", out)
 
 
 class TestImportHygiene(unittest.TestCase):
