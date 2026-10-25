@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -357,12 +358,14 @@ class TestRenderReviewerPrompt(unittest.TestCase):
         for phrase in (
             "Operation not permitted",
             "$TMPDIR",
-            "the hosts the operator listed",
-            "`git push`",
             "the paths the operator granted",
-            "git config and hooks are not writable",
+            "the few paths the sandbox needs in order to run",
+            "the repository itself may be unwritable too",
+            "the hosts the operator listed, so a push to any other host fails",
+            "`.git/config` and `.git/hooks` are never writable",
             "In a linked worktree (a campaign node)",
-            "You can still read the pinned diff, the repository and every branch.",
+            "anything that updates a branch other than the one under review",
+            "You can still read the pinned diff, every branch and the repository, except paths the operator denied.",
             "a boundary, not a bug to work around",
         ):
             self.assertIn(phrase, paragraph)
@@ -371,6 +374,8 @@ class TestRenderReviewerPrompt(unittest.TestCase):
         malformed = {
             "trailing space on the closing marker": "[sandboxed]\nBoundary.\n[/sandboxed] \n\nSlice {slice_id}.",
             "block at the end of the fence": "Slice {slice_id}.\n\n[sandboxed]\nBoundary.\n[/sandboxed]",
+            "bullet-prefixed markers": "- [sandboxed]\n- Boundary.\n- [/sandboxed]\n\nSlice {slice_id}.",
+            "quote-prefixed markers": "> [sandboxed]\n> Boundary.\n> [/sandboxed]\n\nSlice {slice_id}.",
         }
         with tempfile.TemporaryDirectory() as tmp:
             reference = Path(tmp) / "reviewer-prompt.md"
@@ -380,6 +385,19 @@ class TestRenderReviewerPrompt(unittest.TestCase):
                     with self.subTest(shape=shape, sandboxed=sandboxed), self.assertRaises(PmError) as ctx:
                         self._render(reference_path=reference, sandboxed=sandboxed)
                     self.assertIn("malformed [sandboxed] block", str(ctx.exception))
+
+    def test_an_empty_sandbox_block_counts_as_missing_when_sandboxed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "reviewer-prompt.md"
+            for shape, body in {"empty": "", "whitespace only": "   \t"}.items():
+                reference.write_text(
+                    f"# T\n\n```md\n[sandboxed]\n{body}\n[/sandboxed]\n\nSlice {{slice_id}}.\n```\n", encoding="utf-8"
+                )
+                with self.subTest(shape=shape):
+                    self.assertEqual(self._render(reference_path=reference), "Slice Slice 3.")
+                    with self.assertRaises(PmError) as ctx:
+                        self._render(reference_path=reference, sandboxed=True)
+                    self.assertIn("an empty or no [sandboxed] paragraph", str(ctx.exception))
 
     def test_absent_adjudications_render_as_the_literal_none(self) -> None:
         rendered = self._render()
@@ -1773,13 +1791,9 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
             'for arg in "$@"; do echo "ARG=$arg"; done',
         )
 
-    def _environ(self, *, sandbox_runtime: bool, srt_on_path: bool = True) -> dict[str, str]:
+    def _environ(self, *, sandbox_runtime: bool) -> dict[str, str]:
         env = {key: value for key, value in os.environ.items() if key != "SANDBOX_RUNTIME"}
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
-        if not srt_on_path:
-            env["PATH"] = os.pathsep.join(
-                entry for entry in env["PATH"].split(os.pathsep) if entry and not (Path(entry) / "srt").exists()
-            )
         if sandbox_runtime:
             env["SANDBOX_RUNTIME"] = "1"
         return env
@@ -1811,7 +1825,7 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
         state_mod.save_state(run_dir, state, token)
         return control
 
-    def _review(self, token: str, *, sandbox_runtime: bool, srt_on_path: bool = True, extra: list[str] | None = None):
+    def _review(self, token: str, *, sandbox_runtime: bool, extra: list[str] | None = None):
         """Commission one review; returns (code, out, err, reviewer argv as
         launched or None). `review` resolves the repository from the cwd, so
         the composed `-C` path is the real one (`/private/var/...` on macOS)."""
@@ -1826,9 +1840,7 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
             *(extra or ["--tool", "codex"]),
         ]
         with (
-            mock.patch.dict(
-                os.environ, self._environ(sandbox_runtime=sandbox_runtime, srt_on_path=srt_on_path), clear=True
-            ),
+            mock.patch.dict(os.environ, self._environ(sandbox_runtime=sandbox_runtime), clear=True),
             mock.patch.object(review_mod.subprocess, "Popen", wraps=subprocess.Popen) as popen,
         ):
             code, out, err = self.run_cli_in_repo(argv)
@@ -1909,19 +1921,53 @@ class TestReviewInsideSandbox(SandboxedReviewTestCase):
         self.assertIn("Sandbox: this review runs inside an OS sandbox", prompt)
         self.assert_identity_unchanged(review)
 
-    def test_recorded_sandbox_without_a_reviewer_policy_refuses_before_launching(self) -> None:
+    def _refusal(self, *, policy: bool, tmpdir: bool) -> tuple[Path, str]:
+        """Commission a review whose recorded sandbox lacks the reviewer
+        policy and/or the record's temp dir; asserts nothing was launched and
+        returns the control directory and stderr."""
         token, run_dir = self._ready_run()
         control = self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=self.repo.parent / "tmp")
-        (control / "reviewer-policy.json").unlink()
+        if not policy:
+            (control / "reviewer-policy.json").unlink()
+        if not tmpdir:
+            record = sandbox_mod.read_record(control)
+            del record["tmpdir"]
+            (control / sandbox_mod.RECORD_NAME).write_text(json.dumps(record), encoding="utf-8")
         code, _out, err, launched = self._review(token, sandbox_runtime=False)
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 2, err)
         self.assertIn("refusing to run the reviewer outside the sandbox", err)
         self.assertIsNone(launched)
+        return control, err
+
+    def test_recorded_sandbox_without_a_reviewer_policy_refuses_before_launching(self) -> None:
+        control, err = self._refusal(policy=False, tmpdir=True)
+        self.assertIn(f"its reviewer policy {control / 'reviewer-policy.json'} is missing", err)
+        self.assertNotIn("names no temp dir", err)
+
+    def test_recorded_sandbox_whose_record_names_no_temp_dir_refuses_before_launching(self) -> None:
+        control, err = self._refusal(policy=True, tmpdir=False)
+        self.assertIn(f"its record {control / sandbox_mod.RECORD_NAME} names no temp dir", err)
+        self.assertNotIn("reviewer policy", err)
+
+    def test_recorded_sandbox_missing_both_names_both_before_launching(self) -> None:
+        control, err = self._refusal(policy=False, tmpdir=False)
+        self.assertIn(
+            f"its reviewer policy {control / 'reviewer-policy.json'} is missing "
+            f"and its record {control / sandbox_mod.RECORD_NAME} names no temp dir",
+            err,
+        )
 
     def test_recorded_sandbox_without_srt_on_path_refuses_before_launching(self) -> None:
+        """Only the `srt` lookup fails, so every other tool still resolves."""
         token, run_dir = self._ready_run()
         self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=self.repo.parent / "tmp")
-        code, _out, err, launched = self._review(token, sandbox_runtime=False, srt_on_path=False)
+        real_which = shutil.which
+
+        def which(name, *args, **kwargs):
+            return None if name == "srt" else real_which(name, *args, **kwargs)
+
+        with mock.patch.object(review_mod.shutil, "which", side_effect=which):
+            code, _out, err, launched = self._review(token, sandbox_runtime=False)
         self.assertEqual(code, 2, err)
         self.assertIn(sandbox_mod.SRT_MISSING, err)
         self.assertNotIn("Traceback", err)

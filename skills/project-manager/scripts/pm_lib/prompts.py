@@ -40,10 +40,11 @@ _HEADING_RE = re.compile(r"^#{1,6} .*$", re.MULTILINE)
 # it; sandboxed, it is replaced by `body` and that blank line. The wording
 # stays in the template, like every other prompt line.
 _SANDBOX_BLOCK_RE = re.compile(r"^\[sandboxed\]\n(?P<body>.*?)\n\[/sandboxed\]\n\n", re.DOTALL | re.MULTILINE)
-# A marker line left after that substitution belongs to a block the pattern
-# could not match (a stray space, no blank line after it), whose paragraph
-# would otherwise reach the seat unannounced or with its markers.
-_SANDBOX_MARKER_RE = re.compile(r"^[ \t]*\[/?sandboxed\]", re.MULTILINE)
+# A marker left anywhere after that substitution belongs to a block the
+# pattern could not match (a stray space or prefix, no blank line after it),
+# whose paragraph would otherwise reach the seat unannounced or with its
+# markers.
+_SANDBOX_MARKERS = ("[sandboxed]", "[/sandboxed]")
 
 _STEER_MESSAGE_HEADING = "## Steer Message Template"
 _LAUNCH_POINTER_HEADING = "## Launch Pointer"
@@ -159,15 +160,21 @@ def render_developer_prompt(
     `sandboxed` keeps the template's `[sandboxed]` paragraph (what an `srt`
     sandbox denies the session); otherwise it is removed. A sandboxed render
     of a template without one raises `PmError` rather than silently omitting
-    the boundary the session runs inside, and so does any render that leaves
-    a marker line behind (a malformed block).
+    the boundary the session runs inside, as does one whose paragraph is
+    empty, and so does any render that leaves a marker behind (a malformed
+    block).
     """
     template_path = reference_path or _DEFAULT_REFERENCE_PATH
-    template, found = _SANDBOX_BLOCK_RE.subn(r"\g<body>\n\n" if sandboxed else "", load_template(template_path))
-    if _SANDBOX_MARKER_RE.search(template):
+    source = load_template(template_path)
+    bodies = [match.group("body") for match in _SANDBOX_BLOCK_RE.finditer(source)]
+    template = _SANDBOX_BLOCK_RE.sub(r"\g<body>\n\n" if sandboxed else "", source)
+    if any(marker in template for marker in _SANDBOX_MARKERS):
         raise PmError(f"developer prompt template has a malformed [sandboxed] block: {template_path}")
-    if sandboxed and not found:
-        raise PmError(f"developer prompt template has no [sandboxed] paragraph for a sandboxed launch: {template_path}")
+    if sandboxed and not (bodies and all(body.strip() for body in bodies)):
+        raise PmError(
+            f"developer prompt template has an empty or no [sandboxed] paragraph "
+            f"for a sandboxed launch: {template_path}"
+        )
     sections = plan_slice.sections
     lint_script = (skills_root or _DEFAULT_SKILLS_ROOT) / "lint" / "scripts" / "lint.py"
     fields: dict[str, Any] = {
@@ -358,11 +365,15 @@ def render_reviewer_prompt(
     `render_developer_prompt`, and raises the same way when it is missing.
     """
     template_path = reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH
-    template, found = _SANDBOX_BLOCK_RE.subn(r"\g<body>\n\n" if sandboxed else "", load_template(template_path))
-    if _SANDBOX_MARKER_RE.search(template):
+    source = load_template(template_path)
+    bodies = [match.group("body") for match in _SANDBOX_BLOCK_RE.finditer(source)]
+    template = _SANDBOX_BLOCK_RE.sub(r"\g<body>\n\n" if sandboxed else "", source)
+    if any(marker in template for marker in _SANDBOX_MARKERS):
         raise PmError(f"reviewer prompt template has a malformed [sandboxed] block: {template_path}")
-    if sandboxed and not found:
-        raise PmError(f"reviewer prompt template has no [sandboxed] paragraph for a sandboxed review: {template_path}")
+    if sandboxed and not (bodies and all(body.strip() for body in bodies)):
+        raise PmError(
+            f"reviewer prompt template has an empty or no [sandboxed] paragraph for a sandboxed review: {template_path}"
+        )
     skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root)
     changed_files_text = "\n".join(f"  - {path}" for path in changed_files) if changed_files else "  - (none)"
     fields: dict[str, Any] = {

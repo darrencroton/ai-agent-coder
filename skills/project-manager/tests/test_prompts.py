@@ -9,6 +9,7 @@ loader tests build their own templates instead.
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 import tempfile
@@ -313,16 +314,16 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
         for phrase in (
             "Operation not permitted",
             "$TMPDIR",
-            "the hosts the operator listed",
-            "`git push`",
+            "the paths the operator granted",
+            "the few paths the sandbox needs in order to run",
+            "the hosts the operator listed, so a push to any other host fails",
+            "`.git/config` and `.git/hooks` are never writable",
+            "In a linked worktree (a campaign node)",
             "`git stash`",
             "`git tag`",
             "`git worktree`",
             "`git gc`",
-            "the paths the operator granted",
-            "git config and hooks are not writable",
-            "In a linked worktree (a campaign node)",
-            "any branch but the one you work on",
+            "anything that updates a branch other than the one you work on",
             "a boundary, not a bug to work around",
         ):
             self.assertIn(phrase, paragraph)
@@ -370,6 +371,8 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
         malformed = {
             "trailing space on the opening marker": "[sandboxed] \nBoundary.\n[/sandboxed]\n\nSlice {slice_id}.",
             "block at the end of the fence": "Slice {slice_id}.\n\n[sandboxed]\nBoundary.\n[/sandboxed]",
+            "bullet-prefixed markers": "- [sandboxed]\n- Boundary.\n- [/sandboxed]\n\nSlice {slice_id}.",
+            "quote-prefixed markers": "> [sandboxed]\n> Boundary.\n> [/sandboxed]\n\nSlice {slice_id}.",
         }
         with tempfile.TemporaryDirectory() as tmp:
             reference = Path(tmp) / "developer-prompt.md"
@@ -387,6 +390,31 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
                             sandboxed=sandboxed,
                         )
                     self.assertIn("malformed [sandboxed] block", str(ctx.exception))
+                    self.assertIn(str(reference), str(ctx.exception))
+
+    def test_an_empty_sandbox_block_counts_as_missing_when_sandboxed(self) -> None:
+        """An empty paragraph would announce no boundary at all; unsandboxed,
+        the block is removed as usual."""
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "developer-prompt.md"
+            for shape, body in {"empty": "", "whitespace only": "   \t"}.items():
+                reference.write_text(
+                    f"# T\n\n```md\n[sandboxed]\n{body}\n[/sandboxed]\n\nSlice {{slice_id}}.\n```\n", encoding="utf-8"
+                )
+                render = functools.partial(
+                    prompts.render_developer_prompt,
+                    _make_plan_slice(3),
+                    plan_path=Path("/p"),
+                    artifact_dir=Path("/a"),
+                    notes_path=Path("/n"),
+                    result_path=Path("/r"),
+                    reference_path=reference,
+                )
+                with self.subTest(shape=shape):
+                    self.assertEqual(render(), "Slice Slice 3.")
+                    with self.assertRaises(PmError) as ctx:
+                        render(sandboxed=True)
+                    self.assertIn("an empty or no [sandboxed] paragraph", str(ctx.exception))
                     self.assertIn(str(reference), str(ctx.exception))
 
     def test_missing_placeholder_field_raises_pm_error(self) -> None:

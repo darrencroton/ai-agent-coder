@@ -354,8 +354,9 @@ def run_review(
     recorded sandbox commissioned from outside one is wrapped in `srt` with
     the control directory's reviewer policy at `Popen` time, after everything
     recorded about the commission is built. That wrap fails closed: a missing
-    reviewer policy or temp dir, or no `srt` on PATH, raises PmError before
-    anything is launched rather than running the reviewer unwrapped.
+    reviewer policy, a record naming no temp dir (the refusal names which), or
+    no `srt` on PATH raises PmError before anything is launched rather than
+    running the reviewer unwrapped.
     """
     state = slice_ops.load_writable_state(run_dir, token)
     current = state.get("current_slice")
@@ -519,10 +520,15 @@ def run_review(
         control = Path(control_text)
         policy_path = control / "reviewer-policy.json"
         tmpdir = sandbox.read_record(control).get("tmpdir")
-        if not policy_path.is_file() or not isinstance(tmpdir, str) or not tmpdir:
+        missing = []
+        if not policy_path.is_file():
+            missing.append(f"its reviewer policy {policy_path} is missing")
+        if not isinstance(tmpdir, str) or not tmpdir:
+            missing.append(f"its record {control / sandbox.RECORD_NAME} names no temp dir")
+        if missing:
             raise PmError(
-                f"this run records a sandbox but its control directory {control} has no reviewer policy "
-                "or no temp dir in its record; refusing to run the reviewer outside the sandbox"
+                f"this run records a sandbox, but {' and '.join(missing)}; "
+                "refusing to run the reviewer outside the sandbox"
             )
         if shutil.which("srt") is None:
             raise PmError(sandbox.SRT_MISSING)
