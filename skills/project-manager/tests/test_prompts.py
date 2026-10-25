@@ -49,8 +49,6 @@ class TestLoadTemplate(unittest.TestCase):
         self.assertIn("{intended_change}", template)
 
     def test_no_fence_rejected(self, tmp_path: Path | None = None) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "no-fence.md"
             path.write_text("Just some prose, no fenced block here.\n", encoding="utf-8")
@@ -59,8 +57,6 @@ class TestLoadTemplate(unittest.TestCase):
             self.assertIn(str(path), str(ctx.exception))
 
     def test_multiple_fences_rejected(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "multi-fence.md"
             path.write_text(
@@ -76,8 +72,6 @@ class TestLoadTemplate(unittest.TestCase):
             prompts.load_template(Path("/does/not/exist/reference.md"))
 
     def test_named_heading_scopes_extraction_around_a_second_section(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "two-section.md"
             path.write_text(
@@ -108,8 +102,6 @@ class TestRenderSteerPointer(unittest.TestCase):
         """A custom reference file with a distinctive marker proves
         `render_steer_pointer` actually reads its wording from disk rather
         than duplicating an equivalent wrapper inline in prompts.py."""
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "custom-developer-prompt.md"
             path.write_text(
@@ -135,8 +127,6 @@ class TestRenderAnswerPointer(unittest.TestCase):
         self.assertIn("never widens your authorized surface", rendered)
 
     def test_wording_is_sourced_from_the_answer_pointer_section(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "custom-developer-prompt.md"
             path.write_text(
@@ -161,8 +151,6 @@ class TestRenderLaunchPointer(unittest.TestCase):
         self.assertNotIn("{prompt_path}", rendered)
 
     def test_wording_is_sourced_from_the_reference_file_not_hardcoded(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "custom-developer-prompt.md"
             path.write_text(
@@ -256,8 +244,6 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
         self.assertNotIn("check --base HEAD", rendered)
 
     def test_stray_unescaped_brace_raises_pm_error_naming_the_file(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "broken.md"
             path.write_text(
@@ -333,6 +319,10 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
             "`git tag`",
             "`git worktree`",
             "`git gc`",
+            "the paths the operator granted",
+            "git config and hooks are not writable",
+            "In a linked worktree (a campaign node)",
+            "any branch but the one you work on",
             "a boundary, not a bug to work around",
         ):
             self.assertIn(phrase, paragraph)
@@ -374,9 +364,32 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
         self.assertIn("[sandboxed]", str(ctx.exception))
         self.assertIn(str(reference), str(ctx.exception))
 
-    def test_missing_placeholder_field_raises_pm_error(self) -> None:
-        import tempfile
+    def test_a_malformed_sandbox_block_raises_whether_sandboxed_or_not(self) -> None:
+        """A block the pattern cannot match would otherwise ship its markers
+        and paragraph to an unsandboxed seat, unannounced."""
+        malformed = {
+            "trailing space on the opening marker": "[sandboxed] \nBoundary.\n[/sandboxed]\n\nSlice {slice_id}.",
+            "block at the end of the fence": "Slice {slice_id}.\n\n[sandboxed]\nBoundary.\n[/sandboxed]",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "developer-prompt.md"
+            for shape, body in malformed.items():
+                reference.write_text(f"# T\n\n```md\n{body}\n```\n", encoding="utf-8")
+                for sandboxed in (False, True):
+                    with self.subTest(shape=shape, sandboxed=sandboxed), self.assertRaises(PmError) as ctx:
+                        prompts.render_developer_prompt(
+                            _make_plan_slice(3),
+                            plan_path=Path("/p"),
+                            artifact_dir=Path("/a"),
+                            notes_path=Path("/n"),
+                            result_path=Path("/r"),
+                            reference_path=reference,
+                            sandboxed=sandboxed,
+                        )
+                    self.assertIn("malformed [sandboxed] block", str(ctx.exception))
+                    self.assertIn(str(reference), str(ctx.exception))
 
+    def test_missing_placeholder_field_raises_pm_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "unknown-field.md"
             path.write_text("```md\nSlice: {slice_id}\nUnknown: {not_a_real_field}\n```\n", encoding="utf-8")

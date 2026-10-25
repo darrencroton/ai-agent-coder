@@ -29,9 +29,10 @@ SUPPORTED_HARNESSES: tuple[str, ...] = ("codex", "claude", "copilot", "opencode"
 #
 # `sandboxed_args` are appended when the seat runs inside an `srt` sandbox. A
 # Seatbelt-sandboxed process cannot apply a second sandbox profile (exit 71),
-# so a harness's own sandbox is switched off there rather than left to fail;
-# Codex additionally wants a shared app-server daemon whose lock the sandbox
-# cannot take, which `--no-daemon` avoids.
+# so Claude's own sandbox is switched off there rather than left to fail.
+# Codex's is already bypassed by its base command; inside `srt` it gets
+# `--no-daemon`, because its shared app-server daemon takes a lock the sandbox
+# denies.
 HARNESS_PROFILES: dict[str, dict[str, Any]] = {
     "codex": {
         "base_command": ["codex", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"],

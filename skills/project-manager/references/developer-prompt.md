@@ -55,7 +55,7 @@ Workflow:
    Use status "blocked" with the reason in "summary" when you must stop instead.
 
 [sandboxed]
-Sandbox: this session runs inside an OS sandbox the operator configured. Writes outside the repository and `$TMPDIR` fail with "Operation not permitted"; the network reaches only the hosts the operator listed; `git push`, `git stash`, `git tag`, `git worktree`, `git gc` and every branch but the one you work on are unavailable. A denied operation is a boundary, not a bug to work around: do not retry it by another route — if the slice genuinely needs it, report blocked and name the operation and its error.
+Sandbox: this session runs inside an OS sandbox the operator configured. Writes outside the repository, `$TMPDIR` and the paths the operator granted fail with "Operation not permitted"; the network reaches only the hosts the operator listed, so `git push` fails; the repository's git config and hooks are not writable. In a linked worktree (a campaign node), `git stash`, `git tag`, `git worktree`, `git gc` and git operations on any branch but the one you work on are denied too. A denied operation is a boundary, not a bug to work around: do not retry it by another route — if the slice genuinely needs it, report blocked and name the operation and its error.
 [/sandboxed]
 
 Hard rules:

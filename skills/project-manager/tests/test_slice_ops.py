@@ -1782,8 +1782,8 @@ class TestSandboxedLaunch(SliceOpsTestCase):
         run_id, token = parse_init_output(out)
         run_dir = state_mod.resolve_run_dir(self.repo, run_id)
         if record_sandbox:
-            # The block Slice 4's `init --sandbox` records; start-slice only
-            # asks whether one is there.
+            # A recorded `sandbox` block (policy, its sha256, socket and
+            # control directory); start-slice only asks whether one is there.
             state = state_mod.load_state(run_dir, token)
             state["sandbox"] = {
                 "policy": "/p.json",

@@ -33,11 +33,17 @@ _MD_FENCE_RE = re.compile(r"```md\n(?P<body>.*?)\n```", re.DOTALL)
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\((?P<target>[^)]+)\)")
 _HEADING_RE = re.compile(r"^#{1,6} .*$", re.MULTILINE)
 # The paragraph of a prompt template that renders only for a seat inside an
-# `srt` sandbox: the lines between a `[sandboxed]` and a `[/sandboxed]` line,
-# plus the blank line after. Unsandboxed, the whole block is removed, so the
-# render is exactly the template without it; sandboxed, only the two marker
-# lines are. The wording stays in the template, like every other prompt line.
+# `srt` sandbox. A match runs from a line that is exactly `[sandboxed]`
+# through a line that is exactly `[/sandboxed]` and the blank line that must
+# follow it; `body` is the text between the two marker lines. Unsandboxed,
+# the whole match is removed, so the render is exactly the template without
+# it; sandboxed, it is replaced by `body` and that blank line. The wording
+# stays in the template, like every other prompt line.
 _SANDBOX_BLOCK_RE = re.compile(r"^\[sandboxed\]\n(?P<body>.*?)\n\[/sandboxed\]\n\n", re.DOTALL | re.MULTILINE)
+# A marker line left after that substitution belongs to a block the pattern
+# could not match (a stray space, no blank line after it), whose paragraph
+# would otherwise reach the seat unannounced or with its markers.
+_SANDBOX_MARKER_RE = re.compile(r"^[ \t]*\[/?sandboxed\]", re.MULTILINE)
 
 _STEER_MESSAGE_HEADING = "## Steer Message Template"
 _LAUNCH_POINTER_HEADING = "## Launch Pointer"
@@ -153,10 +159,13 @@ def render_developer_prompt(
     `sandboxed` keeps the template's `[sandboxed]` paragraph (what an `srt`
     sandbox denies the session); otherwise it is removed. A sandboxed render
     of a template without one raises `PmError` rather than silently omitting
-    the boundary the session runs inside.
+    the boundary the session runs inside, and so does any render that leaves
+    a marker line behind (a malformed block).
     """
     template_path = reference_path or _DEFAULT_REFERENCE_PATH
     template, found = _SANDBOX_BLOCK_RE.subn(r"\g<body>\n\n" if sandboxed else "", load_template(template_path))
+    if _SANDBOX_MARKER_RE.search(template):
+        raise PmError(f"developer prompt template has a malformed [sandboxed] block: {template_path}")
     if sandboxed and not found:
         raise PmError(f"developer prompt template has no [sandboxed] paragraph for a sandboxed launch: {template_path}")
     sections = plan_slice.sections
@@ -350,6 +359,8 @@ def render_reviewer_prompt(
     """
     template_path = reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH
     template, found = _SANDBOX_BLOCK_RE.subn(r"\g<body>\n\n" if sandboxed else "", load_template(template_path))
+    if _SANDBOX_MARKER_RE.search(template):
+        raise PmError(f"reviewer prompt template has a malformed [sandboxed] block: {template_path}")
     if sandboxed and not found:
         raise PmError(f"reviewer prompt template has no [sandboxed] paragraph for a sandboxed review: {template_path}")
     skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root)

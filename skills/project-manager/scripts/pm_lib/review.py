@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 from dataclasses import dataclass, field
@@ -346,6 +347,15 @@ def run_review(
     rendered prompt is persisted beside the report: a channel that can narrow
     what a reviewer reports must leave the human an audit trail of what it
     was told.
+
+    A reviewer runs inside a sandbox when this PM already does
+    (`SANDBOX_RUNTIME=1`) or the run records one: its command and prompt are
+    then the sandboxed variants, which leave the boundary to the OS. A
+    recorded sandbox commissioned from outside one is wrapped in `srt` with
+    the control directory's reviewer policy at `Popen` time, after everything
+    recorded about the commission is built. That wrap fails closed: a missing
+    reviewer policy or temp dir, or no `srt` on PATH, raises PmError before
+    anything is launched rather than running the reviewer unwrapped.
     """
     state = slice_ops.load_writable_state(run_dir, token)
     current = state.get("current_slice")
@@ -514,6 +524,8 @@ def run_review(
                 f"this run records a sandbox but its control directory {control} has no reviewer policy "
                 "or no temp dir in its record; refusing to run the reviewer outside the sandbox"
             )
+        if shutil.which("srt") is None:
+            raise PmError(sandbox.SRT_MISSING)
         popen_command = sandbox.wrap_command(policy_path, command, tmpdir=tmpdir)
 
     with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:

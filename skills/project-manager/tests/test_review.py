@@ -258,7 +258,8 @@ class TestComposeReviewerCommand(unittest.TestCase):
 class TestComposeReviewerCommandSandboxed(unittest.TestCase):
     """Inside an `srt` sandbox no harness can start a sandbox of its own
     (nesting fails with exit 71), so the sandboxed variants turn each one
-    off; `sandboxed=False` is exactly today's command for every tool."""
+    off; `sandboxed=False` composes the same command as omitting it, for
+    every tool."""
 
     def _both(self, tool: str, **kwargs) -> tuple[list[str], list[str], list[str]]:
         default = review_mod.compose_reviewer_command(tool, "PROMPT", repo=Path("/repo"), **kwargs)
@@ -358,9 +359,27 @@ class TestRenderReviewerPrompt(unittest.TestCase):
             "$TMPDIR",
             "the hosts the operator listed",
             "`git push`",
+            "the paths the operator granted",
+            "git config and hooks are not writable",
+            "In a linked worktree (a campaign node)",
+            "You can still read the pinned diff, the repository and every branch.",
             "a boundary, not a bug to work around",
         ):
             self.assertIn(phrase, paragraph)
+
+    def test_a_malformed_sandbox_block_raises_whether_sandboxed_or_not(self) -> None:
+        malformed = {
+            "trailing space on the closing marker": "[sandboxed]\nBoundary.\n[/sandboxed] \n\nSlice {slice_id}.",
+            "block at the end of the fence": "Slice {slice_id}.\n\n[sandboxed]\nBoundary.\n[/sandboxed]",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "reviewer-prompt.md"
+            for shape, body in malformed.items():
+                reference.write_text(f"# T\n\n```md\n{body}\n```\n", encoding="utf-8")
+                for sandboxed in (False, True):
+                    with self.subTest(shape=shape, sandboxed=sandboxed), self.assertRaises(PmError) as ctx:
+                        self._render(reference_path=reference, sandboxed=sandboxed)
+                    self.assertIn("malformed [sandboxed] block", str(ctx.exception))
 
     def test_absent_adjudications_render_as_the_literal_none(self) -> None:
         rendered = self._render()
@@ -1754,9 +1773,13 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
             'for arg in "$@"; do echo "ARG=$arg"; done',
         )
 
-    def _environ(self, *, sandbox_runtime: bool) -> dict[str, str]:
+    def _environ(self, *, sandbox_runtime: bool, srt_on_path: bool = True) -> dict[str, str]:
         env = {key: value for key, value in os.environ.items() if key != "SANDBOX_RUNTIME"}
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        if not srt_on_path:
+            env["PATH"] = os.pathsep.join(
+                entry for entry in env["PATH"].split(os.pathsep) if entry and not (Path(entry) / "srt").exists()
+            )
         if sandbox_runtime:
             env["SANDBOX_RUNTIME"] = "1"
         return env
@@ -1769,9 +1792,10 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
         return token, run_dir
 
     def _record_sandbox(self, token: str, run_dir: Path, *, socket: str, tmpdir: Path, policy: dict | None = None):
-        """What Slice 4's `init --sandbox` will leave: the run's `sandbox`
-        block, and a control directory holding the reviewer policy and the
-        record naming the run's temp dir. Returns the control directory."""
+        """A recorded sandbox: the run's `sandbox` block (policy, its
+        sha256, socket and control directory), and that control directory
+        holding the reviewer policy and the record naming the run's temp
+        dir. Returns the control directory."""
         common = self.repo / ".git"
         control = sandbox_mod.control_dir(common, socket)
         control.mkdir(parents=True)
@@ -1787,7 +1811,7 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
         state_mod.save_state(run_dir, state, token)
         return control
 
-    def _review(self, token: str, *, sandbox_runtime: bool, extra: list[str] | None = None):
+    def _review(self, token: str, *, sandbox_runtime: bool, srt_on_path: bool = True, extra: list[str] | None = None):
         """Commission one review; returns (code, out, err, reviewer argv as
         launched or None). `review` resolves the repository from the cwd, so
         the composed `-C` path is the real one (`/private/var/...` on macOS)."""
@@ -1802,7 +1826,9 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
             *(extra or ["--tool", "codex"]),
         ]
         with (
-            mock.patch.dict(os.environ, self._environ(sandbox_runtime=sandbox_runtime), clear=True),
+            mock.patch.dict(
+                os.environ, self._environ(sandbox_runtime=sandbox_runtime, srt_on_path=srt_on_path), clear=True
+            ),
             mock.patch.object(review_mod.subprocess, "Popen", wraps=subprocess.Popen) as popen,
         ):
             code, out, err = self.run_cli_in_repo(argv)
@@ -1851,7 +1877,7 @@ class TestReviewInsideSandbox(SandboxedReviewTestCase):
         self.assertEqual(launched[0], "codex", launched)
         self.assertIn('sandbox_mode="danger-full-access"', launched)
 
-    def test_neither_runs_todays_command(self) -> None:
+    def test_no_sandbox_runs_the_read_only_reviewer_unwrapped(self) -> None:
         token, run_dir = self._ready_run()
         code, _out, err, launched = self._review(token, sandbox_runtime=False)
         self.assertEqual(code, 0, err)
@@ -1890,6 +1916,15 @@ class TestReviewInsideSandbox(SandboxedReviewTestCase):
         code, _out, err, launched = self._review(token, sandbox_runtime=False)
         self.assertEqual(code, 2)
         self.assertIn("refusing to run the reviewer outside the sandbox", err)
+        self.assertIsNone(launched)
+
+    def test_recorded_sandbox_without_srt_on_path_refuses_before_launching(self) -> None:
+        token, run_dir = self._ready_run()
+        self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=self.repo.parent / "tmp")
+        code, _out, err, launched = self._review(token, sandbox_runtime=False, srt_on_path=False)
+        self.assertEqual(code, 2, err)
+        self.assertIn(sandbox_mod.SRT_MISSING, err)
+        self.assertNotIn("Traceback", err)
         self.assertIsNone(launched)
 
 

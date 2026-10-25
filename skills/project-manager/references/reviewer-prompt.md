@@ -43,7 +43,7 @@ Frozen contract the change must satisfy:
 {risk_flags}
 
 [sandboxed]
-Sandbox: this review runs inside an OS sandbox the operator configured. Writes outside the repository and `$TMPDIR` fail with "Operation not permitted", and the repository itself may be unwritable too; the network reaches only the hosts the operator listed; `git push`, `git stash`, `git tag`, `git worktree`, `git gc` and other branches are unavailable. A denied operation is a boundary, not a bug to work around: say what it kept you from checking and continue the review with what you can read.
+Sandbox: this review runs inside an OS sandbox the operator configured. Writes outside the repository, `$TMPDIR` and the paths the operator granted fail with "Operation not permitted", and the repository itself may be unwritable too; the network reaches only the hosts the operator listed, so `git push` fails; the repository's git config and hooks are not writable. In a linked worktree (a campaign node), `git stash`, `git tag`, `git worktree`, `git gc` and git operations on other branches are denied too. You can still read the pinned diff, the repository and every branch. A denied operation is a boundary, not a bug to work around: say what it kept you from checking and continue the review with what you can read.
 [/sandboxed]
 
 Rules:
