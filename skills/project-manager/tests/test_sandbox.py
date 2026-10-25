@@ -2,9 +2,10 @@
 the server-scoped `sessions` helpers they rest on.
 
 Policy loading, derivation, the binaries check, the record, the temp dir and
-`wrap_command` run without `srt`, and so do the start deadline and the
-teardown's record checks, against a fake `srt` (and a fake `tmux` where the
-probe itself is under test). The `sessions` helpers run with tmux alone.
+`wrap_command` run without `srt`, and so do the start's process shape and
+deadline and the teardown's record checks, against a fake `srt` (and a fake
+`tmux` where the probe itself is under test), and the bound on
+`verify_server`'s probes. The `sessions` helpers run with tmux alone.
 Everything that starts a real sandboxed server is gated on `srt`, `tmux` and
 macOS (`requires_srt`), and each such test drives a `<TEST_TMUX_SOCKET>-sb*`
 socket of its own, never the suite's shared server.
@@ -82,6 +83,12 @@ def _case_variant(test: unittest.TestCase, path: Path | str) -> str:
 
 # A NUL, a control character and a lone surrogate, each inside a path.
 _BAD_PATHS = ("/tmp/a\x00b", "/tmp/a\x1bb", "/tmp/a\ud800b")
+
+# (section, key) of every list `srt` reads from a policy.
+_POLICY_LISTS = (
+    *(("network", key) for key in ("allowedDomains", "deniedDomains", "allowUnixSockets")),
+    *(("filesystem", key) for key in ("denyRead", "allowRead", "allowWrite", "denyWrite")),
+)
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -217,12 +224,29 @@ class TestLoadBasePolicy(TempDirTestCase):
                     sandbox.load_base_policy(self.tmp / name)
                 self.assertIn("unreadable", str(ctx.exception))
 
-    def test_a_non_list_allow_unix_sockets_is_refused(self) -> None:
-        for value in (None, "/var/run/x.sock", {"path": "/var/run/x.sock"}):
-            with self.subTest(value=value):
-                policy = minimal_base_policy()
-                policy["network"]["allowUnixSockets"] = value
-                self.assertRefused(self._write(policy), "network.allowUnixSockets is not a list")
+    def test_a_non_list_policy_list_is_refused(self) -> None:
+        for section, key in _POLICY_LISTS:
+            for value in (None, "/var/run/x.sock", {"path": "/var/run/x.sock"}):
+                with self.subTest(key=key, value=value):
+                    policy = minimal_base_policy()
+                    policy[section][key] = value
+                    self.assertRefused(self._write(policy), f"{section}.{key} is not a list")
+
+    def test_a_case_variant_of_a_socket_directory_not_yet_created_is_refused(self) -> None:
+        # On a fresh host the directory appears only when start_server's
+        # host probe runs, after the base policy was loaded; srt then
+        # enforces the variant as the directory, so it is refused before.
+        for directory, variant in (("tmux-absent", "TMUX-Absent"), ("tmux-\u00e9", "TMUX-E\u0301")):
+            with self.subTest(directory=directory):
+                absent = self.tmp / directory
+                with mock.patch.object(
+                    sandbox.sessions, "socket_path", side_effect=lambda name, parent=absent: parent / name
+                ):
+                    self.assertRefused(
+                        self._write(self._policy_with_write(str(self.tmp / variant))), "the tmux socket directory"
+                    )
+                    self.assertFalse(absent.exists())
+                    sandbox.load_base_policy(self._write(self._policy_with_write(str(self.tmp / "tmux-other"))))
 
     def test_weaker_network_isolation_and_local_binding_each_warn(self) -> None:
         policy = minimal_base_policy()
@@ -438,27 +462,37 @@ class TestDerivePolicy(DerivationTestCase):
                     )
 
     def test_a_malformed_base_raises_pm_error_from_every_derivation(self) -> None:
-        bases = []
-        for value in (None, "/var/run/x.sock", {"path": "/var/run/x.sock"}):
+        derivations = {
+            "server": self.derive,
+            "reviewer": lambda base: sandbox.derive_reviewer_policy(
+                base, worktree=self.worktree, tmpdir=self.tmpdir, control_root=self.control_root
+            ),
+            "attach": lambda base: sandbox.derive_attach_policy(
+                base, socket=self.socket, control_root=self.control_root
+            ),
+        }
+        # (base, the fragment its PmError names, the derivations it reaches).
+        cases = []
+        for section, key in _POLICY_LISTS:
+            for value in (None, "/var/run/x.sock", {"path": "/var/run/x.sock"}):
+                base = minimal_base_policy()
+                base[section][key] = value
+                cases.append((base, f"{section}.{key} is not a list", tuple(derivations)))
+        for section in ("network", "filesystem"):
             base = minimal_base_policy()
-            base["network"]["allowUnixSockets"] = value
-            bases.append(base)
+            base[section] = ["not", "an", "object"]
+            cases.append((base, f"{section} is not an object", tuple(derivations)))
         for text in _BAD_PATHS:
             base = minimal_base_policy()
             base["filesystem"]["allowWrite"] = [text]
-            bases.append(base)
-        for base in bases:
-            with self.subTest(base=base):
-                with self.assertRaises(PmError):
-                    self.derive(base)
-                with self.assertRaises(PmError):
-                    sandbox.derive_reviewer_policy(
-                        base, worktree=self.worktree, tmpdir=self.tmpdir, control_root=self.control_root
-                    )
-                if base["filesystem"]["allowWrite"]:
-                    continue  # the attach policy carries no write grant
-                with self.assertRaises(PmError):
-                    sandbox.derive_attach_policy(base, socket=self.socket, control_root=self.control_root)
+            # The attach policy carries no write grant, so it never reads them.
+            cases.append((base, "lone-surrogate character", ("server", "reviewer")))
+        for base, fragment, names in cases:
+            for name in names:
+                with self.subTest(base=base, derivation=name):
+                    with self.assertRaises(PmError) as ctx:
+                        derivations[name](base)
+                    self.assertIn(fragment, str(ctx.exception))
 
 
 class TestDeriveReviewerAndAttachPolicies(DerivationTestCase):
@@ -770,10 +804,10 @@ def _wait_gone(pid: int, timeout: float = 5.0) -> bool:
     return False
 
 
-class TestStartServerDeadline(TempDirTestCase):
-    """`start_server` against a fake `srt` (a process group holding one
-    long-lived child) and, where the probe itself is under test, a fake
-    `tmux`, both first on PATH."""
+class TestStartServerWithFakes(TempDirTestCase):
+    """`start_server`'s process shape and its deadline, against a fake `srt`
+    (a process group holding one long-lived child) and, where the probe
+    itself is under test, a fake `tmux`, both first on PATH."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -862,6 +896,54 @@ class TestStartServerDeadline(TempDirTestCase):
             self.assertIn("the server did not answer within 1 s", self.start())
         self.assertTrue(all(timeout is not None and timeout <= 10.0 for timeout in calls[1:]), calls)
 
+    def test_a_server_that_answers_starts_in_its_own_session_without_the_token(self) -> None:
+        self.fake_tmux("echo 5151; exit 0")
+        worktree = self.tmp / "wt"
+        worktree.mkdir()
+        self.log.write_text("earlier run\n", encoding="utf-8")
+        real_popen = subprocess.Popen
+        srt_calls: list[tuple[list[str], dict, str | None, subprocess.Popen]] = []
+
+        def spy(argv, *args, **kwargs):
+            process = real_popen(argv, *args, **kwargs)
+            if argv[0] == "srt":
+                srt_calls.append((argv, kwargs, os.environ.get("PM_RUN_TOKEN"), process))
+                self.addCleanup(sandbox._STARTED.pop, process.pid, None)
+                self.addCleanup(sandbox._kill_group, process)
+            return process
+
+        # The class's 1 s deadline is for the failure tests; a first exec of
+        # the fresh fake scripts can take longer than that on a loaded host.
+        with (
+            mock.patch.object(sandbox, "START_DEADLINE_SECONDS", 10.0),
+            mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "tok-1"}),
+            mock.patch.object(sandbox.subprocess, "Popen", side_effect=spy),
+        ):
+            srt_pid, server_pid = sandbox.start_server(
+                socket="pm-run-x",
+                policy_path=self.tmp / "p.json",
+                worktree=worktree,
+                tmpdir=self.tmp,
+                log_path=self.log,
+            )
+
+        self.assertEqual(len(srt_calls), 1)
+        argv, kwargs, token_during_call, process = srt_calls[0]
+        self.assertEqual(argv[:4], ["srt", "-s", str(self.tmp / "p.json"), "env"])
+        self.assertEqual(argv[-4:], ["tmux", "-L", "pm-run-x", "-D"])
+        self.assertEqual(kwargs["cwd"], str(worktree))
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], kwargs["stderr"])
+        self.assertEqual(kwargs["stdout"].name, str(self.log))
+        self.assertEqual(kwargs["stdout"].mode, "ab")
+        self.assertIs(kwargs["start_new_session"], True)
+        self.assertEqual(token_during_call, "tok-1")
+        self.assertNotIn("PM_RUN_TOKEN", kwargs["env"])
+        self.assertEqual(kwargs["env"]["PATH"], os.environ["PATH"])
+        self.assertTrue(self.log.read_text(encoding="utf-8").startswith("earlier run\n"))
+        self.assertEqual((srt_pid, server_pid), (process.pid, 5151))
+        self.assertIs(sandbox._STARTED[srt_pid], process)
+
 
 # Marks a field `TestStopServerRecord.record` leaves out.
 _ABSENT = object()
@@ -906,14 +988,22 @@ class TestStopServerRecord(TempDirTestCase):
         self.assertIn(f"removed sandbox temp dir {self.tmpdir}", notes)
 
     def test_a_missing_or_malformed_field_is_refused_before_anything_is_stopped(self) -> None:
+        linked = self.tmp / "pm-sandbox-linked"
+        linked.symlink_to(self.tmpdir)
+        regular = self.tmp / "pm-sandbox-file"
+        regular.write_text("x", encoding="utf-8")
         cases = (
-            (self.record(srt_pid=_ABSENT), "srt_pid"),
-            (self.record(srt_pid="123"), "srt_pid"),
-            (self.record(srt_pid=True), "srt_pid"),
-            (self.record(srt_pid=-1), "srt_pid"),
+            (self.record(srt_pid=_ABSENT), "srt_pid is missing"),
+            (self.record(srt_pid="123"), "srt_pid is not a pid"),
+            (self.record(srt_pid=True), "srt_pid is not a pid"),
+            (self.record(srt_pid=-1), "srt_pid is not a pid"),
+            (self.record(srt_pid=2**31), "srt_pid is not a pid"),
+            (self.record(srt_pid=2**100), "srt_pid is not a pid"),
             (self.record(tmpdir=_ABSENT), "tmpdir is missing"),
             (self.record(tmpdir=7), "tmpdir is not a path"),
             (self.record(tmpdir=str(self.tmp / "elsewhere")), "refusing to remove"),
+            (self.record(tmpdir=str(linked)), f"refusing to remove {linked}: not a directory"),
+            (self.record(tmpdir=str(regular)), f"refusing to remove {regular}: not a directory"),
             (self.record(control="pm-sandbox/pm-run-x"), "refusing to remove sandbox control dir"),
             (self.record(control=str(self.tmp / "pm-sandbox" / "other")), "refusing to remove sandbox control dir"),
             (self.record(control=str(self.tmp / "elsewhere" / "pm-run-x")), "refusing to remove sandbox control dir"),
@@ -924,13 +1014,40 @@ class TestStopServerRecord(TempDirTestCase):
         )
         for record, fragment in cases:
             with self.subTest(record=record):
-                with mock.patch.object(sandbox.sessions, "kill_server") as kill:
+                with (
+                    mock.patch.object(sandbox.sessions, "kill_server") as kill,
+                    mock.patch.object(sandbox, "_pid_alive") as alive,
+                    mock.patch.object(sandbox.shutil, "rmtree") as rmtree,
+                ):
                     with self.assertRaises(PmError) as ctx:
                         sandbox.stop_server(socket=self.socket, record=record)
                 self.assertIn(fragment, str(ctx.exception))
-                kill.assert_not_called()
+                for double in (kill, alive, rmtree):
+                    double.assert_not_called()
                 self.assertTrue(self.tmpdir.is_dir())
                 self.assertTrue(self.control.is_dir())
+                self.assertTrue(linked.is_symlink())
+                self.assertTrue(regular.is_file())
+
+    def test_a_control_path_that_is_not_a_directory_is_noted_as_refused_not_gone(self) -> None:
+        target = self.tmp / "target"
+        target.mkdir()
+        shutil.rmtree(self.control)
+        for make in (lambda: self.control.symlink_to(target), lambda: self.control.write_text("x", encoding="utf-8")):
+            with self.subTest(make=make):
+                if not os.path.lexists(self.tmpdir):
+                    self.tmpdir.mkdir()
+                make()
+                with mock.patch.object(sandbox.sessions, "kill_server", return_value=[]):
+                    _remaining, notes = sandbox.stop_server(socket=self.socket, record=self.record())
+                self.assertIn(
+                    f"refused to remove sandbox control dir {self.control}: not a directory; it was left in place",
+                    notes,
+                )
+                self.assertFalse(any("already gone" in note and str(self.control) in note for note in notes), notes)
+                self.assertTrue(os.path.lexists(self.control))
+                self.assertTrue(target.is_dir())
+                self.control.unlink()
 
 
 class TestVerifyServerNegativeProbeCleanup(unittest.TestCase):
@@ -946,6 +1063,47 @@ class TestVerifyServerNegativeProbeCleanup(unittest.TestCase):
         self.assertIn("negative probe failed", message)
         self.assertIn("killing the server failed too: could not kill: boom", message)
         self.assertNotIn("the server was killed", message)
+
+
+class TestVerifyServerProbeTimeouts(TempDirTestCase):
+    socket = f"{TEST_TMUX_SOCKET}-sb-verify-timeouts"
+
+    def test_both_probes_are_bounded(self) -> None:
+        calls: list[tuple[str, float | None]] = []
+
+        def run_shell(socket: str, command: str, timeout: float | None = None) -> tuple[int, str]:
+            calls.append((command, timeout))
+            if len(calls) == 1:
+                return 1, "touch: Operation not permitted"  # the negative probe, refused as it must be
+            (self.tmp / ".pm" / "sandbox-probe").touch()
+            return 0, ""
+
+        with (
+            mock.patch.object(sandbox.sessions, "server_environment", return_value="1"),
+            mock.patch.object(sandbox.sessions, "run_shell", side_effect=run_shell),
+        ):
+            sandbox.verify_server(socket=self.socket, worktree=self.tmp)
+        self.assertEqual([timeout for _command, timeout in calls], [sandbox.PROBE_TIMEOUT_SECONDS] * 2, calls)
+        self.assertFalse((self.tmp / ".pm").exists())
+
+    def test_a_probe_that_does_not_return_fails_verification(self) -> None:
+        for wedged in (1, 2):
+            with self.subTest(wedged=wedged):
+                calls = itertools.count(1)
+
+                def run_shell(socket: str, command: str, timeout: float | None = None, wedged=wedged, calls=calls):
+                    if next(calls) == wedged:
+                        raise PmError(f"run-shell on tmux socket {socket!r} did not return within {timeout:g} s")
+                    return 1, ""
+
+                with (
+                    mock.patch.object(sandbox.sessions, "server_environment", return_value="1"),
+                    mock.patch.object(sandbox.sessions, "run_shell", side_effect=run_shell),
+                ):
+                    with self.assertRaises(PmError) as ctx:
+                        sandbox.verify_server(socket=self.socket, worktree=self.tmp)
+                self.assertIn("did not return within 10 s", str(ctx.exception))
+                self.assertFalse((self.tmp / ".pm").exists())
 
 
 class TestSocketNamesAtTheEntryPoints(TempDirTestCase):

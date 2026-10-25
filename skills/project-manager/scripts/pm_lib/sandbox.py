@@ -31,8 +31,9 @@ them.
 A grant is compared with a protected path by file identity (`st_dev`,
 `st_ino`), not by spelling: on a case-insensitive volume `/users/me` is
 `/Users/me`, and `srt` enforces it as such. A path that does not exist yet is
-judged by its deepest existing ancestor plus the components below it, as
-spelled.
+judged by its deepest existing ancestor plus the components below it, those
+compared case-folded and NFC-normalized: the directory may exist, under
+either spelling, by the time `srt` resolves the grant.
 
 The socket path is granted under its real directory: `srt` resolves a path
 only when it exists, the socket does not exist when `srt` starts, and
@@ -58,6 +59,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -75,8 +77,11 @@ PROBE_DIR_NAME = ".pm"
 PROBE_FILE_NAME = "sandbox-probe"
 
 START_DEADLINE_SECONDS = 10.0
-START_POLL_SECONDS = 0.1
+PROBE_TIMEOUT_SECONDS = 10.0
 SRT_EXIT_WAIT_SECONDS = 5.0
+POLL_SECONDS = 0.1
+# A C `pid_t` is a signed 32-bit integer on macOS (and Linux).
+_PID_MAX = 2**31 - 1
 
 # `srt` grants every sandbox `/tmp/claude` (its shared TMPDIR) without being
 # asked; a literal deny removes the grant, under both spellings because the
@@ -164,17 +169,25 @@ def _write_grant(entry: Any) -> tuple[str, Path]:
         raise ValueError(f"cannot be resolved ({exc})") from None
 
 
+def _fold(component: str) -> str:
+    """`component` case-folded and NFC-normalized, so spellings a
+    case-insensitive volume treats as one name compare equal."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", component).casefold())
+
+
 def _anchor(path: Path) -> tuple[tuple[int, int] | None, tuple[str, ...]]:
     """`path`'s identity: (`st_dev`, `st_ino`) of its deepest existing
-    ancestor (itself, when it exists) and the components below that, as
-    spelled. Two spellings of one file have the same identity."""
+    ancestor (itself, when it exists) and the components below that, folded
+    (see `_fold`). Two spellings of one file have the same identity; two
+    paths that do not exist yet compare equal whenever a case-insensitive
+    volume could make them one, which errs toward refusing."""
     for candidate in (path, *path.parents):
         try:
             status = os.stat(candidate)
         except OSError:
             continue
-        return (status.st_dev, status.st_ino), path.parts[len(candidate.parts) :]
-    return None, path.parts
+        return (status.st_dev, status.st_ino), tuple(_fold(part) for part in path.parts[len(candidate.parts) :])
+    return None, tuple(_fold(part) for part in path.parts)
 
 
 def _same(a: Path, b: Path) -> bool:
@@ -216,6 +229,36 @@ def _socket_dir() -> Path:
     return _real(sessions.socket_path("x").parent)
 
 
+# The lists `srt` reads from a policy's two sections; each must be a list when present.
+_POLICY_LISTS = (
+    ("network", ("allowedDomains", "deniedDomains", "allowUnixSockets")),
+    ("filesystem", ("denyRead", "allowRead", "allowWrite", "denyWrite")),
+)
+
+
+def _list_fault(policy: Any) -> str | None:
+    """Why `policy`, its `network` or `filesystem` section, or one of
+    `_POLICY_LISTS` has the wrong shape, or None; an absent section or list
+    passes (the derivations add it)."""
+    if not isinstance(policy, dict):
+        return "the policy is not an object"
+    for section_name, keys in _POLICY_LISTS:
+        section = policy.get(section_name, {})
+        if not isinstance(section, dict):
+            return f"{section_name} is not an object"
+        for key in keys:
+            if key in section and not isinstance(section[key], list):
+                return f"{section_name}.{key} is not a list"
+    return None
+
+
+def _check_lists(policy: Any) -> None:
+    """PmError naming the fault `_list_fault` finds in `policy`, if any."""
+    fault = _list_fault(policy)
+    if fault:
+        raise PmError(f"sandbox policy: {fault}")
+
+
 def _write_entries(policy: dict[str, Any]) -> list[Any]:
     filesystem = policy.get("filesystem")
     entries = filesystem.get("allowWrite", []) if isinstance(filesystem, dict) else []
@@ -234,7 +277,9 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     file, or a path that cannot name one; a top level that is not an object
     holding `network` and `filesystem` objects; `network.allowAllUnixSockets`,
     `allowAppleEvents` or `filesystem.disabled` set (each defeats the
-    boundary outright); a `network.allowUnixSockets` that is not a list; an
+    boundary outright); a network or filesystem list `srt` reads
+    (`allowedDomains`, `deniedDomains`, `allowUnixSockets`, `denyRead`,
+    `allowRead`, `allowWrite`, `denyWrite`) present but not a list; an
     `allowWrite` entry that is not a path entry, holds a NUL, control or
     lone-surrogate character, is relative, or is the same file as `/`, the
     home directory, `toolkit_root()` or the tmux socket directory, however
@@ -251,9 +296,11 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     def refuse(reason: str) -> PmError:
         return PmError(f"sandbox policy {label}: {reason}")
 
+    # ValueError covers a path no file can have: one with an embedded NUL,
+    # or one that cannot be encoded (UnicodeError is a ValueError).
     try:
         text = path.read_text(encoding="utf-8")
-    except (OSError, ValueError) as exc:  # ValueError, UnicodeError among them: a path no file can have
+    except (OSError, ValueError) as exc:
         raise refuse(f"unreadable ({exc})") from exc
     try:
         policy = json.loads(text)
@@ -272,19 +319,17 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
         raise refuse("allowAppleEvents is set: Apple Events let a sandboxed process drive applications on the host")
     if filesystem.get("disabled"):
         raise refuse("filesystem.disabled is set: it turns filesystem confinement off")
-    if "allowUnixSockets" in network and not isinstance(network["allowUnixSockets"], list):
-        raise refuse("network.allowUnixSockets is not a list")
+    fault = _list_fault(policy)
+    if fault:
+        raise refuse(fault)
 
-    entries = filesystem.get("allowWrite", [])
-    if not isinstance(entries, list):
-        raise refuse("filesystem.allowWrite is not a list")
     forbidden = (
         (Path("/"), "the filesystem root"),
         (_real(Path.home()), "the home directory"),
         (toolkit_root(), "the toolkit checkout"),
         (_socket_dir(), "the tmux socket directory"),
     )
-    for entry in entries:
+    for entry in filesystem.get("allowWrite", []):
         try:
             text_entry, _literal_entry = _entry_text(entry)
             if not _is_absolute_entry(text_entry):
@@ -348,27 +393,16 @@ def _refuse_repository_grants(base: dict[str, Any], worktree: Path, common: Path
 def _with_lists(base: dict[str, Any]) -> dict[str, Any]:
     """A deep copy of `base` whose `network.allowedDomains`,
     `network.deniedDomains` and four filesystem lists exist (`srt` requires
-    the first four); PmError when one of them, or a present
-    `network.allowUnixSockets`, is not a list."""
+    the first four); PmError from `_check_lists` first."""
+    _check_lists(base)
     policy = copy.deepcopy(base)
     network = policy.setdefault("network", {})
     filesystem = policy.setdefault("filesystem", {})
-    if not isinstance(network, dict) or not isinstance(filesystem, dict):
-        raise PmError("sandbox policy: network and filesystem must be objects")
-    _check_unix_sockets(network)
-    for section, keys in (
-        (network, ("allowedDomains", "deniedDomains")),
-        (filesystem, ("denyRead", "allowRead", "allowWrite", "denyWrite")),
-    ):
-        for key in keys:
-            if not isinstance(section.setdefault(key, []), list):
-                raise PmError(f"sandbox policy: {key} is not a list")
+    for key in ("allowedDomains", "deniedDomains"):
+        network.setdefault(key, [])
+    for key in ("denyRead", "allowRead", "allowWrite", "denyWrite"):
+        filesystem.setdefault(key, [])
     return policy
-
-
-def _check_unix_sockets(network: dict[str, Any]) -> None:
-    if "allowUnixSockets" in network and not isinstance(network["allowUnixSockets"], list):
-        raise PmError("sandbox policy: network.allowUnixSockets is not a list")
 
 
 def _repository_denies(worktree: Path, git_dir: Path, common: Path, control_root: Path) -> list[dict[str, Any]]:
@@ -488,23 +522,22 @@ def derive_attach_policy(base: dict[str, Any], *, socket: str, control_root: Pat
     added) and read lists, no write grant at all, and `base`'s `denyWrite`
     plus the control root and `srt`'s implicit grants. A pane can make an
     attached client run a command (`detach-client -E`); under this policy
-    that command can write nothing. `base` is not mutated."""
-    network = copy.deepcopy(base.get("network") or {})
-    if not isinstance(network, dict):
-        raise PmError("sandbox policy: network must be an object")
-    _check_unix_sockets(network)
+    that command can write nothing. `base` is not mutated; PmError from
+    `_check_lists`."""
+    _check_lists(base)
+    network = copy.deepcopy(base.get("network", {}))
     for key in ("allowedDomains", "deniedDomains"):
         network.setdefault(key, [])
     network.setdefault("allowUnixSockets", []).append(_socket_grant(socket))
-    filesystem = base.get("filesystem") or {}
-    deny_write = copy.deepcopy(filesystem.get("denyWrite") or [])
+    filesystem = base.get("filesystem", {})
+    deny_write = copy.deepcopy(filesystem.get("denyWrite", []))
     deny_write += [_literal(_real(control_root)), *(_literal(path) for path in _SHARED_TMP_DENIES)]
     deny_write += [_literal(path) for path in _IMPLICIT_GRANT_DENIES]
     return {
         "network": network,
         "filesystem": {
-            "denyRead": copy.deepcopy(filesystem.get("denyRead") or []),
-            "allowRead": copy.deepcopy(filesystem.get("allowRead") or []),
+            "denyRead": copy.deepcopy(filesystem.get("denyRead", [])),
+            "allowRead": copy.deepcopy(filesystem.get("allowRead", [])),
             "allowWrite": [],
             "denyWrite": deny_write,
         },
@@ -666,11 +699,15 @@ def make_tmpdir(socket: str) -> Path:
     return _real(path)
 
 
-def _check_tmpdir_location(path: Path) -> None:
+def _check_tmpdir(path: Path) -> None:
+    """PmError unless `path` is a `pm-sandbox-*` name directly under
+    `tempfile.gettempdir()` that is absent or a directory, not a symbolic link."""
     if not path.name.startswith(TMPDIR_PREFIX) or _real(path.parent) != _real(tempfile.gettempdir()):
         raise PmError(
             f"refusing to remove {path}: not a {TMPDIR_PREFIX}* directory directly under {tempfile.gettempdir()}"
         )
+    if os.path.lexists(path) and (path.is_symlink() or not path.is_dir()):
+        raise PmError(f"refusing to remove {path}: not a directory")
 
 
 def remove_tmpdir(path: Path | str) -> bool:
@@ -679,11 +716,9 @@ def remove_tmpdir(path: Path | str) -> bool:
     `pm-sandbox-` and its parent is `tempfile.gettempdir()`, or when it is
     not a directory."""
     path = Path(path)
-    _check_tmpdir_location(path)
+    _check_tmpdir(path)
     if not os.path.lexists(path):
         return False
-    if path.is_symlink() or not path.is_dir():
-        raise PmError(f"refusing to remove {path}: not a directory")
     try:
         shutil.rmtree(path)
     except OSError as exc:
@@ -695,6 +730,7 @@ def remove_tmpdir(path: Path | str) -> bool:
 
 
 def _server_pid(socket: str, timeout: float | None = None) -> int:
+    """The pid of the server on `socket`; PmError when tmux cannot say, or does not within `timeout` s."""
     argv = ["tmux", "-L", socket, "display-message", "-p", "#{pid}"]
     try:
         result = subprocess.run(argv, check=False, text=True, capture_output=True, timeout=timeout)
@@ -793,7 +829,7 @@ def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path
         try:
             answered = sessions.server_running(socket, timeout=remaining)
             if answered:
-                server_pid = _server_pid(socket, timeout=max(deadline - time.monotonic(), START_POLL_SECONDS))
+                server_pid = _server_pid(socket, timeout=max(deadline - time.monotonic(), POLL_SECONDS))
         except PmError as exc:
             # A probe bounded by the time left fails as the deadline passes.
             failure = f"{late} (last probe: {exc})" if time.monotonic() >= deadline else str(exc)
@@ -804,7 +840,7 @@ def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path
         if answered:
             _STARTED[process.pid] = process
             return process.pid, server_pid
-        time.sleep(START_POLL_SECONDS)
+        time.sleep(POLL_SECONDS)
     _kill_group(process)
     raise PmError(
         f"sandboxed tmux server on socket {socket!r} did not start: {failure}; {log_path} ends: {_log_tail(log_path)}"
@@ -826,7 +862,9 @@ def verify_server(*, socket: str, worktree: Path) -> None:
        that does not grant the worktree is caught here. The host creates
        `<worktree>/.pm` first when it is absent (and removes it again).
 
-    PmError at once for an invalid socket name.
+    Each probe must return within 10 s, or verification fails with
+    PmError, so a wedged server cannot hang it. PmError at once for an
+    invalid socket name.
     """
     _check_socket_name(socket)
     value = sessions.server_environment(socket, "SANDBOX_RUNTIME")
@@ -841,7 +879,7 @@ def verify_server(*, socket: str, worktree: Path) -> None:
         outside.unlink(missing_ok=True)
     except OSError as exc:
         raise PmError(f"could not clear the negative probe file {outside}: {exc}") from exc
-    returncode, output = sessions.run_shell(socket, f"touch {shlex.quote(str(outside))}")
+    returncode, output = sessions.run_shell(socket, f"touch {shlex.quote(str(outside))}", timeout=PROBE_TIMEOUT_SECONDS)
     if returncode == 0 or os.path.lexists(outside):
         cleanup: list[str] = []
         try:
@@ -865,7 +903,9 @@ def verify_server(*, socket: str, worktree: Path) -> None:
     try:
         probe_dir.mkdir(exist_ok=True)
         inside.unlink(missing_ok=True)
-        returncode, output = sessions.run_shell(socket, f"touch {shlex.quote(str(inside))}")
+        returncode, output = sessions.run_shell(
+            socket, f"touch {shlex.quote(str(inside))}", timeout=PROBE_TIMEOUT_SECONDS
+        )
         found = inside.is_file()
         inside.unlink(missing_ok=True)
     except OSError as exc:
@@ -904,7 +944,8 @@ def _pid_alive(pid: int) -> bool:
 
 def _teardown_targets(socket: str, record: dict[str, Any]) -> tuple[int | None, str, Path]:
     """(`srt` pid or None, temp dir, control dir) from `record`, each checked
-    so that `stop_server` refuses before it kills or removes anything."""
+    so that `stop_server` refuses before it kills or removes anything: the
+    pid fits a `pid_t`, and the temp dir passes `_check_tmpdir`."""
 
     def malformed(reason: str) -> PmError:
         return PmError(f"the sandbox record for socket {socket!r} is malformed: {reason}")
@@ -919,13 +960,15 @@ def _teardown_targets(socket: str, record: dict[str, Any]) -> tuple[int | None, 
 
     if not isinstance(record, dict):
         raise malformed("it is not an object")
-    srt_pid = record.get("srt_pid", "missing")
-    if not (srt_pid is None or (type(srt_pid) is int and srt_pid > 0)):
+    if "srt_pid" not in record:
+        raise malformed("srt_pid is missing")
+    srt_pid = record["srt_pid"]
+    if not (srt_pid is None or (type(srt_pid) is int and 0 < srt_pid <= _PID_MAX)):
         raise malformed(f"srt_pid is not a pid or null: {srt_pid!r}")
     tmpdir = path_field("tmpdir")
     if tmpdir is None:
         raise malformed("tmpdir is missing")
-    _check_tmpdir_location(Path(tmpdir))
+    _check_tmpdir(Path(tmpdir))
 
     control_text = path_field("control")
     if control_text is not None:
@@ -952,12 +995,14 @@ def stop_server(*, socket: str, record: dict[str, Any]) -> tuple[list[str], list
     directory removed. That directory is `record["control"]`, which must be
     an absolute `.../pm-sandbox/<socket>`; only a record without it falls
     back to deriving it from the record's worktree's common git dir.
-    `notes` holds one line per step's outcome, removals and already-gone
-    directories included, for the caller to print.
+    `notes` holds one line per step's outcome, removals, already-gone
+    directories and a control path refused as not a directory included, for
+    the caller to print.
 
     PmError, before anything is killed or removed, for an invalid socket
-    name or a missing or malformed `srt_pid`, `tmpdir`, `control` or (in the
-    fallback) `worktree`.
+    name or a missing or malformed `srt_pid` (one that does not fit a
+    `pid_t` included), `tmpdir` (an existing one that is a symbolic link or
+    not a directory included), `control` or (in the fallback) `worktree`.
     """
     _check_socket_name(socket)
     srt_pid, tmpdir, control = _teardown_targets(socket, record)
@@ -967,7 +1012,7 @@ def stop_server(*, socket: str, record: dict[str, Any]) -> tuple[list[str], list
     if srt_pid is not None:
         deadline = time.monotonic() + SRT_EXIT_WAIT_SECONDS
         while _pid_alive(srt_pid) and time.monotonic() < deadline:
-            time.sleep(START_POLL_SECONDS)
+            time.sleep(POLL_SECONDS)
         if _pid_alive(srt_pid):
             notes.append(f"srt still running: {srt_pid}")
 
@@ -976,12 +1021,14 @@ def stop_server(*, socket: str, record: dict[str, Any]) -> tuple[list[str], list
     else:
         notes.append(f"sandbox temp dir already gone: {tmpdir}")
 
-    if control.is_dir() and not control.is_symlink():
+    if not os.path.lexists(control):
+        notes.append(f"sandbox control dir already gone: {control}")
+    elif control.is_symlink() or not control.is_dir():
+        notes.append(f"refused to remove sandbox control dir {control}: not a directory; it was left in place")
+    else:
         try:
             shutil.rmtree(control)
         except OSError as exc:
             raise PmError(f"could not remove sandbox control dir {control}: {exc}") from exc
         notes.append(f"removed sandbox control dir {control}")
-    else:
-        notes.append(f"sandbox control dir already gone: {control}")
     return remaining, notes
