@@ -1010,7 +1010,7 @@ def _run_launch_child(args: argparse.Namespace) -> int:
         sandbox=Path(args.sandbox).expanduser() if args.sandbox else None,
     )
     for warning in outcome.sandbox_warnings:
-        print(f"note: {warning}")
+        print(f"WARNING: {warning}")
     print(
         f"child launched: session={outcome.session} socket={outcome.socket} "
         f"worktree={outcome.worktree} launcher={outcome.launcher}"

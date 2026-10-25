@@ -243,6 +243,23 @@ class TestBriefSandboxPin(unittest.TestCase):
                 sandbox.brief_sandbox_pin(f"## Sandbox\n{section}\n")
             self.assertIn(fragment, str(raised.exception))
 
+    def test_none_is_no_pin_only_as_the_whole_section(self) -> None:
+        for section in ("- none", "none", "* NONE", "  1. None  ", "\n\n+ none\n\n"):
+            with self.subTest(section=section):
+                self.assertIsNone(sandbox.brief_sandbox_pin(f"## Sandbox\n{section}\n## Budgets\n"))
+        # `none` among other words is neither reading; the error says which failed.
+        for section in ("- none of the drafted policies is final", "- none\n- maybe a policy later", "- none."):
+            with self.subTest(section=section), self.assertRaises(PmError) as raised:
+                sandbox.brief_sandbox_pin(f"## Sandbox\n{section}\n")
+            message = str(raised.exception)
+            self.assertIn("names neither sandbox.json nor none", message)
+            self.assertIn("read as a pin, it does not name sandbox.json", message)
+            self.assertIn("read as no pin, it holds more than `none` alone", message)
+        # A section naming sandbox.json is read as a pin, `none` beside it or not.
+        with self.assertRaises(PmError) as raised:
+            sandbox.brief_sandbox_pin("## Sandbox\n- none (`sandbox.json` not used yet)\n")
+        self.assertIn("without its pin: read as a pin, it carries no SHA-256", str(raised.exception))
+
     def test_find_brief_walks_up_to_the_nearest_brief(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -356,6 +373,18 @@ class TestPreflightSandbox(PreflightTestCase):
         code, out = self.run_preflight()
         self.assertEqual(code, 1, out)
         self.assert_failed_with_instruction(out, "sandbox.json is a valid sandbox policy", "allowAppleEvents")
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a file whatever its mode")
+    def test_an_unreadable_pinned_policy_fails_with_an_instruction_not_a_traceback(self) -> None:
+        self.pin_sandbox(policy=self.policy)
+        policy_file = self.dossier / "sandbox.json"
+        policy_file.chmod(0)
+        self.addCleanup(policy_file.chmod, 0o644)
+        code, out = self.run_preflight()
+        self.assertEqual(code, 1, out)
+        self.assert_failed_with_instruction(out, "sandbox.json is readable", f"chmod u+r {policy_file.resolve()}")
+        self.assertNotIn("sandbox.json matches its pin", out)
+        self.assertNotIn("sandbox.json is a valid sandbox policy", out)
 
     def test_srt_absent_fails_when_a_policy_is_pinned(self) -> None:
         self.pin_sandbox(policy=self.policy)

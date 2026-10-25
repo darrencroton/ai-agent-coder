@@ -104,7 +104,8 @@ _BAD_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 # which imports this module.
 _SANDBOX_SECTION = re.compile(r"^##\s+Sandbox\s*$(.*?)(?=^##\s|\Z)", re.M | re.S | re.I)
 _PIN_SHA256 = re.compile(r"SHA-256 `([0-9a-f]{64})`")
-_NONE_WORD = re.compile(r"\bnone\b", re.I)
+# `none` as the whole section, give or take one list marker, whitespace and case.
+_NONE_ONLY = re.compile(r"\s*(?:(?:[-*+]|\d+[.)])\s+)?none\s*", re.I)
 
 # `srt` processes this process started, by pid. The server outlives
 # `start_server`, so its `Popen` is kept here rather than dropped while still
@@ -1065,12 +1066,13 @@ def find_brief(path: Path | str) -> Path | None:
 def brief_sandbox_pin(text: str) -> str | None:
     """The SHA-256 a brief's `## Sandbox` section pins for the dossier's
     `sandbox.json`, or None when the brief has no such section or the
-    section says `none`.
+    section is `none` alone.
 
-    A section that mentions `sandbox.json` is a pin and must carry
-    SHA-256 `<64 hex digits>`; one that names neither `sandbox.json` nor
-    `none` is malformed. Both raise PmError, so a pin the owner meant to
-    write is never read as no pin.
+    A section that mentions `sandbox.json` is read as a pin and must carry
+    SHA-256 `<64 hex digits>`; any other section is read as no pin and must
+    hold nothing but `none` (one list marker, whitespace and case aside).
+    Each failed reading raises PmError saying which reading failed, so a pin
+    the owner meant to write is never read as no pin.
     """
     match = _SANDBOX_SECTION.search(text)
     if match is None:
@@ -1080,10 +1082,14 @@ def brief_sandbox_pin(text: str) -> str | None:
         pin = _PIN_SHA256.search(section)
         if pin is None:
             raise PmError(
-                f"the brief's ## Sandbox section names {DOSSIER_POLICY_NAME} without its pin; write SHA-256"
-                " `<64 lowercase hex digits>` beside it"
+                f"the brief's ## Sandbox section names {DOSSIER_POLICY_NAME} without its pin: read as a pin, it"
+                " carries no SHA-256 `<64 lowercase hex digits>`; write the pin beside it"
             )
         return pin.group(1)
-    if _NONE_WORD.search(section):
+    if _NONE_ONLY.fullmatch(section):
         return None
-    raise PmError(f"the brief's ## Sandbox section names neither {DOSSIER_POLICY_NAME} nor none")
+    raise PmError(
+        f"the brief's ## Sandbox section names neither {DOSSIER_POLICY_NAME} nor none: read as a pin, it does not"
+        f" name {DOSSIER_POLICY_NAME}, and read as no pin, it holds more than `none` alone; write a pinned"
+        f" {DOSSIER_POLICY_NAME}, or `- none` as the whole section"
+    )

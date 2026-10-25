@@ -24,6 +24,7 @@ torn down in cleanup through `sandbox.stop_server` when a record exists.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -1061,6 +1062,20 @@ class SandboxLaunchTestCase(CampaignTestCase):
     def sandbox_tmpdir(self, socket: str) -> Path:
         return Path(os.path.realpath(tempfile.gettempdir())) / f"{sandbox.TMPDIR_PREFIX}{socket}"
 
+    def without_srt(self) -> contextlib.ExitStack:
+        """Patches under which a sandboxed launch passes the `srt` and macOS
+        preconditions on any host, for tests that stop before a server starts."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(campaign.sandbox_mod, "check_binaries"))
+        stack.enter_context(mock.patch.object(campaign.sandbox_mod, "srt_version", return_value="0.0.81-test"))
+        stack.enter_context(mock.patch.object(campaign.platform, "system", return_value="Darwin"))
+        return stack
+
+    def clean_sandbox_dirs(self, socket: str) -> None:
+        """Remove `socket`'s temp dir and the control root once the test ends."""
+        self.addCleanup(shutil.rmtree, self.sandbox_tmpdir(socket), True)
+        self.addCleanup(shutil.rmtree, sandbox.control_root(Path(os.path.realpath(self.repo / ".git"))), True)
+
 
 class TestSandboxLaunchRefusals(SandboxLaunchTestCase):
     """Each refusal exits 2 before any branch, worktree, control directory
@@ -1104,10 +1119,12 @@ class TestSandboxLaunchRefusals(SandboxLaunchTestCase):
         self.assert_refused(self.launch_argv(self.harness) + ["--sandbox", str(other_path)], f"pins `{pin}`", other_sha)
 
     def test_a_sandbox_section_naming_neither_a_policy_nor_none_is_refused(self) -> None:
-        self.write_brief("- to be decided")
-        self.assert_refused(self.launch_argv(self.harness), "names neither sandbox.json nor none")
+        brief = self.write_brief("- to be decided")
+        self.assert_refused(
+            self.launch_argv(self.harness), "names neither sandbox.json nor none", f"(in {brief.resolve()})"
+        )
         self.write_brief("- `sandbox.json` in this dossier, unpinned.")
-        self.assert_refused(self.launch_argv(self.harness), "without its pin")
+        self.assert_refused(self.launch_argv(self.harness), "without its pin", f"(in {brief.resolve()})")
 
     @unittest.skipUnless(_HAS_TMUX, "the tmux precondition is checked first")
     def test_srt_absent_from_path_is_refused_before_anything_is_created(self) -> None:
@@ -1196,6 +1213,261 @@ class TestStopChildSandboxRecord(SandboxLaunchTestCase):
         self.assertTrue((decoy / "record.json").is_file())
         self.assertFalse((directory / "pane.txt").exists())
         self.assert_socket_untouched()
+
+
+@unittest.skipUnless(_HAS_TMUX, "the preconditions list the socket's server")
+class TestSandboxLaunchHostRefusals(SandboxLaunchTestCase):
+    """The host-state refusals of a sandboxed launch, and its control
+    directory acquisition, on any host (`srt` and macOS checks patched)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.clean_sandbox_dirs(CHILD_SOCKET)
+        self.argv = self.launch_argv(self.harness) + ["--sandbox", str(self.policy)]
+
+    def assert_refused_creating_nothing(self, *fragments: str) -> None:
+        branches, worktrees = self.branches(), self.worktrees()
+        with self.without_srt():
+            code, out, err = self.run_cli(self.argv)
+        self.assertEqual(code, 2, out + err)
+        for fragment in fragments:
+            self.assertIn(fragment, err)
+        self.assertEqual(self.branches(), branches)
+        self.assertEqual(self.worktrees(), worktrees)
+        self.assertFalse(self.worktree.exists())
+
+    def test_a_server_already_answering_on_the_socket_is_refused(self) -> None:
+        with mock.patch.object(campaign.sessions, "server_running", return_value=True):
+            self.assert_refused_creating_nothing(f"a tmux server already answers on socket {CHILD_SOCKET!r}")
+        self.assertFalse(sandbox.control_root(self.repo / ".git").exists())
+        self.assertFalse(self.sandbox_tmpdir(CHILD_SOCKET).exists())
+
+    def test_an_existing_control_dir_is_refused_and_left_intact(self) -> None:
+        control = self.control_dir(CHILD_SOCKET)
+        control.mkdir(parents=True)
+        (control / "record.json").write_text("another child's\n", encoding="utf-8")
+        self.assert_refused_creating_nothing(f"sandbox control dir already exists: {control}", "stop-child")
+        self.assertEqual((control / "record.json").read_text(encoding="utf-8"), "another child's\n")
+        self.assertFalse(self.sandbox_tmpdir(CHILD_SOCKET).exists())
+
+    def test_an_existing_temp_dir_is_refused_and_left_intact(self) -> None:
+        tmpdir = self.sandbox_tmpdir(CHILD_SOCKET)
+        tmpdir.mkdir()
+        (tmpdir / "keep").write_text("x\n", encoding="utf-8")
+        self.assert_refused_creating_nothing("sandbox temp dir already exists: ", tmpdir.name)
+        self.assertTrue((tmpdir / "keep").is_file())
+        self.assertFalse(self.control_dir(CHILD_SOCKET).exists())
+
+    def test_a_control_dir_created_by_a_rival_after_the_checks_is_never_removed(self) -> None:
+        control = self.control_dir(CHILD_SOCKET)
+
+        def rival_launch(launch: campaign._ChildLaunch) -> None:
+            # A rival on the same socket acquires the directory while this launch runs its setup.
+            control.mkdir(parents=True)
+            (control / "record.json").write_text("the rival's record\n", encoding="utf-8")
+            (control / "policy.json").write_text("{}\n", encoding="utf-8")
+
+        with self.without_srt(), mock.patch.object(campaign, "_run_worktree_setup", side_effect=rival_launch):
+            code, out, err = self.run_cli(self.argv)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"sandbox control dir already exists: {control}", err)
+        self.assertIn("it was left untouched", err)
+        self.assertIn("are left behind", err)
+        self.assertNotIn("removed sandbox", err)
+        self.assertEqual(sorted(path.name for path in control.iterdir()), ["policy.json", "record.json"])
+        self.assertEqual((control / "record.json").read_text(encoding="utf-8"), "the rival's record\n")
+        self.assertFalse(self.sandbox_tmpdir(CHILD_SOCKET).exists())
+        self.assertFalse(sessions.server_running(CHILD_SOCKET))
+
+    def test_an_interrupt_inside_start_server_kills_the_server_it_left_and_removes_the_dirs(self) -> None:
+        control = self.control_dir(CHILD_SOCKET)
+        tmpdir = self.sandbox_tmpdir(CHILD_SOCKET)
+
+        def interrupted_start(*, socket: str, **_kwargs) -> tuple[int, int]:
+            # srt has brought a server up, and the pid is never handed back.
+            started = _child_tmux(socket, "new-session", "-d", "-s", "srt-started", "sleep 120")
+            self.assertEqual(started.returncode, 0, started.stderr)
+            raise KeyboardInterrupt
+
+        with self.without_srt(), mock.patch.object(campaign.sandbox_mod, "start_server", side_effect=interrupted_start):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.run_cli(self.argv)
+        self.assertFalse(sessions.server_running(CHILD_SOCKET))
+        self.assertFalse(control.exists())
+        self.assertFalse(tmpdir.exists())
+        notes = "\n".join(getattr(raised.exception, "__notes__", []))
+        self.assertIn(f"the tmux server the interrupted start left on socket {CHILD_SOCKET} was killed", notes)
+        self.assertIn(f"removed sandbox temp dir {tmpdir}", notes)
+        self.assertIn(f"removed sandbox control dir {control}", notes)
+        self.assertIn("are left behind", notes)
+
+    def test_base_policy_warnings_print_as_warning_lines(self) -> None:
+        policy = minimal_base_policy()
+        policy["enableWeakerNetworkIsolation"] = True
+        write_base_policy(self.policy, policy)
+        with self.without_srt(), mock.patch.object(campaign, "_start_child_session"):
+            code, out, err = self.run_cli(self.argv)
+        self.assertEqual(code, 0, out + err)
+        warnings = [line for line in out.splitlines() if line.startswith("WARNING: ")]
+        self.assertEqual(len(warnings), 1, out)
+        self.assertIn("enableWeakerNetworkIsolation", warnings[0])
+        self.assertNotIn("note:", out)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to host the marked server")
+class TestStopChildSandboxTeardown(SandboxLaunchTestCase):
+    """stop-child's sandbox teardown outcomes on a marked plain server
+    standing in for a sandboxed one: every way the sandbox is left up exits
+    2 with its line printed."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.clean_sandbox_dirs(CHILD_SOCKET)
+        self.child = make_linked_worktree(self.repo, self.worktree, "node-1").resolve()
+        self.session = "campaign-node-1-000000"
+        self.control = self.control_dir(CHILD_SOCKET)
+        self.tmpdir = self.sandbox_tmpdir(CHILD_SOCKET)
+        self.control.mkdir(parents=True)
+        self.tmpdir.mkdir()
+        directory = campaign.campaign_dir(self.child)
+        directory.mkdir(parents=True)
+        manifest = {
+            "socket": CHILD_SOCKET,
+            "session": self.session,
+            "branch": "node-1",
+            "base": self.base_commit,
+            "worktree": str(self.child),
+            "launcher": str(directory / "launcher.md"),
+            "launched_at": "2026-10-25T00:00:00Z",
+            "sandbox": {"policy": "x", "policy_sha256": "0" * 64, "socket": CHILD_SOCKET, "control_dir": "/ignored"},
+        }
+        campaign.manifest_path(self.child).write_text(json.dumps(manifest), encoding="utf-8")
+        started = _child_tmux(CHILD_SOCKET, "new-session", "-d", "-s", self.session, "sleep 120")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        sessions.set_server_environment(CHILD_SOCKET, "PM_CHILD_WORKTREE", str(self.child))
+
+    def write_record(self) -> None:
+        sandbox.write_record(
+            self.control, worktree=str(self.child), socket=CHILD_SOCKET, tmpdir=str(self.tmpdir), srt_pid=None
+        )
+
+    def stop(self) -> tuple[int, str]:
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(self.child), "--reason", "test"])
+        self.assertEqual(err, "")
+        return code, out
+
+    def test_each_teardown_note_that_leaves_the_sandbox_up_exits_2(self) -> None:
+        self.write_record()
+        for note in (
+            "srt still running: 4242",
+            f"refused to remove sandbox control dir {self.control}: not a directory; it was left in place",
+        ):
+            with self.subTest(note=note):
+                notes = [note, f"removed sandbox temp dir {self.tmpdir}"]
+                with mock.patch.object(campaign.sandbox_mod, "stop_server", return_value=([], notes)) as stop:
+                    code, out = self.stop()
+                self.assertEqual(code, 2, out)
+                stop.assert_called_once()
+                self.assertIn(f"\n{note}\n", out)
+                self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+
+    def test_a_teardown_that_raises_exits_2_naming_the_failure(self) -> None:
+        self.write_record()
+        failure = PmError(f"could not remove sandbox control dir {self.control}: busy")
+        with mock.patch.object(campaign.sandbox_mod, "stop_server", side_effect=failure):
+            code, out = self.stop()
+        self.assertEqual(code, 2, out)
+        self.assertIn(f"sandbox: not torn down (could not remove sandbox control dir {self.control}: busy)\n", out)
+
+    def test_an_unconfirmed_kill_skips_the_teardown_and_exits_2(self) -> None:
+        self.write_record()
+        with (
+            mock.patch.object(campaign.sessions, "kill_server", return_value=[self.session]),
+            mock.patch.object(campaign.sandbox_mod, "stop_server") as stop,
+        ):
+            code, out = self.stop()
+        self.assertEqual(code, 2, out)
+        stop.assert_not_called()
+        self.assertIn(f"tmux server {CHILD_SOCKET} still has sessions: {self.session}", out)
+        self.assertIn("sandbox: not torn down (the server was not confirmed gone", out)
+        self.assertTrue((self.control / "record.json").is_file())
+        self.assertTrue(self.tmpdir.is_dir())
+
+    def test_a_control_dir_without_a_readable_record_is_stopped_and_left_for_removal_by_hand(self) -> None:
+        # A teardown that failed partway: the record is gone, the directory and the log are not.
+        (self.control / "srt.log").write_text("log\n", encoding="utf-8")
+        code, out = self.stop()
+        self.assertEqual(code, 2, out)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+        self.assertFalse(sessions.server_running(CHILD_SOCKET))
+        self.assertTrue((campaign.campaign_dir(self.child) / "pane.txt").is_file())
+        self.assertIn(f"sandbox control dir {self.control} left in place: sandbox record is missing", out)
+        self.assertIn(f"rm -rf {self.control}\n", out)
+        self.assertIn(f"sandbox temp dir {self.tmpdir} left in place", out)
+        self.assertIn(f"rm -rf {self.tmpdir}\n", out)
+        self.assertIn(f"sandbox: not torn down (no readable sandbox record in {self.control}", out)
+        self.assertTrue((self.control / "srt.log").is_file())
+        self.assertTrue(self.tmpdir.is_dir())
+        # A re-run is not blocked by it either.
+        code, out = self.stop()
+        self.assertEqual(code, 2, out)
+        self.assertIn(f"rm -rf {self.control}\n", out)
+
+    def test_a_record_less_control_dir_still_requires_the_server_mark(self) -> None:
+        sessions.set_server_environment(CHILD_SOCKET, "PM_CHILD_WORKTREE", str(self.repo.parent / "other-wt"))
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(self.child), "--reason", "test"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("was not launched for", err)
+        self.assertEqual(_child_tmux(CHILD_SOCKET, "has-session", "-t", self.session).returncode, 0)
+        self.assertTrue(self.control.is_dir())
+
+
+class TestStopChildSocketNamesTheSandboxRefuses(CampaignTestCase):
+    """A manifest without a sandbox block whose socket the sandbox's naming
+    rules refuse: never sandboxed, so stopped as an unsandboxed child."""
+
+    def test_an_unsandboxed_child_on_such_a_socket_is_stopped_and_a_sandboxed_one_refused(self) -> None:
+        socket = "pm-x\x01y"
+        with self.assertRaises(PmError):
+            sandbox.control_dir(self.repo / ".git", socket)
+        child = make_linked_worktree(self.repo, self.worktree, "node-1").resolve()
+        directory = campaign.campaign_dir(child)
+        directory.mkdir(parents=True)
+        manifest = {
+            "socket": socket,
+            "session": "campaign-node-1-000000",
+            "branch": "node-1",
+            "base": self.base_commit,
+            "worktree": str(child),
+            "launcher": str(directory / "launcher.md"),
+            "launched_at": "2026-10-25T00:00:00Z",
+        }
+        campaign.manifest_path(child).write_text(json.dumps(manifest), encoding="utf-8")
+        tmux = {
+            "list_sessions_on": mock.DEFAULT,
+            "server_environment": mock.DEFAULT,
+            "session_exists": mock.DEFAULT,
+            "capture_to": mock.DEFAULT,
+            "kill_server": mock.DEFAULT,
+        }
+        with mock.patch.multiple(campaign.sessions, **tmux) as fakes:
+            fakes["list_sessions_on"].return_value = [manifest["session"]]
+            fakes["server_environment"].return_value = str(child)
+            fakes["session_exists"].return_value = True
+            fakes["kill_server"].return_value = []
+            outcome = campaign.stop_child(child)
+            fakes["kill_server"].assert_called_once_with(socket)
+            self.assertTrue(outcome.server_gone)
+            self.assertTrue(outcome.sandbox_stopped)
+            self.assertEqual(outcome.sandbox_notes, [])
+
+            manifest["sandbox"] = {"policy": "x", "policy_sha256": "0" * 64, "socket": socket, "control_dir": "/x"}
+            campaign.manifest_path(child).write_text(json.dumps(manifest), encoding="utf-8")
+            fakes["kill_server"].reset_mock()
+            with self.assertRaises(PmError) as raised:
+                campaign.stop_child(child)
+            self.assertIn("invalid tmux socket name for a sandbox", str(raised.exception))
+            fakes["kill_server"].assert_not_called()
 
 
 _SANDBOX_SOCKET_NUMBERS = iter(range(1, 1000))

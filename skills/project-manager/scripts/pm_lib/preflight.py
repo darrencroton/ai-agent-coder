@@ -299,12 +299,24 @@ def campaign_preflight(
         else:
             sandbox_pinned = True
             policy_file = dossier / sandbox.DOSSIER_POLICY_NAME
-            if not policy_file.is_file():
+            read_error: str | None = None
+            try:
+                policy_sha256 = sha256_of(policy_file) if policy_file.is_file() else None
+            except OSError as exc:
+                policy_sha256, read_error = None, str(exc)
+            if read_error is not None:
+                fail(
+                    "sandbox.json is readable",
+                    f"it could not be read ({read_error}); make it readable to this user "
+                    f"(chmod u+r {policy_file}), then run campaign-preflight again",
+                )
+                integrity = False
+            elif policy_sha256 is None:
                 fail("sandbox.json is in the dossier", "the brief's Sandbox section pins it; commit it beside brief.md")
-            elif sha256_of(policy_file) != sandbox_pin:
+            elif policy_sha256 != sandbox_pin:
                 fail(
                     "sandbox.json matches its pin",
-                    f"its SHA-256 is {sha256_of(policy_file)}; a changed policy is a question to the owner",
+                    f"its SHA-256 is {policy_sha256}; a changed policy is a question to the owner",
                 )
                 integrity = False
             else:

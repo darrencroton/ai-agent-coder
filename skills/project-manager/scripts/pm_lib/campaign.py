@@ -309,8 +309,8 @@ def launch_child(
 ) -> LaunchChildOutcome:
     """Create the node branch and worktree, then launch a child PM in tmux.
 
-    Every precondition is checked before anything is created, the last
-    being that no tmux server on the chosen socket hosts a session. Then
+    Every precondition is checked before anything is created, among them
+    that no tmux server on the chosen socket hosts a session. Then
     `git worktree add -b <branch> <worktree> <base commit>`, `/HANDOFF.md` in
     the git exclude file the worktree reads (verified with `git
     check-ignore`), the self-ignoring `.pm/.gitignore`, `.pm/campaign/` and
@@ -341,8 +341,8 @@ def launch_child(
     and keeps any manifest written, so `stop-child` can be re-run against it.
     A sandboxed server is torn down instead (`sandbox.stop_server`: the
     server, its temp and its control directories) wherever a failure after
-    it started would kill it, and the directories alone are removed when the
-    failure came before it started.
+    it started would kill it; a failure before it started removes only the
+    directories this launch created (see `_start_child_session`).
     """
     launch = _check_launch_preconditions(
         repo=repo,
@@ -446,7 +446,7 @@ def _check_launch_preconditions(
         except (OSError, UnicodeDecodeError) as exc:
             raise PmError(f"the launcher's dossier brief could not be read: {brief} ({exc})") from exc
         except PmError as exc:
-            raise PmError(f"{exc}: {brief}") from exc
+            raise PmError(f"{exc} (in {brief})") from exc
     if pin is not None and sandbox is None:
         raise PmError(
             f"the launcher's dossier brief {brief} pins a sandbox policy, SHA-256 `{pin}`; launch with --sandbox "
@@ -457,10 +457,14 @@ def _check_launch_preconditions(
     sandbox_warnings: list[str] = []
     if sandbox is not None:
         sandbox = sandbox.expanduser()
-        try:
-            policy_sha256 = hashlib.sha256(sandbox.read_bytes()).hexdigest()
-        except OSError as exc:
-            raise PmError(f"sandbox policy could not be read: {sandbox} ({exc})") from exc
+
+        def policy_digest(path: Path) -> str:
+            try:
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise PmError(f"sandbox policy could not be read: {path} ({exc})") from exc
+
+        policy_sha256 = policy_digest(sandbox)
         if pin is not None and policy_sha256 != pin:
             raise PmError(
                 f"--sandbox {sandbox} has SHA-256 {policy_sha256}, but the launcher's dossier brief {brief} pins "
@@ -468,7 +472,7 @@ def _check_launch_preconditions(
             )
         base_policy, sandbox_warnings = sandbox_mod.load_base_policy(sandbox)
         # The policy the server will run under must be the one hashed (and pinned).
-        if hashlib.sha256(sandbox.read_bytes()).hexdigest() != policy_sha256:
+        if policy_digest(sandbox) != policy_sha256:
             raise PmError(f"sandbox policy {sandbox} changed while it was being read; launch again")
         sandbox = sandbox.resolve()
     # `is not None`, not truthiness: an explicit blank override is refused as
@@ -725,11 +729,17 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
     directories, the effective and attach policies written to the control
     directory, the server started under `srt` and verified, the record
     written; the session is then created through that server, so it can
-    exist nowhere else. From the directories' creation on, every failure
-    tears down what exists before it propagates: `sandbox.stop_server` once
-    the server has started (it is this launch's own, by `start_server`'s
-    refusal of a socket already answering), the two directories alone before
-    that, so a server some other process started is never killed here.
+    exist nowhere else. A control directory that appeared after the
+    preconditions checked for it belongs to a rival launch on the same
+    socket: the launch is refused and nothing of it is touched. Once this
+    launch has created the control directory it owns the socket (a rival
+    fails at its own creation), and from then on every failure tears down
+    what this launch created before it propagates: `sandbox.stop_server`
+    once the server has started (it is this launch's own, by
+    `start_server`'s refusal of a socket already answering); before that,
+    the directories it created and, when `start_server` was interrupted
+    before returning (it raises PmError only after killing what it
+    started), any server answering on the socket.
     """
     branch, worktree, session, socket = launch.branch, launch.worktree, launch.session, launch.socket
     directory = campaign_dir(worktree)
@@ -747,12 +757,18 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
         "launcher": str(launcher),
     }
     control = launch.control_dir
+    # What this launch created, and so may remove: the control directory
+    # once its `mkdir` succeeded, the temp dir once `make_tmpdir` returned.
+    control_created = False
     tmpdir: Path | None = None
+    # True while `start_server` may have started `srt` without returning its pid.
+    server_pending = False
     srt_pid: int | None = None
 
     def sandbox_teardown() -> str:
-        """Undo the sandbox's server and directories, as far as they exist;
-        return what happened, for the failure message. Never raises."""
+        """Undo the sandbox's server and directories, as far as this launch
+        created them; return what happened, for the failure message. Never
+        raises."""
         if control is None:
             return ""
         try:
@@ -762,9 +778,21 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
                 killed = "was killed" if remaining == [] else f"still lists sessions: {', '.join(remaining)}"
                 return f"; the sandboxed tmux server {socket} {killed}; {'; '.join(notes)}"
             notes = []
+            if server_pending:
+                # The socket is this launch's, so a server answering there is
+                # the one the interrupted `srt` started.
+                if sessions.server_running(socket, timeout=sandbox_mod.START_DEADLINE_SECONDS):
+                    remaining = sessions.kill_server(socket)
+                    killed = "was killed" if remaining == [] else f"still lists sessions: {', '.join(remaining)}"
+                    notes.append(f"the tmux server the interrupted start left on socket {socket} {killed}")
+                else:
+                    notes.append(
+                        f"no tmux server answered on socket {socket} after the interrupted start; check by hand that "
+                        f"no srt is still starting one (pgrep -f {shlex.quote(f'tmux -L {socket}')})"
+                    )
             if tmpdir is not None and sandbox_mod.remove_tmpdir(tmpdir):
                 notes.append(f"removed sandbox temp dir {tmpdir}")
-            if os.path.lexists(control):
+            if control_created and os.path.lexists(control):
                 shutil.rmtree(control)
                 notes.append(f"removed sandbox control dir {control}")
             return f"; {'; '.join(notes)}" if notes else ""
@@ -781,6 +809,17 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
         # later host-launched srt would read.
         try:
             control.mkdir(parents=True)
+        except FileExistsError:
+            raise PmError(
+                f"sandbox control dir already exists: {control}; another launch on socket {socket} created it after "
+                f"this launch's checks, and it was left untouched; {_left_behind(branch, worktree)}"
+            ) from None
+        except OSError as exc:
+            raise PmError(
+                f"child sandbox did not start (could not create {control}: {exc}); {_left_behind(branch, worktree)}"
+            ) from exc
+        control_created = True
+        try:
             tmpdir = sandbox_mod.make_tmpdir(socket)
             control_root = control.parent  # <common git dir>/pm-sandbox, which every policy denies
             policy = sandbox_mod.derive_policy(
@@ -799,13 +838,20 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
             policy_path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
             (control / _ATTACH_POLICY_FILE).write_text(json.dumps(attach, indent=2) + "\n", encoding="utf-8")
             started_at = state_mod.utc_now_iso()
-            srt_pid, server_pid = sandbox_mod.start_server(
-                socket=socket,
-                policy_path=policy_path,
-                worktree=worktree,
-                tmpdir=tmpdir,
-                log_path=control / _SRT_LOG_FILE,
-            )
+            server_pending = True
+            try:
+                srt_pid, server_pid = sandbox_mod.start_server(
+                    socket=socket,
+                    policy_path=policy_path,
+                    worktree=worktree,
+                    tmpdir=tmpdir,
+                    log_path=control / _SRT_LOG_FILE,
+                )
+            except PmError:
+                # `start_server` kills what it started before raising one.
+                server_pending = False
+                raise
+            server_pending = False
             sandbox_mod.verify_server(socket=socket, worktree=worktree)
             sandbox_mod.write_record(
                 control,
@@ -823,6 +869,8 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
         except BaseException as exc:
             teardown = sandbox_teardown()
             if not isinstance(exc, Exception):
+                # An interrupt propagates as itself, carrying what was torn down.
+                exc.add_note(f"child sandbox did not start{teardown}; {_left_behind(branch, worktree)}")
                 raise
             raise PmError(f"child sandbox did not start ({exc}){teardown}; {_left_behind(branch, worktree)}") from exc
 
@@ -835,9 +883,11 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
         except PmError as exc:
             teardown = sandbox_teardown()
             raise PmError(f"child session did not start ({exc}){teardown}; {_left_behind(branch, worktree)}") from exc
-        except BaseException:
+        except BaseException as exc:
             # An interrupt or an unexpected error still takes a sandbox down.
-            sandbox_teardown()
+            teardown = sandbox_teardown()
+            if teardown:
+                exc.add_note(f"child session did not start{teardown}; {_left_behind(branch, worktree)}")
             raise
         # The session is live from here. The server is marked as this child's
         # before anything else (stop-child kills only a server carrying the
@@ -870,6 +920,7 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
                 # A sandboxed server goes with its temp and control directories.
                 teardown = sandbox_teardown()
                 if not isinstance(exc, Exception):
+                    exc.add_note(f"child launch failed after its session started; {pane_note}{teardown}")
                     raise
                 raise PmError(
                     f"child launch failed after its session started ({exc}); {pane_note}{teardown}; "
@@ -1050,23 +1101,28 @@ class StopChildOutcome:
     # `server_gone` is False with `remaining` empty.
     kill_error: str | None = None
     # For a sandboxed child: one line per teardown step (`sandbox.stop_server`'s
-    # notes, or that both directories were already gone), and why the
-    # teardown did not run or failed, when it did not complete.
+    # notes, that both directories were already gone, or that they were left
+    # for removal by hand), and why the teardown did not run or failed, when
+    # it did not complete.
     sandbox_notes: list[str] = field(default_factory=list)
     sandbox_error: str | None = None
 
     @property
     def sandbox_stopped(self) -> bool:
-        """False when a sandbox teardown was skipped, failed, or left `srt` running."""
+        """False when a sandbox teardown was skipped, failed, left `srt`
+        running or refused to remove the control directory."""
         return self.sandbox_error is None and not any(
-            note.startswith("srt still running") for note in self.sandbox_notes
+            note.startswith(("srt still running", "refused to remove sandbox control dir"))
+            for note in self.sandbox_notes
         )
 
 
 def stop_child(worktree: Path) -> StopChildOutcome:
-    """Capture the child's full pane, report its recorded reviewers, and kill
-    its private tmux server. Safe to re-run: with the session already gone,
-    an existing `pane.txt` is kept rather than overwritten.
+    """Capture the child's full pane, report its recorded reviewers, kill its
+    private tmux server and tear down its sandbox, if it has one; a sandbox
+    left up makes `stop-child` exit non-zero. Safe to re-run: with the
+    session already gone, an existing `pane.txt` is kept rather than
+    overwritten.
 
     The manifest sits in the child's own worktree, so the server it names is
     checked rather than trusted, before anything is captured or killed.
@@ -1091,15 +1147,22 @@ def stop_child(worktree: Path) -> StopChildOutcome:
 
     A sandboxed child is one whose manifest has a `sandbox` block, or whose
     control directory exists. That directory is derived, never read from the
-    manifest: `<common git dir of the worktree>/pm-sandbox/<socket>`. The
-    record there is host-written (nothing inside the sandbox can write under
-    the control root), so one naming another worktree or socket, which is
-    what a manifest pointed at another child's socket meets, is refused
-    before anything is captured or killed. After a confirmed kill,
-    `sandbox.stop_server` waits for the recorded `srt` to exit and removes
-    the record's temp directory and the control directory; with the control
-    directory already gone, both are reported gone (a temp dir still at the
-    conventional path is left for a by-hand check: no record names it).
+    manifest: `<common git dir of the worktree>/pm-sandbox/<socket>`. A child
+    with no `sandbox` block whose socket name the sandbox refuses (a control
+    character, say) can never have been sandboxed, and is stopped as an
+    unsandboxed one. The record in the control directory is host-written
+    (nothing inside the sandbox can write under the control root), so one
+    naming another worktree or socket, which is what a manifest pointed at
+    another child's socket meets, is refused before anything is captured or
+    killed. After a confirmed kill, `sandbox.stop_server` waits for the
+    recorded `srt` to exit and removes the record's temp directory and the
+    control directory; with the control directory already gone, both are
+    reported gone (a temp dir still at the conventional path is left for a
+    by-hand check: no record names it). A control directory holding no
+    readable record (a teardown that failed partway leaves one) is checked
+    by the server mark alone, the server captured and killed as usual, and
+    the directory and any temp dir at the conventional path left in place,
+    each reported with the command that removes it by hand.
     """
     worktree = worktree.expanduser().resolve()
     manifest = load_manifest(worktree)
@@ -1112,9 +1175,18 @@ def stop_child(worktree: Path) -> StopChildOutcome:
         common_error = None
     except PmError as exc:
         common, common_error = None, str(exc)
-    control = sandbox_mod.control_dir(common, socket) if common is not None else None
+    control: Path | None = None
+    if common is not None:
+        try:
+            control = sandbox_mod.control_dir(common, socket)
+        except PmError:
+            # A socket name the sandbox refuses can never have been sandboxed.
+            if "sandbox" in manifest:
+                raise
     sandboxed = "sandbox" in manifest or (control is not None and os.path.lexists(control))
     record: dict[str, Any] | None = None
+    # Set when the control directory exists but holds no readable record.
+    record_error: str | None = None
     if sandboxed:
         if control is None:
             raise PmError(
@@ -1122,8 +1194,13 @@ def stop_child(worktree: Path) -> StopChildOutcome:
                 f"({common_error}); refusing to kill the server"
             )
         if os.path.lexists(control):
-            record = sandbox_mod.read_record(control)
-            if record.get("worktree") != str(worktree) or record.get("socket") != socket:
+            try:
+                record = sandbox_mod.read_record(control)
+            except PmError as exc:
+                # Nothing to check here, so the server mark below is the
+                # ownership proof, and nothing is removed.
+                record_error = str(exc)
+            if record is not None and (record.get("worktree") != str(worktree) or record.get("socket") != socket):
                 raise PmError(
                     f"the sandbox record in {control} names worktree {record.get('worktree')!r} on socket "
                     f"{record.get('socket')!r}, not {worktree} on {socket}; refusing to kill the server"
@@ -1165,6 +1242,8 @@ def stop_child(worktree: Path) -> StopChildOutcome:
     server_gone = kill_error is None and not remaining
     sandbox_notes: list[str] = []
     sandbox_error: str | None = None
+    # Where `sandbox.make_tmpdir` puts the temp dir, for when no record names it.
+    tmpdir = Path(os.path.realpath(tempfile.gettempdir())) / f"{sandbox_mod.TMPDIR_PREFIX}{socket}"
     if record is not None and control is not None:
         if not server_gone:
             sandbox_error = (
@@ -1178,10 +1257,19 @@ def stop_child(worktree: Path) -> StopChildOutcome:
                 )
             except PmError as exc:
                 sandbox_error = str(exc)
+    elif record_error is not None and control is not None:
+        sandbox_notes.append(
+            f"sandbox control dir {control} left in place: {record_error}; once no server runs on socket {socket}, "
+            f"remove it by hand: rm -rf {shlex.quote(str(control))}"
+        )
+        if os.path.lexists(tmpdir):
+            sandbox_notes.append(
+                f"sandbox temp dir {tmpdir} left in place: no record names it; once no child runs on socket "
+                f"{socket}, remove it by hand: rm -rf {shlex.quote(str(tmpdir))}"
+            )
+        sandbox_error = f"no readable sandbox record in {control}, so nothing of the sandbox was removed"
     elif sandboxed and control is not None:
-        # An earlier stop removed the control directory and its record; the
-        # temp dir is looked for where `sandbox.make_tmpdir` puts it.
-        tmpdir = Path(os.path.realpath(tempfile.gettempdir())) / f"{sandbox_mod.TMPDIR_PREFIX}{socket}"
+        # An earlier stop removed the control directory and its record.
         if os.path.lexists(tmpdir):
             sandbox_notes.append(
                 f"sandbox temp dir {tmpdir} remains, but no record names it; remove it by hand once no child runs "
