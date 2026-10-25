@@ -1796,6 +1796,11 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
         if sandbox_runtime:
             env["SANDBOX_RUNTIME"] = "1"
+        # A run that records a sandbox is driven on its socket, as the
+        # operator's `export PM_TMUX_SOCKET` from init leaves it.
+        recorded_socket = getattr(self, "_recorded_socket", None)
+        if recorded_socket is not None:
+            env["PM_TMUX_SOCKET"] = recorded_socket
         return env
 
     def _ready_run(self) -> tuple[str, Path]:
@@ -1823,6 +1828,7 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
             "control_dir": str(control),
         }
         state_mod.save_state(run_dir, state, token)
+        self._recorded_socket = socket
         return control
 
     def _review(self, token: str, *, sandbox_runtime: bool, extra: list[str] | None = None):
@@ -1867,6 +1873,23 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
 
 
 class TestReviewInsideSandbox(SandboxedReviewTestCase):
+    def test_recorded_sandbox_with_the_wrong_socket_refuses_and_launches_nothing(self) -> None:
+        token, run_dir = self._ready_run()
+        self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=self.repo.parent / "tmp")
+        before = (run_dir / "run.json").read_bytes()
+        environ = {**self._environ(sandbox_runtime=False), "PM_TMUX_SOCKET": "pm-run-another"}
+        argv = ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "codex", "--token", token]
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(review_mod.subprocess, "Popen", wraps=subprocess.Popen) as popen,
+        ):
+            code, _out, err = self.run_cli_in_repo(argv)
+        self.assertEqual(code, 2, err)
+        self.assertIn("export PM_TMUX_SOCKET=pm-run-x", err)
+        # A reviewer launch is the one Popen with its own session; git's are not.
+        self.assertEqual([call for call in popen.call_args_list if call.kwargs.get("start_new_session")], [])
+        self.assertEqual((run_dir / "run.json").read_bytes(), before)
+
     def test_inherited_sandbox_runs_the_sandboxed_variant_unwrapped(self) -> None:
         token, run_dir = self._ready_run()
         code, _out, err, launched = self._review(token, sandbox_runtime=True)

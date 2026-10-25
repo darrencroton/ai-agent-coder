@@ -1087,7 +1087,8 @@ def require_run_socket(state: dict[str, Any]) -> None:
     message gives the export line. Every tmux call of a run goes through
     `PM_TMUX_SOCKET`, so without this a sandboxed run's command could reach
     the operator's default, unsandboxed server. Nothing for an unsandboxed
-    run."""
+    run. A recorded `sandbox` block that is not an object naming a socket is
+    refused with PmError too: a malformed record fails closed."""
     block = state.get("sandbox")
     if not block:
         return
@@ -1228,8 +1229,13 @@ def teardown_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
     from what `init` created: the socket's server, if one answers, and the
     temp dir `make_tmpdir` names, so a repeated teardown reports both as
     gone rather than failing. The control root `<common git dir>/pm-sandbox`
-    is removed as well when nothing else is left in it. PmError from
-    `stop_server`, before it kills anything, for a malformed record.
+    is removed as well when nothing else is left in it.
+
+    PmError, before anything is killed or removed, for a malformed `sandbox`
+    block in run state or a control dir it names other than
+    `<common git dir>/pm-sandbox/<socket>` (`_run_sandbox`), for an
+    unreadable or malformed record (`read_record`), and for a record whose
+    pid, temp dir or control dir `stop_server` refuses.
     """
     if not state.get("sandbox"):
         return None

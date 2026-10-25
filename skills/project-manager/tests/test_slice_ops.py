@@ -1814,7 +1814,7 @@ class TestSandboxedLaunch(SliceOpsTestCase):
         if sandbox_runtime:
             environ["SANDBOX_RUNTIME"] = "1"
         if record_sandbox:
-            # A recorded sandbox needs its socket exported (Slice 4), and its
+            # A recorded sandbox needs its socket exported, and its
             # session starts through the server, which is stood in for here.
             environ["PM_TMUX_SOCKET"] = "pm-run-x"
         with (

@@ -618,7 +618,8 @@ def status(repo: Path, run_dir: Path, token: str | None = None) -> StatusResult:
     # commands, so a tampered state should surface here, not one command
     # later. Tokenless (human) reads stay unverified, as documented.
     state = state_mod.load_state(run_dir, token)
-    # A sandboxed run's session lives on its own server only.
+    # A sandboxed run's session lives on its own server only, so the socket
+    # refusal applies to tokenless (human) reads as well.
     sandbox.require_run_socket(state)
     plan_error: str | None = None
     slices: list[plan_mod.PlanSlice] | None = None
@@ -837,9 +838,10 @@ class StartSliceOutcome:
     reaped: list[str] = field(default_factory=list)
     message: str = ""
     notes_warning: str | None = None
-    # A sandboxed run: whether this launch started the server, and what the
+    # A sandboxed run: the socket of the server this launch started (None
+    # when it was already running or the run is unsandboxed), and what the
     # all-complete teardown did (None when no teardown ran).
-    server_started: bool = False
+    server_started_on: str | None = None
     sandbox_notes: list[str] | None = None
 
 
@@ -905,6 +907,19 @@ def start_slice(
     harness_command: str | None = None,
     risk: str | None = None,
 ) -> StartSliceOutcome:
+    """`start-slice`: launch (or relaunch) the next eligible slice's Developer.
+
+    On a sandboxed run it refuses first, through `sandbox.require_run_socket`,
+    unless `PM_TMUX_SOCKET` names the run's socket. Before anything of the
+    launch is written it ensures the run's sandboxed server
+    (`sandbox.ensure_run_server`: started and verified when absent, refused
+    when the server on the socket is not this run's), and then creates the
+    session through that server (`sessions.start_session_via_server`), never
+    with a bare `new-session`; the outcome's `server_started_on` names the
+    socket when this call started the server. An all-attested run is
+    completed here, and a sandboxed one torn down (`sandbox.teardown_run`),
+    its notes in `sandbox_notes`.
+    """
     state = load_writable_state(run_dir, token)
     sandbox.require_run_socket(state)
     run_id = state["run_id"]
@@ -1009,10 +1024,11 @@ def start_slice(
     # A sandboxed run's server comes up (or is proven to be this run's) before
     # anything of the launch is rotated, reaped or written.
     run_socket: str | None = None
-    server_started = False
+    server_started_on: str | None = None
     if state.get("sandbox"):
-        server_started = sandbox.ensure_run_server(state, repo=repo)
         run_socket = state["sandbox"]["socket"]
+        if sandbox.ensure_run_server(state, repo=repo):
+            server_started_on = run_socket
 
     artifact_dir = slice_artifact_dir(repo, run_id, plan_slice.slice_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1189,7 +1205,7 @@ def start_slice(
         session=session_name,
         reaped=reaped,
         notes_warning=notes_warning,
-        server_started=server_started,
+        server_started_on=server_started_on,
     )
 
 
@@ -1813,6 +1829,12 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     an elevated slice additionally requires both a drift-audit and a
     code-review entry recorded fresh against the current HEAD before
     acceptance is recorded.
+
+    On a sandboxed run it refuses first, through `sandbox.require_run_socket`,
+    unless `PM_TMUX_SOCKET` names the run's socket. The accept that completes
+    the run also tears the run's sandbox down (`sandbox.teardown_run`: the
+    server, its temp and control directories, a `sandbox-stopped` event) and
+    returns what that did in `sandbox_notes`.
     """
     stripped_reasoning = reasoning.strip()
     if len(stripped_reasoning) < _ACCEPT_REASONING_MIN_CHARS:
@@ -2263,6 +2285,14 @@ def stop(
     reason: str,
     slice_status: str | None = None,
 ) -> StopOutcome:
+    """`stop`: end the run, capturing the pane and killing its sessions.
+
+    On a sandboxed run it refuses first, through `sandbox.require_run_socket`,
+    unless `PM_TMUX_SOCKET` names the run's socket; once the stop is recorded
+    it tears the run's sandbox down (`sandbox.teardown_run`: the server, its
+    temp and control directories, a `sandbox-stopped` event) and returns
+    what that did in `sandbox_notes`.
+    """
     state = load_writable_state(run_dir, token)
     sandbox.require_run_socket(state)
     run_id = state["run_id"]

@@ -679,8 +679,8 @@ def _run_start_slice(args: argparse.Namespace) -> int:
         return 2
 
     verb = "relaunched" if outcome.kind == "relaunched" else "launched"
-    if outcome.server_started:
-        print(f"sandbox: started the run's sandboxed tmux server on socket {os.environ.get('PM_TMUX_SOCKET')}")
+    if outcome.server_started_on:
+        print(f"sandbox: started the run's sandboxed tmux server on socket {outcome.server_started_on}")
     print(f"{verb} {outcome.slice_id} (attempt {outcome.attempt}) in tmux session {outcome.session}")
     if outcome.reaped:
         print(f"reaped stale sessions: {', '.join(outcome.reaped)}")
