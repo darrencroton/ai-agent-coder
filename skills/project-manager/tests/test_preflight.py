@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,9 +17,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from pm_test_helpers import PmTestCase
+from pm_test_helpers import PmTestCase, minimal_base_policy, write_base_policy
 
+from pm_lib import PmError
 from pm_lib import preflight
+from pm_lib import sandbox
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "references" / "dossier-template.md"
 POLICY = json.dumps({"schema": 1, "protected_paths": ["instruments"]}) + "\n"
@@ -216,6 +220,165 @@ class TestPreflight(PreflightTestCase):
         subparsers = next(a for a in cli.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
         flags = {o for a in subparsers.choices["campaign-preflight"]._actions for o in a.option_strings}
         self.assertFalse(flags & {"--run", "--token"}, flags)
+
+
+class TestBriefSandboxPin(unittest.TestCase):
+    """`sandbox.brief_sandbox_pin` and `sandbox.find_brief`, which launch-child and preflight share."""
+
+    PIN = "a" * 64
+
+    def test_no_section_and_none_are_no_pin_and_a_pinned_policy_returns_its_digest(self) -> None:
+        self.assertIsNone(sandbox.brief_sandbox_pin("# Brief\n\n## Worktree setup\n- none\n"))
+        self.assertIsNone(sandbox.brief_sandbox_pin("## Sandbox\n- none\n\n## Budgets\n- sandbox.json: later\n"))
+        pinned = f"## Sandbox\n- `sandbox.json` in this dossier, SHA-256 `{self.PIN}`.\n## Budgets\n"
+        self.assertEqual(sandbox.brief_sandbox_pin(pinned), self.PIN)
+
+    def test_a_policy_named_without_a_pin_or_a_section_naming_neither_is_refused(self) -> None:
+        for section, fragment in (
+            ("- `sandbox.json` in this dossier.", "without its pin"),
+            ("- `sandbox.json`, SHA-256 `ABC`.", "without its pin"),
+            ("- to be decided", "names neither"),
+        ):
+            with self.subTest(section=section), self.assertRaises(PmError) as raised:
+                sandbox.brief_sandbox_pin(f"## Sandbox\n{section}\n")
+            self.assertIn(fragment, str(raised.exception))
+
+    def test_find_brief_walks_up_to_the_nearest_brief(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(os.path.realpath(directory.name))
+        launcher = root / "dossier" / "nodes" / "n1" / "launcher.md"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("# Launcher\n", encoding="utf-8")
+        (root / "dossier" / "brief.md").write_text("# Brief\n", encoding="utf-8")
+        self.assertEqual(sandbox.find_brief(launcher), root / "dossier" / "brief.md")
+        (root / "dossier" / "nodes" / "brief.md").write_text("# Nearer\n", encoding="utf-8")
+        self.assertEqual(sandbox.find_brief(launcher), root / "dossier" / "nodes" / "brief.md")
+
+
+class TestPreflightSandbox(PreflightTestCase):
+    """The brief's `## Sandbox` section: `none`, or a pinned `sandbox.json`
+    checked against its pin, `load_base_policy` and `srt` on PATH. A fake
+    `srt` first on PATH makes the version line machine-independent."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        fake_bin = self.repo.parent / "fake-bin"
+        fake_bin.mkdir()
+        srt = fake_bin / "srt"
+        srt.write_text("#!/bin/sh\necho 0.0.81-test\n", encoding="utf-8")
+        srt.chmod(0o755)
+        patcher = mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.policy = minimal_base_policy()
+
+    def pin_sandbox(self, *, policy: dict | None = None, sha: str | None = None, section: str | None = None) -> None:
+        """Write `sandbox.json` when `policy` is given, add a `## Sandbox` section to the brief (`section`, or a
+        pin of `sha` or the file's own digest), and commit the dossier."""
+        path = self.dossier / "sandbox.json"
+        if policy is not None:
+            write_base_policy(path, policy)
+        if section is None:
+            digest = sha or hashlib.sha256(path.read_bytes()).hexdigest()
+            section = f"- `sandbox.json` in this dossier, SHA-256 `{digest}`."
+        brief = self.dossier / "brief.md"
+        brief.write_text(brief.read_text(encoding="utf-8") + f"## Sandbox\n{section}\n", encoding="utf-8")
+        self._commit_dossier()
+
+    def run_preflight(self, *, srt_present: bool = True) -> tuple[int, str]:
+        real_which = shutil.which
+
+        def which(name: str, *args, **kwargs) -> str | None:
+            if name == "tmux":
+                return "/usr/bin/tmux"
+            if name == "srt" and not srt_present:
+                return None
+            return real_which(name, *args, **kwargs)
+
+        argv = ["campaign-preflight", "--dossier", str(self.dossier), "--repo", str(self.repo)]
+        with mock.patch.object(preflight.shutil, "which", side_effect=which):
+            code, out, err = self.run_cli(argv + ["--integration-branch", "integration/t"])
+        self.assertEqual(err, "")
+        return code, out
+
+    def assert_failed_with_instruction(self, out: str, name: str, fragment: str) -> None:
+        lines = out.splitlines()
+        self.assertIn(f"FAIL  {name}", lines, out)
+        instruction = lines[lines.index(f"FAIL  {name}") + 1]
+        self.assertTrue(instruction.startswith("      -> "), instruction)
+        self.assertIn(fragment, instruction)
+
+    def test_a_brief_without_a_sandbox_section_or_with_none_passes_with_sandbox_none(self) -> None:
+        code, out = self.run_preflight()
+        self.assertEqual(code, 0, out)
+        self.assertIn("ok    sandbox: none\n", out)
+        self.assertNotRegex(out, r"(?m)^(ok|FAIL) +srt")
+        self.pin_sandbox(section="- none")
+        code, out = self.run_preflight()
+        self.assertEqual(code, 0, out)
+        self.assertIn("ok    sandbox: none\n", out)
+        self.assertNotRegex(out, r"(?m)^(ok|FAIL) +srt")
+
+    def test_a_pinned_valid_policy_passes_and_each_warning_is_a_note(self) -> None:
+        self.policy["enableWeakerNetworkIsolation"] = True
+        self.pin_sandbox(policy=self.policy)
+        code, out = self.run_preflight()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.failures(out), [])
+        for line in (
+            "ok    sandbox.json is committed and unchanged",
+            "ok    sandbox.json matches its pin",
+            "ok    sandbox.json is a valid sandbox policy",
+            "ok    srt 0.0.81-test on PATH",
+        ):
+            self.assertIn(f"{line}\n", out)
+        notes = [line for line in out.splitlines() if line.startswith("note  sandbox policy")]
+        self.assertEqual(len(notes), 1, out)
+        self.assertIn("enableWeakerNetworkIsolation", notes[0])
+
+    def test_a_pinned_policy_missing_from_the_dossier_fails(self) -> None:
+        self.pin_sandbox(sha="0" * 64)
+        code, out = self.run_preflight()
+        self.assertEqual(code, 1, out)
+        self.assert_failed_with_instruction(out, "sandbox.json is in the dossier", "commit it beside brief.md")
+
+    def test_a_policy_that_does_not_match_its_pin_fails_and_is_not_validated(self) -> None:
+        self.pin_sandbox(policy=self.policy, sha="0" * 64)
+        code, out = self.run_preflight()
+        self.assertEqual(code, 1, out)
+        self.assert_failed_with_instruction(out, "sandbox.json matches its pin", "question to the owner")
+        self.assertNotIn("sandbox.json is a valid sandbox policy", out)
+
+    def test_an_invalid_pinned_policy_fails_naming_the_reason(self) -> None:
+        self.policy["allowAppleEvents"] = True
+        self.pin_sandbox(policy=self.policy)
+        code, out = self.run_preflight()
+        self.assertEqual(code, 1, out)
+        self.assert_failed_with_instruction(out, "sandbox.json is a valid sandbox policy", "allowAppleEvents")
+
+    def test_srt_absent_fails_when_a_policy_is_pinned(self) -> None:
+        self.pin_sandbox(policy=self.policy)
+        code, out = self.run_preflight(srt_present=False)
+        self.assertEqual(code, 1, out)
+        self.assert_failed_with_instruction(out, "srt on PATH", "srt is required")
+
+    def test_a_changed_policy_fails_the_owner_file_check_and_a_malformed_section_fails(self) -> None:
+        self.pin_sandbox(policy=self.policy)
+        (self.dossier / "sandbox.json").write_text("{}\n", encoding="utf-8")
+        code, out = self.run_preflight()
+        self.assertEqual(code, 1, out)
+        self.assertIn("sandbox.json is committed and unchanged", self.failures(out))
+        brief = self.dossier / "brief.md"
+        unpinned = brief.read_text(encoding="utf-8").replace(
+            "- `sandbox.json` in this dossier, SHA-256 `", "- `sandbox.json`, digest `"
+        )
+        brief.write_text(unpinned, encoding="utf-8")
+        code, out = self.run_preflight()
+        self.assertEqual(code, 1, out)
+        self.assert_failed_with_instruction(
+            out, "brief's Sandbox section names sandbox.json or none", "without its pin"
+        )
 
 
 if __name__ == "__main__":

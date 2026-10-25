@@ -14,11 +14,17 @@ tmux and runs its children on a dedicated socket
 server in cleanup through `sessions.kill_server`, so no per-session reaping
 is needed. Worktrees, prompt files and the fake's records all sit under
 `self.repo.parent`, outside the repository under test.
+
+A sandboxed launch (`--sandbox`) refuses its inputs without `srt`; the tests
+that start a sandboxed server need `srt`, `tmux` and macOS (`requires_srt`)
+and each runs its child on a `<TEST_TMUX_SOCKET>-sb*` socket of its own,
+torn down in cleanup through `sandbox.stop_server` when a record exists.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -38,12 +44,25 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 # Imported for its side effect as much as its helpers: pm_test_helpers pins
 # PM_TMUX_SOCKET, which every command here must leave exactly as it found it.
-from pm_test_helpers import TEST_TMUX_SOCKET, PmTestCase, trigger_wait, write_fake_harness
+from pm_test_helpers import (
+    SANDBOX_TEST_SOCKET_PREFIX,
+    TEST_TMUX_SOCKET,
+    PmTestCase,
+    make_linked_worktree,
+    minimal_base_policy,
+    register_sandbox_socket,
+    requires_srt,
+    sandbox_probe_child_script,
+    trigger_wait,
+    write_base_policy,
+    write_fake_harness,
+)
 
 from pm_lib import PmError
 from pm_lib import campaign
 from pm_lib import cli
 from pm_lib import prompts
+from pm_lib import sandbox
 from pm_lib import sessions
 from pm_lib import slice_ops
 from pm_lib import state as state_mod
@@ -207,6 +226,7 @@ class TestCampaignParsers(unittest.TestCase):
             "--socket",
             "--harness-command",
             "--setup",
+            "--sandbox",
         },
         "wait-child": {"--worktree", "--wait"},
         "answer-child": {"--worktree", "--text"},
@@ -1001,6 +1021,322 @@ class TestChildLifecycle(CampaignTestCase):
         self.assertLess(time.monotonic() - start, 20.0)
         self.assertEqual(code, 0, err)
         self.assertIn("session running: False", out)
+        self.assert_socket_untouched()
+
+
+# --- sandboxed children ----------------------------------------------------------
+
+
+class SandboxLaunchTestCase(CampaignTestCase):
+    """A dossier holding `brief.md` and `sandbox.json`, with the launcher
+    under `nodes/n1/` (the walk up from it finds the brief), and an idle
+    fake child."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.dossier = self.repo.parent / "dossier"
+        (self.dossier / "nodes" / "n1").mkdir(parents=True)
+        self.prompt_file = self.dossier / "nodes" / "n1" / "launcher.md"
+        self.prompt_file.write_text("# Launcher\n\nRun the node plan.\n", encoding="utf-8")
+        self.policy = write_base_policy(self.dossier / "sandbox.json")
+        self.harness = write_fake_harness(self.repo.parent / "fake-child.sh", "echo FAKE_HARNESS_READY\nexec cat -")
+
+    def write_brief(self, section: str | None) -> Path:
+        """`brief.md` in the dossier, with `section` as its `## Sandbox` body (none when None)."""
+        text = "# Brief: t\n\n## Worktree setup\n- none\n"
+        if section is not None:
+            text += f"\n## Sandbox\n{section}\n"
+        text += "\n## Budgets\n- max_parallel: 1\n"
+        path = self.dossier / "brief.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def pin(self, policy: Path) -> str:
+        """A `## Sandbox` body pinning `policy`'s SHA-256."""
+        return f"- `sandbox.json` in this dossier, SHA-256 `{hashlib.sha256(policy.read_bytes()).hexdigest()}`."
+
+    def control_dir(self, socket: str) -> Path:
+        return sandbox.control_dir(Path(os.path.realpath(self.repo / ".git")), socket)
+
+    def sandbox_tmpdir(self, socket: str) -> Path:
+        return Path(os.path.realpath(tempfile.gettempdir())) / f"{sandbox.TMPDIR_PREFIX}{socket}"
+
+
+class TestSandboxLaunchRefusals(SandboxLaunchTestCase):
+    """Each refusal exits 2 before any branch, worktree, control directory
+    or temp directory exists."""
+
+    def assert_refused(self, argv: list[str], *fragments: str) -> str:
+        branches, worktrees = self.branches(), self.worktrees()
+        code, out, err = self.run_cli(argv)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("pm: error:", err)
+        for fragment in fragments:
+            self.assertIn(fragment, err)
+        self.assertEqual(self.branches(), branches)
+        self.assertEqual(self.worktrees(), worktrees)
+        self.assertFalse(self.worktree.exists())
+        self.assertFalse(sandbox.control_root(self.repo / ".git").exists())
+        self.assertFalse(self.sandbox_tmpdir(CHILD_SOCKET).exists())
+        self.assert_socket_untouched()
+        return err
+
+    def test_a_base_policy_that_fails_validation_is_refused_naming_the_file_and_the_reason(self) -> None:
+        policy = minimal_base_policy()
+        policy["allowAppleEvents"] = True
+        write_base_policy(self.policy, policy)
+        self.assert_refused(
+            self.launch_argv(self.harness) + ["--sandbox", str(self.policy)], str(self.policy), "allowAppleEvents"
+        )
+
+    def test_a_pinned_brief_refuses_a_launch_without_sandbox_quoting_the_pin(self) -> None:
+        pin = hashlib.sha256(self.policy.read_bytes()).hexdigest()
+        brief = self.write_brief(self.pin(self.policy))
+        self.assert_refused(self.launch_argv(self.harness), f"SHA-256 `{pin}`", str(brief.resolve()), "--sandbox")
+
+    def test_a_pinned_brief_refuses_a_policy_with_another_sha256_quoting_the_pin(self) -> None:
+        pin = hashlib.sha256(self.policy.read_bytes()).hexdigest()
+        self.write_brief(self.pin(self.policy))
+        other = minimal_base_policy()
+        other["network"]["allowedDomains"] = ["example.com"]
+        other_path = write_base_policy(self.repo.parent / "other-sandbox.json", other)
+        other_sha = hashlib.sha256(other_path.read_bytes()).hexdigest()
+        self.assert_refused(self.launch_argv(self.harness) + ["--sandbox", str(other_path)], f"pins `{pin}`", other_sha)
+
+    def test_a_sandbox_section_naming_neither_a_policy_nor_none_is_refused(self) -> None:
+        self.write_brief("- to be decided")
+        self.assert_refused(self.launch_argv(self.harness), "names neither sandbox.json nor none")
+        self.write_brief("- `sandbox.json` in this dossier, unpinned.")
+        self.assert_refused(self.launch_argv(self.harness), "without its pin")
+
+    @unittest.skipUnless(_HAS_TMUX, "the tmux precondition is checked first")
+    def test_srt_absent_from_path_is_refused_before_anything_is_created(self) -> None:
+        real_which = shutil.which
+
+        def which(name: str, *args, **kwargs) -> str | None:
+            return None if name == "srt" else real_which(name, *args, **kwargs)
+
+        with mock.patch.object(campaign.shutil, "which", side_effect=which):
+            self.assert_refused(self.launch_argv(self.harness) + ["--sandbox", str(self.policy)], "srt is required")
+
+    @unittest.skipUnless(_HAS_TMUX, "the preconditions list the socket's server")
+    def test_a_brief_without_a_pin_leaves_sandbox_optional(self) -> None:
+        for number, section in enumerate((None, "- none")):
+            with self.subTest(section=section):
+                self.write_brief(section)
+                self.worktree = self.repo.parent / f"node-wt-{number}"
+                with mock.patch.object(campaign, "_start_child_session") as start:
+                    code, out, err = self.run_cli(self.launch_argv(self.harness, branch=f"node-{number}"))
+                self.assertEqual(code, 0, out + err)
+                start.assert_called_once()
+                launch = start.call_args.args[0]
+                self.assertIsNone(launch.sandbox)
+                self.assertIsNone(launch.control_dir)
+                self.assertIn(f"watch: tmux -L {CHILD_SOCKET} attach -t {launch.session}", out)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real child session")
+class TestUnsandboxedLaunchUnchanged(CampaignTestCase):
+    def test_no_control_dir_no_sandbox_key_and_a_plain_watch_line_and_stop_output(self) -> None:
+        harness = write_fake_harness(self.repo.parent / "fake-child.sh", "echo FAKE_HARNESS_READY\nexec cat -")
+        code, out, err = self.run_cli(self.launch_argv(harness))
+        self.assertEqual(code, 0, out + err)
+        worktree = self.worktree.resolve()
+        manifest = json.loads(campaign.manifest_path(worktree).read_text(encoding="utf-8"))
+        self.assertEqual(list(manifest), list(campaign._MANIFEST_FIELDS))
+        session = manifest["session"]
+        self.assertIn(f"\nwatch: tmux -L {CHILD_SOCKET} attach -t {session}\n", out)
+        self.assertNotIn("sandbox", out)
+        self.assertFalse(sandbox.control_root(self.repo / ".git").exists())
+        self.assertIsNone(sessions.server_environment(CHILD_SOCKET, "SANDBOX_RUNTIME"))
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(worktree), "--reason", "done"])
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("sandbox", out)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to host the marked server")
+class TestStopChildSandboxRecord(SandboxLaunchTestCase):
+    def test_a_record_naming_another_worktree_is_refused_and_the_manifest_control_dir_is_ignored(self) -> None:
+        worktree = make_linked_worktree(self.repo, self.worktree, "node-1").resolve()
+        session = "campaign-node-1-000000"
+        control = self.control_dir(CHILD_SOCKET)
+        self.addCleanup(shutil.rmtree, control.parent, True)
+        other = str(self.repo.parent / "other-wt")
+        sandbox.write_record(
+            control, worktree=other, socket=CHILD_SOCKET, tmpdir=str(self.sandbox_tmpdir(CHILD_SOCKET)), srt_pid=None
+        )
+        # A decoy the manifest names, holding a record that would pass: never read.
+        decoy = self.repo.parent / "decoy" / "pm-sandbox" / CHILD_SOCKET
+        sandbox.write_record(decoy, worktree=str(worktree), socket=CHILD_SOCKET, tmpdir="/nowhere", srt_pid=None)
+        directory = campaign.campaign_dir(worktree)
+        directory.mkdir(parents=True)
+        manifest = {
+            "socket": CHILD_SOCKET,
+            "session": session,
+            "branch": "node-1",
+            "base": self.base_commit,
+            "worktree": str(worktree),
+            "launcher": str(directory / "launcher.md"),
+            "launched_at": "2026-10-25T00:00:00Z",
+            "sandbox": {"policy": "x", "policy_sha256": "0" * 64, "socket": CHILD_SOCKET, "control_dir": str(decoy)},
+        }
+        campaign.manifest_path(worktree).write_text(json.dumps(manifest), encoding="utf-8")
+        started = _child_tmux(CHILD_SOCKET, "new-session", "-d", "-s", session, "sleep 120")
+        self.assertEqual(started.returncode, 0, started.stderr)
+        # The right mark, so the record is what refuses.
+        sessions.set_server_environment(CHILD_SOCKET, "PM_CHILD_WORKTREE", str(worktree))
+
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(worktree), "--reason", "test"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"the sandbox record in {control} names worktree {other!r}", err)
+        self.assertIn("refusing to kill the server", err)
+        self.assertEqual(_child_tmux(CHILD_SOCKET, "has-session", "-t", session).returncode, 0)
+        self.assertTrue((control / "record.json").is_file())
+        self.assertTrue((decoy / "record.json").is_file())
+        self.assertFalse((directory / "pane.txt").exists())
+        self.assert_socket_untouched()
+
+
+_SANDBOX_SOCKET_NUMBERS = iter(range(1, 1000))
+
+
+@requires_srt
+class TestSandboxedChild(SandboxLaunchTestCase):
+    """A child launched with `--sandbox` on a socket of its own, under the
+    minimal base policy (nothing beyond the derived grants)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.socket = register_sandbox_socket(f"{SANDBOX_TEST_SOCKET_PREFIX}-child{next(_SANDBOX_SOCKET_NUMBERS)}")
+        self.control = self.control_dir(self.socket)
+        self.tmpdir = self.sandbox_tmpdir(self.socket)
+        self.worktree_real = Path(os.path.realpath(self.repo.parent)) / "node-wt"
+        self.addCleanup(self._teardown_sandbox)
+
+    def _teardown_sandbox(self) -> None:
+        try:
+            record = sandbox.read_record(self.control)
+            sandbox.stop_server(socket=self.socket, record=record)
+        except PmError:
+            pass
+        sessions.kill_server(self.socket)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        shutil.rmtree(self.control.parent, ignore_errors=True)
+
+    def sandbox_argv(self, harness: Path) -> list[str]:
+        return self.launch_argv(harness, socket=self.socket) + ["--sandbox", str(self.policy)]
+
+    def assert_torn_down(self) -> None:
+        self.assertFalse(sessions.server_running(self.socket))
+        self.assertFalse(self.tmpdir.exists())
+        self.assertFalse(self.control.exists())
+
+    def test_a_sandboxed_launch_confines_the_child_and_stop_child_tears_it_down(self) -> None:
+        # The brief pins the policy, so the launch also shows a matching pin is accepted.
+        self.write_brief(self.pin(self.policy))
+        pm_dir = self.worktree_real / ".pm"
+        probes = pm_dir / "probes.txt"
+        leak = self.worktree_real.parent / "leak"
+        harness = write_fake_harness(
+            self.repo.parent / "fake-child.sh",
+            sandbox_probe_child_script(
+                out=probes, leak=leak, control_probe=self.control / "x", inside=pm_dir / "inside"
+            ),
+        )
+        with mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "caller-token-must-not-leak"}):
+            code, out, err = self.run_cli(self.sandbox_argv(harness))
+        self.assertEqual(code, 0, out + err)
+        self.assert_socket_untouched()
+        worktree = self.worktree.resolve()
+        self.assertEqual(worktree, self.worktree_real)
+
+        # The server: sandboxed, and marked as this child's.
+        self.assertEqual(sessions.server_environment(self.socket, "SANDBOX_RUNTIME"), "1")
+        self.assertEqual(sessions.server_environment(self.socket, "PM_CHILD_WORKTREE"), str(worktree))
+        # The effective policy, the record and the manifest's sandbox block.
+        policy = json.loads((self.control / "policy.json").read_text(encoding="utf-8"))
+        self.assertIn({"path": str(worktree), "literal": True}, policy["filesystem"]["allowWrite"])
+        self.assertIn({"path": str(worktree / ".git"), "literal": True}, policy["filesystem"]["denyWrite"])
+        self.assertIn(
+            {"path": str(self.prompt_file.resolve().parent), "literal": True}, policy["filesystem"]["allowRead"]
+        )
+        record = sandbox.read_record(self.control)
+        self.assertEqual(record["worktree"], str(worktree))
+        manifest = json.loads(campaign.manifest_path(worktree).read_text(encoding="utf-8"))
+        self.assertEqual(list(manifest), [*campaign._MANIFEST_FIELDS, "sandbox"])
+        block = manifest["sandbox"]
+        self.assertEqual(set(block), {"policy", "policy_sha256", "socket", "control_dir"})
+        for key, value in block.items():
+            with self.subTest(key=key):
+                self.assertIsInstance(value, str)
+                self.assertTrue(value)
+        self.assertEqual(block["control_dir"], str(self.control))
+        self.assertEqual(block["policy_sha256"], hashlib.sha256(self.policy.read_bytes()).hexdigest())
+        # The attach policy writes nothing, and the watch line attaches under it.
+        attach = json.loads((self.control / "attach-policy.json").read_text(encoding="utf-8"))
+        self.assertEqual(attach["filesystem"]["allowWrite"], [])
+        session = manifest["session"]
+        self.assertIn(
+            f"\nwatch: srt -s {self.control}/attach-policy.json tmux -L {self.socket} attach -t {session}\n", out
+        )
+
+        # What the fake child found from inside.
+        self.assertTrue(self._wait_for(lambda: probes.is_file() and "done" in probes.read_text(encoding="utf-8")))
+        found = dict(line.split("=", 1) for line in probes.read_text(encoding="utf-8").splitlines() if "=" in line)
+        self.assertNotEqual(found["leak_rc"], "0")
+        self.assertEqual(found["leak_exists"], "no")
+        self.assertFalse(leak.exists())
+        self.assertNotEqual(found["control_rc"], "0")
+        self.assertFalse((self.control / "x").exists())
+        self.assertEqual(found["inside_rc"], "0")
+        self.assertTrue((pm_dir / "inside").is_file())
+        self.assertEqual(found["tmpdir"], record["tmpdir"])
+        self.assertEqual(found["token"], "unset")
+
+        # stop-child: the server, srt, the temp and control directories all go.
+        srt_pid = record["srt_pid"]
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(worktree), "--reason", "node judged"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"killed tmux server {self.socket}", out)
+        self.assertIn(f"removed sandbox temp dir {record['tmpdir']}\n", out)
+        self.assertIn(f"removed sandbox control dir {self.control}\n", out)
+        self.assert_torn_down()
+        with self.assertRaises(ProcessLookupError):
+            os.kill(srt_pid, 0)
+
+        # A re-run reports both directories already gone.
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(worktree), "--reason", "again"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"sandbox temp dir already gone: {record['tmpdir']}\n", out)
+        self.assertIn(f"sandbox control dir already gone: {self.control}\n", out)
+
+    def test_a_server_failing_verification_is_torn_down_and_the_leftovers_named(self) -> None:
+        # Denying the worktree's .pm/ fails the positive probe.
+        policy = minimal_base_policy()
+        policy["filesystem"]["denyWrite"] = [str(self.worktree_real / ".pm")]
+        write_base_policy(self.policy, policy)
+        code, out, err = self.run_cli(self.sandbox_argv(self.harness))
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("child sandbox did not start (positive probe failed", err)
+        self.assertIn(f"removed sandbox temp dir {self.tmpdir}", err)
+        self.assertIn(f"removed sandbox control dir {self.control}", err)
+        self.assertIn(f"branch node-1 and worktree {self.worktree_real} are left behind", err)
+        self.assertTrue(self.worktree_real.is_dir())
+        self.assertIn("refs/heads/node-1", self.branches())
+        self.assertFalse(campaign.manifest_path(self.worktree_real).exists(), "no session, so no manifest")
+        self.assert_torn_down()
+        self.assert_socket_untouched()
+
+    def test_a_session_ending_before_readiness_tears_the_sandbox_down(self) -> None:
+        harness = write_fake_harness(self.repo.parent / "fake-child.sh", "exit 3")
+        code, out, err = self.run_cli(self.sandbox_argv(harness))
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("pm: error:", err)
+        self.assertIn(f"removed sandbox temp dir {self.tmpdir}", err)
+        self.assertIn(f"removed sandbox control dir {self.control}", err)
+        self.assertIn(f"branch node-1 and worktree {self.worktree_real} are left behind", err)
+        self.assert_torn_down()
         self.assert_socket_untouched()
 
 

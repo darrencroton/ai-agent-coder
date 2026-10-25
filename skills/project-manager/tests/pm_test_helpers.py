@@ -389,6 +389,32 @@ def trigger_gated_exit_script(trigger_path: Path) -> str:
     return f"{_READY}\ncat - >/dev/null &\n{trigger_wait(trigger_path)}"
 
 
+def sandbox_probe_child_script(*, out: Path, leak: Path, control_probe: Path, inside: Path) -> str:
+    """A fake child PM for a sandboxed launch: comes up ready, then records
+    to `out`, one `key=value` line each, the exit status of `touch` on
+    `leak`, `control_probe` and `inside`, whether `leak` exists afterwards,
+    its `$TMPDIR`, and whether `PM_RUN_TOKEN` is set; `done` last. Then it
+    drains stdin, so the launch pointer is read.
+
+    `out` must be writable inside the sandbox: under the worktree's `.pm/`,
+    say. Everything else this suite's fakes write to (`self.records`, beside
+    the repository) is outside every grant.
+    """
+    return "\n".join(
+        [
+            _READY,
+            f'touch "{leak}" 2>/dev/null; echo "leak_rc=$?" >> "{out}"',
+            f'if [ -e "{leak}" ]; then echo leak_exists=yes; else echo leak_exists=no; fi >> "{out}"',
+            f'touch "{control_probe}" 2>/dev/null; echo "control_rc=$?" >> "{out}"',
+            f'touch "{inside}" 2>/dev/null; echo "inside_rc=$?" >> "{out}"',
+            f'echo "tmpdir=$TMPDIR" >> "{out}"',
+            f'if [ -n "${{PM_RUN_TOKEN+x}}" ]; then echo token=set; else echo token=unset; fi >> "{out}"',
+            f'echo done >> "{out}"',
+            "exec cat -",
+        ]
+    )
+
+
 def trigger_gated_churn_script(trigger_path: Path) -> str:
     """Holds the pane still until `trigger_path` exists, then changes it every
     0.3s forever. Never writes result.json and never prints a dialog marker.

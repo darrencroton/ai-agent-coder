@@ -14,7 +14,6 @@ import argparse
 import math
 import os
 import re
-import shlex
 import sys
 from pathlib import Path
 
@@ -286,6 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="a shell script run as `sh FILE` inside the new worktree after it is created and before the child's "
         "session starts (output in .pm/campaign/setup.log); a non-zero exit or a hang fails the launch",
+    )
+    launch_child.add_argument(
+        "--sandbox",
+        metavar="FILE",
+        help="an srt base policy: run the child's tmux server, and everything it starts, inside an srt sandbox "
+        "(macOS); required, and matched by SHA-256, when the launcher's dossier brief pins one in ## Sandbox",
     )
 
     wait_child = subparsers.add_parser(
@@ -1002,14 +1007,17 @@ def _run_launch_child(args: argparse.Namespace) -> int:
         socket=args.socket,
         harness_command=args.harness_command,
         setup=Path(args.setup) if args.setup else None,
+        sandbox=Path(args.sandbox).expanduser() if args.sandbox else None,
     )
+    for warning in outcome.sandbox_warnings:
+        print(f"note: {warning}")
     print(
         f"child launched: session={outcome.session} socket={outcome.socket} "
         f"worktree={outcome.worktree} launcher={outcome.launcher}"
     )
-    # `-t` is the point: a bare `attach` lands on the most recent session,
-    # usually a Developer rather than the child PM.
-    print(f"watch: tmux -L {shlex.quote(outcome.socket)} attach -t {shlex.quote(outcome.session)}")
+    if outcome.control_dir is not None:
+        print(f"sandbox: control dir {outcome.control_dir}")
+    print(f"watch: {outcome.watch}")
     return 0
 
 
@@ -1091,9 +1099,13 @@ def _run_stop_child(args: argparse.Namespace) -> int:
     else:
         server = f"tmux server {outcome.socket} still has sessions: {', '.join(outcome.remaining)}"
     print(f"stopped child: session={outcome.session} ({state}); {server}")
+    for line in outcome.sandbox_notes:
+        print(line)
+    if outcome.sandbox_error is not None:
+        print(f"sandbox: not torn down ({outcome.sandbox_error})")
     print(f"reason: {args.reason}")
-    # Sessions still listed after the kill: the child is not stopped.
-    return 0 if outcome.server_gone else 2
+    # Sessions still listed after the kill, or a sandbox left up: the child is not stopped.
+    return 0 if outcome.server_gone and outcome.sandbox_stopped else 2
 
 
 # --- notes ----------------------------------------------------------------

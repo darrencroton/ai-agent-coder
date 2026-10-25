@@ -17,7 +17,9 @@ was started with. This module is the toolkit's one seam onto that mechanism:
   (`make_tmpdir`, `remove_tmpdir`);
 - the server itself: started under `srt`, verified by two probes, stopped
   (`start_server`, `verify_server`, `stop_server`), and a one-shot command
-  wrapped the same way (`wrap_command`).
+  wrapped the same way (`wrap_command`);
+- a campaign brief's sandbox pin, which `launch-child` and
+  `campaign-preflight` both read (`find_brief`, `brief_sandbox_pin`).
 
 Paths in a policy are judged as `srt` resolves them: `~` and `~/` expanded,
 symbolic links followed. A pattern entry (a string holding `*`, `?`, `[` or
@@ -75,6 +77,9 @@ RECORD_NAME = "record.json"
 TMPDIR_PREFIX = "pm-sandbox-"
 PROBE_DIR_NAME = ".pm"
 PROBE_FILE_NAME = "sandbox-probe"
+BRIEF_NAME = "brief.md"
+# The base policy's file name in a campaign dossier, beside `brief.md`.
+DOSSIER_POLICY_NAME = "sandbox.json"
 
 START_DEADLINE_SECONDS = 10.0
 PROBE_TIMEOUT_SECONDS = 10.0
@@ -93,6 +98,13 @@ _PATTERN_SPLIT = re.compile(r"[*?\[\]]")
 # A NUL, a control character or a lone surrogate: none names a usable path,
 # and each breaks a later step (realpath, the OS call, a printed message).
 _BAD_PATH_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
+# A brief's `## Sandbox` section and its pin, in the shapes
+# `campaign-preflight` reads every other dossier pin in (`preflight._section`,
+# `preflight.SHA256`); kept here because `preflight` imports `campaign`,
+# which imports this module.
+_SANDBOX_SECTION = re.compile(r"^##\s+Sandbox\s*$(.*?)(?=^##\s|\Z)", re.M | re.S | re.I)
+_PIN_SHA256 = re.compile(r"SHA-256 `([0-9a-f]{64})`")
+_NONE_WORD = re.compile(r"\bnone\b", re.I)
 
 # `srt` processes this process started, by pid. The server outlives
 # `start_server`, so its `Popen` is kept here rather than dropped while still
@@ -1032,3 +1044,46 @@ def stop_server(*, socket: str, record: dict[str, Any]) -> tuple[list[str], list
             raise PmError(f"could not remove sandbox control dir {control}: {exc}") from exc
         notes.append(f"removed sandbox control dir {control}")
     return remaining, notes
+
+
+# --- A campaign brief's pin ----------------------------------------------------
+
+
+def find_brief(path: Path | str) -> Path | None:
+    """The nearest `brief.md` at or above the directory holding `path` (its
+    real path), or None when no directory up to the root holds one: the
+    dossier brief a campaign launcher sits under."""
+    start = _real(Path(path).expanduser())
+    directory = start if start.is_dir() else start.parent
+    for candidate in (directory, *directory.parents):
+        brief = candidate / BRIEF_NAME
+        if brief.is_file():
+            return brief
+    return None
+
+
+def brief_sandbox_pin(text: str) -> str | None:
+    """The SHA-256 a brief's `## Sandbox` section pins for the dossier's
+    `sandbox.json`, or None when the brief has no such section or the
+    section says `none`.
+
+    A section that mentions `sandbox.json` is a pin and must carry
+    SHA-256 `<64 hex digits>`; one that names neither `sandbox.json` nor
+    `none` is malformed. Both raise PmError, so a pin the owner meant to
+    write is never read as no pin.
+    """
+    match = _SANDBOX_SECTION.search(text)
+    if match is None:
+        return None
+    section = match.group(1)
+    if DOSSIER_POLICY_NAME in section:
+        pin = _PIN_SHA256.search(section)
+        if pin is None:
+            raise PmError(
+                f"the brief's ## Sandbox section names {DOSSIER_POLICY_NAME} without its pin; write SHA-256"
+                " `<64 lowercase hex digits>` beside it"
+            )
+        return pin.group(1)
+    if _NONE_WORD.search(section):
+        return None
+    raise PmError(f"the brief's ## Sandbox section names neither {DOSSIER_POLICY_NAME} nor none")

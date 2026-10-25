@@ -23,6 +23,7 @@ from pathlib import Path
 from . import PmError
 from . import campaign
 from . import git_ops
+from . import sandbox
 
 # A placeholder is any `<…>` outside a code span, or, inside one, an
 # UPPER_CASE token or one with whitespace: `campaign/<id>/<node>` is campaign
@@ -32,7 +33,9 @@ CODE_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.S)
 SHA256 = re.compile(r"SHA-256 `([0-9a-f]{64})`")
 BASE = re.compile(r"^\s*-\s+[^\n]*?campaign base: `([^`]+)` at `([0-9a-f]{7,40})`", re.IGNORECASE | re.M)
 BACKTICKED = re.compile(r"`([^`]+)`")
-OWNER_FILES = ("brief.md", "setup.sh")
+# The owner's files: brief.md always; the others only when present (the
+# brief's own sections say whether each is required).
+OWNER_FILES = ("brief.md", "setup.sh", sandbox.DOSSIER_POLICY_NAME)
 
 
 @dataclass
@@ -112,7 +115,7 @@ def campaign_preflight(
     else:
         ok("dossier is its own git repository")
         for name in OWNER_FILES:
-            if name == "setup.sh" and not (dossier / name).exists():
+            if name != "brief.md" and not (dossier / name).exists():
                 continue
             if git_ops.git_result(dossier, "ls-files", "--error-unmatch", name)[0] != 0:
                 fail(f"{name} is tracked in the dossier", f"git -C {dossier} add {name} and commit")
@@ -283,6 +286,41 @@ def campaign_preflight(
     else:
         ok("Worktree setup: none")
 
+    # The owner's sandbox policy, if the brief pins one. A pin is checked
+    # against the file, and the file against what launch-child will refuse.
+    sandbox_pinned = False
+    try:
+        sandbox_pin = sandbox.brief_sandbox_pin(brief)
+    except PmError as exc:
+        fail("brief's Sandbox section names sandbox.json or none", str(exc))
+    else:
+        if sandbox_pin is None:
+            ok("sandbox: none")
+        else:
+            sandbox_pinned = True
+            policy_file = dossier / sandbox.DOSSIER_POLICY_NAME
+            if not policy_file.is_file():
+                fail("sandbox.json is in the dossier", "the brief's Sandbox section pins it; commit it beside brief.md")
+            elif sha256_of(policy_file) != sandbox_pin:
+                fail(
+                    "sandbox.json matches its pin",
+                    f"its SHA-256 is {sha256_of(policy_file)}; a changed policy is a question to the owner",
+                )
+                integrity = False
+            else:
+                ok("sandbox.json matches its pin")
+                try:
+                    _policy, warnings = sandbox.load_base_policy(policy_file)
+                except PmError as exc:
+                    fail(
+                        "sandbox.json is a valid sandbox policy",
+                        f"{exc}; the owner corrects the policy, commits it and re-pins its SHA-256",
+                    )
+                else:
+                    ok("sandbox.json is a valid sandbox policy")
+                    for warning in warnings:
+                        note(warning)
+
     # The node worktree parent.
     parent_text = _pin_line(brief, "Node worktree parent", 0)
     parent = BACKTICKED.search(parent_text) if parent_text else None
@@ -302,6 +340,11 @@ def campaign_preflight(
 
     # Tools on this machine.
     ok("tmux on PATH") if shutil.which("tmux") else fail("tmux on PATH", "install tmux")
+    if sandbox_pinned:
+        try:
+            ok(f"srt {sandbox.srt_version()} on PATH")
+        except PmError as exc:
+            fail("srt on PATH", f"{exc}; the brief pins a sandbox, and launch-child refuses it without srt")
     for harness in harnesses:
         ok(f"harness {harness} on PATH") if shutil.which(harness) else fail(
             f"harness {harness} on PATH", "install it or change the seats"
