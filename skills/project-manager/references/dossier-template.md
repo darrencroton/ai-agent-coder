@@ -1,6 +1,6 @@
 # Campaign Dossier Template
 
-The layout of a campaign dossier and a template for each of its files. This is a template only: the rules that govern every file (who writes it, when, and what the Campaign Manager does with it) are in [campaign-mode.md](campaign-mode.md), and nothing here restates them. Keep the backticked pin lines in the shape shown (the campaign base, the node worktree parent, the policy file and `setup.sh` with their SHA-256 digests): `campaign-preflight` reads them.
+The layout of a campaign dossier and a template for each of its files. This is a template only: the rules that govern every file (who writes it, when, and what the Campaign Manager does with it) are in [campaign-mode.md](campaign-mode.md), and nothing here restates them. Keep the backticked pin lines in the shape shown (the campaign base, the node worktree parent, the policy file, `setup.sh` and `sandbox.json` with their SHA-256 digests): `campaign-preflight` reads them.
 
 ## Layout
 
@@ -8,6 +8,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 <dossier>/                      a git repository of its own, outside the product repository
   brief.md                      the owner's brief
   setup.sh                      the owner's worktree setup script, when brief.md's Worktree setup names one
+  sandbox.json                  the owner's srt base policy, when brief.md's Sandbox section names one
   work.md                       now, and the node table
   evidence.md                   findings, one entry each
   decisions.md                  decisions, one entry each
@@ -46,6 +47,9 @@ The layout of a campaign dossier and a template for each of its files. This is a
 
 ## Worktree setup
 - <none, or: `setup.sh` in this dossier, SHA-256 `<digest of the file, from shasum -a 256>`, run by launch-child --setup in every node worktree before its session starts; what it links or creates, all of it git-ignored and none of it a product change>
+
+## Sandbox
+- <none, or: `sandbox.json` in this dossier, SHA-256 `<digest of the file, from shasum -a 256>`, the srt base policy every child runs under (see [sandbox.md](sandbox.md)); the section is either that pin line or `- none` alone>
 
 ## Budgets
 - Node budget per target: <N>

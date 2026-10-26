@@ -24,6 +24,7 @@ Each contract lives in exactly one place; everything else points at it. Before e
 | Protected-paths policy file contract | `skills/project-manager/references/run-state.md` |
 | Campaign-mode (Mode C) operating contract and the campaign launcher | `skills/project-manager/references/campaign-mode.md` |
 | Dossier layout and templates | `skills/project-manager/references/dossier-template.md` |
+| Sandbox contract (the boundary, what enforces what, limitations, base-policy refusals and warnings, derived policies, example policy, per-harness facts) | `skills/project-manager/references/sandbox.md` |
 | Developer and Reviewer prompt contracts | `skills/project-manager/references/developer-prompt.md`, `…/reviewer-prompt.md` |
 | Harness profile table | `skills/project-manager/scripts/pm_lib/profiles.py` |
 | Delegate request contract and access-mode semantics | `skills/orchestrator/references/delegate-contract.md` |
@@ -37,7 +38,7 @@ Each skill's `SKILL.md` is the source of truth for its own triggers, workflow, a
 
 ## Tests
 
-- Project Manager: `python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'`. Tests needing `tmux` self-skip when it is absent; no test needs a real coding CLI (runtime tests inject fake harnesses). Module layout: `skills/project-manager/README.md` → "Maintainer map".
+- Project Manager: `python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'`. Tests needing `tmux` self-skip when it is absent, and the sandbox tests that start a real server (`requires_srt`) self-skip without `srt` or off macOS, as on CI's Linux runner, so run them on a Mac with `srt` installed before changing the sandbox; no test needs a real coding CLI (runtime tests inject fake harnesses). Module layout: `skills/project-manager/README.md` → "Maintainer map".
 - The PM modules are independent and safe to run in parallel, which is roughly 2.5x faster than the serial discover above:
   `cd skills/project-manager/tests && for m in test_*.py; do python3 -m unittest "${m%.py}" & done; wait`
   Each test process pins its own tmux server (`PM_TMUX_SOCKET=pm-tests-<pid>`), so parallel runs cannot collide with each other — or with the tmux sessions you are working in. Never point the suite at the default tmux server, and never run a bare `tmux kill-server`: both reach the operator's own sessions.

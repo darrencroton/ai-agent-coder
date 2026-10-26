@@ -215,6 +215,7 @@ Developer: <harness> <full model id> <effort>   (model and effort may be "per pl
 Drift auditor: <harness> <full model id> <effort>
 Code reviewers: <harness> <full model id> <effort>; <harness> <full model id> <effort>
 Run tag (optional): <tag>
+Sandbox policy (optional, macOS): <absolute path to an srt base policy, per project-manager's references/sandbox.md; omit the line for a campaign child, whose server the Campaign Manager sandboxes>
 Campaign child (include this paragraph only when a Campaign Manager launched this run; delete it otherwise; the contract it serves is project-manager's references/campaign-mode.md):
 - Nobody is present: confirm nothing with a human.
 - The plan is committed in the dossier at the path given, which meets the "plan committed" requirement; it is not in the product repository.
@@ -236,7 +237,7 @@ For a new run, prepare, then confirm with me once:
 - Read the whole plan, run check-plan with repo context, and check that the repo still matches what the plan assumes. Init freezes the plan, so raise any drift or warning now.
 - Require a clean worktree with the plan committed. Propose the plan's feature branch, or a new branch name to create.
 - Confirm: plan read, check-plan result, seats, branch, first slice, any approval-flagged slices (each stops the run until I approve it), and my standing authorisation for Developers to commit each slice.
-After my go-ahead, run init with full model ids, efforts where the harness supports them, and the run tag. Give me the run id and token, then begin.
+After my go-ahead, run init with full model ids, efforts where the harness supports them, the run tag and, when a sandbox policy is given, `--sandbox <path>`; then set `PM_TMUX_SOCKET` exactly as the `export PM_TMUX_SOCKET=…` line init prints, for every later command of the run. Give me the run id and token, then begin.
 
 Per slice, in plan order:
 1. start-slice with the Developer seat's model and effort. Wait with one long background `observe --wait`; never poll.

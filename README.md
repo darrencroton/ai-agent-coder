@@ -12,7 +12,7 @@ Background, motivation, and design principles: [`docs/VISION.md`](docs/VISION.md
 - **`lint`** — whichever linters your repository needs. `skills/lint/scripts/lint.py detect` reports what is missing and prints install commands; it never installs anything.
 - **`code-health`** — Python 3.13+ and `git` only; Lizard is an optional multi-language complexity collector that `skills/code-health/scripts/health.py detect` reports as present or missing and never installs.
 - **Mode B (Project Manager)** — Python 3.13+, `git`, `tmux`, and at least one supported coding CLI on the machine running PM.
-- **Mode C (campaign)** — everything Mode B needs, plus `git worktree`, a second git repository for the dossier, a worktree parent directory trusted in each harness, and the `implementation-plan` and `orchestrator` skills installed beside `project-manager` in the Campaign Manager's harness.
+- **Mode C (campaign)** — everything Mode B needs, plus `git worktree`, a second git repository for the dossier, a worktree parent directory trusted in each harness, and the `implementation-plan` and `orchestrator` skills installed beside `project-manager` in the Campaign Manager's harness; when the brief sandboxes the children, macOS and Anthropic's `srt` on `PATH` ([`skills/project-manager/references/sandbox.md`](skills/project-manager/references/sandbox.md)).
 
 ## Installation
 
