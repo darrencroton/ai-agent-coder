@@ -1070,15 +1070,29 @@ def _run_sandbox(state: dict[str, Any], repo: Path) -> tuple[dict[str, Any], str
     """(the run's `sandbox` block, its socket, its control dir) from MAC-checked
     run state. PmError when the block is malformed, or when its control dir
     is not `<repo's common git dir>/pm-sandbox/<socket>`: the location every
-    derived policy denies, which is what makes its files the host's."""
+    derived policy denies, which is what makes its files the host's. A
+    control dir holding a NUL, control or surrogate character, or one whose
+    real path cannot be resolved, is a malformed block too."""
     block = state.get("sandbox")
     socket = block.get("socket") if isinstance(block, dict) else None
     control_text = block.get("control_dir") if isinstance(block, dict) else None
-    if not isinstance(socket, str) or not isinstance(control_text, str):
+    if (
+        not isinstance(socket, str)
+        or not isinstance(control_text, str)
+        or not control_text
+        or _BAD_PATH_CHARS.search(control_text)
+    ):
         raise PmError(f"this run's sandbox record in run state is malformed: {block!r}")
     expected = control_dir(_common_dir_of(repo), socket)
     control = Path(control_text)
-    if not _same(_real(control), _real(expected)):
+    try:
+        same = _same(_real(control), _real(expected))
+    except (OSError, ValueError) as exc:
+        raise PmError(
+            f"this run's sandbox record in run state is malformed: {block!r} (its control dir cannot be resolved:"
+            f" {exc})"
+        ) from exc
+    if not same:
         raise PmError(
             f"this run's sandbox control dir {control} is not {expected}, the only place a host-written one can be"
         )
@@ -1243,9 +1257,11 @@ def ensure_run_server(state: dict[str, Any], *, repo: Path) -> bool:
     record updated with its pids.
 
     On any failure after `start_server` returned, the server is killed and
-    `srt` waited for; the PmError then carries that outcome ("the server
-    was killed", "srt still running: <pid>" or the kill's own failure), and
-    an interrupt propagates as itself with the outcome as a note. The
+    `srt` waited for, and the PmError carries that outcome: "the server was
+    killed" only when the kill left no session listed and `srt` has exited;
+    otherwise the sessions still listed and/or "srt still running: <pid>";
+    or the kill's own failure. An interrupt propagates as itself, with the
+    outcome as a note. The
     control and temp directories are the run's and stay, and the record
     keeps its last pids, so the next `start-slice` starts afresh. PmError
     for every refusal, a temp dir outside this process's temp root and a
@@ -1298,13 +1314,16 @@ def ensure_run_server(state: dict[str, Any], *, repo: Path) -> bool:
             tmpdir = make_tmpdir(socket)
         elif tmpdir.is_symlink() or not tmpdir.is_dir():
             raise PmError(f"sandbox temp dir {tmpdir} exists but is not a directory; refusing to use it")
+        else:
+            # A partial teardown left it; the server gets the real path the record stores.
+            tmpdir = _real(tmpdir)
         for name, content in policies.items():
             write_control_file(control, name, content)
         record = {
             "worktree": str(repo),
             "branch": state["branch"],
             "socket": socket,
-            "tmpdir": str(_real(tmpdir)),
+            "tmpdir": str(tmpdir),
             "policy": policy_text,
             "policy_sha256": recorded_sha256,
             "srt_version": version,
@@ -1335,11 +1354,17 @@ def ensure_run_server(state: dict[str, Any], *, repo: Path) -> bool:
     except BaseException as exc:
         # Cleanup must never replace the failure it is cleaning up after.
         try:
-            sessions.kill_server(socket)
-            deadline = time.monotonic() + SRT_EXIT_WAIT_SECONDS
-            while _pid_alive(srt_pid) and time.monotonic() < deadline:
-                time.sleep(POLL_SECONDS)
-            left = f"srt still running: {srt_pid}" if _pid_alive(srt_pid) else "the server was killed"
+            remaining = sessions.kill_server(socket)
+            survivors: list[str] = []
+            if remaining:
+                survivors.append(f"sessions still listed on socket {socket}: {', '.join(remaining)}")
+            else:
+                deadline = time.monotonic() + SRT_EXIT_WAIT_SECONDS
+                while _pid_alive(srt_pid) and time.monotonic() < deadline:
+                    time.sleep(POLL_SECONDS)
+            if _pid_alive(srt_pid):
+                survivors.append(f"srt still running: {srt_pid}")
+            left = "; ".join(survivors) or "the server was killed"
         except BaseException as cleanup_exc:
             left = f"killing the server failed too ({cleanup_exc}): check tmux -L {socket}"
         outcome = f"sandboxed server on socket {socket!r} did not come up verified; {left}"
@@ -1359,15 +1384,50 @@ def _sandbox_left(socket: str, control: Path) -> bool:
     return sessions.server_running(socket, timeout=START_DEADLINE_SECONDS)
 
 
-def sandbox_left(state: dict[str, Any], *, repo: Path) -> bool:
+def _stop_unrecorded(state: dict[str, Any], run_dir: Path, socket: str) -> bool:
+    """Whether a complete run's event log holds no `sandbox-stopped` event
+    for `socket` since its last `complete` event: the run end's teardown
+    went through, but the event recording it was lost (an append that
+    failed). False for a run that is not complete."""
+    if state.get("status") != "complete":
+        return False
+    for event in reversed(state_mod.read_events(run_dir)):
+        data = event.get("data")
+        if event.get("kind") == "sandbox-stopped" and isinstance(data, dict) and data.get("socket") == socket:
+            return False
+        if event.get("kind") == "complete":
+            return True
+    return True
+
+
+def sandbox_left(state: dict[str, Any], *, repo: Path, run_dir: Path | None = None) -> bool:
     """Whether the run records a sandbox of which anything is still there
     (`_sandbox_left`), so a run end whose teardown failed can retry it.
-    False for an unsandboxed run; PmError from `_run_sandbox` for a
-    malformed block."""
+    With `run_dir`, a complete run whose `sandbox-stopped` event was lost
+    (`_stop_unrecorded`) counts too: recording it is what is left of the
+    teardown. False for an unsandboxed run; PmError from `_run_sandbox` for
+    a malformed block."""
     if not records_sandbox(state):
         return False
     _block, socket, control = _run_sandbox(state, repo)
-    return _sandbox_left(socket, control)
+    if _sandbox_left(socket, control):
+        return True
+    return run_dir is not None and _stop_unrecorded(state, run_dir, socket)
+
+
+def _foreign_tmpdir(record: dict[str, Any], socket: str) -> Path | None:
+    """The record's temp dir when it is a well-formed `pm-sandbox-<socket>`
+    path under a temp root other than this process's (a `TMPDIR` other than
+    the one the record was written under), else None: `stop_server` would
+    refuse it before killing anything, and a temp dir it cannot see is no
+    reason to leave the server running."""
+    text = record.get("tmpdir")
+    if not isinstance(text, str) or _BAD_PATH_CHARS.search(text):
+        return None
+    tmpdir = Path(text)
+    if not tmpdir.is_absolute() or tmpdir.name != f"{TMPDIR_PREFIX}{socket}":
+        return None
+    return tmpdir if _real(tmpdir.parent) != _real(tempfile.gettempdir()) else None
 
 
 def _tear_down(socket: str, control: Path) -> tuple[list[str], bool]:
@@ -1375,13 +1435,28 @@ def _tear_down(socket: str, control: Path) -> tuple[list[str], bool]:
     whether anything was there to tear down). A control dir without a
     record (an earlier teardown) is torn down from what `init` created: the
     socket's server, if one answers, and the temp dir `make_tmpdir` names.
-    The control root goes too once nothing else is left in it."""
+    A record whose temp dir lies under another temp root (`_foreign_tmpdir`)
+    still has its server killed and its control dir removed; that temp dir
+    is left in place, and a note names it and the `TMPDIR` difference. The
+    control root goes too once nothing else is left in it."""
     present = _sandbox_left(socket, control)
     if os.path.lexists(control / RECORD_NAME):
         record = read_record(control)
     else:
         record = {"srt_pid": None, "tmpdir": str(run_tmpdir(socket)), "control": str(control)}
+    foreign = _foreign_tmpdir(record, socket)
+    if foreign is not None:
+        # This process's own name for the temp dir passes `stop_server`'s
+        # check; it is the socket's, so removing it is right if it exists.
+        record = {**record, "tmpdir": str(run_tmpdir(socket))}
     remaining, notes = stop_server(socket=socket, record=record)
+    if foreign is not None:
+        notes = [note for note in notes if note != f"sandbox temp dir already gone: {run_tmpdir(socket)}"]
+        notes.append(
+            f"left sandbox temp dir {foreign} in place: it is not under this process's temp root"
+            f" {tempfile.gettempdir()}, so TMPDIR differs from the one the run's sandbox was set up under; remove"
+            " it by hand, or repeat this under that TMPDIR"
+        )
     if remaining:
         notes.append(f"sessions still listed on socket {socket}: {', '.join(remaining)}")
     # `rmdir` refuses a non-empty root, so another run's directory is never touched.
@@ -1395,15 +1470,18 @@ def _tear_down(socket: str, control: Path) -> tuple[list[str], bool]:
 def teardown_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[str] | None:
     """The run end of a sandboxed Mode B run: `stop_server` with the run's
     record, then a `sandbox-stopped` event when anything was there to tear
-    down; returns the notes for the caller to print (the remaining sessions
-    among them when any are left), or None for an unsandboxed run.
+    down, or when the run is complete and the event recording its run-end
+    teardown was lost (`_stop_unrecorded`); returns the notes for the caller
+    to print (the remaining sessions among them when any are left), or None
+    for an unsandboxed run.
 
     Idempotent: a control dir already removed (an earlier teardown) is torn
     down again from what `init` created, the socket's server if one answers
     and the temp dir `make_tmpdir` names, so a repeated teardown reports both
-    as gone rather than failing, and appends no second event. The control
-    root `<common git dir>/pm-sandbox` is removed as well when nothing else
-    is left in it.
+    as gone rather than failing, and appends no second event. A temp dir
+    under another temp root is left in place with a note (`_tear_down`).
+    The control root `<common git dir>/pm-sandbox` is removed as well when
+    nothing else is left in it.
 
     PmError, before anything is killed or removed, for a malformed `sandbox`
     block in run state (an empty one included) or a control dir it names
@@ -1415,7 +1493,7 @@ def teardown_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
         return None
     _block, socket, control = _run_sandbox(state, repo)
     notes, present = _tear_down(socket, control)
-    if present:
+    if present or _stop_unrecorded(state, run_dir, socket):
         state_mod.append_event(run_dir, "sandbox-stopped", note="; ".join(notes), data={"socket": socket})
     return notes
 

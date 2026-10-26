@@ -916,8 +916,9 @@ def start_slice(
     run's sandbox, that call rebuilds it first. An all-attested run is
     completed here, and a sandboxed one torn down (`sandbox.teardown_run`),
     its notes in `sandbox_notes`; on a run already complete the teardown is
-    retried whenever anything of its sandbox is left (`sandbox.sandbox_left`),
-    so a teardown that failed at the run end can be finished.
+    retried whenever anything of its sandbox is left, or its `sandbox-stopped`
+    event was lost (`sandbox.sandbox_left`), so a teardown that failed at the
+    run end can be finished.
     """
     state = load_writable_state(run_dir, token)
     sandbox.require_run_socket(state)
@@ -959,8 +960,8 @@ def start_slice(
                 state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
             # The run end takes a sandboxed run's server down with it; on a run
             # already complete, a teardown that failed before is retried while
-            # anything of the sandbox is left.
-            if completing or sandbox.sandbox_left(state, repo=repo):
+            # anything of the sandbox is left or its event is missing.
+            if completing or sandbox.sandbox_left(state, repo=repo, run_dir=run_dir):
                 try:
                     sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
                 finally:
@@ -2273,6 +2274,12 @@ def _kill_reviewer_pgid(pgid: int) -> None:
         pass
 
 
+class StopTeardownError(PmError):
+    """`stop` recorded the stop (state saved, event appended), but the
+    sandbox teardown after it failed: what is left of the run's sandbox must
+    still be torn down."""
+
+
 @dataclass
 class StopOutcome:
     run_id: str
@@ -2295,7 +2302,9 @@ def stop(
     unless `PM_TMUX_SOCKET` names the run's socket; once the stop is recorded
     it tears the run's sandbox down (`sandbox.teardown_run`: the server, its
     temp and control directories, a `sandbox-stopped` event) and returns
-    what that did in `sandbox_notes`.
+    what that did in `sandbox_notes`; a teardown that fails (PmError or
+    OSError) raises `StopTeardownError`, a PmError, so a caller can tell a
+    recorded stop from one refused before it was recorded.
     """
     state = load_writable_state(run_dir, token)
     sandbox.require_run_socket(state)
@@ -2342,6 +2351,8 @@ def stop(
     # The run end takes a sandboxed run's server down with it.
     try:
         sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
+    except (PmError, OSError) as exc:
+        raise StopTeardownError(str(exc)) from exc
     finally:
         regenerate_report(repo, run_dir, state)
     return StopOutcome(run_id=run_id, killed=killed, sandbox_notes=sandbox_notes)
