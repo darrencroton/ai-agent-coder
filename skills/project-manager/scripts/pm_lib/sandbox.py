@@ -44,15 +44,9 @@ the toolkit derives itself is written that way: a worktree under `work[1]`
 must not also grant `work1`. Base-policy entries stay as the operator wrote
 them.
 
-A base policy is refused for a grant that is the filesystem root or the home
-directory (equality only: every grant lies inside `/`, and grants inside the
-home directory are normal), or that is, contains or lies inside the toolkit
-checkout or the tmux socket directory; for a `network.allowUnixSockets` entry
-that is, contains or lies inside the tmux socket directory (`srt` renders each
-entry as a `subpath` connect rule, so it would let a pane drive the operator's
-own unsandboxed tmux server); and, at `check_binaries`, for a write grant that
-is or contains `srt`'s package, the real or the `PATH`-spelled `srt` and
-`node`.
+The base-policy refusals are listed once, in `load_pinned_policy`'s
+docstring; `check_binaries` adds the refusal of a write grant reaching `srt`
+or `node`.
 
 A grant is compared with a protected path by file identity (`st_dev`,
 `st_ino`), not by spelling: on a case-insensitive volume `/users/me` is

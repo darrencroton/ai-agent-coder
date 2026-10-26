@@ -126,8 +126,10 @@ def refuse_gitlinks(repo: Path) -> None:
 def git_status_text(repo: Path) -> str:
     """The repository's `git status --short` text, unstripped.
 
-    This is the one host-side `git status` in the toolkit, so every status
-    read goes through it. It refuses (PmError) a repository whose index holds a
+    This is the one host-side `git status` on a repository a sandbox can
+    write (`campaign-preflight`'s status on the dossier, the Campaign
+    Manager's own repository, is the exception), so every such status read
+    goes through it. It refuses (PmError) a repository whose index holds a
     gitlink, before `status` runs, because `status` would recurse into the
     submodule and execute its configuration on the host; see `refuse_gitlinks`.
 
