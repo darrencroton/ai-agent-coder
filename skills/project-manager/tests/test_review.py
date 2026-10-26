@@ -1913,7 +1913,18 @@ class TestReviewInsideSandbox(SandboxedReviewTestCase):
         control = self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=tmpdir)
         code, _out, err, launched = self._review(token, sandbox_runtime=True)
         self.assertEqual(code, 0, err)
-        self.assertEqual(launched[:5], ["srt", "-s", str(control / "reviewer-policy.json"), "env", f"TMPDIR={tmpdir}"])
+        self.assertEqual(
+            launched[:7],
+            [
+                "srt",
+                "-s",
+                str(control / "reviewer-policy.json"),
+                "--",
+                "env",
+                f"TMPDIR={tmpdir}",
+                f"CLAUDE_CODE_TMPDIR={tmpdir}",
+            ],
+        )
         self.assertIn('sandbox_mode="danger-full-access"', launched)
 
     def test_no_sandbox_runs_the_read_only_reviewer_unwrapped(self) -> None:
@@ -1940,7 +1951,9 @@ class TestReviewInsideSandbox(SandboxedReviewTestCase):
         self.assertEqual(code, 0, err)
         review, report, prompt = self._only_review(token, run_dir)
         policy = control / "reviewer-policy.json"
-        self.assertEqual(launched[:5], ["srt", "-s", str(policy), "env", f"TMPDIR={tmpdir}"])
+        self.assertEqual(
+            launched[:7], ["srt", "-s", str(policy), "--", "env", f"TMPDIR={tmpdir}", f"CLAUDE_CODE_TMPDIR={tmpdir}"]
+        )
         composed = review_mod.compose_reviewer_command("codex", prompt, repo=self.repo.resolve(), sandboxed=True)
         self.assertEqual(launched, sandbox_mod.wrap_command(policy, composed, tmpdir=tmpdir))
         self.assertIn("SRT_ARG=codex", report)

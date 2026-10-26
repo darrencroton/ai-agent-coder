@@ -729,12 +729,31 @@ def inside_sandbox() -> bool:
 
 
 def wrap_command(policy_path: Path | str, argv: list[str], *, tmpdir: Path | str) -> list[str]:
-    """`argv` run under `srt` with `policy_path`, with `TMPDIR` set to
-    `tmpdir` and, when the file exists, `SSL_CERT_FILE` pointed at the system
-    bundle (some harnesses verify TLS through `trustd`, which Seatbelt
-    blocks)."""
+    """`argv` run under `srt` with `policy_path`, with `TMPDIR` and
+    `CLAUDE_CODE_TMPDIR` set to `tmpdir` and, when the file exists,
+    `SSL_CERT_FILE` pointed at the system bundle (some harnesses verify TLS
+    through `trustd`, which Seatbelt blocks).
+
+    The `--` ends `srt`'s own options: without it `srt` (0.0.81) parses its
+    `-s`, `--settings`, `-c` and `-d` anywhere in the line, so a wrapped
+    reviewer's `-c key=value` (Codex) or `--settings '{...}'` (Claude Code)
+    would be taken as `srt`'s command string or policy file. Claude Code keeps
+    its working files under `$CLAUDE_CODE_TMPDIR/claude-<uid>`, by default
+    `/tmp/claude-<uid>`, which every Claude Code session on the machine
+    shares; pointing it at the run's temp dir keeps a sandboxed seat's files
+    there and lets a base policy deny the shared directory."""
     certs = [f"SSL_CERT_FILE={SSL_CERT_FILE}"] if SSL_CERT_FILE.exists() else []
-    return ["srt", "-s", str(policy_path), "env", f"TMPDIR={tmpdir}", *certs, *argv]
+    return [
+        "srt",
+        "-s",
+        str(policy_path),
+        "--",
+        "env",
+        f"TMPDIR={tmpdir}",
+        f"CLAUDE_CODE_TMPDIR={tmpdir}",
+        *certs,
+        *argv,
+    ]
 
 
 # --- Control directory, record, temp directory ----------------------------------
@@ -889,7 +908,7 @@ def _kill_group(process: subprocess.Popen) -> None:
 
 
 def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path, log_path: Path) -> tuple[int, int]:
-    """Start `srt -s <policy> env TMPDIR=<tmpdir> [SSL_CERT_FILE=...] tmux -L <socket> -D`
+    """Start `srt -s <policy> -- env TMPDIR=<tmpdir> CLAUDE_CODE_TMPDIR=<tmpdir> [SSL_CERT_FILE=...] tmux -L <socket> -D`
     and return `(srt_pid, server_pid)` once the server answers.
 
     `-D` keeps tmux in the foreground, so `srt` stays its parent and `srt`'s

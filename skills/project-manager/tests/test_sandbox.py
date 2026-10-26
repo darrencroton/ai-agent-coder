@@ -825,8 +825,10 @@ class TestWrapCommandAndDetection(unittest.TestCase):
                     "srt",
                     "-s",
                     "/c/policy.json",
+                    "--",
                     "env",
                     "TMPDIR=/t/run",
+                    "CLAUDE_CODE_TMPDIR=/t/run",
                     f"SSL_CERT_FILE={certs.name}",
                     "codex",
                     "exec",
@@ -836,7 +838,7 @@ class TestWrapCommandAndDetection(unittest.TestCase):
         with mock.patch.object(sandbox, "SSL_CERT_FILE", Path("/nonexistent/cert.pem")):
             self.assertEqual(
                 sandbox.wrap_command(Path("/c/policy.json"), ["true"], tmpdir=Path("/t/run")),
-                ["srt", "-s", "/c/policy.json", "env", "TMPDIR=/t/run", "true"],
+                ["srt", "-s", "/c/policy.json", "--", "env", "TMPDIR=/t/run", "CLAUDE_CODE_TMPDIR=/t/run", "true"],
             )
 
     def test_inside_sandbox_reads_sandbox_runtime(self) -> None:
@@ -872,6 +874,29 @@ class TestWrapCommandAndDetection(unittest.TestCase):
                 )
         self.assertIn("already answers", str(ctx.exception))
         popen.assert_not_called()
+
+
+@requires_srt
+class TestWrapCommandUnderRealSrt(TempDirTestCase):
+    """`srt` parses its own options anywhere in the line unless `--` ends
+    them; a wrapped reviewer carries `-c` (Codex) and `--settings` (Claude
+    Code), which must reach the reviewer verbatim."""
+
+    def test_the_wrapped_command_receives_srt_option_spellings_verbatim(self) -> None:
+        policy = write_base_policy(self.tmp / "policy.json")
+        argv = ["-c", 'model_reasoning_effort="high"', "--settings", '{"sandbox":{"enabled":false}}', "-s", "x", "-d"]
+        result = subprocess.run(
+            sandbox.wrap_command(
+                policy, ["sh", "-c", 'printf "%s\\n" "$CLAUDE_CODE_TMPDIR" "$@"', "sh", *argv], tmpdir="/t/run"
+            ),
+            check=False,
+            text=True,
+            capture_output=True,
+            cwd=self.tmp,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["/t/run", *argv])
 
 
 # --- the server lifecycle without srt -------------------------------------------------
@@ -1050,7 +1075,7 @@ class TestStartServerWithFakes(TempDirTestCase):
 
         self.assertEqual(len(srt_calls), 1)
         argv, kwargs, token_during_call, process = srt_calls[0]
-        self.assertEqual(argv[:4], ["srt", "-s", str(self.tmp / "p.json"), "env"])
+        self.assertEqual(argv[:5], ["srt", "-s", str(self.tmp / "p.json"), "--", "env"])
         self.assertEqual(argv[-4:], ["tmux", "-L", "pm-run-x", "-D"])
         self.assertEqual(kwargs["cwd"], str(worktree))
         self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
@@ -1565,7 +1590,7 @@ class TestSandboxedServer(SandboxServerTestCase):
             self.repo.parent / "harness.sh",
             "\n".join(
                 [
-                    f'echo "X=$PM_X TOKEN=${{PM_RUN_TOKEN:-ABSENT}} TMPDIR=$TMPDIR" > "{out}"',
+                    f'echo "X=$PM_X TOKEN=${{PM_RUN_TOKEN:-ABSENT}} TMPDIR=$TMPDIR CC=$CLAUDE_CODE_TMPDIR" > "{out}"',
                     f'touch "{leak}" 2>/dev/null; echo "leak_rc=$?" >> "{out}"',
                     f'touch "{self.worktree}/inside"; echo "inside_rc=$?" >> "{out}"',
                     f'git -C "{self.worktree}" branch sibling 2>/dev/null; echo "branch_rc=$?" >> "{out}"',
@@ -1581,7 +1606,7 @@ class TestSandboxedServer(SandboxServerTestCase):
         self.assertEqual(sessions.list_sessions_on(self.socket), ["pm-test-sb-s01a0"])
         self.assertTrue(self.wait_for(lambda: out.is_file() and "done" in out.read_text(encoding="utf-8")))
         lines = out.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[0], f"X=a b TOKEN=ABSENT TMPDIR={self.tmpdir}")
+        self.assertEqual(lines[0], f"X=a b TOKEN=ABSENT TMPDIR={self.tmpdir} CC={self.tmpdir}")
         self.assertNotEqual(lines[1], "leak_rc=0")
         self.assertEqual(lines[2], "inside_rc=0")
         self.assertNotEqual(lines[3], "branch_rc=0")

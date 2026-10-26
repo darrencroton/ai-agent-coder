@@ -20,7 +20,7 @@ Facts marked *tested* were established on macOS 27.0.1 with tmux 3.5a, git 2.54,
 The run's private tmux server runs in the foreground under `srt`:
 
 ```sh
-srt -s <control dir>/policy.json env TMPDIR=<per-run temp dir> SSL_CERT_FILE=/etc/ssl/cert.pem tmux -L <socket> -D
+srt -s <control dir>/policy.json -- env TMPDIR=<per-run temp dir> CLAUDE_CODE_TMPDIR=<per-run temp dir> SSL_CERT_FILE=/etc/ssl/cert.pem tmux -L <socket> -D
 ```
 
 Seatbelt restrictions are per-process kernel state inherited across `fork` and `exec`, so every pane the server ever creates, whichever client asked for it, and every descendant of those panes (reviewers started in their own process groups included) runs under the policy (OS, *tested*). `-D` keeps tmux in the foreground, so `srt` stays its parent and `srt`'s in-process proxy stays up for the server's whole life; `tmux kill-server` ends the server, `srt` exits and the proxy closes (*tested*). The `SSL_CERT_FILE` pair is passed only when `/etc/ssl/cert.pem` exists. The server's working directory is the worktree, its stdin is closed, its output goes to `<control dir>/srt.log`, and `PM_RUN_TOKEN` is absent from its environment.

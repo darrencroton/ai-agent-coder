@@ -2500,7 +2500,10 @@ class TestSandboxedDeveloperLaunch(_SandboxedRun):
         # A reviewer launch is the one Popen with its own session; git's are not.
         launched = [call.args[0] for call in popen.call_args_list if call.kwargs.get("start_new_session")]
         tmpdir = sandbox_mod.read_record(self.control)["tmpdir"]
-        self.assertEqual(launched[0][:5], ["srt", "-s", str(reviewer_policy), "env", f"TMPDIR={tmpdir}"])
+        self.assertEqual(
+            launched[0][:7],
+            ["srt", "-s", str(reviewer_policy), "--", "env", f"TMPDIR={tmpdir}", f"CLAUDE_CODE_TMPDIR={tmpdir}"],
+        )
         review = state_mod.load_state(self.run_dir, self.token)["slices"][0]["reviews"][0]
         self.assertIn("SANDBOX_RUNTIME=1", Path(review["artifact"]).read_text(encoding="utf-8"))
 
