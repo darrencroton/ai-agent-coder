@@ -819,7 +819,7 @@ class TestSteerTypedStateCleanup(PmTestCase):
     def test_typed_not_submitted_preserves_the_correction_file(self) -> None:
         plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
-        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir = self.repo.resolve() / ".pm" / "runs" / run_dir.name / "slices" / "slice-001"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         self.launch_current_slice(
             state,
@@ -1622,7 +1622,7 @@ class TestCurrentSubmissionGaps(PmTestCase):
         plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
         head = self._git("rev-parse", "HEAD").stdout.strip()
-        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir = self.repo.resolve() / ".pm" / "runs" / run_dir.name / "slices" / "slice-001"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         self.launch_current_slice(
             state,
@@ -2156,11 +2156,13 @@ class TestPaneTailPrinter(unittest.TestCase):
 
     def _render(self, text: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
-            pane = Path(tmp) / "pane.txt"
+            repo = Path(tmp)
+            pane = repo / ".pm" / "pane.txt"
+            pane.parent.mkdir()
             pane.write_text(text, encoding="utf-8")
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
-                cli._print_pane_tail(pane)
+                cli._print_pane_tail(repo, pane)
             return buffer.getvalue()
 
     def test_a_capture_prints_its_tail_bounded_to_the_last_lines(self) -> None:
@@ -2178,7 +2180,7 @@ class TestPaneTailPrinter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
-                cli._print_pane_tail(Path(tmp) / "absent.txt")
+                cli._print_pane_tail(Path(tmp), Path(tmp) / ".pm" / "absent.txt")
         self.assertIn("not captured", buffer.getvalue())
 
 

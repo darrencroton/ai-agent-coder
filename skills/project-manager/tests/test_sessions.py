@@ -575,19 +575,14 @@ class TestStartSessionAndBasicLifecycle(TmuxSessionTestCase):
         self.assertTrue(self._wait_for(lambda: sessions.session_exists(mine) and sessions.session_exists(stray)))
         self.assertEqual(sessions.sessions_for_run(run_id), [mine])
 
-    def test_capture_to_writes_pane_text(self) -> None:
+    def test_capture_text_returns_pane_text(self) -> None:
         name = "pm-test-capture-s01a0"
         self._start(name, "bash -c 'echo CAPTURE_MARKER_TEXT; sleep 5'")
         self.assertTrue(self._wait_for(lambda: "CAPTURE_MARKER_TEXT" in sessions.pane_text(name)))
-        destination = self.repo / "pane.txt"
-        sessions.capture_to(name, destination)
-        self.assertIn("CAPTURE_MARKER_TEXT", destination.read_text(encoding="utf-8"))
+        self.assertIn("CAPTURE_MARKER_TEXT", sessions.capture_text(name))
 
-    def test_capture_to_writes_placeholder_for_dead_session(self) -> None:
-        destination = self.repo / "pane-dead.txt"
-        sessions.capture_to("pm-test-does-not-exist-s01a0", destination)
-        content = destination.read_text(encoding="utf-8")
-        self.assertTrue(content.strip())
+    def test_capture_text_returns_placeholder_for_dead_session(self) -> None:
+        self.assertTrue(sessions.capture_text("pm-test-does-not-exist-s01a0").strip())
 
     def test_detect_activity_returns_the_latest_capture(self) -> None:
         name = "pm-test-activity-s01a0"

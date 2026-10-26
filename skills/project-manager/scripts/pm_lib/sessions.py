@@ -320,7 +320,7 @@ def visible_pane_text(session: str) -> str:
     *now*, so history is not merely unnecessary here but wrong: a trust
     dialog answered an hour ago still sits inside `pane_text`'s 32k lines,
     and scanning those refused every later send for the life of the session.
-    Full scrollback stays the right capture for evidence (`capture_to`).
+    Full scrollback stays the right capture for evidence (`capture_text`).
     """
     return _pane_capture(session, visible=True) or ""
 
@@ -348,16 +348,19 @@ def scan_visible_pane(session: str, *, required: bool = False) -> PaneObservatio
     return PaneObservation(capture=capture, dialog_markers=scan_dialog_markers(capture or ""))
 
 
-def capture_to(session: str, destination: Path) -> None:
-    """Write pane text to `destination`; an explanatory placeholder when unavailable."""
+def capture_text(session: str) -> str:
+    """Full-scrollback pane text of `session`, or an explanatory placeholder when unavailable.
+
+    Returns the text instead of writing it: the callers' destinations sit in
+    the sandbox-writable `.pm/` tree, which host code writes only through
+    `pm_paths.write_pm_text`.
+    """
     if not shutil.which("tmux"):
-        destination.write_text("tmux was unavailable during capture\n", encoding="utf-8")
-        return
+        return "tmux was unavailable during capture\n"
     result = _run_tmux("capture-pane", "-p", "-J", "-S", "-32768", "-t", session)
     if result.returncode == 0:
-        destination.write_text(result.stdout, encoding="utf-8")
-    else:
-        destination.write_text("tmux pane was unavailable during capture\n", encoding="utf-8")
+        return result.stdout
+    return "tmux pane was unavailable during capture\n"
 
 
 def session_exists(session: str) -> bool:

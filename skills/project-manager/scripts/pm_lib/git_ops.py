@@ -179,13 +179,16 @@ def changed_files_between(repo: Path, before_head: str | None, after_head: str |
     return {path for path in files if path}
 
 
-def write_git_diff(repo: Path, before_head: str | None, after_head: str | None, destination: Path) -> None:
-    """Write a binary-safe diff patch to destination.
+def git_diff_text(repo: Path, before_head: str | None, after_head: str | None) -> tuple[str, str | None]:
+    """A binary-safe diff patch as `(diff text, error text)`; the caller writes it.
 
-    On git failure, destination is still written as an empty (but valid,
-    zero-change) diff, and the error is recorded in a sidecar file next to
-    it — so the artifact is never a diff-shaped file that is actually a git
-    error message.
+    On git failure the diff text is empty (a valid, zero-change diff) and the
+    error text is git's stderr, so a caller records the error beside the
+    artifact and the artifact is never a diff-shaped file that is actually a
+    git error message; on success the error text is None. This function
+    writes nothing: the callers own the destination, and finalize's destination
+    is under the sandbox-writable `.pm/` tree, which host code may write only
+    through `pm_paths.write_pm_text`.
 
     The worktree-mode diff (no refs) recurses into submodules like `git
     status`, so it refuses (PmError) a repository whose index holds a gitlink
@@ -204,10 +207,8 @@ def write_git_diff(repo: Path, before_head: str | None, after_head: str | None, 
         refuse_gitlinks(repo)
         returncode, stdout, stderr = git_result(repo, "diff", "--binary")
     if returncode == 0:
-        destination.write_text(stdout, encoding="utf-8")
-    else:
-        destination.write_text("", encoding="utf-8")
-        (destination.parent / "git-diff-error.txt").write_text(stderr, encoding="utf-8")
+        return stdout, None
+    return "", stderr
 
 
 def is_full_commit_hash(value: str | None) -> bool:

@@ -705,7 +705,7 @@ class TestManifestErrors(CampaignTestCase):
     def test_stop_child_reports_a_pane_capture_that_could_not_be_written(self) -> None:
         self.worktree.mkdir()
         self._write_manifest("campaign-node-1-000000")
-        with mock.patch.object(campaign.sessions, "capture_to", side_effect=OSError("disk full")):
+        with mock.patch.object(campaign.sessions, "capture_text", side_effect=OSError("disk full")):
             code, out, err = self.run_cli(["stop-child", "--worktree", str(self.worktree), "--reason", "test"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("pane: not captured (disk full)", out)
@@ -861,7 +861,7 @@ class TestChildLifecycle(CampaignTestCase):
         with mock.patch.object(campaign.slice_ops, "deliver_answer", wraps=slice_ops.deliver_answer) as deliver:
             code, out, err = self.run_cli(["answer-child", "--worktree", str(worktree), "--text", "A, data first"])
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(deliver.call_args.args[:3], (directory, "cm-", session))
+        self.assertEqual(deliver.call_args.args[:4], (worktree, directory, "cm-", session))
         answer_path = directory / "cm-answer-1.md"
         self.assertEqual(answer_path.read_text(encoding="utf-8"), "A, data first")
         self.assertTrue((directory / "cm-question-1.md").is_file())
@@ -1491,13 +1491,14 @@ class TestStopChildSocketNamesTheSandboxRefuses(CampaignTestCase):
             "list_sessions_on": mock.DEFAULT,
             "server_environment": mock.DEFAULT,
             "session_exists": mock.DEFAULT,
-            "capture_to": mock.DEFAULT,
+            "capture_text": mock.DEFAULT,
             "kill_server": mock.DEFAULT,
         }
         with mock.patch.multiple(campaign.sessions, **tmux) as fakes:
             fakes["list_sessions_on"].return_value = [manifest["session"]]
             fakes["server_environment"].return_value = str(child)
             fakes["session_exists"].return_value = True
+            fakes["capture_text"].return_value = "pane\n"
             fakes["kill_server"].return_value = []
             outcome = campaign.stop_child(child)
             fakes["kill_server"].assert_called_once_with(socket)
@@ -1536,7 +1537,7 @@ class TestStopChildTempDirLookup(CampaignTestCase):
     def stop_with_no_usable_temp_dir(self) -> tuple[campaign.StopChildOutcome, mock.MagicMock, mock.MagicMock]:
         campaign.manifest_path(self.child).write_text(json.dumps(self.manifest), encoding="utf-8")
         tmux = dict.fromkeys(
-            ("list_sessions_on", "server_environment", "session_exists", "capture_to", "kill_server"), mock.DEFAULT
+            ("list_sessions_on", "server_environment", "session_exists", "capture_text", "kill_server"), mock.DEFAULT
         )
         failure = FileNotFoundError("No usable temporary directory found")
         with (
@@ -1546,6 +1547,7 @@ class TestStopChildTempDirLookup(CampaignTestCase):
             fakes["list_sessions_on"].return_value = [self.manifest["session"]]
             fakes["server_environment"].return_value = str(self.child)
             fakes["session_exists"].return_value = True
+            fakes["capture_text"].return_value = "pane\n"
             fakes["kill_server"].return_value = []
             outcome = campaign.stop_child(self.child)
         return outcome, gettempdir, fakes["kill_server"]

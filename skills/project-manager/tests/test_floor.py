@@ -286,6 +286,24 @@ class TestFactResult(FloorTestCase):
         report = floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
         self.assertFalse(_facts_by_name(report)["result"].passed)
 
+    def test_a_symlinked_result_fails_with_the_refusal_and_is_never_followed(self) -> None:
+        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
+        self._commit_authorized_change()
+        # A result.json planted as a link to a file outside `.pm/`, whose
+        # content would otherwise pass the fact.
+        outside = self.repo.parent / "outside-result.json"
+        outside.write_text(json.dumps({"slice": "Slice 1", "status": "complete"}), encoding="utf-8")
+        (self.artifact_dir / "result.json").symlink_to(outside)
+        state = self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        )
+
+        report = floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
+        fact = _facts_by_name(report)["result"]
+        self.assertFalse(fact.passed)
+        self.assertIn("sandbox-writable .pm/", fact.detail)
+        self.assertIn("result.json", fact.detail)
+
 
 class TestFactSurface(FloorTestCase):
     def test_unauthorized_committed_change_fails_surface(self) -> None:

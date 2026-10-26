@@ -408,7 +408,12 @@ def run_review(
     # Per-commission, so a later commission cannot replace the pinned diff a
     # running reviewer has not opened yet.
     diff_path = original_slice_dir / f"review-{seq}-{skill}-{resolved_tool}.patch"
-    git_ops.write_git_diff(repo, before_head, reviewed_head, diff_path)
+    # The pinned diff lives under the run dir (`.git/pm/...`, host-only), not
+    # `.pm/`, so a plain write is correct; the error sidecar sits beside it.
+    diff_text, diff_error = git_ops.git_diff_text(repo, before_head, reviewed_head)
+    diff_path.write_text(diff_text, encoding="utf-8")
+    if diff_error is not None:
+        (diff_path.parent / "git-diff-error.txt").write_text(diff_error, encoding="utf-8")
     if before_head and before_head != reviewed_head:
         changed_files = sorted(
             path for path in git_ops.git(repo, "diff", "--name-only", before_head, reviewed_head).splitlines() if path

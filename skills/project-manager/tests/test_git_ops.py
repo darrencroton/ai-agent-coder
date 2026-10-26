@@ -218,15 +218,13 @@ class TestGitFacts(PmTestCase):
             linked_dir = git_ops.worktree_git_dir(linked_path)
             self.assertNotEqual(main_dir, linked_dir)
 
-    def test_write_git_diff_produces_a_patch_for_working_tree_change(self) -> None:
+    def test_git_diff_text_produces_a_patch_for_working_tree_change(self) -> None:
         (self.repo / "README.md").write_text("hello, changed\n", encoding="utf-8")
-        destination = self.repo / "diff.patch"
-        git_ops.write_git_diff(self.repo, None, None, destination)
-        content = destination.read_text(encoding="utf-8")
+        content, error = git_ops.git_diff_text(self.repo, None, None)
         self.assertIn("README.md", content)
-        self.assertFalse((destination.parent / "git-diff-error.txt").exists())
+        self.assertIsNone(error)
 
-    def test_write_git_diff_covers_first_commit_on_unborn_branch_run(self) -> None:
+    def test_git_diff_text_covers_first_commit_on_unborn_branch_run(self) -> None:
         # A run initialized before the first commit has before_head=None; the
         # committed slice must still appear in the evidence patch, mirroring
         # changed_files_between's `git show` handling of the same case.
@@ -234,11 +232,9 @@ class TestGitFacts(PmTestCase):
         self._git("add", "new-file.txt")
         self._git("commit", "-q", "-m", "first slice commit")
         after_head = git_ops.git_head(self.repo)
-        destination = self.repo / "diff.patch"
-        git_ops.write_git_diff(self.repo, None, after_head, destination)
-        content = destination.read_text(encoding="utf-8")
+        content, error = git_ops.git_diff_text(self.repo, None, after_head)
         self.assertIn("new-file.txt", content)
-        self.assertFalse((destination.parent / "git-diff-error.txt").exists())
+        self.assertIsNone(error)
 
     def test_gitlink_in_index_is_refused_by_status_and_worktree_diff(self) -> None:
         # A gitlink makes the host's `git status` and ref-less `git diff` execute
@@ -249,18 +245,14 @@ class TestGitFacts(PmTestCase):
         self.assertEqual(git_ops.gitlinks(self.repo), ["sub"])
         with self.assertRaisesRegex(PmError, "submodules are not supported.*sub"):
             git_ops.git_status_text(self.repo)
-        destination = self.repo / "diff.patch"
         with self.assertRaisesRegex(PmError, "submodules are not supported.*sub"):
-            git_ops.write_git_diff(self.repo, None, None, destination)
-        self.assertFalse(destination.exists())
+            git_ops.git_diff_text(self.repo, None, None)
 
-    def test_write_git_diff_writes_error_sidecar_on_bad_ref(self) -> None:
-        destination = self.repo / "diff.patch"
-        git_ops.write_git_diff(self.repo, "0" * 40, "1" * 40, destination)
-        self.assertEqual(destination.read_text(encoding="utf-8"), "")
-        sidecar = destination.parent / "git-diff-error.txt"
-        self.assertTrue(sidecar.exists())
-        self.assertTrue(sidecar.read_text(encoding="utf-8").strip())
+    def test_git_diff_text_returns_empty_diff_and_error_text_on_bad_ref(self) -> None:
+        content, error = git_ops.git_diff_text(self.repo, "0" * 40, "1" * 40)
+        self.assertEqual(content, "")
+        self.assertIsNotNone(error)
+        self.assertTrue(error.strip())
 
     def test_resolve_repo_and_resolve_plan(self) -> None:
         resolved = git_ops.resolve_repo(self.repo)

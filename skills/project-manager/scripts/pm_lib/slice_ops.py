@@ -12,6 +12,16 @@ Semantic judgement enters in `finalize_accept` / `finalize_steer` /
 through the CLI (never inferred from evidence alone), gated by the floor
 (never waivable) and, on elevated slices, by review freshness. Assessment
 text assembles facts around the PM's own reasoning; it never invents it.
+
+Guarded `.pm/` access (the rule). `<worktree>/.pm/` is writable by the
+sandboxed Developer, and `Path.read_text`/`write_text` follow symlinks, so a
+planted link would turn a host write of Developer-chosen text into a write
+anywhere the operator can write, and a host read into a read of a file the
+sandbox is denied. Host code therefore never opens a path under `.pm/`
+except through `pm_paths` (`open_pm_file` and its wrappers), which refuses
+any symlink, non-regular file or multi-link file with a `PmError`; that
+module's docstring is the rule's home and gives the mechanism. The rule binds
+`campaign`, `review`, `floor` and `cli` as well as this module.
 """
 
 from __future__ import annotations
@@ -33,6 +43,7 @@ from . import IntegrityError, PmError, TypedNotSubmitted
 from . import code_metrics
 from . import git_ops
 from . import plan as plan_mod
+from . import pm_paths
 from . import profiles
 from . import prompts
 from . import sandbox
@@ -155,11 +166,9 @@ def slice_artifact_dir(repo: Path, run_id: str, slice_id: str) -> Path:
 
 def write_pm_gitignore(repo: Path) -> None:
     """A self-ignoring `.pm/.gitignore` (a bare `*`) so the artifact tree never
-    needs individual entries in the repository's own `.gitignore`."""
-    directory = pm_dir(repo)
-    directory.mkdir(parents=True, exist_ok=True)
-    gitignore = directory / ".gitignore"
-    gitignore.write_text("*\n", encoding="utf-8")
+    needs individual entries in the repository's own `.gitignore`. Written
+    through `pm_paths.write_pm_text`, like every host write under `.pm/`."""
+    pm_paths.write_pm_text(repo, pm_dir(repo) / ".gitignore", "*\n")
 
 
 # --- Controller-owned originals + mirrors -------------------------------------
@@ -183,11 +192,12 @@ def mirror_artifact(repo: Path, run_dir: Path, run_id: str, relative_path: str) 
     """Copy an already-written ORIGINAL (under `run_dir`) to its `.pm/`
     mirror location, creating any missing mirror directories (this is what
     lets the report/mirror tree regenerate correctly after `.pm/` has been
-    deleted entirely). Returns the original path."""
+    deleted entirely). The mirror side is written through `pm_paths.write_pm_bytes`,
+    so a symlink planted in `.pm/` is refused (PmError), never followed.
+    Returns the original path."""
     original = run_dir / relative_path
     mirror = run_artifact_dir(repo, run_id) / relative_path
-    mirror.parent.mkdir(parents=True, exist_ok=True)
-    mirror.write_bytes(original.read_bytes())
+    pm_paths.write_pm_bytes(repo, mirror, original.read_bytes())
     return original
 
 
@@ -559,7 +569,7 @@ def _finish_init(repo: Path, run_dir: Path, run_id: str, note: str) -> None:
     """`init`'s last steps once run state is saved: the `.pm` gitignore, the
     run's artifact directory and the `init` event."""
     write_pm_gitignore(repo)
-    (run_artifact_dir(repo, run_id) / "slices").mkdir(parents=True, exist_ok=True)
+    pm_paths.ensure_pm_dir(repo, run_artifact_dir(repo, run_id) / "slices")
     state_mod.append_event(run_dir, "init", note=note)
 
 
@@ -841,7 +851,7 @@ class StartSliceOutcome:
     sandbox_notes: list[str] | None = None
 
 
-def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> list[str]:
+def _rotate_prior_attempt(repo: Path, artifact_dir: Path, superseded_attempt: int) -> list[str]:
     # `validation.md` rotates with the rest: it is Developer-authored evidence
     # PM assesses the attempt against, so a steer or relaunch that left the
     # prior attempt's copy in place would present stale evidence as this
@@ -855,12 +865,17 @@ def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> list[s
     # it, and left in place it would read as the new attempt's question.
     # Answered questions (`question-<n>.md`) and their `answer-<n>.md` files
     # stay at the top level, numbered across the whole slice.
+    #
+    # The destination is created through `pm_paths.ensure_pm_dir`, so a symlink planted
+    # at `attempt-<n>` (or above it) is refused rather than moving the files
+    # into whatever it points at. The renames themselves move names, never
+    # content, and `rename` does not follow a leaf link.
     names = ("result.json", "pane.txt", "pane-live.txt", "validation.md", "question.md")
     present = [name for name in names if (artifact_dir / name).exists()]
     if not present:
         return []
     destination = artifact_dir / f"attempt-{superseded_attempt}"
-    destination.mkdir(parents=True, exist_ok=True)
+    pm_paths.ensure_pm_dir(repo, destination)
     for name in present:
         (artifact_dir / name).rename(destination / name)
     return present
@@ -1035,10 +1050,10 @@ def start_slice(
             server_started_on = run_socket
 
     artifact_dir = slice_artifact_dir(repo, run_id, plan_slice.slice_id)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    pm_paths.ensure_pm_dir(repo, artifact_dir)
 
     if relaunch:
-        _rotate_prior_attempt(artifact_dir, attempts - 1)
+        _rotate_prior_attempt(repo, artifact_dir, attempts - 1)
 
     reaped: list[str] = []
     for name in sessions.sessions_for_run(run_id):
@@ -1049,7 +1064,7 @@ def start_slice(
         before_head = current.get("before_head") if current else None
     else:
         before_head = git_ops.git_head(repo)
-        (artifact_dir / "status-before.txt").write_text(git_ops.git_status_text(repo), encoding="utf-8")
+        pm_paths.write_pm_text(repo, artifact_dir / "status-before.txt", git_ops.git_status_text(repo))
 
     # Controller-owned notes.md: the PM agent curates the ORIGINAL (under
     # run_dir) via the `notes` command (write_notes) — start-slice's job here
@@ -1063,8 +1078,7 @@ def start_slice(
         original_notes.write_text("", encoding="utf-8")
     notes_warning = _notes_cap_warning(original_notes.stat().st_size)
     slice_notes_path = notes_path(repo, run_id)
-    slice_notes_path.parent.mkdir(parents=True, exist_ok=True)
-    slice_notes_path.write_bytes(original_notes.read_bytes())
+    pm_paths.write_pm_bytes(repo, slice_notes_path, original_notes.read_bytes())
 
     result_path = artifact_dir / "result.json"
     question_path = artifact_dir / "question.md"
@@ -1083,7 +1097,7 @@ def start_slice(
         sandboxed=sandboxed,
     )
     prompt_path = artifact_dir / "prompt.md"
-    prompt_path.write_text(prompt_text, encoding="utf-8")
+    pm_paths.write_pm_text(repo, prompt_path, prompt_text)
 
     env = {
         "PM_SLICE_ARTIFACT_DIR": str(artifact_dir),
@@ -1237,8 +1251,12 @@ class ObserveOutcome:
     question_text: str | None = None
 
 
-def read_question_head(path: Path) -> str | None:
+def read_question_head(repo: Path, path: Path) -> str | None:
     """The head of a question file for PM's context, or None when unreadable.
+
+    `path` is under `<repo>/.pm/` and is read through `pm_paths.read_pm_bytes`, so a
+    planted symlink raises PmError (it is not "unreadable"); an absent or
+    otherwise unreadable file is None.
 
     The file is Developer-written, so its size and line width are untrusted:
     at most `_OBSERVE_QUESTION_LINES` lines and `_OBSERVE_QUESTION_BYTES`
@@ -1250,8 +1268,7 @@ def read_question_head(path: Path) -> str | None:
     lower bound and the marker says `of at least M lines`.
     """
     try:
-        with path.open("rb") as handle:
-            raw = handle.read(_QUESTION_READ_BYTES + 1)
+        raw = pm_paths.read_pm_bytes(repo, path, _QUESTION_READ_BYTES + 1)
     except OSError:
         return None
     read_whole = len(raw) <= _QUESTION_READ_BYTES
@@ -1278,13 +1295,16 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     session = current["tmux_session"]
     artifact_dir = Path(current["artifact_dir"])
     pane_live_path = artifact_dir / "pane-live.txt"
-    previous_capture = pane_live_path.read_text(encoding="utf-8") if pane_live_path.exists() else ""
+    try:
+        previous_capture = pm_paths.read_pm_text(repo, pane_live_path, errors="replace")
+    except FileNotFoundError:
+        previous_capture = ""
     result_path = artifact_dir / "result.json"
     question_path = artifact_dir / "question.md"
 
     initial_running = sessions.session_exists(session)
-    result_existed_before = result_path.is_file()
-    question_existed_before = question_path.is_file()
+    result_existed_before = pm_paths.pm_file_present(repo, result_path)
+    question_existed_before = pm_paths.pm_file_present(repo, question_path)
 
     deadline = time.monotonic() + wait if wait else None
     wait_start = time.monotonic()
@@ -1306,7 +1326,11 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
             # marker reported, but marker absent from the tail and pane-live.
             marker_observation = visible
             break
-        if not activity["running"] or result_path.is_file() or question_path.is_file():
+        if (
+            not activity["running"]
+            or pm_paths.pm_file_present(repo, result_path)
+            or pm_paths.pm_file_present(repo, question_path)
+        ):
             break
         time.sleep(_OBSERVE_POLL_SECONDS)
         activity = sessions.detect_activity(session)
@@ -1331,21 +1355,20 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
 
     pane_changed = capture != previous_capture
     if pane_changed:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        pane_live_path.write_text(capture, encoding="utf-8")
+        pm_paths.write_pm_text(repo, pane_live_path, capture)
 
-    result_present = result_path.is_file()
+    result_present = pm_paths.pm_file_present(repo, result_path)
     result_status: str | None = None
     if result_present:
         try:
-            data = json.loads(result_path.read_text(encoding="utf-8"))
+            data = json.loads(pm_paths.read_pm_text(repo, result_path))
             if isinstance(data, dict):
                 result_status = data.get("status")
         except (OSError, json.JSONDecodeError):
             result_status = None
 
-    question_present = question_path.is_file()
-    question_text = read_question_head(question_path) if question_present else None
+    question_present = pm_paths.pm_file_present(repo, question_path)
+    question_text = read_question_head(repo, question_path) if question_present else None
 
     # Visible pane, not the scrollback `capture` above: an interactive dialog
     # is only actionable while it is on screen, and a dead session captures
@@ -1427,9 +1450,11 @@ def _answer_paths(directory: Path, prefix: str) -> tuple[int, Path, Path, Path]:
     )
 
 
-def deliver_answer(directory: Path, prefix: str, session: str, text: str) -> tuple[Path, Path, int]:
+def deliver_answer(repo: Path, directory: Path, prefix: str, session: str, text: str) -> tuple[Path, Path, int]:
     """Deliver a supervisor's answer to the open question in `directory`.
 
+    `directory` is under `<repo>/.pm/`; the answer is written through
+    `pm_paths.write_pm_text`, so a planted symlink on its path is refused (PmError).
     Writes `<prefix>answer-<n>.md` exclusively with `text` verbatim, where
     `n` is one more than the number of existing `<prefix>answer-*.md` files;
     renames `<prefix>question.md` to `<prefix>question-<n>.md`; then injects
@@ -1451,11 +1476,10 @@ def deliver_answer(directory: Path, prefix: str, session: str, text: str) -> tup
     fail on numbering.
     """
     number, question_path, answer_path, archived_path = _answer_paths(directory, prefix)
-    if archived_path.exists():
+    if pm_paths.pm_file_present(repo, archived_path):
         raise PmError(f"{archived_path} already exists; the question and answer numbering disagree — read both by hand")
     try:
-        with answer_path.open("x", encoding="utf-8") as handle:
-            handle.write(text)
+        pm_paths.write_pm_text(repo, answer_path, text, exclusive=True)
     except FileExistsError as exc:
         raise PmError(
             f"{answer_path} already exists; the question and answer numbering disagree — read both by hand"
@@ -1522,9 +1546,9 @@ def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome
         raise PmError("--text answer must be non-empty (there is nothing to deliver)")
     artifact_dir = Path(current["artifact_dir"])
     question_path = artifact_dir / "question.md"
-    if not question_path.is_file():
+    if not pm_paths.pm_file_present(repo, question_path):
         raise PmError(f"no open question for {slice_id}: {question_path} does not exist")
-    if (artifact_dir / "result.json").exists():
+    if pm_paths.pm_file_present(repo, artifact_dir / "result.json"):
         raise PmError(
             f"{slice_id}'s submission is in (result.json exists); an answer cannot reach it — "
             "assess it with finalize, and deliver a correction with finalize --steer"
@@ -1537,7 +1561,7 @@ def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome
     # number has moved on, and the undelivered event below needs this one.
     _number, _question, pending_answer, pending_archive = _answer_paths(artifact_dir, "")
     try:
-        answer_path, archived_path, number = deliver_answer(artifact_dir, "", session, text)
+        answer_path, archived_path, number = deliver_answer(repo, artifact_dir, "", session, text)
     except TypedNotSubmitted:
         # The pointer is typed and names the answer file, but that file is
         # Developer-writable; this event is the durable record.
@@ -1622,15 +1646,22 @@ def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[
         # result.json and stops — so capturing only a live pane left pane.txt
         # empty in the common case, which is exactly when PM is required to
         # say what the pane showed.
-        pane_live = artifact_dir / "pane-live.txt"
-        pane_text = pane_live.read_text(encoding="utf-8") if pane_live.is_file() else ""
+        # Read through the guard: a symlink planted at pane-live.txt must not
+        # turn this host read into a read of a file the sandbox is denied,
+        # which the copy into pane.txt would then hand back to it.
+        try:
+            pane_text = pm_paths.read_pm_text(repo, artifact_dir / "pane-live.txt", errors="replace")
+        except FileNotFoundError:
+            pane_text = ""
 
-    (artifact_dir / "pane.txt").write_text(pane_text, encoding="utf-8")
-    (artifact_dir / "status-after.txt").write_text(git_ops.git_status_text(repo), encoding="utf-8")
+    pm_paths.write_pm_text(repo, artifact_dir / "pane.txt", pane_text)
+    pm_paths.write_pm_text(repo, artifact_dir / "status-after.txt", git_ops.git_status_text(repo))
 
-    diff_path = artifact_dir / "diff.patch"
     after_head = git_ops.git_head(repo)
-    git_ops.write_git_diff(repo, current.get("before_head"), after_head, diff_path)
+    diff_text, diff_error = git_ops.git_diff_text(repo, current.get("before_head"), after_head)
+    pm_paths.write_pm_text(repo, artifact_dir / "diff.patch", diff_text)
+    if diff_error is not None:
+        pm_paths.write_pm_text(repo, artifact_dir / "git-diff-error.txt", diff_error)
 
     slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
     report = evaluate_floor(repo, state, slices, slice_id, artifact_dir=artifact_dir)
@@ -2057,7 +2088,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # line later), so restoring would risk the same race this ordering
     # exists to avoid.
     artifact_dir = Path(current["artifact_dir"])
-    rotated = _rotate_prior_attempt(artifact_dir, attempts - 1)
+    rotated = _rotate_prior_attempt(repo, artifact_dir, attempts - 1)
 
     # File plus one-line pointer, the split `start_slice` uses for prompt.md:
     # no harness TUI is trusted with long multi-line input (sessions.send_prompt).
@@ -2071,8 +2102,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     correction_path = artifact_dir / f"steer-attempt-{attempts}.md"
     try:
         try:
-            with correction_path.open("x", encoding="utf-8") as handle:
-                handle.write(correction)
+            pm_paths.write_pm_text(repo, correction_path, correction, exclusive=True)
         except FileExistsError as exc:
             raise PmError(
                 f"{correction_path} already exists: a correction for attempt {attempts} was written but "
@@ -2315,8 +2345,7 @@ def stop(
         artifact_dir = Path(current["artifact_dir"])
         session = current.get("tmux_session")
         pane_text = sessions.pane_text(session) if session else ""
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        (artifact_dir / "pane.txt").write_text(pane_text, encoding="utf-8")
+        pm_paths.write_pm_text(repo, artifact_dir / "pane.txt", pane_text)
 
     # Applies whenever state is readable, including the
     # --scavenge-with-readable-state path (cli.py routes that through here).

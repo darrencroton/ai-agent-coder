@@ -57,6 +57,7 @@ from typing import Any
 
 from . import PmError
 from . import git_ops
+from . import pm_paths
 from . import profiles
 from . import prompts
 from . import sandbox as sandbox_mod
@@ -99,7 +100,13 @@ _OWNER_ENV_VAR = "PM_CHILD_WORKTREE"
 
 
 def campaign_dir(worktree: Path) -> Path:
-    """`<worktree>/.pm/campaign/`: the manifest and every child channel file."""
+    """`<worktree>/.pm/campaign/`: the manifest and every child channel file.
+
+    The directory is in the sandbox-writable `.pm/` tree, so every host read
+    and write of a file in it goes through `pm_paths`' guarded helpers
+    (`read_pm_text`, `write_pm_text`, `pm_file_present`, ...), which refuse a
+    planted symlink or hard link; see that module's docstring.
+    """
     return slice_ops.pm_dir(worktree) / "campaign"
 
 
@@ -161,8 +168,8 @@ def load_manifest(worktree: Path) -> dict[str, Any]:
     unreadable, malformed, or carries a socket `launch-child` would refuse."""
     path = manifest_path(worktree)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        data = json.loads(pm_paths.read_pm_text(worktree, path))
+    except (OSError, PmError, UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise PmError(f"child manifest could not be read: {path} ({exc})") from exc
     if not isinstance(data, dict):
         raise PmError(f"child manifest is not a JSON object: {path}")
@@ -588,8 +595,7 @@ def _create_node_worktree(launch: _ChildLaunch) -> Path:
     try:
         _exclude_handoff(worktree)
         slice_ops.write_pm_gitignore(worktree)
-        directory.mkdir(parents=True, exist_ok=True)
-        launcher.write_bytes(launch.prompt_bytes)
+        pm_paths.write_pm_bytes(worktree, launcher, launch.prompt_bytes)
     except (OSError, PmError) as exc:
         raise PmError(f"child setup failed ({exc}); {_left_behind(branch, worktree)}") from exc
     return launcher
@@ -917,7 +923,7 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
                     "socket": socket,
                     "control_dir": str(control),
                 }
-            manifest_path(worktree).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            pm_paths.write_pm_text(worktree, manifest_path(worktree), json.dumps(manifest, indent=2) + "\n")
             sessions.wait_until_ready(session, launch.executable, expected_model_display=launch.expected_model_display)
             sessions.send_prompt(session, prompts.render_child_launch_pointer(launcher))
         except BaseException as exc:
@@ -926,7 +932,7 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
             # dialog or error that made the launch fail.
             pane_path = directory / "pane.txt"
             try:
-                sessions.capture_to(session, pane_path)
+                pm_paths.write_pm_text(worktree, pane_path, sessions.capture_text(session))
                 pane_note = f"its pane was captured to {pane_path}"
             except BaseException as capture_exc:
                 pane_note = f"its pane could not be captured to {pane_path} ({capture_exc})"
@@ -976,9 +982,9 @@ class WaitChildOutcome:
     pane_live_error: str | None = None
 
 
-def _result_status(path: Path) -> str | None:
+def _result_status(worktree: Path, path: Path) -> str | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(pm_paths.read_pm_text(worktree, path))
     except (OSError, UnicodeDecodeError, ValueError, RecursionError):
         return None
     status = data.get("status") if isinstance(data, dict) else None
@@ -992,8 +998,12 @@ def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome
     each poll, and returns early only on session death, `child-result.json`
     or `cm-question.md` appearing, or a dialog marker on the visible pane —
     never on a pane change, which a working TUI produces constantly. Without
-    `wait` it polls once. Once the manifest has loaded nothing here raises:
-    a read that fails is reported in the outcome instead.
+    `wait` it polls once. Once the manifest has loaded nothing here raises
+    for an ordinary failure: a read that fails is reported in the outcome
+    instead. The one exception is a symlink, hard link or non-regular file
+    planted under `.pm/` at `child-result.json` or `cm-question.md`: the
+    guarded probe (`pm_paths.pm_file_present`) raises PmError naming it,
+    because a path the sandbox can write must not be read through a link.
     """
     worktree = worktree.expanduser().resolve()
     manifest = load_manifest(worktree)
@@ -1003,8 +1013,8 @@ def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome
     result_path = directory / "child-result.json"
     question_path = directory / "cm-question.md"
     try:
-        capture = pane_live_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        capture = pm_paths.read_pm_text(worktree, pane_live_path, errors="replace")
+    except (OSError, PmError):
         capture = ""
     pane_live_error: str | None = None
 
@@ -1018,13 +1028,18 @@ def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome
                 # the last good capture stays as the evidence.
                 capture = observation.capture
                 try:
-                    pane_live_path.write_text(capture, encoding="utf-8")
+                    pm_paths.write_pm_text(worktree, pane_live_path, capture)
                     pane_live_error = None
-                except OSError as exc:
+                except (OSError, PmError) as exc:
                     pane_live_error = str(exc)
             dialog_markers = observation.dialog_markers
             running = sessions.session_exists(session)
-            if dialog_markers["present"] or not running or result_path.is_file() or question_path.is_file():
+            if (
+                dialog_markers["present"]
+                or not running
+                or pm_paths.pm_file_present(worktree, result_path)
+                or pm_paths.pm_file_present(worktree, question_path)
+            ):
                 break
             remaining = deadline - time.monotonic() if deadline is not None else 0.0
             if remaining <= 0:
@@ -1032,17 +1047,17 @@ def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome
             time.sleep(min(_WAIT_POLL_SECONDS, remaining))
         elapsed_seconds = time.monotonic() - start
 
-    result_present = result_path.is_file()
-    question_present = question_path.is_file()
+    result_present = pm_paths.pm_file_present(worktree, result_path)
+    question_present = pm_paths.pm_file_present(worktree, question_path)
     no_signal = bool(wait) and running and not result_present and not question_present and not dialog_markers["present"]
     runs, runs_error = _runs_or_error(worktree)
     return WaitChildOutcome(
         session=session,
         running=running,
         result_present=result_present,
-        result_status=_result_status(result_path) if result_present else None,
+        result_status=_result_status(worktree, result_path) if result_present else None,
         question_present=question_present,
-        question_text=slice_ops.read_question_head(question_path) if question_present else None,
+        question_text=slice_ops.read_question_head(worktree, question_path) if question_present else None,
         dialog_markers=dialog_markers,
         tail="\n".join(capture.splitlines()[-_TAIL_LINES:]),
         elapsed_seconds=elapsed_seconds,
@@ -1079,16 +1094,16 @@ def answer_child(worktree: Path, *, text: str) -> AnswerChildOutcome:
     with _tmux_socket(manifest["socket"]):
         if not sessions.session_exists(session):
             raise PmError(f"no live child session {session} on tmux server {manifest['socket']}")
-        if not question_path.is_file():
+        if not pm_paths.pm_file_present(worktree, question_path):
             raise PmError(f"no open child question: {question_path} does not exist")
-        if (directory / "child-result.json").exists():
+        if pm_paths.pm_file_present(worktree, directory / "child-result.json"):
             raise PmError(
                 f"the child has written its completion file ({directory / 'child-result.json'}); "
                 "an answer cannot reach a finished run"
             )
         if not text.strip():
             raise PmError("--text answer must be non-empty (there is nothing to deliver)")
-        answer_path, archived_path, number = slice_ops.deliver_answer(directory, "cm-", session, text)
+        answer_path, archived_path, number = slice_ops.deliver_answer(worktree, directory, "cm-", session, text)
     return AnswerChildOutcome(answer_path=answer_path, question_archived_path=archived_path, answer_number=number)
 
 
@@ -1244,13 +1259,15 @@ def stop_child(worktree: Path) -> StopChildOutcome:
     with _tmux_socket(socket):
         was_running = sessions.session_exists(session)
         # A re-run against a server already gone would overwrite the first
-        # stop's capture with capture_to's placeholder; keep the evidence.
-        pane_kept = not was_running and pane_path.is_file()
-        if not pane_kept:
-            try:
-                sessions.capture_to(session, pane_path)
-            except OSError as exc:
-                pane_error = str(exc)
+        # stop's capture with capture_text's placeholder; keep the evidence.
+        # A refused (planted-link) pane.txt is reported as the capture's
+        # error, never allowed to abort the stop before the server is killed.
+        try:
+            pane_kept = not was_running and pm_paths.pm_file_present(worktree, pane_path)
+            if not pane_kept:
+                pm_paths.write_pm_text(worktree, pane_path, sessions.capture_text(session))
+        except (OSError, PmError) as exc:
+            pane_error = str(exc)
     runs, runs_error = _runs_or_error(worktree)
     pgids = sorted({pgid for run in runs for pgid in run.reviewer_pgids})
     kill_error: str | None = None

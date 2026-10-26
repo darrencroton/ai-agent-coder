@@ -1118,8 +1118,8 @@ class TestObserveEventAppendFailure(PmTestCase):
         always fails. `capture != previous` is what makes the change real."""
         plan_path = self.write_plan(slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
-        artifact_dir = self.repo / "artifacts"
-        artifact_dir.mkdir()
+        artifact_dir = self.repo / ".pm" / "artifacts"
+        artifact_dir.mkdir(parents=True)
         (artifact_dir / "pane-live.txt").write_text(previous, encoding="utf-8")
         self.set_current_slice(
             state,
@@ -1155,8 +1155,8 @@ class TestObserveQuestion(PmTestCase):
     def _observe(self, *, wait: float | None, on_first_poll=None):
         plan_path = self.write_plan(slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
-        artifact_dir = self.repo / "artifacts"
-        artifact_dir.mkdir()
+        artifact_dir = self.repo / ".pm" / "artifacts"
+        artifact_dir.mkdir(parents=True)
         (artifact_dir / "pane-live.txt").write_text("same pane", encoding="utf-8")
         self.set_current_slice(
             state,
@@ -1464,8 +1464,8 @@ class TestAnswerWithoutTmux(PmTestCase):
             state["stop_reason"] = "attempt budget exhausted"
             state_mod.save_state(run_dir, state, token)
             state = state_mod.load_state(run_dir, token)
-        artifact_dir = self.repo / "artifacts"
-        artifact_dir.mkdir()
+        artifact_dir = self.repo / ".pm" / "artifacts"
+        artifact_dir.mkdir(parents=True)
         (artifact_dir / "question.md").write_text("which?\n", encoding="utf-8")
         self.set_current_slice(
             state,
@@ -1563,11 +1563,11 @@ class TestAnswerWithoutTmux(PmTestCase):
         self.assertEqual(sorted(path.name for path in artifact_dir.iterdir()), ["question.md"])
 
     def test_rotation_moves_an_open_question_and_leaves_numbered_pairs(self) -> None:
-        artifact_dir = self.repo / "artifacts"
-        artifact_dir.mkdir()
+        artifact_dir = self.repo / ".pm" / "artifacts"
+        artifact_dir.mkdir(parents=True)
         for name in ("question.md", "question-1.md", "answer-1.md"):
             (artifact_dir / name).write_text(name, encoding="utf-8")
-        moved = slice_ops._rotate_prior_attempt(artifact_dir, 2)
+        moved = slice_ops._rotate_prior_attempt(self.repo, artifact_dir, 2)
         self.assertEqual(moved, ["question.md"])
         self.assertEqual((artifact_dir / "attempt-2" / "question.md").read_text(encoding="utf-8"), "question.md")
         self.assertTrue((artifact_dir / "question-1.md").is_file())
@@ -1578,15 +1578,17 @@ class TestReadQuestionHead(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.path = Path(self._tmp.name) / "question.md"
+        self.repo = Path(self._tmp.name)
+        (self.repo / ".pm").mkdir()
+        self.path = self.repo / ".pm" / "question.md"
 
     def test_a_question_under_both_caps_is_returned_whole_without_a_marker(self) -> None:
         self.path.write_text("which?\nsecond line\n", encoding="utf-8")
-        self.assertEqual(slice_ops.read_question_head(self.path), "which?\nsecond line")
+        self.assertEqual(slice_ops.read_question_head(self.repo, self.path), "which?\nsecond line")
 
     def test_the_line_cap_cuts_and_the_marker_reports_what_was_shown(self) -> None:
         self.path.write_text("".join(f"l{n}\n" for n in range(1, 61)), encoding="utf-8")
-        head = slice_ops.read_question_head(self.path)
+        head = slice_ops.read_question_head(self.repo, self.path)
         lines = head.splitlines()
         self.assertEqual(lines[0], "l1")
         self.assertEqual(lines[39], "l40")
@@ -1596,7 +1598,7 @@ class TestReadQuestionHead(unittest.TestCase):
 
     def test_the_byte_cap_cuts_a_wide_line_without_splitting_a_character(self) -> None:
         self.path.write_text("é" * 3000 + "\nsecond\n", encoding="utf-8")
-        head = slice_ops.read_question_head(self.path)
+        head = slice_ops.read_question_head(self.repo, self.path)
         body, marker = head.rsplit("\n", 1)
         self.assertLessEqual(len(body.encode("utf-8")), 4096)
         self.assertEqual(body, "é" * 2048)
@@ -1604,10 +1606,12 @@ class TestReadQuestionHead(unittest.TestCase):
 
     def test_a_file_past_the_read_limit_reports_a_lower_bound_on_its_lines(self) -> None:
         self.path.write_text("x\n" * 40000, encoding="utf-8")
-        self.assertTrue(slice_ops.read_question_head(self.path).endswith("of at least 32768 lines, 79 bytes]"))
+        self.assertTrue(
+            slice_ops.read_question_head(self.repo, self.path).endswith("of at least 32768 lines, 79 bytes]")
+        )
 
     def test_an_unreadable_file_is_none(self) -> None:
-        self.assertIsNone(slice_ops.read_question_head(self.path))
+        self.assertIsNone(slice_ops.read_question_head(self.repo, self.path))
 
 
 class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
@@ -1621,7 +1625,7 @@ class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
     def test_marker_wins_the_break_without_losing_liveness_or_the_capture(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
-        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir = self.repo / ".pm" / "runs" / run_dir.name / "slices" / "slice-001"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         (artifact_dir / "pane-live.txt").write_text("earlier screen\n", encoding="utf-8")
         self.set_current_slice(
@@ -1682,7 +1686,7 @@ class TestObserveMarkerAndDeathInTheSamePoll(SliceOpsTestCase):
     def test_session_death_preserves_the_last_good_capture(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
-        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir = self.repo / ".pm" / "runs" / run_dir.name / "slices" / "slice-001"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         pane_live = artifact_dir / "pane-live.txt"
         pane_live.write_text("last good screen\n", encoding="utf-8")

@@ -44,6 +44,7 @@ from typing import Any
 
 from . import PmError
 from . import git_ops
+from . import pm_paths
 from .plan import PlanSlice
 from .plan import effective_authorized_files
 from .plan import plan_digest as compute_plan_digest
@@ -157,14 +158,24 @@ def _fact_approval(state: dict[str, Any], plan_slice: PlanSlice | None, slice_id
     return FloorFact(3, "approval", recorded, detail, evidence)
 
 
-def _fact_result(artifact_dir: Path, slice_id: str) -> FloorFact:
+def _fact_result(repo: Path, artifact_dir: Path, slice_id: str) -> FloorFact:
+    # `result.json` is Developer-written under the sandbox-writable `.pm/`
+    # tree, so it is read through `pm_paths`: a planted symlink, hard link or
+    # non-regular file fails the fact with the refusal as its detail, and is
+    # never followed, never passed, and never raised through the floor.
     result_path = artifact_dir / "result.json"
     evidence: dict[str, Any] = {"path": str(result_path)}
-    if not result_path.is_file():
-        return FloorFact(4, "result", False, "result.json does not exist in the slice artifact directory", evidence)
     try:
-        data = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        text = pm_paths.read_pm_text(repo, result_path)
+    except FileNotFoundError:
+        return FloorFact(4, "result", False, "result.json does not exist in the slice artifact directory", evidence)
+    except PmError as exc:
+        return FloorFact(4, "result", False, f"result.json was refused: {exc}", evidence)
+    except (OSError, ValueError) as exc:
+        return FloorFact(4, "result", False, f"result.json could not be parsed: {exc}", evidence)
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
         return FloorFact(4, "result", False, f"result.json could not be parsed: {exc}", evidence)
     if not isinstance(data, dict):
         return FloorFact(4, "result", False, "result.json does not contain a JSON object", evidence)
@@ -288,7 +299,7 @@ def evaluate_floor(
         _fact_plan_digest(state),
         _fact_identity_branch(repo, state),
         _fact_approval(state, plan_slice, slice_id),
-        _fact_result(artifact_dir, slice_id),
+        _fact_result(repo, artifact_dir, slice_id),
         _fact_surface(repo, state, plan_slice),
         _fact_commit_ancestry(repo, state),
         _fact_clean_worktree(repo),

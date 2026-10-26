@@ -23,6 +23,7 @@ from . import git_ops
 from . import judgments
 from . import leaderboard, ledger
 from . import plan as plan_mod
+from . import pm_paths
 from . import preflight
 from . import review as review_mod
 from . import sandbox
@@ -806,7 +807,7 @@ def _print_floor_facts(report) -> None:
 _PANE_TAIL_LINES = 40
 
 
-def _print_pane_tail(pane_path: Path) -> None:
+def _print_pane_tail(repo: Path, pane_path: Path) -> None:
     """Print the tail of the captured pane on every path that records an assessment.
 
     No floor fact reads the pane any more, so PM's own read is the only thing
@@ -820,10 +821,16 @@ def _print_pane_tail(pane_path: Path) -> None:
     and the session it is correcting is still running, so its pane is a moving
     target that the next `finalize` before acceptance shows properly.
     """
-    if not pane_path.is_file():
+    # Read through the guard: the pane file is in the sandbox-writable `.pm/`
+    # tree, and a planted link must not print a denied file to this terminal.
+    try:
+        lines = pm_paths.read_pm_text(repo, pane_path, errors="replace").splitlines()
+    except FileNotFoundError:
         print("pane: (not captured — no live session at finalize)")
         return
-    lines = Path(pane_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except PmError as exc:
+        print(f"pane: (not shown — {exc})")
+        return
     if not lines:
         # Said outright rather than printed as "0 of 0 lines", which reads like
         # a clear pane. An empty capture is absence of evidence, not evidence
@@ -860,7 +867,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         outcome = slice_ops.finalize_accept(repo, run_dir, token, reasoning=args.accept, risk=args.risk)
         print(f"slice: {outcome.slice_id}")
         _print_floor_facts(outcome.report)
-        _print_pane_tail(outcome.pane_path)
+        _print_pane_tail(repo, outcome.pane_path)
         if outcome.kind == "accepted":
             if outcome.code_warning:
                 print(f"pm: code metrics: {outcome.code_warning}", file=sys.stderr)
@@ -885,7 +892,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         outcome = slice_ops.finalize_stop(repo, run_dir, token, reason=args.stop, cause=args.cause, risk=args.risk)
         print(f"STOPPED {outcome.slice_id}")
         _print_floor_facts(outcome.report)
-        _print_pane_tail(outcome.pane_path)
+        _print_pane_tail(repo, outcome.pane_path)
         print(f"assessment: {outcome.assessment_path}")
         return 0
 
@@ -897,7 +904,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
     print(f"evidence: status-after={outcome.status_after_path}")
     print(f"evidence: diff={outcome.diff_path}")
     print(f"evidence: result={outcome.result_path}")
-    _print_pane_tail(outcome.pane_path)
+    _print_pane_tail(repo, outcome.pane_path)
     return 0 if outcome.report.passed else 1
 
 
