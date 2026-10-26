@@ -984,6 +984,43 @@ class TestStartServerWithFakes(TempDirTestCase):
             self.assertIn("the server did not answer within 1 s", self.start())
         self.assertTrue(all(timeout is not None and timeout <= 10.0 for timeout in calls[1:]), calls)
 
+    def test_an_interrupt_during_the_wait_kills_the_group_and_propagates(self) -> None:
+        processes: list[subprocess.Popen] = []
+        real_popen = subprocess.Popen
+
+        def spy(argv, *args, **kwargs):
+            process = real_popen(argv, *args, **kwargs)
+            processes.append(process)
+            return process
+
+        def interrupted(socket: str, timeout: float | None = None) -> bool:
+            if not processes:
+                return False  # the pre-start check
+            deadline = time.monotonic() + 5.0
+            while not self.started.exists() and time.monotonic() < deadline:  # the child pid is written
+                time.sleep(0.05)
+            raise KeyboardInterrupt
+
+        started_before = dict(sandbox._STARTED)
+        with (
+            mock.patch.object(sandbox.subprocess, "Popen", side_effect=spy),
+            mock.patch.object(sandbox.sessions, "server_running", side_effect=interrupted),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                sandbox.start_server(
+                    socket="pm-run-x",
+                    policy_path=self.tmp / "p.json",
+                    worktree=self.tmp,
+                    tmpdir=self.tmp,
+                    log_path=self.log,
+                )
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].returncode, "srt was not reaped")
+        self.assertTrue(_wait_gone(processes[0].pid), "srt is still running")
+        child = int(self.child_pid_file.read_text(encoding="utf-8"))
+        self.assertTrue(_wait_gone(child), "the process group was not killed")
+        self.assertEqual(sandbox._STARTED, started_before)
+
     def test_a_server_that_answers_starts_in_its_own_session_without_the_token(self) -> None:
         self.fake_tmux("echo 5151; exit 0")
         worktree = self.tmp / "wt"
@@ -1175,23 +1212,43 @@ class TestVerifyServerProbeTimeouts(TempDirTestCase):
         self.assertFalse((self.tmp / ".pm").exists())
 
     def test_a_probe_that_does_not_return_fails_verification(self) -> None:
-        for wedged in (1, 2):
+        # 0 wedges the environment probe, 1 the negative and 2 the positive
+        # `run-shell`. A wedged negative probe gets the same cleanup as one
+        # that succeeds: its file removed and the server killed.
+        for wedged in (0, 1, 2):
             with self.subTest(wedged=wedged):
                 calls = itertools.count(1)
 
+                def server_environment(socket: str, name: str, timeout: float | None = None, wedged=wedged):
+                    if wedged == 0 and timeout is not None:
+                        raise PmError(f"could not read {name} on tmux socket {socket!r}: no reply within {timeout:g} s")
+                    return "1"
+
                 def run_shell(socket: str, command: str, timeout: float | None = None, wedged=wedged, calls=calls):
                     if next(calls) == wedged:
+                        if wedged == 1:
+                            Path(shlex.split(command)[-1]).touch()  # it ran, then wedged
                         raise PmError(f"run-shell on tmux socket {socket!r} did not return within {timeout:g} s")
                     return 1, ""
 
                 with (
-                    mock.patch.object(sandbox.sessions, "server_environment", return_value="1"),
+                    mock.patch.object(sandbox.sessions, "server_environment", side_effect=server_environment),
                     mock.patch.object(sandbox.sessions, "run_shell", side_effect=run_shell),
+                    mock.patch.object(sandbox.sessions, "socket_path", return_value=self.tmp / self.socket),
+                    mock.patch.object(sandbox.sessions, "kill_server", return_value=[]) as kill_server,
                 ):
                     with self.assertRaises(PmError) as ctx:
                         sandbox.verify_server(socket=self.socket, worktree=self.tmp)
-                self.assertIn("did not return within 10 s", str(ctx.exception))
+                message = str(ctx.exception)
+                self.assertIn("within 10 s", message)
                 self.assertFalse((self.tmp / ".pm").exists())
+                if wedged == 1:
+                    self.assertIn("negative probe could not run", message)
+                    self.assertIn("the server was killed", message)
+                    kill_server.assert_called_once_with(self.socket)
+                    self.assertFalse((self.tmp / f"{self.socket}.probe").exists())
+                else:
+                    kill_server.assert_not_called()
 
 
 class TestSocketNamesAtTheEntryPoints(TempDirTestCase):

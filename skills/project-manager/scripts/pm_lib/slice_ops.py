@@ -320,7 +320,7 @@ class InitResult:
     state: dict[str, Any]
     slices: list[plan_mod.PlanSlice]
     branch: str
-    # What `sandbox.load_base_policy` warned about, for the caller to print.
+    # What `sandbox.load_pinned_policy` warned about, for the caller to print.
     sandbox_warnings: list[str] = field(default_factory=list)
 
 
@@ -357,7 +357,7 @@ def init_run(
     `sandbox_policy`, an `srt` base policy, makes the run sandboxed (Mode B,
     see `sandbox`): the policy is validated, `srt` required and the three
     derived policies computed before anything is created, so a refusal
-    leaves no run directory, control directory or temp dir. The run's socket
+    leaves no run directory, control directory, temp dir or new branch. The run's socket
     is `pm-run-<run id>`; its control directory
     `<common git dir>/pm-sandbox/<socket>/` receives `policy.json` (the PM
     outside, the plan's directory readable), `reviewer-policy.json`,
@@ -376,18 +376,8 @@ def init_run(
     sandbox_warnings: list[str] = []
     if sandbox_policy is not None:
         sandbox_policy = sandbox_policy.expanduser()
-
-        def policy_digest() -> str:
-            try:
-                return hashlib.sha256(sandbox_policy.read_bytes()).hexdigest()
-            except OSError as exc:
-                raise PmError(f"sandbox policy could not be read: {sandbox_policy} ({exc})") from exc
-
-        policy_sha256 = policy_digest()
-        sandbox_base, sandbox_warnings = sandbox.load_base_policy(sandbox_policy)
-        # The policy every later server start re-checks must be the one hashed.
-        if policy_digest() != policy_sha256:
-            raise PmError(f"sandbox policy {sandbox_policy} changed while it was being read; run init again")
+        # The policy every later server start re-checks is the one hashed: one read.
+        sandbox_base, sandbox_warnings, policy_sha256 = sandbox.load_pinned_policy(sandbox_policy)
         sandbox_policy = sandbox_policy.resolve()
         # `check_binaries` refuses first when srt is absent.
         sandbox.check_binaries(sandbox_base)
@@ -408,6 +398,33 @@ def init_run(
         candidate_executable = profiles.HARNESS_PROFILES[harness]["base_command"][0]
     if not candidate_executable or not _executable_exists(candidate_executable):
         raise PmError(f"harness executable not found on PATH: {candidate_executable!r}")
+
+    # The run id is chosen here, before anything exists, because a sandboxed
+    # run's socket, control directory and temp dir are named after it.
+    root = state_mod.state_root(repo)
+    run_id = state_mod.new_run_id({child.name for child in root.iterdir() if child.is_dir()} if root.exists() else ())
+    derived: dict[str, dict[str, Any]] = {}
+    if sandbox_base is not None:
+        # Derived, and so refused, before `--create-branch` creates a branch or
+        # `--branch` checks one out: the branch is named by the arguments, or
+        # is the current one (that resolution is read-only).
+        planned_branch = create_branch or branch or _resolve_init_branch(repo, branch=None, create_branch=None)
+        socket = f"{sandbox.RUN_SOCKET_PREFIX}{run_id}"
+        common = Path(git_ops.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+        control = sandbox.control_dir(common, socket)
+        planned_tmpdir = sandbox.run_tmpdir(socket)
+        for path, what in ((control, "control dir"), (planned_tmpdir, "temp dir")):
+            if os.path.lexists(path):
+                raise PmError(f"sandbox {what} already exists: {path}; another run may own socket {socket}")
+        derived = sandbox.derive_run_policies(
+            sandbox_base,
+            repo=repo,
+            branch=planned_branch,
+            socket=socket,
+            tmpdir=planned_tmpdir,
+            control_root=control.parent,  # <common git dir>/pm-sandbox, which every policy denies
+            plan_dir=plan_path.parent,
+        )
 
     resolved_branch = _resolve_init_branch(repo, branch=branch, create_branch=create_branch)
     # Required in every case, including after a branch switch and on the
@@ -455,29 +472,6 @@ def init_run(
         "protected_paths": policy["protected_paths"] if policy else [],
         "protected_paths_source": {"path": policy["path"], "sha256": policy["sha256"]} if policy else None,
     }
-
-    # The run id is chosen here, before anything exists, because a sandboxed
-    # run's socket, control directory and temp dir are named after it.
-    root = state_mod.state_root(repo)
-    run_id = state_mod.new_run_id({child.name for child in root.iterdir() if child.is_dir()} if root.exists() else ())
-    derived: dict[str, dict[str, Any]] = {}
-    if sandbox_base is not None:
-        socket = f"{sandbox.RUN_SOCKET_PREFIX}{run_id}"
-        common = Path(git_ops.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
-        control = sandbox.control_dir(common, socket)
-        planned_tmpdir = sandbox.run_tmpdir(socket)
-        for path, what in ((control, "control dir"), (planned_tmpdir, "temp dir")):
-            if os.path.lexists(path):
-                raise PmError(f"sandbox {what} already exists: {path}; another run may own socket {socket}")
-        derived = sandbox.derive_run_policies(
-            sandbox_base,
-            repo=repo,
-            branch=resolved_branch,
-            socket=socket,
-            tmpdir=planned_tmpdir,
-            control_root=control.parent,  # <common git dir>/pm-sandbox, which every policy denies
-            plan_dir=plan_path.parent,
-        )
 
     note = (
         f"harness={harness} branch={resolved_branch} slices={len(slices)} "
@@ -1044,7 +1038,7 @@ def start_slice(
     # anything of the launch is rotated, reaped or written.
     run_socket: str | None = None
     server_started_on: str | None = None
-    if state.get("sandbox"):
+    if sandbox.records_sandbox(state):
         run_socket = state["sandbox"]["socket"]
         if sandbox.ensure_run_server(state, repo=repo):
             server_started_on = run_socket
@@ -1084,7 +1078,7 @@ def start_slice(
     question_path = artifact_dir / "question.md"
     # Inside a sandbox: inherited, when this PM already runs under `srt` (a
     # campaign child), or the run's own sandboxed server (Mode B).
-    sandboxed = sandbox.inside_sandbox() or bool(state.get("sandbox"))
+    sandboxed = sandbox.inside_sandbox() or sandbox.records_sandbox(state)
     prompt_text = prompts.render_developer_prompt(
         plan_slice,
         plan_path=plan_path,

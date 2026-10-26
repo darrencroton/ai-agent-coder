@@ -1967,15 +1967,18 @@ class TestInitSandbox(_SandboxedRun):
         self.assertNotIn("sandbox", out)
         self.assertFalse((self.repo / ".git" / sandbox_mod.CONTROL_ROOT_NAME).exists())
 
-    def _init_refused(self, plan_path: Path, harness: Path, *, sandbox_value: str | None = None) -> str:
+    def _init_refused(
+        self, plan_path: Path, harness: Path, *, sandbox_value: str | None = None, extra: list[str] | None = None
+    ) -> str:
         """`init --sandbox` that must refuse creating nothing: no run
         directory, no control directory, and no temp dir (asserted on the
         call that would create one, since the shared temp directory holds
         other test processes' run temp dirs). `sandbox_value` is the flag's
-        value (this test's base policy by default). Returns stderr."""
+        value (this test's base policy by default); `extra` adds arguments.
+        Returns stderr."""
         value = str(self.base_policy) if sandbox_value is None else sandbox_value
         with mock.patch.object(sandbox_mod, "make_tmpdir", wraps=sandbox_mod.make_tmpdir) as make_tmpdir:
-            code, _out, err = self._init(plan_path, harness, extra=["--sandbox", value])
+            code, _out, err = self._init(plan_path, harness, extra=["--sandbox", value, *(extra or [])])
         self.assertEqual(code, 2, err)
         make_tmpdir.assert_not_called()
         state_root = self.repo / ".git" / "pm"
@@ -2006,15 +2009,25 @@ class TestInitSandbox(_SandboxedRun):
                 self.assertIn("--sandbox needs an srt base policy file", err)
 
     def test_init_sandbox_refuses_an_invalid_policy_creating_nothing(self) -> None:
+        """Refused at load or at derivation, before `--create-branch` creates
+        the branch."""
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
-        policy = minimal_base_policy()
-        policy["network"]["allowAllUnixSockets"] = True
-        write_base_policy(self.base_policy, policy)
-        with self._srt_stand_in():
-            err = self._init_refused(plan_path, harness)
-        self.assertIn(str(self.base_policy), err)
-        self.assertIn("allowAllUnixSockets", err)
+        at_load = minimal_base_policy()
+        at_load["network"]["allowAllUnixSockets"] = True
+        at_derivation = minimal_base_policy()
+        at_derivation["filesystem"]["allowWrite"] = [str(self.repo / "src")]
+        for policy, fragments in (
+            (at_load, [str(self.base_policy), "allowAllUnixSockets"]),
+            (at_derivation, ["is inside the worktree"]),
+        ):
+            with self.subTest(fragments=fragments):
+                write_base_policy(self.base_policy, policy)
+                with self._srt_stand_in():
+                    err = self._init_refused(plan_path, harness, extra=["--create-branch", "pm-refused"])
+                for fragment in fragments:
+                    self.assertIn(fragment, err)
+                self.assertEqual(self._git("branch", "--list", "pm-refused").stdout, "")
 
     def test_a_failure_in_init_s_last_steps_removes_the_control_and_temp_dirs(self) -> None:
         """The cleanup covers the steps after the sandbox setup too: here the
@@ -2281,12 +2294,15 @@ class TestSandboxedDeveloperLaunch(_SandboxedRun):
     def test_start_slice_starts_the_server_launches_through_it_and_a_relaunch_reuses_it(self) -> None:
         leak = self.repo.parent / "leak"
         self._sandboxed_run(sandbox_probe_developer_script(leak=leak, git_dir=self.repo / ".git"))
+        # A start with the record present rewrites all three policies, so a lost one is repaired.
+        (self.control / sandbox_mod.REVIEWER_POLICY_NAME).unlink()
         start_session = mock.Mock(side_effect=AssertionError("bare start_session on a sandboxed run"))
         with self.on_socket(self.socket), mock.patch.object(sessions, "start_session", start_session):
             code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
         self.assertEqual(code, 0, out + err)
         start_session.assert_not_called()
         self.assertIn(f"sandbox: started the run's sandboxed tmux server on socket {self.socket}", out)
+        self.assertTrue((self.control / sandbox_mod.REVIEWER_POLICY_NAME).is_file())
         self.assertEqual(sessions.server_environment(self.socket, "SANDBOX_RUNTIME"), "1")
         state = state_mod.load_state(self.run_dir, self.token)
         self.assertIn(state["current_slice"]["tmux_session"], sessions.list_sessions_on(self.socket))
@@ -2730,6 +2746,24 @@ class TestSandboxedRunEnds(_SandboxedRun):
         self.assertIn("state unavailable", out)
         self.assertIn(f"pm: scavenge: sandboxed tmux server {self.socket} killed", out)
         self.assertFalse(sessions.server_running(self.socket))
+
+    def test_scavenge_whose_server_kill_leaves_sessions_exits_non_zero_finding_the_run_without_run(self) -> None:
+        """Unreadable state and no `--run`: the run directory the current
+        pointer names gives the server's name, and a kill that leaves a
+        session listed (a stand-in) is a failure, not a report."""
+        self._sandboxed_run()
+        self._start_plain_server()
+        run_json = self.run_dir / "run.json"
+        os.replace(run_json, self.run_dir / "run.json.saved")
+        run_json.mkdir()
+        with (
+            self.on_socket(self.socket),
+            sessions.scoped_environ("PM_RUN_TOKEN", None),
+            mock.patch.object(sessions, "kill_server", return_value=["survivor"]),
+        ):
+            code, out, err = self.run_cli_in_repo(["stop", "--reason", "emergency", "--scavenge"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"pm: scavenge: sandboxed tmux server {self.socket} still lists sessions: survivor", out)
 
     def test_scavenge_on_a_readable_run_with_the_wrong_socket_refuses_and_sweeps_nothing(self) -> None:
         self._sandboxed_run()

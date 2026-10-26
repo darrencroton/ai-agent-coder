@@ -6,7 +6,8 @@ descendant of those, inherits the Seatbelt restrictions of the policy `srt`
 was started with. This module is the toolkit's one seam onto that mechanism:
 
 - the operator's base policy, loaded and refused when it defeats the boundary
-  (`load_base_policy`);
+  (`load_base_policy`; `load_pinned_policy` also returns the SHA-256 of the
+  very bytes it parsed);
 - the policies the toolkit derives from it for a worktree and branch: the
   server's effective policy, a Mode B reviewer's, and the operator's attach
   client's (`derive_policy`, `derive_reviewer_policy`, `derive_attach_policy`),
@@ -85,7 +86,7 @@ import tempfile
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from . import PmError
 from . import git_ops
@@ -336,18 +337,52 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     the caller prints them. The policy is returned as parsed: deriving from
     it never mutates it, and `srt` applies its own schema check on top.
     """
-    path = Path(path)
+    policy, warnings, _sha256 = load_pinned_policy(path)
+    return policy, warnings
+
+
+def _policy_refusal(path: Path) -> Callable[[str], PmError]:
+    """A builder of the PmError `sandbox policy <path>: <reason>`, the path
+    quoted when it holds a character that would garble the message."""
     label = repr(str(path)) if _BAD_PATH_CHARS.search(str(path)) else str(path)
+    return lambda reason: PmError(f"sandbox policy {label}: {reason}")
 
-    def refuse(reason: str) -> PmError:
-        return PmError(f"sandbox policy {label}: {reason}")
 
+def load_pinned_policy(path: Path | str, expected_sha256: str | None = None) -> tuple[dict[str, Any], list[str], str]:
+    """Load the operator's base policy as `load_base_policy` does and return
+    `(policy, warnings, sha256)`, the digest being of the very bytes parsed:
+    the file is read once, so no swap between a hash and a parse can put a
+    policy under the server other than the one hashed. With
+    `expected_sha256`, PmError before any parse when the digest differs
+    (the file no longer has the SHA-256 the run recorded). PmError for every
+    `load_base_policy` refusal.
+    """
+    path = Path(path)
+    refuse = _policy_refusal(path)
     # ValueError covers a path no file can have: one with an embedded NUL,
     # or one that cannot be encoded (UnicodeError is a ValueError).
     try:
-        text = path.read_text(encoding="utf-8")
+        data = path.read_bytes()
     except (OSError, ValueError) as exc:
         raise refuse(f"unreadable ({exc})") from exc
+    sha256 = hashlib.sha256(data).hexdigest()
+    if expected_sha256 is not None and sha256 != expected_sha256:
+        raise PmError(
+            f"sandbox policy {path} no longer has the SHA-256 this run recorded ({expected_sha256}); refusing"
+            " to start the server under a policy the run was not initialised with"
+        )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise refuse(f"unreadable ({exc})") from exc
+    policy, warnings = _validate_base_policy(text, path)
+    return policy, warnings, sha256
+
+
+def _validate_base_policy(text: str, path: Path) -> tuple[dict[str, Any], list[str]]:
+    """`(policy, warnings)` from the base policy `text` read from `path`;
+    PmError for every refusal `load_base_policy` names but an unreadable file."""
+    refuse = _policy_refusal(path)
     try:
         policy = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -872,8 +907,9 @@ def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path
     within 10 s (polled every 0.1 s, each probe bounded by the time left, and
     an answer after the deadline refused); when `srt` exits first, the
     deadline passes or the probe cannot look, the process group is killed
-    and the PmError quotes the log's last three lines. No retry and no
-    fallback to an unsandboxed server.
+    and the PmError quotes the log's last three lines. An exception during
+    the wait, KeyboardInterrupt included, kills the group too and
+    propagates. No retry and no fallback to an unsandboxed server.
     """
     _check_socket_name(socket)
     if platform.system() != "Darwin":
@@ -904,30 +940,36 @@ def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path
 
     deadline = time.monotonic() + START_DEADLINE_SECONDS
     late = f"the server did not answer within {START_DEADLINE_SECONDS:g} s"
-    while True:
-        returncode = process.poll()
-        if returncode is not None:
-            failure = f"srt exited with status {returncode} before the server answered"
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            failure = late
-            break
-        try:
-            answered = sessions.server_running(socket, timeout=remaining)
+    # Any exit from the wait but success kills the group, an interrupt
+    # included: the pid is recorded nowhere until the server answers.
+    try:
+        while True:
+            returncode = process.poll()
+            if returncode is not None:
+                failure = f"srt exited with status {returncode} before the server answered"
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = late
+                break
+            try:
+                answered = sessions.server_running(socket, timeout=remaining)
+                if answered:
+                    server_pid = _server_pid(socket, timeout=max(deadline - time.monotonic(), POLL_SECONDS))
+            except PmError as exc:
+                # A probe bounded by the time left fails as the deadline passes.
+                failure = f"{late} (last probe: {exc})" if time.monotonic() >= deadline else str(exc)
+                break
+            if time.monotonic() >= deadline:
+                failure = late
+                break
             if answered:
-                server_pid = _server_pid(socket, timeout=max(deadline - time.monotonic(), POLL_SECONDS))
-        except PmError as exc:
-            # A probe bounded by the time left fails as the deadline passes.
-            failure = f"{late} (last probe: {exc})" if time.monotonic() >= deadline else str(exc)
-            break
-        if time.monotonic() >= deadline:
-            failure = late
-            break
-        if answered:
-            _STARTED[process.pid] = process
-            return process.pid, server_pid
-        time.sleep(POLL_SECONDS)
+                _STARTED[process.pid] = process
+                return process.pid, server_pid
+            time.sleep(POLL_SECONDS)
+    except BaseException:
+        _kill_group(process)
+        raise
     _kill_group(process)
     raise PmError(
         f"sandboxed tmux server on socket {socket!r} did not start: {failure}; {log_path} ends: {_log_tail(log_path)}"
@@ -941,20 +983,21 @@ def verify_server(*, socket: str, worktree: Path) -> None:
     1. its global environment carries `SANDBOX_RUNTIME=1`;
     2. the negative probe: a `run-shell` touch of `<socket dir>/<socket>.probe`
        must fail and leave no file (it succeeds on any unsandboxed server).
-       When it does not, the file is removed, the server is killed, and the
-       error names the probe; a failure of either cleanup step is appended
-       to that error, never raised in its place;
+       When it does not, or does not return in time, the file is removed if
+       present, the server is killed, and the error names the probe; a
+       failure of either cleanup step is appended to that error, never
+       raised in its place;
     3. the positive probe: a `run-shell` touch of `<worktree>/.pm/sandbox-probe`
        must succeed and leave the file, which is then removed, so a policy
        that does not grant the worktree is caught here. The host creates
        `<worktree>/.pm` first when it is absent (and removes it again).
 
-    Each probe must return within 10 s, or verification fails with
-    PmError, so a wedged server cannot hang it. PmError at once for an
-    invalid socket name.
+    Each of the three probes must return within 10 s, or verification
+    fails with PmError, so a wedged server cannot hang it. PmError at once
+    for an invalid socket name.
     """
     _check_socket_name(socket)
-    value = sessions.server_environment(socket, "SANDBOX_RUNTIME")
+    value = sessions.server_environment(socket, "SANDBOX_RUNTIME", timeout=PROBE_TIMEOUT_SECONDS)
     if value != "1":
         raise PmError(
             f"the server on socket {socket!r} does not carry SANDBOX_RUNTIME=1 (found {value!r}): it is not running"
@@ -966,8 +1009,10 @@ def verify_server(*, socket: str, worktree: Path) -> None:
         outside.unlink(missing_ok=True)
     except OSError as exc:
         raise PmError(f"could not clear the negative probe file {outside}: {exc}") from exc
-    returncode, output = sessions.run_shell(socket, f"touch {shlex.quote(str(outside))}", timeout=PROBE_TIMEOUT_SECONDS)
-    if returncode == 0 or os.path.lexists(outside):
+
+    def clean_up() -> str:
+        """Remove the probe file if present and kill the server; the outcome,
+        for the error the caller raises."""
         cleanup: list[str] = []
         try:
             outside.unlink(missing_ok=True)
@@ -979,9 +1024,18 @@ def verify_server(*, socket: str, worktree: Path) -> None:
             cleanup.append(f"killing the server failed too: {exc}")
         else:
             cleanup.append("the server was killed")
+        return "; ".join(cleanup)
+
+    try:
+        returncode, output = sessions.run_shell(
+            socket, f"touch {shlex.quote(str(outside))}", timeout=PROBE_TIMEOUT_SECONDS
+        )
+    except PmError as exc:
+        raise PmError(f"negative probe could not run: {exc}; {clean_up()}") from exc
+    if returncode == 0 or os.path.lexists(outside):
         raise PmError(
             f"negative probe failed: the server on socket {socket!r} could create {outside}, outside any sandbox"
-            f" grant, so it is not confined; {'; '.join(cleanup)}"
+            f" grant, so it is not confined; {clean_up()}"
         )
 
     probe_dir = Path(worktree) / PROBE_DIR_NAME
@@ -1124,7 +1178,7 @@ def stop_server(*, socket: str, record: dict[str, Any]) -> tuple[list[str], list
 # --- A Mode B run's server -------------------------------------------------------
 
 
-def _run_sandbox(state: dict[str, Any], repo: Path) -> tuple[dict[str, Any], str, Path]:
+def run_sandbox(state: dict[str, Any], repo: Path) -> tuple[dict[str, Any], str, Path]:
     """(the run's `sandbox` block, its socket, its control dir) from MAC-checked
     run state. PmError when the block is malformed, or when its control dir
     is not `<repo's common git dir>/pm-sandbox/<socket>`: the location every
@@ -1187,13 +1241,6 @@ def require_run_socket(state: dict[str, Any]) -> None:
         f"this run's Developer server is sandboxed on tmux socket {socket!r}, but {found}; run "
         f"`export PM_TMUX_SOCKET={socket}` and retry"
     )
-
-
-def _policy_sha256(path: Path) -> str:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError as exc:
-        raise PmError(f"sandbox policy could not be read: {path} ({exc})") from exc
 
 
 def run_tmpdir(socket: str) -> Path:
@@ -1300,19 +1347,22 @@ def ensure_run_server(state: dict[str, Any], *, repo: Path) -> bool:
     A running server is accepted only when the run's record exists, the
     server's global environment carries `SANDBOX_RUNTIME=1` and its pid is
     the record's `server_pid`: anything else on the socket is refused, never
-    joined or killed. With no server, the base policy file is re-read and
-    refused unless its SHA-256 is still the one `init` recorded, and the
-    three policies are re-derived from it (`derive_run_policies`).
+    joined or killed. With no server, the base policy file is re-read once
+    (`load_pinned_policy`) and refused unless its SHA-256 is still the one
+    `init` recorded, and the three policies are re-derived from it
+    (`derive_run_policies`).
 
     When the control directory or its record is absent (a `stop` removed
     them, and `start-slice` resumes the run), what `init` created is rebuilt
     from the MAC-checked `sandbox` block and that policy: the control
     directory at the recorded path, `policy.json`, `reviewer-policy.json`,
     `attach-policy.json`, the temp dir `make_tmpdir` names (created unless a
-    partial teardown left it) and a record without pids. Otherwise only
-    `policy.json` is rewritten, and the record's temp dir is recreated when
-    it has gone. Either way the server is then started and verified and the
-    record updated with its pids.
+    partial teardown left it) and a record without pids. Otherwise the three
+    policy files are rewritten, which deliberately repairs a missing
+    `reviewer-policy.json` or `attach-policy.json` (a Mode B review would
+    otherwise fail closed on it), and the record's temp dir is recreated
+    when it has gone. Either way the server is then started and verified and
+    the record updated with its pids.
 
     On any failure after `start_server` returned, the server is killed and
     `srt` waited for, and the PmError carries that outcome: "the server was
@@ -1325,7 +1375,7 @@ def ensure_run_server(state: dict[str, Any], *, repo: Path) -> bool:
     for every refusal, a temp dir outside this process's temp root and a
     control file that cannot be written among them.
     """
-    block, socket, control = _run_sandbox(state, repo)
+    block, socket, control = run_sandbox(state, repo)
     record_path = control / RECORD_NAME
     record: dict[str, Any] | None = None
     if os.path.lexists(record_path):
@@ -1341,16 +1391,7 @@ def ensure_run_server(state: dict[str, Any], *, repo: Path) -> bool:
     recorded_sha256 = block.get("policy_sha256")
     if not isinstance(policy_text, str) or not isinstance(recorded_sha256, str):
         raise PmError(f"this run's sandbox record in run state is malformed: {block!r}")
-    policy_file = Path(policy_text)
-    if _policy_sha256(policy_file) != recorded_sha256:
-        raise PmError(
-            f"sandbox policy {policy_file} no longer has the SHA-256 this run recorded ({recorded_sha256}); refusing"
-            " to start the server under a policy the run was not initialised with"
-        )
-    base, _warnings = load_base_policy(policy_file)
-    # The policy the server runs under must be the one hashed.
-    if _policy_sha256(policy_file) != recorded_sha256:
-        raise PmError(f"sandbox policy {policy_file} changed while it was being read; retry")
+    base, _warnings, _sha256 = load_pinned_policy(Path(policy_text), recorded_sha256)
 
     tmpdir = _recorded_tmpdir(record, socket, record_path) if record is not None else run_tmpdir(socket)
     policies = derive_run_policies(
@@ -1394,7 +1435,8 @@ def ensure_run_server(state: dict[str, Any], *, repo: Path) -> bool:
         except OSError as exc:
             raise PmError(f"could not write sandbox record {record_path}: {exc}") from exc
     else:
-        write_control_file(control, POLICY_NAME, policies[POLICY_NAME])
+        for name, content in policies.items():
+            write_control_file(control, name, content)
 
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     srt_pid, server_pid = start_server(
@@ -1472,11 +1514,11 @@ def sandbox_left(state: dict[str, Any], *, repo: Path, run_dir: Path | None = No
     (`_sandbox_left`), so a run end whose teardown failed can retry it.
     With `run_dir`, a complete run whose `sandbox-stopped` event was lost
     (`_stop_unrecorded`) counts too: recording it is what is left of the
-    teardown. False for an unsandboxed run; PmError from `_run_sandbox` for
+    teardown. False for an unsandboxed run; PmError from `run_sandbox` for
     a malformed block."""
     if not records_sandbox(state):
         return False
-    _block, socket, control = _run_sandbox(state, repo)
+    _block, socket, control = run_sandbox(state, repo)
     if _sandbox_left(socket, control):
         return True
     return run_dir is not None and _stop_unrecorded(state, run_dir, socket)
@@ -1572,13 +1614,13 @@ def teardown_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
 
     PmError, before anything is killed or removed, for a malformed `sandbox`
     block in run state (an empty one included) or a control dir it names
-    other than `<common git dir>/pm-sandbox/<socket>` (`_run_sandbox`), for
+    other than `<common git dir>/pm-sandbox/<socket>` (`run_sandbox`), for
     an unreadable or malformed record (`read_record`), and for a record
     whose pid, temp dir or control dir `stop_server` refuses.
     """
     if not records_sandbox(state):
         return None
-    _block, socket, control = _run_sandbox(state, repo)
+    _block, socket, control = run_sandbox(state, repo)
     notes, present = _tear_down(socket, control)
     if present or _stop_unrecorded(state, run_dir, socket):
         state_mod.append_event(run_dir, "sandbox-stopped", note="; ".join(notes), data={"socket": socket})
@@ -1604,7 +1646,7 @@ def scavenge_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
             f"run state in {run_dir} names run id {state.get('run_id')!r}, not {run_dir.name!r}; refusing to tear"
             " down a sandbox on its word"
         )
-    _block, socket, control = _run_sandbox(state, repo)
+    _block, socket, control = run_sandbox(state, repo)
     expected = f"{RUN_SOCKET_PREFIX}{run_dir.name}"
     if socket != expected:
         raise PmError(
@@ -1617,17 +1659,37 @@ def scavenge_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
 # --- A campaign brief's pin ----------------------------------------------------
 
 
+def _git_toplevel(directory: Path) -> Path | None:
+    """The real path of the git toplevel `directory` lies in, or None when it
+    lies in no repository (or git cannot say)."""
+    code, top, _err = git_ops.git_result(directory, "rev-parse", "--show-toplevel")
+    return _real(top.strip()) if code == 0 and top.strip() else None
+
+
 def find_brief(path: Path | str) -> Path | None:
-    """The nearest `brief.md` at or above the directory holding `path` (its
-    real path), or None when no directory up to the root holds one: the
-    dossier brief a campaign launcher sits under."""
-    start = _real(Path(path).expanduser())
-    directory = start if start.is_dir() else start.parent
-    for candidate in (directory, *directory.parents):
-        brief = candidate / BRIEF_NAME
-        if brief.is_file():
-            return brief
-    return None
+    """The dossier brief a campaign launcher at `path` sits under: `brief.md`
+    at the root of the dossier, which is the git toplevel of the directory
+    holding the launcher. None when that root holds no `brief.md`, or the
+    launcher lies in no git repository (an unpinned launch, as when no brief
+    is found). A `brief.md` anywhere below the root is not the brief.
+
+    PmError when the toplevel of the launcher's directory as given differs
+    from that of its real path's (a launcher symbolically linked in from
+    another place): which brief governs it would depend on the spelling."""
+    given = Path(path).expanduser()
+    real = _real(given)
+    toplevel, real_toplevel = (
+        _git_toplevel(candidate if candidate.is_dir() else candidate.parent) for candidate in (given, real)
+    )
+    if toplevel != real_toplevel:
+        raise PmError(
+            f"the launcher {given} lies in {toplevel or 'no git repository'}, but its real path {real} lies in"
+            f" {real_toplevel or 'no git repository'}; refusing to guess which dossier's brief governs it"
+        )
+    if toplevel is None:
+        return None
+    brief = toplevel / BRIEF_NAME
+    return brief if brief.is_file() else None
 
 
 def brief_sandbox_pin(text: str) -> str | None:

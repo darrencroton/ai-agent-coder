@@ -260,23 +260,42 @@ class TestBriefSandboxPin(unittest.TestCase):
             sandbox.brief_sandbox_pin("## Sandbox\n- none (`sandbox.json` not used yet)\n")
         self.assertIn("without its pin: read as a pin, it carries no SHA-256", str(raised.exception))
 
-    def test_find_brief_walks_up_to_the_nearest_brief(self) -> None:
+    def test_find_brief_is_the_dossier_root_s_brief(self) -> None:
+        """The brief is `brief.md` at the launcher's git toplevel: a nearer one
+        is ignored, a launcher outside any repository has none, and one
+        symlinked in from elsewhere is refused."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(os.path.realpath(directory.name))
-        launcher = root / "dossier" / "nodes" / "n1" / "launcher.md"
+        dossier = root / "dossier"
+        launcher = dossier / "nodes" / "n1" / "launcher.md"
         launcher.parent.mkdir(parents=True)
         launcher.write_text("# Launcher\n", encoding="utf-8")
-        (root / "dossier" / "brief.md").write_text("# Brief\n", encoding="utf-8")
-        self.assertEqual(sandbox.find_brief(launcher), root / "dossier" / "brief.md")
-        (root / "dossier" / "nodes" / "brief.md").write_text("# Nearer\n", encoding="utf-8")
-        self.assertEqual(sandbox.find_brief(launcher), root / "dossier" / "nodes" / "brief.md")
+        self.assertIsNone(sandbox.find_brief(launcher))  # no repository yet
+        subprocess.run(["git", "init", "-q", str(dossier)], check=True)
+        self.assertIsNone(sandbox.find_brief(launcher))  # a repository without a brief
+        (dossier / "brief.md").write_text("# Brief\n", encoding="utf-8")
+        self.assertEqual(sandbox.find_brief(launcher), dossier / "brief.md")
+        (dossier / "nodes" / "brief.md").write_text("# Nearer\n", encoding="utf-8")
+        self.assertEqual(sandbox.find_brief(launcher), dossier / "brief.md")
+
+        outside = root / "elsewhere" / "launcher.md"
+        outside.parent.mkdir()
+        outside.write_text("# Launcher\n", encoding="utf-8")
+        linked = dossier / "nodes" / "n1" / "linked.md"
+        linked.symlink_to(outside)
+        with self.assertRaises(PmError) as raised:
+            sandbox.find_brief(linked)
+        self.assertIn(f"its real path {outside} lies in no git repository", str(raised.exception))
 
 
 class TestPreflightSandbox(PreflightTestCase):
     """The brief's `## Sandbox` section: `none`, or a pinned `sandbox.json`
-    checked against its pin, `load_base_policy` and `srt` on PATH. A fake
-    `srt` first on PATH makes the version line machine-independent."""
+    checked against its pin, `load_base_policy`, launch-child's own `srt`
+    checks and platform, and `srt` on PATH. A fake `srt` first on PATH makes
+    the version line machine-independent; `check_binaries` (which would look
+    for the fake's package) and the platform pass by stand-in, as on a Mac
+    with `srt` installed, unless a test says otherwise."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -285,9 +304,13 @@ class TestPreflightSandbox(PreflightTestCase):
         srt = fake_bin / "srt"
         srt.write_text("#!/bin/sh\necho 0.0.81-test\n", encoding="utf-8")
         srt.chmod(0o755)
-        patcher = mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (
+            mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}),
+            mock.patch.object(sandbox, "check_binaries"),
+            mock.patch.object(preflight.platform, "system", return_value="Darwin"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.policy = minimal_base_policy()
 
     def pin_sandbox(self, *, policy: dict | None = None, sha: str | None = None, section: str | None = None) -> None:
@@ -385,6 +408,20 @@ class TestPreflightSandbox(PreflightTestCase):
         self.assert_failed_with_instruction(out, "sandbox.json is readable", f"chmod u+r {policy_file.resolve()}")
         self.assertNotIn("sandbox.json matches its pin", out)
         self.assertNotIn("sandbox.json is a valid sandbox policy", out)
+
+    def test_what_launch_child_refuses_of_a_valid_policy_fails_here_too(self) -> None:
+        self.pin_sandbox(policy=self.policy)
+        with (
+            mock.patch.object(sandbox, "check_binaries", side_effect=PmError("stand-in: grant reaches srt")),
+            mock.patch.object(preflight.platform, "system", return_value="Linux"),
+        ):
+            code, out = self.run_preflight()
+        self.assertEqual(code, 1, out)
+        self.assertIn("ok    sandbox.json is a valid sandbox policy\n", out)
+        self.assert_failed_with_instruction(
+            out, "sandbox.json passes launch-child's srt checks", "stand-in: grant reaches srt"
+        )
+        self.assert_failed_with_instruction(out, "sandboxing is supported on this host", "macOS only")
 
     def test_srt_absent_fails_when_a_policy_is_pinned(self) -> None:
         self.pin_sandbox(policy=self.policy)

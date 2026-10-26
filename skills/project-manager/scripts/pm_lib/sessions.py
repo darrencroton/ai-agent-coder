@@ -581,19 +581,22 @@ def set_server_environment(socket: str, name: str, value: str) -> None:
         raise PmError(f"could not set {name} on tmux socket {socket!r}: {detail or 'tmux failed'}")
 
 
-def server_environment(socket: str, name: str) -> str | None:
+def server_environment(socket: str, name: str, timeout: float | None = None) -> str | None:
     """The value of `name` in the global environment of the server on
     `socket`, read with `tmux -L <socket> show-environment -g <name>`.
 
     None when the variable is unset (tmux prints `-NAME` for a removed one
     and fails with "unknown variable" for one never set), when no server
     runs on `socket`, or when tmux is missing — in each case no server
-    carries the value. Any other failure raises PmError: the caller is
-    proving ownership, and an unreadable answer is not "unset".
+    carries the value. Any other failure, including, with `timeout`
+    (seconds), no reply in time, raises PmError: the caller is proving
+    ownership, and an unreadable answer is not "unset".
     """
     argv = ["tmux", "-L", socket, "show-environment", "-g", name]
     try:
-        result = subprocess.run(argv, check=False, text=True, capture_output=True)
+        result = subprocess.run(argv, check=False, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise PmError(f"could not read {name} on tmux socket {socket!r}: no reply within {timeout:g} s") from None
     except OSError:
         return None
     if result.returncode != 0:

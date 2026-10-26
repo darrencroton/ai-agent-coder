@@ -38,7 +38,6 @@ cross-check on the child's own completion file, never as a fact.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import platform
@@ -256,7 +255,7 @@ class LaunchChildOutcome:
     watch: str
     # Set for a sandboxed child: the host-only control directory.
     control_dir: Path | None = None
-    # What `sandbox.load_base_policy` warned about, for the caller to print.
+    # What `sandbox.load_pinned_policy` warned about, for the caller to print.
     sandbox_warnings: list[str] = field(default_factory=list)
 
 
@@ -465,23 +464,13 @@ def _check_launch_preconditions(
     sandbox_warnings: list[str] = []
     if sandbox is not None:
         sandbox = sandbox.expanduser()
-
-        def policy_digest(path: Path) -> str:
-            try:
-                return hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError as exc:
-                raise PmError(f"sandbox policy could not be read: {path} ({exc})") from exc
-
-        policy_sha256 = policy_digest(sandbox)
+        # The policy the server will run under is the one hashed (and pinned): one read.
+        base_policy, sandbox_warnings, policy_sha256 = sandbox_mod.load_pinned_policy(sandbox)
         if pin is not None and policy_sha256 != pin:
             raise PmError(
                 f"--sandbox {sandbox} has SHA-256 {policy_sha256}, but the launcher's dossier brief {brief} pins "
                 f"`{pin}`; launch with the pinned policy"
             )
-        base_policy, sandbox_warnings = sandbox_mod.load_base_policy(sandbox)
-        # The policy the server will run under must be the one hashed (and pinned).
-        if policy_digest(sandbox) != policy_sha256:
-            raise PmError(f"sandbox policy {sandbox} changed while it was being read; launch again")
         sandbox = sandbox.resolve()
     # `is not None`, not truthiness: an explicit blank override is refused as
     # a blank command below rather than silently replaced by the composed one.

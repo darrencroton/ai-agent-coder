@@ -1903,13 +1903,17 @@ class TestReviewInsideSandbox(SandboxedReviewTestCase):
         self.assertIn("Sandbox: this review runs inside an OS sandbox", prompt)
         self.assert_identity_unchanged(review)
 
-    def test_inherited_sandbox_wins_over_a_recorded_one(self) -> None:
-        """Already inside `srt`, a second one cannot start: no wrap."""
+    def test_a_recorded_sandbox_wraps_the_reviewer_even_inside_an_inherited_one(self) -> None:
+        """An inherited sandbox never stands in for the run's own: the wrap is
+        applied, and a real nested `srt` would fail closed. A fake `srt`
+        stands in, so what is asserted is the argv `review` launches."""
+        _write_fake_reviewer(self.bin_dir / "srt", "echo wrapped")
         token, run_dir = self._ready_run()
-        self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=self.repo.parent / "tmp")
+        tmpdir = self.repo.parent / "tmp"
+        control = self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=tmpdir)
         code, _out, err, launched = self._review(token, sandbox_runtime=True)
         self.assertEqual(code, 0, err)
-        self.assertEqual(launched[0], "codex", launched)
+        self.assertEqual(launched[:5], ["srt", "-s", str(control / "reviewer-policy.json"), "env", f"TMPDIR={tmpdir}"])
         self.assertIn('sandbox_mode="danger-full-access"', launched)
 
     def test_no_sandbox_runs_the_read_only_reviewer_unwrapped(self) -> None:
@@ -1960,6 +1964,8 @@ class TestReviewInsideSandbox(SandboxedReviewTestCase):
         self.assertEqual(code, 2, err)
         self.assertIn("refusing to run the reviewer outside the sandbox", err)
         self.assertIsNone(launched)
+        # Refused before any commission artifact, so none raises the next sequence.
+        self.assertEqual(list((run_dir / "slices" / "slice-001").glob("review-*")), [])
         return control, err
 
     def test_recorded_sandbox_without_a_reviewer_policy_refuses_before_launching(self) -> None:

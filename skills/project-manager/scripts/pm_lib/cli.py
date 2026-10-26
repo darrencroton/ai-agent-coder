@@ -429,11 +429,19 @@ def _run_check_plan(args: argparse.Namespace) -> int:
 # --- init ----------------------------------------------------------------
 
 
+def _sandbox_arg(args: argparse.Namespace) -> Path | None:
+    """`--sandbox` as a path, or None when the flag is absent. A sandbox
+    that was asked for is established or refused: an empty or whitespace
+    value is refused with PmError, never taken for the flag's absence."""
+    if args.sandbox is None:
+        return None
+    if not args.sandbox.strip():
+        raise PmError("--sandbox needs an srt base policy file; an empty value was given, so nothing was created")
+    return Path(args.sandbox)
+
+
 def _run_init(args: argparse.Namespace) -> int:
-    # A sandbox that was asked for is established or refused: an empty
-    # value is never taken for the flag's absence.
-    if args.sandbox is not None and not args.sandbox.strip():
-        raise PmError("--sandbox needs an srt base policy file; an empty value was given, so no run was created")
+    sandbox_policy = _sandbox_arg(args)
     model_tag = state_mod.tag_value(args.model_tag, flag="--model-tag")
     run_tag = state_mod.tag_value(args.run_tag, flag="--run-tag")
     repo = git_ops.resolve_repo(Path(args.repo))
@@ -467,7 +475,7 @@ def _run_init(args: argparse.Namespace) -> int:
         model_tag=model_tag,
         run_tag=run_tag,
         policy=policy,
-        sandbox_policy=Path(args.sandbox) if args.sandbox is not None else None,
+        sandbox_policy=sandbox_policy,
     )
 
     for warning in result.sandbox_warnings:
@@ -1072,9 +1080,13 @@ def _scavenge_after_failed_stop(
     The run id is `--run`, except that readable state names its run by its
     directory, `--run` or not, when it records a sandbox or the stop was
     recorded (`StopTeardownError`); an unsandboxed run keeps the original
-    sweep. Exits 2 when readable sandboxed state still has a server, control
-    dir or temp dir after the kill, and whenever the stop's teardown failed:
-    no `sandbox-stopped` event records it, whatever the kill here did."""
+    sweep. The `pm-run-<run id>` server is looked for under that id, or,
+    without `--run`, under the run directory's name when one resolved
+    (unreadable state still names its run). Exits 2 when that server's kill
+    leaves sessions listed or the server cannot be checked, when readable
+    sandboxed state still has a server, control dir or temp dir after the
+    kill, and whenever the stop's teardown failed: no `sandbox-stopped`
+    event records it, whatever the kill here did."""
     teardown_failed = isinstance(exc, slice_ops.StopTeardownError)
     run_id = args.run
     if readable is not None and readable_dir is not None and (sandbox.records_sandbox(readable) or teardown_failed):
@@ -1084,14 +1096,18 @@ def _scavenge_after_failed_stop(
     print(f"pm: scavenge: {what} ({exc}); swept sessions: {killed}")
     # A sandboxed run's server is named after its id, so it can be found
     # without state; a name tmux cannot take is no run's.
-    if run_id and re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
-        socket = f"{sandbox.RUN_SOCKET_PREFIX}{run_id}"
+    server_run_id = run_id or (readable_dir.name if readable_dir is not None else None)
+    server_left = False
+    if server_run_id and re.fullmatch(r"[A-Za-z0-9._-]+", server_run_id):
+        socket = f"{sandbox.RUN_SOCKET_PREFIX}{server_run_id}"
         try:
             if sessions.server_running(socket, timeout=sandbox.START_DEADLINE_SECONDS):
                 remaining = sessions.kill_server(socket)
-                killed_note = "killed" if remaining == [] else f"still lists sessions: {', '.join(remaining)}"
+                server_left = remaining != []
+                killed_note = f"still lists sessions: {', '.join(remaining)}" if server_left else "killed"
                 print(f"pm: scavenge: sandboxed tmux server {socket} {killed_note}")
         except PmError as server_exc:
+            server_left = True
             print(f"pm: scavenge: could not check tmux server {socket}: {server_exc}")
     if readable is not None and sandbox.records_sandbox(readable):
         left = _sandbox_remains(repo, readable)
@@ -1107,7 +1123,7 @@ def _scavenge_after_failed_stop(
             "pm: scavenge: the stop's sandbox teardown failed, and no sandbox-stopped event records it", file=sys.stderr
         )
         return 2
-    return 0
+    return 2 if server_left else 0
 
 
 def _sandbox_remains(repo: Path, state: dict) -> list[str]:
@@ -1154,6 +1170,7 @@ def _scavenge_without_token(repo: Path, run_dir: Path, state: dict) -> int:
 
 
 def _run_launch_child(args: argparse.Namespace) -> int:
+    sandbox_policy = _sandbox_arg(args)
     outcome = campaign.launch_child(
         repo=Path(args.repo),
         base=args.base,
@@ -1166,7 +1183,7 @@ def _run_launch_child(args: argparse.Namespace) -> int:
         socket=args.socket,
         harness_command=args.harness_command,
         setup=Path(args.setup) if args.setup else None,
-        sandbox=Path(args.sandbox).expanduser() if args.sandbox else None,
+        sandbox=sandbox_policy,
     )
     for warning in outcome.sandbox_warnings:
         print(f"WARNING: {warning}")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import platform
 import re
 import shutil
 import tempfile
@@ -322,7 +323,7 @@ def campaign_preflight(
             else:
                 ok("sandbox.json matches its pin")
                 try:
-                    _policy, warnings = sandbox.load_base_policy(policy_file)
+                    policy, warnings = sandbox.load_base_policy(policy_file)
                 except PmError as exc:
                     fail(
                         "sandbox.json is a valid sandbox policy",
@@ -332,6 +333,20 @@ def campaign_preflight(
                     ok("sandbox.json is a valid sandbox policy")
                     for warning in warnings:
                         note(warning)
+                    # The rest of what launch-child refuses before creating
+                    # anything; an absent srt is the `srt on PATH` check's.
+                    if shutil.which("srt") is not None:
+                        try:
+                            sandbox.check_binaries(policy)
+                        except PmError as exc:
+                            fail("sandbox.json passes launch-child's srt checks", f"{exc}; launch-child refuses it")
+                        else:
+                            ok("sandbox.json passes launch-child's srt checks")
+                    if platform.system() != "Darwin":
+                        fail(
+                            "sandboxing is supported on this host",
+                            "sandboxing is implemented for macOS only; launch-child refuses a sandboxed launch here",
+                        )
 
     # The node worktree parent.
     parent_text = _pin_line(brief, "Node worktree parent", 0)

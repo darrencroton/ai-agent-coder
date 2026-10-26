@@ -350,13 +350,16 @@ def run_review(
 
     A reviewer runs inside a sandbox when this PM already does
     (`SANDBOX_RUNTIME=1`) or the run records one: its command and prompt are
-    then the sandboxed variants, which leave the boundary to the OS. A
-    recorded sandbox commissioned from outside one is wrapped in `srt` with
-    the control directory's reviewer policy at `Popen` time, after everything
-    recorded about the commission is built. That wrap fails closed: a missing
-    reviewer policy, a record naming no temp dir (the refusal names which), or
-    no `srt` on PATH raises PmError before anything is launched rather than
-    running the reviewer unwrapped.
+    then the sandboxed variants, which leave the boundary to the OS. A run
+    that records a sandbox always has its reviewer wrapped in `srt` with the
+    control directory's reviewer policy at `Popen` time, after everything
+    recorded about the commission is built, even when this PM itself runs
+    inside a sandbox: a nested `srt` fails closed (exit 71) rather than the
+    inherited sandbox standing in for the run's. That wrap fails closed: a
+    control directory outside the one place a host-written one can be, a
+    missing reviewer policy, a record naming no temp dir (the refusal names
+    which), or no `srt` on PATH raises PmError before any commission
+    artifact is written rather than running the reviewer unwrapped.
     """
     state = slice_ops.load_writable_state(run_dir, token)
     # Like every other command of a sandboxed run: never against another server.
@@ -385,6 +388,30 @@ def run_review(
             "worktree is dirty outside .pm/ — a review must run against the pinned committed tree; "
             "quiesce the Developer session and commit or restore before commissioning: " + "; ".join(dirty)
         )
+
+    # A run that records a sandbox runs its reviewer under `srt` with the
+    # host-written reviewer policy: read-only on the repository and with no
+    # route to the Developer server. Its prerequisites are checked here,
+    # before any commission artifact exists, so a refusal leaves none behind
+    # to raise the next commission's sequence; the wrap is applied at launch.
+    reviewer_wrap: tuple[Path, str] | None = None
+    if sandbox.records_sandbox(state):
+        _block, _socket, control = sandbox.run_sandbox(state, repo)
+        policy_path = control / sandbox.REVIEWER_POLICY_NAME
+        tmpdir = sandbox.read_record(control).get("tmpdir")
+        missing = []
+        if not policy_path.is_file():
+            missing.append(f"its reviewer policy {policy_path} is missing")
+        if not isinstance(tmpdir, str) or not tmpdir:
+            missing.append(f"its record {control / sandbox.RECORD_NAME} names no temp dir")
+        if missing:
+            raise PmError(
+                f"this run records a sandbox, but {' and '.join(missing)}; "
+                "refusing to run the reviewer outside the sandbox"
+            )
+        if shutil.which("srt") is None:
+            raise PmError(sandbox.SRT_MISSING)
+        reviewer_wrap = (policy_path, tmpdir)
 
     run_id = state["run_id"]
     plan_slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
@@ -447,8 +474,7 @@ def run_review(
     # The reviewer runs inside a sandbox either way: inherited, when this PM
     # already runs under `srt` (a campaign child), or wrapped at launch below,
     # when the run records a sandbox of its own (Mode B).
-    sandbox_block = state.get("sandbox")
-    sandboxed = sandbox.inside_sandbox() or bool(sandbox_block)
+    sandboxed = sandbox.inside_sandbox() or sandbox.records_sandbox(state)
     prompt_text = prompts.render_reviewer_prompt(
         # Never handed to a drift audit itself: a second audit of the same
         # commit must stay independent of the first one's verdict.
@@ -513,32 +539,13 @@ def run_review(
     # alone, and SKILL.md forbids it in any Reviewer session.
     reviewer_env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
 
-    # A run that records a sandbox, commissioned from outside one, runs its
-    # reviewer under `srt` with the host-written reviewer policy: read-only on
-    # the repository and with no route to the Developer server. Applied here,
-    # at launch, so nothing recorded about the commission sees the wrap. `srt`
-    # starts in this new session as its group leader and the reviewer shares
-    # that group, so the timeout's killpg below still reaches every process.
+    # The wrap checked above is applied here, at launch, so nothing recorded
+    # about the commission sees it. `srt` starts in this new session as its
+    # group leader and the reviewer shares that group, so the timeout's
+    # killpg below still reaches every process.
     popen_command = command
-    if sandbox_block and not sandbox.inside_sandbox():
-        control_text = sandbox_block.get("control_dir") if isinstance(sandbox_block, dict) else None
-        if not isinstance(control_text, str) or not control_text:
-            raise PmError("this run records a sandbox without a control directory; refusing to run the reviewer")
-        control = Path(control_text)
-        policy_path = control / "reviewer-policy.json"
-        tmpdir = sandbox.read_record(control).get("tmpdir")
-        missing = []
-        if not policy_path.is_file():
-            missing.append(f"its reviewer policy {policy_path} is missing")
-        if not isinstance(tmpdir, str) or not tmpdir:
-            missing.append(f"its record {control / sandbox.RECORD_NAME} names no temp dir")
-        if missing:
-            raise PmError(
-                f"this run records a sandbox, but {' and '.join(missing)}; "
-                "refusing to run the reviewer outside the sandbox"
-            )
-        if shutil.which("srt") is None:
-            raise PmError(sandbox.SRT_MISSING)
+    if reviewer_wrap is not None:
+        policy_path, tmpdir = reviewer_wrap
         popen_command = sandbox.wrap_command(policy_path, command, tmpdir=tmpdir)
 
     with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:

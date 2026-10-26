@@ -1030,13 +1030,14 @@ class TestChildLifecycle(CampaignTestCase):
 
 class SandboxLaunchTestCase(CampaignTestCase):
     """A dossier holding `brief.md` and `sandbox.json`, with the launcher
-    under `nodes/n1/` (the walk up from it finds the brief), and an idle
-    fake child."""
+    under `nodes/n1/` (the dossier is a git repository, and the brief at its
+    root governs the launcher), and an idle fake child."""
 
     def setUp(self) -> None:
         super().setUp()
         self.dossier = self.repo.parent / "dossier"
         (self.dossier / "nodes" / "n1").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(self.dossier)], check=True)
         self.prompt_file = self.dossier / "nodes" / "n1" / "launcher.md"
         self.prompt_file.write_text("# Launcher\n\nRun the node plan.\n", encoding="utf-8")
         self.policy = write_base_policy(self.dossier / "sandbox.json")
@@ -1103,6 +1104,14 @@ class TestSandboxLaunchRefusals(SandboxLaunchTestCase):
         self.assert_refused(
             self.launch_argv(self.harness) + ["--sandbox", str(self.policy)], str(self.policy), "allowAppleEvents"
         )
+
+    def test_an_empty_sandbox_value_is_refused_not_taken_for_no_flag(self) -> None:
+        # No brief pins a policy here, so an empty value read as absent would launch unsandboxed.
+        for value in ("", "  "):
+            with self.subTest(value=value):
+                self.assert_refused(
+                    self.launch_argv(self.harness) + ["--sandbox", value], "--sandbox needs an srt base policy file"
+                )
 
     def test_a_pinned_brief_refuses_a_launch_without_sandbox_quoting_the_pin(self) -> None:
         pin = hashlib.sha256(self.policy.read_bytes()).hexdigest()
@@ -1320,6 +1329,28 @@ class TestSandboxLaunchHostRefusals(SandboxLaunchTestCase):
         self.assertEqual(len(warnings), 1, out)
         self.assertIn("enableWeakerNetworkIsolation", warnings[0])
         self.assertNotIn("note:", out)
+
+    def test_a_sandboxed_launch_composes_the_sandboxed_harness_command(self) -> None:
+        """A composed codex child gets the profile's sandboxed variant
+        (`--no-daemon`): `sandboxed=True` reaches `launch_command`."""
+        fake_bin = self.repo.parent / "fake-bin"
+        fake_bin.mkdir()
+        write_fake_harness(fake_bin / "codex", "exec cat -")
+        argv = list(self.argv)
+        at = argv.index("--harness")
+        argv[at : at + 4] = ["--harness", "codex"]  # no --harness-command: the profile composes it
+        with (
+            self.without_srt(),
+            mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"}),
+            mock.patch.object(campaign.profiles, "launch_command", wraps=campaign.profiles.launch_command) as compose,
+            mock.patch.object(campaign, "_start_child_session") as start,
+        ):
+            code, out, err = self.run_cli(argv)
+        self.assertEqual(code, 0, out + err)
+        compose.assert_called_once()
+        self.assertIs(compose.call_args.kwargs["sandboxed"], True)
+        start.assert_called_once()
+        self.assertEqual(start.call_args.args[0].command.split()[-1], "--no-daemon")
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required to host the marked server")
