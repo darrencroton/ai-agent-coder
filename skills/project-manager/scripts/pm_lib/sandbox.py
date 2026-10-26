@@ -63,7 +63,7 @@ under `/private/tmp` would match nothing and the server could not create it.
 Session creation and every other tmux call stay in `sessions`; the one tmux
 contact here is the server itself (run under `srt`) and the
 `display-message` that reads its pid. Nothing in this module scrubs or records
-the inherited environment beyond removing `PM_RUN_TOKEN`. macOS only.
+the inherited environment beyond removing `sessions.SEAT_ENV_DROPPED`. macOS only.
 """
 
 from __future__ import annotations
@@ -349,8 +349,9 @@ def load_pinned_policy(path: Path | str, expected_sha256: str | None = None) -> 
     ways, or is, contains or lies inside the tmux socket directory (a pane
     could then drive the operator's own unsandboxed tmux server).
 
-    `warnings` holds one line for `enableWeakerNetworkIsolation` and one for
-    `network.allowLocalBinding`, when set, each naming what the option opens;
+    `warnings` holds one line for `enableWeakerNetworkIsolation`, one for
+    `network.allowLocalBinding` and one for `filesystem.allowGitConfig`, when
+    set, each naming what the option opens;
     the caller prints them. The policy is returned as parsed: deriving from
     it never mutates it, and `srt` applies its own schema check on top.
     """
@@ -453,6 +454,12 @@ def _validate_base_policy(text: str, path: Path) -> tuple[dict[str, Any], list[s
         warnings.append(
             f"sandbox policy {path}: network.allowLocalBinding is set: it opens loopback and this host's own"
             " interface addresses to the sandbox, outside the egress proxy"
+        )
+    if filesystem.get("allowGitConfig"):
+        warnings.append(
+            f"sandbox policy {path}: filesystem.allowGitConfig is set: it lifts srt's deny on writing .git/config in"
+            " repositories beneath the worktree, such as a clone a product gate makes, so a host git command later run"
+            " in one runs whatever configuration the sandbox wrote there"
         )
     return policy, warnings
 
@@ -915,7 +922,7 @@ def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path
     egress proxy lives exactly as long as the server. The process runs with
     cwd `worktree` (`srt`'s own denies key off it), stdin from /dev/null,
     stdout and stderr appended to `log_path`, in a session and process group
-    of its own, and with `PM_RUN_TOKEN` removed from its environment (tmux
+    of its own, and with `sessions.SEAT_ENV_DROPPED` removed from its environment (tmux
     seeds the server's global environment from it).
 
     PmError, before anything starts, for an invalid socket name, off macOS
@@ -938,7 +945,7 @@ def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path
     if shutil.which("srt") is None:
         raise PmError(SRT_MISSING)
     argv = wrap_command(policy_path, ["tmux", "-L", socket, "-D"], tmpdir=tmpdir)
-    env = {name: value for name, value in os.environ.items() if name != "PM_RUN_TOKEN"}
+    env = sessions.seat_environ()
     log_path = Path(log_path)
     try:
         with log_path.open("ab") as log:

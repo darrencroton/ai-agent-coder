@@ -35,6 +35,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 ## Pinned references
 - Campaign base: `<integration branch's starting branch>` at `<SHA>`
 - <reference>: <repository or path> at <SHA>
+- <owner script>: `<file>` in this dossier, SHA-256 `<digest of the file, from shasum -a 256>`, copied byte for byte into each node that runs it
 
 ## Allowed paths
 - <product path the campaign may change>

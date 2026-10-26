@@ -30,6 +30,7 @@ from . import plan as plan_mod
 from . import profiles
 from . import prompts
 from . import sandbox
+from . import sessions
 from . import slice_ops
 from . import state as state_mod
 
@@ -536,8 +537,9 @@ def run_review(
 
     # The reviewer process must not inherit the PM run capability token from
     # the controller's exported environment: the token is the controller's
-    # alone, and SKILL.md forbids it in any Reviewer session.
-    reviewer_env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
+    # alone, and SKILL.md forbids it in any Reviewer session. Nor does it
+    # inherit the supervising session's own variables (`SEAT_ENV_DROPPED`).
+    reviewer_env = sessions.seat_environ()
 
     # The wrap checked above is applied here, at launch, so nothing recorded
     # about the commission sees it. `srt` starts in this new session as its

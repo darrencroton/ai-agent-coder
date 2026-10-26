@@ -593,7 +593,7 @@ def _run_worktree_setup(launch: _ChildLaunch) -> None:
     """Run the launch's setup script, if any, inside the new worktree.
 
     `sh <script>` with the worktree as its working directory, the caller's
-    environment less `PM_RUN_TOKEN`, and its own process group; its stdout
+    environment less `sessions.SEAT_ENV_DROPPED`, and its own process group; its stdout
     and stderr go straight to `.pm/campaign/setup.log`, so the wait depends
     on the shell exiting and never on a pipe closing, and a log that cannot
     be opened fails the launch before the script runs, because the log is
@@ -621,12 +621,12 @@ def _run_worktree_setup(launch: _ChildLaunch) -> None:
 
 def run_setup_script(script: Path, worktree: Path, *, log: Path, left_behind: str) -> None:
     """Run `sh <script>` inside `worktree` as `_run_worktree_setup` describes:
-    output to `log`, own process group, no `PM_RUN_TOKEN`, killed on timeout
+    output to `log`, own process group, no `sessions.SEAT_ENV_DROPPED`, killed on timeout
     or interruption, and a failure, a timeout or a dirty worktree afterwards
     raises `PmError` ending in `left_behind`. `campaign-preflight` runs the
     same code in a throwaway worktree, so what it checks is what a launch
     will do."""
-    env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
+    env = sessions.seat_environ()
     try:
         handle = log.open("w", encoding="utf-8")
     except OSError as exc:

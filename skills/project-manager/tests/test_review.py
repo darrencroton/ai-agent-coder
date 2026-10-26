@@ -1175,19 +1175,20 @@ class TestReviewerEnvSanitization(ReviewCommandTestCase):
 
         fake = _write_fake_reviewer(
             self.repo.parent / "fake_reviewer_envcheck.sh",
-            'echo "TOKEN_IS=${PM_RUN_TOKEN:-ABSENT}"\nexit 0',
+            'echo "TOKEN_IS=${PM_RUN_TOKEN:-ABSENT} MSG_IS=${CLAUDE_CODE_MESSAGING_TOKEN:-ABSENT}'
+            ' BEDROCK_IS=${CLAUDE_CODE_USE_BEDROCK:-ABSENT}"\nexit 0',
         )
 
-        previous = os.environ.get("PM_RUN_TOKEN")
-        os.environ["PM_RUN_TOKEN"] = "should-never-reach-reviewer"
-
-        def _restore() -> None:
-            if previous is None:
-                os.environ.pop("PM_RUN_TOKEN", None)
-            else:
-                os.environ["PM_RUN_TOKEN"] = previous
-
-        self.addCleanup(_restore)
+        env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "PM_RUN_TOKEN": "should-never-reach-reviewer",
+                "CLAUDE_CODE_MESSAGING_TOKEN": "nor-this",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+            },
+        )
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
         # The worktree must be clean at review time (a separate, new
         # requirement pinned by TestReviewDirtyWorktreeRefusal below) — the
@@ -1213,7 +1214,7 @@ class TestReviewerEnvSanitization(ReviewCommandTestCase):
         reloaded = state_mod.load_state(run_dir, token)
         entry = reloaded["slices"][0]
         artifact_path = Path(entry["reviews"][0]["artifact"])
-        self.assertIn("TOKEN_IS=ABSENT", artifact_path.read_text(encoding="utf-8"))
+        self.assertIn("TOKEN_IS=ABSENT MSG_IS=ABSENT BEDROCK_IS=1", artifact_path.read_text(encoding="utf-8"))
 
 
 class TestReviewerPidsClearedOnFailure(ReviewCommandTestCase):

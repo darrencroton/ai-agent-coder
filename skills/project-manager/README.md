@@ -29,7 +29,7 @@ The owner's steps; everything after the paste is the Campaign Manager's, as [ref
 7. Run [Verify campaign mode](#verify-campaign-mode-no-real-model-2-minutes) once on this machine.
 8. Run `campaign-preflight` (see [CLI](#cli)) with the dossier, the product repository, the integration branch and checkout, and the child PM's and each child seat's harness; fix every `FAIL` it names and commit the dossier. The Campaign Manager runs the same command first at every reconcile.
 9. Approve the brief and take its digest with `shasum -a 256 brief.md`. The Campaign Manager needs that digest at every start and resume, and stops on a mismatch.
-10. Fill the campaign launcher from `references/campaign-mode.md` and paste it into a fresh PM-capable session. Resume the same way with the same digest: the Campaign Manager reconciles from the dossier.
+10. Fill the campaign launcher from `references/campaign-mode.md` and paste it into a fresh PM-capable session. Resume the same way with the same digest: the Campaign Manager reconciles from the dossier. Start it from a shell without the product's virtualenv (every seat inherits it), and resume it from that same shell (for a sandboxed child, a `stop-child` run under another `TMPDIR` leaves the sandbox temp dir behind).
 
 ## Requirements
 

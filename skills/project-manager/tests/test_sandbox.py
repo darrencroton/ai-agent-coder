@@ -297,6 +297,18 @@ class TestLoadBasePolicy(TempDirTestCase):
         self.assertIn("allowLocalBinding", warnings[1])
         self.assertIn("loopback", warnings[1])
 
+    def test_allow_git_config_warns_only_when_truthy(self) -> None:
+        policy = minimal_base_policy()
+        for value in (None, False):
+            if value is not None:
+                policy["filesystem"]["allowGitConfig"] = value
+            self.assertEqual(sandbox.load_base_policy(self._write(policy))[1], [])
+        policy["filesystem"]["allowGitConfig"] = True
+        _loaded, warnings = sandbox.load_base_policy(self._write(policy))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("allowGitConfig", warnings[0])
+        self.assertIn(".git/config", warnings[0])
+
 
 # --- derived policies --------------------------------------------------------------
 
@@ -1062,7 +1074,14 @@ class TestStartServerWithFakes(TempDirTestCase):
         # the fresh fake scripts can take longer than that on a loaded host.
         with (
             mock.patch.object(sandbox, "START_DEADLINE_SECONDS", 10.0),
-            mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "tok-1"}),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PM_RUN_TOKEN": "tok-1",
+                    "CLAUDE_CODE_MESSAGING_TOKEN": "msg-1",
+                    "CLAUDE_CODE_USE_BEDROCK": "1",
+                },
+            ),
             mock.patch.object(sandbox.subprocess, "Popen", side_effect=spy),
         ):
             srt_pid, server_pid = sandbox.start_server(
@@ -1085,6 +1104,8 @@ class TestStartServerWithFakes(TempDirTestCase):
         self.assertIs(kwargs["start_new_session"], True)
         self.assertEqual(token_during_call, "tok-1")
         self.assertNotIn("PM_RUN_TOKEN", kwargs["env"])
+        self.assertNotIn("CLAUDE_CODE_MESSAGING_TOKEN", kwargs["env"])
+        self.assertEqual(kwargs["env"]["CLAUDE_CODE_USE_BEDROCK"], "1")
         self.assertEqual(kwargs["env"]["PATH"], os.environ["PATH"])
         self.assertTrue(self.log.read_text(encoding="utf-8").startswith("earlier run\n"))
         self.assertEqual((srt_pid, server_pid), (process.pid, 5151))
@@ -1419,14 +1440,18 @@ class TestStartSessionViaServer(unittest.TestCase):
             sessions.start_session("pm-r-s01a0", Path("/r/repo"), command, env)
         expected = direct.call_args.args[0]
         self.assertEqual(
-            expected[-1], "unset PM_RUN_TOKEN; PM_SLICE_ID='Slice 1' PM_X='a '\"'\"'b'\"'\"' #c' " + command
+            expected[-1],
+            f"unset {' '.join(sessions.SEAT_ENV_DROPPED)}; PM_SLICE_ID='Slice 1' PM_X='a '\"'\"'b'\"'\"' #c' "
+            + command,
         )
 
-        with mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "secret", "PM_TMUX_SOCKET": "other"}):
+        with mock.patch.dict(
+            os.environ, {"PM_RUN_TOKEN": "secret", "CLAUDE_CODE_MESSAGING_TOKEN": "msg", "PM_TMUX_SOCKET": "other"}
+        ):
             seen_token: list[str | None] = []
 
             def fake_run_shell(socket: str, shell: str) -> tuple[int, str]:
-                seen_token.append(os.environ.get("PM_RUN_TOKEN"))
+                seen_token.append(os.environ.get("PM_RUN_TOKEN") or os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN"))
                 return 0, ""
 
             with (

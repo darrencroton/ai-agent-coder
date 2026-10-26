@@ -754,18 +754,26 @@ class TestStartSessionStripsInheritedToken(TmuxSessionTestCase):
         socket = f"{TEST_TMUX_SOCKET}-token"
         self.addCleanup(sessions.kill_server, socket)
         token = "secret-fresh-server-token"
-        with sessions.scoped_environ("PM_RUN_TOKEN", token), sessions.scoped_environ("PM_TMUX_SOCKET", socket):
+        messaging = "secret-fresh-server-messaging"
+        with (
+            sessions.scoped_environ("PM_RUN_TOKEN", token),
+            sessions.scoped_environ("CLAUDE_CODE_MESSAGING_TOKEN", messaging),
+            sessions.scoped_environ("PM_TMUX_SOCKET", socket),
+        ):
             sessions.start_session("pm-test-freshtoken-s01a0", self.repo, "bash -c 'sleep 15'", {})
             self.assertEqual(os.environ["PM_RUN_TOKEN"], token)
+            self.assertEqual(os.environ["CLAUDE_CODE_MESSAGING_TOKEN"], messaging)
         shown = subprocess.run(
-            ["tmux", "-L", socket, "show-environment", "-g", "PM_RUN_TOKEN"],
+            ["tmux", "-L", socket, "show-environment", "-g"],
             check=False,
             capture_output=True,
             text=True,
         )
         output = shown.stdout + shown.stderr
-        self.assertNotIn(token, output)
-        self.assertNotIn("PM_RUN_TOKEN=", output)
+        for secret in (token, messaging):
+            self.assertNotIn(secret, output)
+        for name in ("PM_RUN_TOKEN=", "CLAUDE_CODE_MESSAGING_TOKEN="):
+            self.assertNotIn(name, output)
 
 
 class TestScopedEnviron(unittest.TestCase):

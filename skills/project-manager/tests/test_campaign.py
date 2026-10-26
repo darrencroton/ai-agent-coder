@@ -463,11 +463,18 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         script = self.repo.parent / "setup.sh"
         script.write_text(
             'pwd -P > setup-cwd.txt\necho scaffolded\nln -s "$PWD/README.md" link.md\n'
-            'if [ -n "${PM_RUN_TOKEN+x}" ]; then echo token-leaked >&2; fi\n',
+            'if [ -n "${PM_RUN_TOKEN+x}" ]; then echo token-leaked >&2; fi\n'
+            'if [ -n "${CLAUDE_CODE_MESSAGING_TOKEN+x}" ]; then echo messaging-token-leaked >&2; fi\n'
+            'echo "bedrock=${CLAUDE_CODE_USE_BEDROCK-unset}"\n',
             encoding="utf-8",
         )
+        caller = {
+            "PM_RUN_TOKEN": "caller-token-must-not-leak",
+            "CLAUDE_CODE_MESSAGING_TOKEN": "messaging-token-must-not-leak",
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+        }
         with (
-            mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "caller-token-must-not-leak"}),
+            mock.patch.dict(os.environ, caller),
             mock.patch.object(campaign, "_start_child_session") as start,
         ):
             code, out, err = self.run_cli(self._setup_argv(script))
@@ -479,6 +486,8 @@ class TestLaunchChildPreconditions(CampaignTestCase):
         log = (campaign.campaign_dir(worktree) / "setup.log").read_text(encoding="utf-8")
         self.assertIn("scaffolded", log)
         self.assertNotIn("token-leaked", log)
+        self.assertNotIn("messaging-token-leaked", log)
+        self.assertIn("bedrock=1", log)
 
     def test_a_setup_script_that_dirties_the_worktree_fails_the_launch(self) -> None:
         script = self.repo.parent / "setup-dirty.sh"

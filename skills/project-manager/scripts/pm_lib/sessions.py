@@ -204,6 +204,50 @@ def sessions_for_run(run_id: str) -> list[str]:
     return [name for name in _session_names() if pattern.match(name)]
 
 
+# A supervising session's identity and messaging credentials must not reach a
+# seat it launches: the PM run capability token, and the identity and
+# messaging variables Claude Code sets in its own subprocesses. Its behaviour
+# defaults (`GIT_EDITOR`, `COREPACK_ENABLE_AUTO_PIN`,
+# `NoDefaultCurrentDirectoryInExePath`) and the configuration variables an
+# owner sets (`CLAUDE_CODE_USE_BEDROCK`) are deliberately not listed, so they
+# still reach seats.
+SEAT_ENV_DROPPED = (
+    "PM_RUN_TOKEN",
+    "CLAUDECODE",
+    "CLAUDE_PID",
+    "AI_AGENT",
+    "CLAUDE_EFFORT",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+)
+
+
+def seat_environ() -> dict[str, str]:
+    """This process's environment less `SEAT_ENV_DROPPED`: what a seat's
+    process is started with."""
+    return {name: value for name, value in os.environ.items() if name not in SEAT_ENV_DROPPED}
+
+
+@contextmanager
+def scoped_seat_environ() -> Iterator[None]:
+    """Remove every `SEAT_ENV_DROPPED` name from this process's environment
+    for the block; put back the values it removed on the way out, whatever the
+    block raised."""
+    previous = {name: os.environ[name] for name in SEAT_ENV_DROPPED if name in os.environ}
+    try:
+        for name in previous:
+            del os.environ[name]
+        yield
+    finally:
+        os.environ.update(previous)
+
+
 @contextmanager
 def scoped_environ(name: str, value: str | None) -> Iterator[None]:
     """Set `name` to `value` (unset it when `value` is None) for the block;
@@ -224,11 +268,12 @@ def scoped_environ(name: str, value: str | None) -> Iterator[None]:
 
 
 def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -> None:
-    """`tmux new-session -d -s <session> -c <repo> "unset PM_RUN_TOKEN; <env-prefix> <command>"`.
+    """`tmux new-session -d -s <session> -c <repo> "unset <SEAT_ENV_DROPPED>; <env-prefix> <command>"`.
 
     Env values are shell-quoted. The Developer session's environment must
     never carry the PM run capability token — asserted defensively for the
-    explicit map in `_new_session_args`, AND stripped from the inherited
+    explicit map in `_new_session_args` — nor the supervising session's own
+    variables (`SEAT_ENV_DROPPED`), AND those are stripped from the inherited
     environment: a tmux session inherits the server's (ultimately the
     controller's) environment, so an exported PM_RUN_TOKEN would otherwise
     be visible inside every Developer session. The `unset` runs in the
@@ -237,26 +282,26 @@ def start_session(session: str, repo: Path, command: str, env: dict[str, str]) -
     That `unset` does not reach the server's *global* environment, which tmux
     seeds from the process that starts a new server: an exported token would
     stay readable from inside the session via `tmux show-environment -g`. So
-    the `new-session` call itself runs with the token removed from this
+    the `new-session` call itself runs with those names removed from this
     process's environment.
     """
     args = _new_session_args(session, repo, command, env)
     if not shutil.which("tmux"):
         raise PmError("tmux is required for runtime execution")
-    with scoped_environ("PM_RUN_TOKEN", None):
+    with scoped_seat_environ():
         _tmux_or_raise(args, "tmux start failed")
 
 
 def _new_session_args(session: str, repo: Path, command: str, env: dict[str, str]) -> list[str]:
     """The `new-session` arguments `start_session` and
     `start_session_via_server` both issue: the session's shell runs
-    `unset PM_RUN_TOKEN; <env-prefix> <command>`, with env values
+    `unset <SEAT_ENV_DROPPED>; <env-prefix> <command>`, with env values
     shell-quoted. Refuses an explicit PM_RUN_TOKEN in `env`."""
     if "PM_RUN_TOKEN" in env:
         raise PmError("session environment must never contain PM_RUN_TOKEN")
     env_prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
     payload = f"{env_prefix} {command}".strip() if env_prefix else command
-    shell_command = f"unset PM_RUN_TOKEN; {payload}"
+    shell_command = f"unset {' '.join(SEAT_ENV_DROPPED)}; {payload}"
     return ["new-session", "-d", "-s", session, "-c", str(repo), shell_command]
 
 
@@ -273,14 +318,14 @@ def start_session_via_server(socket: str, session: str, repo: Path, command: str
 
     The session's shell command and the `PM_RUN_TOKEN` handling are exactly
     `start_session`'s (see `_new_session_args`); the run-shell client also
-    runs with the token removed from this process's environment. The socket
+    runs with `SEAT_ENV_DROPPED` removed from this process's environment. The socket
     is the argument, never `PM_TMUX_SOCKET` (see `kill_server`). PmError
     when `run-shell` fails, quoting what tmux or the job printed.
     """
     args = _new_session_args(session, repo, command, env)
     if not shutil.which("tmux"):
         raise PmError("tmux is required for runtime execution")
-    with scoped_environ("PM_RUN_TOKEN", None):
+    with scoped_seat_environ():
         returncode, output = run_shell(socket, shlex.join(["tmux", "-L", socket, *args]))
     if returncode != 0:
         detail = output.strip()
