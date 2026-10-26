@@ -10,8 +10,12 @@ was started with. This module is the toolkit's one seam onto that mechanism:
 - the policies the toolkit derives from it for a worktree and branch: the
   server's effective policy, a Mode B reviewer's, and the operator's attach
   client's (`derive_policy`, `derive_reviewer_policy`, `derive_attach_policy`),
-  plus the refusal of a write grant reaching `srt`'s own installation
-  (`check_binaries`);
+  the first two carrying the denies that keep a pane from redirecting the
+  host's next git command (the repository's config and hooks, and the
+  pointer files `commondir`, `gitdir` and `config.worktree`, denied in every
+  checkout because git honours them in a plain one too), plus the refusal of
+  a write grant reaching `srt`'s own installation or the launchers the host
+  runs it through (`check_binaries`);
 - the host-only control directory and its record (`control_dir`,
   `write_record`, `read_record`), and the per-run temp directory
   (`make_tmpdir`, `remove_tmpdir`);
@@ -36,6 +40,16 @@ that whole directory, which fails toward refusing. An entry written as
 the toolkit derives itself is written that way: a worktree under `work[1]`
 must not also grant `work1`. Base-policy entries stay as the operator wrote
 them.
+
+A base policy is refused for a grant that is the filesystem root or the home
+directory (equality only: every grant lies inside `/`, and grants inside the
+home directory are normal), or that is, contains or lies inside the toolkit
+checkout or the tmux socket directory; for a `network.allowUnixSockets` entry
+that is, contains or lies inside the tmux socket directory (`srt` renders each
+entry as a `subpath` connect rule, so it would let a pane drive the operator's
+own unsandboxed tmux server); and, at `check_binaries`, for a write grant that
+is or contains `srt`'s package, the real or the `PATH`-spelled `srt` and
+`node`.
 
 A grant is compared with a protected path by file identity (`st_dev`,
 `st_ino`), not by spelling: on a case-insensitive volume `/users/me` is
@@ -289,11 +303,10 @@ def _check_lists(policy: Any) -> None:
 
 
 def _write_entries(policy: dict[str, Any]) -> list[Any]:
-    filesystem = policy.get("filesystem")
-    entries = filesystem.get("allowWrite", []) if isinstance(filesystem, dict) else []
-    if not isinstance(entries, list):
-        raise PmError("sandbox policy: filesystem.allowWrite is not a list")
-    return entries
+    """`policy`'s `filesystem.allowWrite` entries; PmError from
+    `_check_lists` first, so a malformed policy is refused here as everywhere."""
+    _check_lists(policy)
+    return policy.get("filesystem", {}).get("allowWrite", [])
 
 
 # --- The base policy -------------------------------------------------------------
@@ -310,9 +323,13 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     (`allowedDomains`, `deniedDomains`, `allowUnixSockets`, `denyRead`,
     `allowRead`, `allowWrite`, `denyWrite`) present but not a list; an
     `allowWrite` entry that is not a path entry, holds a NUL, control or
-    lone-surrogate character, is relative, or is the same file as `/`, the
-    home directory, `toolkit_root()` or the tmux socket directory, however
-    spelled.
+    lone-surrogate character, is relative, is the same file as `/` or the
+    home directory (equality only: any grant is inside `/`, and grants inside
+    the home directory are normal), or is, contains or lies inside
+    `toolkit_root()` or the tmux socket directory, however spelled; a
+    `network.allowUnixSockets` entry that is malformed or relative in the same
+    ways, or is, contains or lies inside the tmux socket directory (a pane
+    could then drive the operator's own unsandboxed tmux server).
 
     `warnings` holds one line for `enableWeakerNetworkIsolation` and one for
     `network.allowLocalBinding`, when set, each naming what the option opens;
@@ -352,26 +369,47 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     if fault:
         raise refuse(fault)
 
-    forbidden = (
-        (Path("/"), "the filesystem root"),
-        (_real(Path.home()), "the home directory"),
-        (toolkit_root(), "the toolkit checkout"),
-        (_socket_dir(), "the tmux socket directory"),
-    )
-    for entry in filesystem.get("allowWrite", []):
+    def resolve_entry(entry: Any, key: str) -> tuple[str, Path]:
+        """(path text, resolved path) of a `key` entry; PmError when it is
+        malformed, relative or unresolvable."""
         try:
             text_entry, _literal_entry = _entry_text(entry)
             if not _is_absolute_entry(text_entry):
                 raise refuse(
-                    f"allowWrite entry {text_entry!r} is relative: it would resolve against the server's working"
-                    " directory"
+                    f"{key} entry {text_entry!r} is relative: it would resolve against the server's working directory"
                 )
-            text_entry, resolved = _write_grant(entry)
+            return _write_grant(entry)
         except ValueError as exc:
-            raise refuse(f"allowWrite entry {entry!r} {exc}") from None
-        for target, name in forbidden:
+            raise refuse(f"{key} entry {entry!r} {exc}") from None
+
+    # Equality only for `/` and the home directory; a relation for the rest.
+    exact = (
+        (Path("/"), "the filesystem root"),
+        (_real(Path.home()), "the home directory"),
+    )
+    related = (
+        (toolkit_root(), "the toolkit checkout"),
+        (_socket_dir(), "the tmux socket directory"),
+    )
+    for entry in filesystem.get("allowWrite", []):
+        text_entry, resolved = resolve_entry(entry, "allowWrite")
+        for target, name in exact:
             if _same(resolved, target):
                 raise refuse(f"allowWrite entry {text_entry!r} resolves to {name} ({target})")
+        for target, name in related:
+            relation = _relation(resolved, target)
+            if relation:
+                verb = "resolves to" if relation == "is" else relation
+                raise refuse(f"allowWrite entry {text_entry!r} {verb} {name} ({target})")
+    socket_dir = _socket_dir()
+    for entry in network.get("allowUnixSockets", []):
+        text_entry, resolved = resolve_entry(entry, "network.allowUnixSockets")
+        relation = _relation(resolved, socket_dir)
+        if relation:
+            raise refuse(
+                f"network.allowUnixSockets entry {text_entry!r} {relation} the tmux socket directory"
+                f" ({socket_dir}): a sandboxed pane could connect to the operator's own tmux server"
+            )
 
     warnings: list[str] = []
     if policy.get("enableWeakerNetworkIsolation"):
@@ -437,23 +475,29 @@ def _with_lists(base: dict[str, Any]) -> dict[str, Any]:
 def _repository_denies(worktree: Path, git_dir: Path, common: Path, control_root: Path) -> list[dict[str, Any]]:
     """The `denyWrite` entries every server and reviewer policy carries,
     whatever runs inside: the repository's config and hooks, the control
-    root, `srt`'s shared temp directory and, where `.git` is a file (a linked
-    worktree), the pointer files that would let a pane redirect the host's
-    next git command to a repository of its own."""
+    root, `srt`'s shared temp directory and, in every checkout, the pointer
+    files `<git dir>/commondir`, `gitdir` and `config.worktree`: git honours
+    them in a plain repository too, where it never writes them, and a pane
+    that wrote one could redirect the host's next git command to a
+    repository of its own. In a plain checkout (the git dir is the common
+    dir) the git dir's `worktrees` directory is denied as well, holding the
+    other linked worktrees' pointer files (`git worktree add` is unavailable
+    inside); `modules` is left writable, which the host-side refusal of a
+    gitlink covers. Where `.git` is a file (a linked worktree) the `.git`
+    file and the git dir's `hooks` are denied too."""
     denies = [
         _literal(common / "config"),
         _literal(common / "hooks"),
         _literal(control_root),
         *(_literal(path) for path in _SHARED_TMP_DENIES),
+        _literal(git_dir / "commondir"),
+        _literal(git_dir / "gitdir"),
+        _literal(git_dir / "config.worktree"),
     ]
+    if git_dir == common:
+        denies.append(_literal(git_dir / "worktrees"))
     if (worktree / ".git").is_file():
-        denies += [
-            _literal(worktree / ".git"),
-            _literal(git_dir / "commondir"),
-            _literal(git_dir / "gitdir"),
-            _literal(git_dir / "config.worktree"),
-            _literal(git_dir / "hooks"),
-        ]
+        denies += [_literal(worktree / ".git"), _literal(git_dir / "hooks")]
     return denies
 
 
@@ -607,13 +651,20 @@ def srt_version() -> str:
 def check_binaries(policy: dict[str, Any]) -> None:
     """PmError when `srt` is absent, or when any write grant of `policy` is,
     contains or lies inside `srt`'s package directory, or is or contains the
-    real `node` that runs it: `srt` documents a writable installation as a
-    way to run code on the host. Judged by identity (see `_relation`)."""
+    real `node` that runs it, or the `srt` and `node` paths as `PATH` spells
+    them (a launcher symlink: a grant on its directory, such as
+    `/opt/homebrew/bin`, would let a sandbox replace the `srt` the host runs
+    next): `srt` documents a writable installation as a way to run code on
+    the host. Judged by identity (see `_relation`)."""
     package = srt_package_root()
     node = shutil.which("node")
     if node is None:
         raise PmError("node is required to run srt but is not on PATH")
     node_real = _real(node)
+    launchers = (
+        (Path(os.path.abspath(shutil.which("srt") or "srt")), "the srt launcher"),
+        (Path(os.path.abspath(node)), "the node launcher"),
+    )
     for entry in _write_entries(policy):
         try:
             text, resolved = _write_grant(entry)
@@ -631,6 +682,13 @@ def check_binaries(policy: dict[str, Any]) -> None:
                 f"sandbox write grant {text!r} {relation} the node that runs srt ({node_real}): a sandbox that"
                 " can write it can run code on the host"
             )
+        for launcher, name in launchers:
+            relation = _relation(resolved, launcher)
+            if relation in ("is", "is an ancestor of"):
+                raise PmError(
+                    f"sandbox write grant {text!r} {relation} {name} ({launcher}): a sandbox that can replace it"
+                    " can run code on the host"
+                )
 
 
 def inside_sandbox() -> bool:

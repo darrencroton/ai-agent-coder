@@ -185,9 +185,46 @@ class TestLoadBasePolicy(TempDirTestCase):
         self.assertTrue((root / "skills" / "project-manager").is_dir(), root)
         self.assertRefused(self._write(self._policy_with_write(str(root))), "the toolkit checkout")
 
+    def test_a_grant_above_or_inside_the_toolkit_checkout_is_refused_but_one_inside_home_is_not(self) -> None:
+        root = sandbox.toolkit_root()
+        if _real(root.parent) == _real(Path.home()):
+            self.skipTest("the toolkit checkout sits directly in the home directory")
+        for entry, relation in ((root.parent, "is an ancestor of"), (root / "skills", "is inside")):
+            with self.subTest(entry=entry):
+                self.assertRefused(self._write(self._policy_with_write(str(entry))), "the toolkit checkout", relation)
+        # Home is refused by equality alone: a grant inside it is normal.
+        self.assertRefused(self._write(self._policy_with_write("~")), "the home directory")
+        sandbox.load_base_policy(self._write(self._policy_with_write("~/.codex/sessions")))
+
     def test_a_grant_of_the_tmux_socket_directory_is_refused(self) -> None:
         directory = sessions.socket_path("x").parent
         self.assertRefused(self._write(self._policy_with_write(str(directory))), "the tmux socket directory")
+
+    def test_a_grant_above_or_inside_the_tmux_socket_directory_is_refused(self) -> None:
+        directory = sessions.socket_path("x").parent
+        for entry, relation in ((directory.parent, "is an ancestor of"), (directory / "inner", "is inside")):
+            with self.subTest(entry=entry):
+                self.assertRefused(
+                    self._write(self._policy_with_write(str(entry))), "the tmux socket directory", relation
+                )
+
+    def test_an_unix_socket_entry_reaching_the_tmux_socket_directory_is_refused(self) -> None:
+        directory = sessions.socket_path("x").parent
+        for entry in (str(directory), str(directory / "default"), _literal(directory / "default")):
+            with self.subTest(entry=entry):
+                policy = minimal_base_policy()
+                policy["network"]["allowUnixSockets"] = [entry]
+                self.assertRefused(self._write(policy), "network.allowUnixSockets entry", "the tmux socket directory")
+        # A relative or malformed entry is refused as an allowWrite one is.
+        for entry, fragment in (("sockets/x.sock", "relative"), (42, "network.allowUnixSockets entry")):
+            with self.subTest(entry=entry):
+                policy = minimal_base_policy()
+                policy["network"]["allowUnixSockets"] = [entry]
+                self.assertRefused(self._write(policy), fragment)
+        # An unrelated socket stays allowed.
+        policy = minimal_base_policy()
+        policy["network"]["allowUnixSockets"] = [str(self.tmp / "agent.sock")]
+        sandbox.load_base_policy(self._write(policy))
 
     def test_the_tmux_socket_directory_honours_tmux_tmpdir(self) -> None:
         with mock.patch.dict(os.environ, {"TMUX_TMPDIR": str(self.tmp)}):
@@ -290,12 +327,18 @@ class DerivationTestCase(PmTestCase):
         arguments.update(overrides)
         return sandbox.derive_policy(minimal_base_policy() if base is None else base, **arguments)
 
-    def escape_denies(self) -> list[dict]:
+    def pointer_denies(self, git_dir: Path) -> list[dict]:
         return [
+            _literal(git_dir / "commondir"),
+            _literal(git_dir / "gitdir"),
+            _literal(git_dir / "config.worktree"),
+        ]
+
+    def escape_denies(self) -> list[dict]:
+        """A linked worktree's: the pointer files, then `.git` and `hooks`."""
+        return [
+            *self.pointer_denies(self.git_dir),
             _literal(self.worktree / ".git"),
-            _literal(self.git_dir / "commondir"),
-            _literal(self.git_dir / "gitdir"),
-            _literal(self.git_dir / "config.worktree"),
             _literal(self.git_dir / "hooks"),
         ]
 
@@ -350,14 +393,34 @@ class TestDerivePolicy(DerivationTestCase):
             for deny in self.escape_denies():
                 self.assertIn(deny, policy["filesystem"]["denyWrite"])
 
-    def test_a_plain_checkout_gets_no_common_dir_grants_and_no_escape_denies(self) -> None:
+    def test_a_plain_checkout_gets_no_common_dir_grants_but_the_pointer_file_and_worktrees_denies(self) -> None:
+        # git honours `$GIT_DIR/commondir` in a plain checkout too, so the
+        # pointer files are denied there; `.git` is a directory and its
+        # `hooks` is already denied as the common dir's, so neither is added.
         policy = self.derive(worktree=self.repo, branch="main")
         repo = _real(self.repo)
         self.assertEqual(
             policy["filesystem"]["allowWrite"],
             [_literal(repo), _literal(repo / ".git"), _literal(_socket_grant(self.socket)), _literal(self.tmpdir)],
         )
-        self.assertEqual(policy["filesystem"]["denyWrite"], [*self.always_denies(), _literal(repo / ".git" / "pm")])
+        self.assertEqual(
+            policy["filesystem"]["denyWrite"],
+            [
+                *self.always_denies(),
+                *self.pointer_denies(repo / ".git"),
+                _literal(repo / ".git" / "worktrees"),
+                _literal(repo / ".git" / "pm"),
+            ],
+        )
+        self.assertNotIn(_literal(repo / ".git"), policy["filesystem"]["denyWrite"])
+        self.assertNotIn(_literal(repo / ".git" / "modules"), policy["filesystem"]["denyWrite"])
+        self.assertEqual(
+            policy["filesystem"]["denyWrite"].count(_literal(repo / ".git" / "hooks")), 1, "only the common dir's"
+        )
+
+    def test_a_linked_worktree_does_not_deny_the_common_worktrees_directory(self) -> None:
+        policy = self.derive()
+        self.assertNotIn(_literal(self.common / "worktrees"), policy["filesystem"]["denyWrite"])
 
     def test_reads_socket_pty_and_required_lists(self) -> None:
         base = {"network": {}, "filesystem": {"allowRead": ["/opt/data"]}, "allowPty": False}
@@ -574,9 +637,9 @@ class TestCheckBinaries(TempDirTestCase):
         self.node.parent.mkdir(parents=True)
         self.node.write_text("", encoding="utf-8")
         found = {"srt": str(self.tmp / "bin" / "srt"), "node": str(self.node)}
-        patcher = mock.patch.object(sandbox.shutil, "which", side_effect=found.get)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self._which = mock.patch.object(sandbox.shutil, "which", side_effect=found.get)
+        self._which.start()
+        self.addCleanup(self._which.stop)
 
     def _policy(self, *entries) -> dict:
         policy = minimal_base_policy()
@@ -608,6 +671,31 @@ class TestCheckBinaries(TempDirTestCase):
                 with self.assertRaises(PmError) as ctx:
                     sandbox.check_binaries(self._policy(entry))
                 self.assertIn("the node that runs srt", str(ctx.exception))
+
+    def test_a_grant_on_or_above_the_launcher_directories_is_refused(self) -> None:
+        # `bin/srt` is a symlink into the package and `PATH` names it, so a
+        # grant on `bin` replaces the symlink the host runs next, though
+        # neither real path is granted. Each launcher sits in a directory of
+        # its own, so each is judged separately.
+        self._which.stop()
+        srt_bin, node_bin = self.tmp / "launch-srt", self.tmp / "launch-node"
+        srt_bin.mkdir()
+        node_bin.mkdir()
+        (self.package / "dist" / "cli.js").chmod(0o755)
+        (srt_bin / "srt").symlink_to(self.package / "dist" / "cli.js")
+        self.node.chmod(0o755)
+        (node_bin / "node").symlink_to(self.node)
+        for entry, fragment in (
+            (str(srt_bin), "the srt launcher"),
+            (str(node_bin), "the node launcher"),
+        ):
+            with self.subTest(entry=entry):
+                with mock.patch.dict(os.environ, {"PATH": f"{srt_bin}{os.pathsep}{node_bin}{os.pathsep}/usr/bin"}):
+                    with self.assertRaises(PmError) as ctx:
+                        sandbox.check_binaries(self._policy(entry))
+                self.assertIn(fragment, str(ctx.exception))
+        with mock.patch.dict(os.environ, {"PATH": f"{srt_bin}{os.pathsep}{node_bin}{os.pathsep}/usr/bin"}):
+            sandbox.check_binaries(self._policy(str(self.tmp / "state")))
 
     def test_a_case_variant_of_the_srt_package_or_node_is_refused(self) -> None:
         cases = (
@@ -1301,6 +1389,7 @@ class SandboxServerTestCase(PmTestCase):
         self.branch = "node/sb"
         self.worktree = _real(make_linked_worktree(self.repo, self.repo.parent / self.worktree_name, self.branch))
         self.common = _real(self.repo / ".git")
+        self.git_dir = self.common / "worktrees" / self.worktree_name
         self.socket = _sandbox_socket()
         self.addCleanup(self._kill_server)
         self.tmpdir = sandbox.make_tmpdir(self.socket)
@@ -1461,15 +1550,20 @@ class TestSandboxedServer(SandboxServerTestCase):
         hook = self.common / "hooks" / "post-checkout"
         self.start(self.write_policy())
         sandbox.verify_server(socket=self.socket, worktree=self.worktree)
+        pointer = self.git_dir / "commondir"
+        pointer_before = pointer.read_bytes()
         lines = self.run_in_pane(
             f'echo "[x]" >> "{config}" 2>/dev/null; echo "config_rc=$?" >> "$OUT"',
             f'touch "{hook}" 2>/dev/null; echo "hooks_rc=$?" >> "$OUT"',
+            f'echo "/tmp" > "{pointer}" 2>/dev/null; echo "commondir_rc=$?" >> "$OUT"',
         )
         self.assertNotIn("config_rc=0", lines)
         self.assertNotIn("hooks_rc=0", lines)
+        self.assertNotIn("commondir_rc=0", lines)
         self.assertIn("done", lines)
         self.assertEqual(config.read_bytes(), before)
         self.assertFalse(hook.exists())
+        self.assertEqual(pointer.read_bytes(), pointer_before)
 
     def test_the_config_deny_holds_in_a_plain_checkout_whose_git_dir_is_granted(self) -> None:
         # Here the whole git dir is granted, and `allowGitConfig` drops srt's
@@ -1501,6 +1595,12 @@ class TestSandboxedServer(SandboxServerTestCase):
         returncode, _output = sessions.run_shell(self.socket, f'echo "[x]" >> "{config}"')
         self.assertNotEqual(returncode, 0)
         self.assertEqual(config.read_bytes(), before)
+        # git honours `.git/commondir` here too; the deny holds although the
+        # file does not exist (git never writes it in a plain repository).
+        pointer = self.common / "commondir"
+        returncode, _output = sessions.run_shell(self.socket, f'echo "/tmp" > "{pointer}"')
+        self.assertNotEqual(returncode, 0)
+        self.assertFalse(pointer.exists())
         returncode, _output = sessions.run_shell(self.socket, f'touch "{_real(self.repo)}/inside"')
         self.assertEqual(returncode, 0)  # the git dir's own checkout is writable
 
