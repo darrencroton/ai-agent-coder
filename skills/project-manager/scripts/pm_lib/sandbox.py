@@ -1388,10 +1388,19 @@ def _stop_unrecorded(state: dict[str, Any], run_dir: Path, socket: str) -> bool:
     """Whether a complete run's event log holds no `sandbox-stopped` event
     for `socket` since its last `complete` event: the run end's teardown
     went through, but the event recording it was lost (an append that
-    failed). False for a run that is not complete."""
+    failed). False for a run that is not complete. PmError naming the log
+    when it cannot be read or holds a line that is not JSON (a truncated
+    append, say)."""
     if state.get("status") != "complete":
         return False
-    for event in reversed(state_mod.read_events(run_dir)):
+    try:
+        events = state_mod.read_events(run_dir)
+    except (OSError, ValueError) as exc:
+        raise PmError(
+            f"the event log {run_dir / 'events.jsonl'} is unreadable or corrupt ({exc}), so whether this run's"
+            " sandbox-stopped event was recorded cannot be told"
+        ) from exc
+    for event in reversed(events):
         data = event.get("data")
         if event.get("kind") == "sandbox-stopped" and isinstance(data, dict) and data.get("socket") == socket:
             return False
@@ -1437,8 +1446,15 @@ def _tear_down(socket: str, control: Path) -> tuple[list[str], bool]:
     socket's server, if one answers, and the temp dir `make_tmpdir` names.
     A record whose temp dir lies under another temp root (`_foreign_tmpdir`)
     still has its server killed and its control dir removed; that temp dir
-    is left in place, and a note names it and the `TMPDIR` difference. The
-    control root goes too once nothing else is left in it."""
+    is left in place, and a note names it and the `TMPDIR` difference (or
+    says it is already gone). The control root goes too once nothing else
+    is left in it.
+
+    PmError when the teardown is incomplete: sessions still listed on the
+    socket, or the control dir still there (`stop_server` refused it as not
+    a directory). The message names what remains and carries every note, so
+    nothing is reported as torn down that is not, and the caller records
+    nothing: a later `stop`, or `start-slice` on a complete run, retries."""
     present = _sandbox_left(socket, control)
     if os.path.lexists(control / RECORD_NAME):
         record = read_record(control)
@@ -1452,18 +1468,30 @@ def _tear_down(socket: str, control: Path) -> tuple[list[str], bool]:
     remaining, notes = stop_server(socket=socket, record=record)
     if foreign is not None:
         notes = [note for note in notes if note != f"sandbox temp dir already gone: {run_tmpdir(socket)}"]
-        notes.append(
-            f"left sandbox temp dir {foreign} in place: it is not under this process's temp root"
-            f" {tempfile.gettempdir()}, so TMPDIR differs from the one the run's sandbox was set up under; remove"
-            " it by hand, or repeat this under that TMPDIR"
-        )
-    if remaining:
-        notes.append(f"sessions still listed on socket {socket}: {', '.join(remaining)}")
+        if os.path.lexists(foreign):
+            notes.append(
+                f"left sandbox temp dir {foreign} in place: it is not under this process's temp root"
+                f" {tempfile.gettempdir()}, so TMPDIR differs from the one the run's sandbox was set up under;"
+                " remove it by hand, or repeat this under that TMPDIR"
+            )
+        else:
+            notes.append(f"sandbox temp dir already gone: {foreign}")
     # `rmdir` refuses a non-empty root, so another run's directory is never touched.
     try:
         control.parent.rmdir()
     except OSError:
         pass
+    left: list[str] = []
+    if remaining:
+        left.append(f"sessions still listed on socket {socket}: {', '.join(remaining)}")
+    if os.path.lexists(control):
+        left.append(f"sandbox control dir {control} is still there")
+    if left:
+        raise PmError(
+            f"the teardown of the sandbox on socket {socket!r} is incomplete: {'; '.join(left)}; nothing was"
+            f" recorded, so retry it (stop, or start-slice on a complete run) once that is cleared (done:"
+            f" {'; '.join(notes) or 'nothing'})"
+        )
     return notes, present
 
 
@@ -1472,8 +1500,9 @@ def teardown_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
     record, then a `sandbox-stopped` event when anything was there to tear
     down, or when the run is complete and the event recording its run-end
     teardown was lost (`_stop_unrecorded`); returns the notes for the caller
-    to print (the remaining sessions among them when any are left), or None
-    for an unsandboxed run.
+    to print, or None for an unsandboxed run. An incomplete teardown (a
+    session still listed, the control dir still there) raises PmError from
+    `_tear_down` naming what remains, and no event is written.
 
     Idempotent: a control dir already removed (an earlier teardown) is torn
     down again from what `init` created, the socket's server if one answers
@@ -1508,7 +1537,8 @@ def scavenge_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
     The unverified state can only point this at the run directory it was
     read from: PmError, before anything is killed or removed, unless its
     `run_id` is `run_dir`'s name and its socket is `pm-run-<run id>`, and
-    for everything `teardown_run` refuses."""
+    for everything `teardown_run` refuses; PmError, after the kill, for an
+    incomplete teardown (`_tear_down`)."""
     if not records_sandbox(state):
         return None
     if state.get("run_id") != run_dir.name:

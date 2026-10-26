@@ -429,6 +429,10 @@ def _run_check_plan(args: argparse.Namespace) -> int:
 
 
 def _run_init(args: argparse.Namespace) -> int:
+    # A sandbox that was asked for is established or refused: an empty
+    # value is never taken for the flag's absence.
+    if args.sandbox is not None and not args.sandbox.strip():
+        raise PmError("--sandbox needs an srt base policy file; an empty value was given, so no run was created")
     model_tag = state_mod.tag_value(args.model_tag, flag="--model-tag")
     run_tag = state_mod.tag_value(args.run_tag, flag="--run-tag")
     repo = git_ops.resolve_repo(Path(args.repo))
@@ -462,7 +466,7 @@ def _run_init(args: argparse.Namespace) -> int:
         model_tag=model_tag,
         run_tag=run_tag,
         policy=policy,
-        sandbox_policy=Path(args.sandbox) if args.sandbox else None,
+        sandbox_policy=Path(args.sandbox) if args.sandbox is not None else None,
     )
 
     for warning in result.sandbox_warnings:
@@ -1022,6 +1026,8 @@ def _run_stop(args: argparse.Namespace) -> int:
                 return 2
             if sandbox.records_sandbox(readable) and not _resolve_token(args):
                 return _scavenge_without_token(repo, readable_dir, readable)
+        # Only the stop itself is in the try: a failure of the sweep or a
+        # print after a stop that succeeded is never relabelled below.
         try:
             token = _require_token(args)
             run_dir = state_mod.resolve_run_dir(repo, args.run)
@@ -1029,46 +1035,17 @@ def _run_stop(args: argparse.Namespace) -> int:
             # id back, so this path reads state once. Unreadable or tampered
             # state still raises PmError (or OSError) from inside `stop`
             # before anything is killed, landing in the state-unavailable
-            # sweep below; a stop recorded before its teardown failed lands
-            # there too, as `StopTeardownError`.
+            # sweep; a stop recorded before its teardown failed lands there
+            # too, as `StopTeardownError`.
             outcome = slice_ops.stop(repo, run_dir, token, reason=args.reason, slice_status=args.slice_status)
-            extra_killed = slice_ops.stop_scavenge_sweep(run_id=outcome.run_id)
-            all_killed = outcome.killed + [name for name in extra_killed if name not in outcome.killed]
-            print(f"stopped run {outcome.run_id}; killed sessions: {all_killed}")
-            for note in outcome.sandbox_notes or []:
-                print(f"sandbox: {note}")
-            return 0
         except (PmError, OSError) as exc:
-            # Readable state names its run by its directory, `--run` or not.
-            run_id = readable_dir.name if readable is not None and readable_dir is not None else args.run
-            killed = slice_ops.stop_scavenge_sweep(run_id=run_id)
-            what = (
-                "stop recorded but teardown failed"
-                if isinstance(exc, slice_ops.StopTeardownError)
-                else "state unavailable"
-            )
-            print(f"pm: scavenge: {what} ({exc}); swept sessions: {killed}")
-            # A sandboxed run's server is named after its id, so it can be
-            # found without state; a name tmux cannot take is no run's.
-            if run_id and re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
-                socket = f"{sandbox.RUN_SOCKET_PREFIX}{run_id}"
-                try:
-                    if sessions.server_running(socket, timeout=sandbox.START_DEADLINE_SECONDS):
-                        remaining = sessions.kill_server(socket)
-                        killed_note = "killed" if remaining == [] else f"still lists sessions: {', '.join(remaining)}"
-                        print(f"pm: scavenge: sandboxed tmux server {socket} {killed_note}")
-                except PmError as server_exc:
-                    print(f"pm: scavenge: could not check tmux server {socket}: {server_exc}")
-            if readable is not None and sandbox.records_sandbox(readable):
-                left = _sandbox_remains(repo, readable)
-                if left:
-                    print(
-                        f"pm: scavenge: the run's sandbox is not torn down: {'; '.join(left)}; finish it with"
-                        " `stop` and the run's token",
-                        file=sys.stderr,
-                    )
-                    return 2
-            return 0
+            return _scavenge_after_failed_stop(repo, args, readable_dir, readable, exc)
+        extra_killed = slice_ops.stop_scavenge_sweep(run_id=outcome.run_id)
+        all_killed = outcome.killed + [name for name in extra_killed if name not in outcome.killed]
+        print(f"stopped run {outcome.run_id}; killed sessions: {all_killed}")
+        for note in outcome.sandbox_notes or []:
+            print(f"sandbox: {note}")
+        return 0
 
     token = _require_token(args)
     run_dir = state_mod.resolve_run_dir(repo, args.run)
@@ -1076,6 +1053,53 @@ def _run_stop(args: argparse.Namespace) -> int:
     print(f"stopped run {outcome.run_id}; killed sessions: {outcome.killed}")
     for note in outcome.sandbox_notes or []:
         print(f"sandbox: {note}")
+    return 0
+
+
+def _scavenge_after_failed_stop(
+    repo: Path, args: argparse.Namespace, readable_dir: Path | None, readable: dict | None, exc: Exception
+) -> int:
+    """`stop --scavenge` once `stop` itself failed with `exc`: the state-free
+    sweep of the run's sessions and its `pm-run-<run id>` server.
+
+    The run id is `--run`, except that readable state names its run by its
+    directory, `--run` or not, when it records a sandbox or the stop was
+    recorded (`StopTeardownError`); an unsandboxed run keeps the original
+    sweep. Exits 2 when readable sandboxed state still has a server, control
+    dir or temp dir after the kill, and whenever the stop's teardown failed:
+    no `sandbox-stopped` event records it, whatever the kill here did."""
+    teardown_failed = isinstance(exc, slice_ops.StopTeardownError)
+    run_id = args.run
+    if readable is not None and readable_dir is not None and (sandbox.records_sandbox(readable) or teardown_failed):
+        run_id = readable_dir.name
+    killed = slice_ops.stop_scavenge_sweep(run_id=run_id)
+    what = "stop recorded but teardown failed" if teardown_failed else "state unavailable"
+    print(f"pm: scavenge: {what} ({exc}); swept sessions: {killed}")
+    # A sandboxed run's server is named after its id, so it can be found
+    # without state; a name tmux cannot take is no run's.
+    if run_id and re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
+        socket = f"{sandbox.RUN_SOCKET_PREFIX}{run_id}"
+        try:
+            if sessions.server_running(socket, timeout=sandbox.START_DEADLINE_SECONDS):
+                remaining = sessions.kill_server(socket)
+                killed_note = "killed" if remaining == [] else f"still lists sessions: {', '.join(remaining)}"
+                print(f"pm: scavenge: sandboxed tmux server {socket} {killed_note}")
+        except PmError as server_exc:
+            print(f"pm: scavenge: could not check tmux server {socket}: {server_exc}")
+    if readable is not None and sandbox.records_sandbox(readable):
+        left = _sandbox_remains(repo, readable)
+        if left:
+            print(
+                f"pm: scavenge: the run's sandbox is not torn down: {'; '.join(left)}; finish it with `stop` and"
+                " the run's token",
+                file=sys.stderr,
+            )
+            return 2
+    if teardown_failed:
+        print(
+            "pm: scavenge: the stop's sandbox teardown failed, and no sandbox-stopped event records it", file=sys.stderr
+        )
+        return 2
     return 0
 
 

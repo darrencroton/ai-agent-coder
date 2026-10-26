@@ -1750,6 +1750,21 @@ class TestStop(SliceOpsTestCase):
         self.assertEqual(stops[-1]["data"], {"slice_status": "stopped"})
         self.assertEqual(state_mod.load_state(run_dir, token)["slices"][0]["status"], "stopped")
 
+    def test_an_unsandboxed_tokenless_scavenge_keeps_the_original_sweep(self) -> None:
+        """Readable unsandboxed state does not narrow the sweep to its run:
+        without `--run` it is the every-PM-session sweep, as before Mode B."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        # Stubbed: the real every-session sweep would reach other tests' sessions.
+        sweep = mock.Mock(return_value=[])
+        with sessions.scoped_environ("PM_RUN_TOKEN", None), mock.patch.object(slice_ops, "stop_scavenge_sweep", sweep):
+            code, out, err = self.run_cli_in_repo(["stop", "--reason", "emergency", "--scavenge"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("state unavailable", out)
+        sweep.assert_called_once_with(run_id=None)
+
     def test_stop_scavenge_finds_run_prefixed_session_with_state_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=30.0))
@@ -1948,13 +1963,15 @@ class TestInitSandbox(_SandboxedRun):
         self.assertNotIn("sandbox", out)
         self.assertFalse((self.repo / ".git" / sandbox_mod.CONTROL_ROOT_NAME).exists())
 
-    def _init_refused(self, plan_path: Path, harness: Path) -> str:
+    def _init_refused(self, plan_path: Path, harness: Path, *, sandbox_value: str | None = None) -> str:
         """`init --sandbox` that must refuse creating nothing: no run
         directory, no control directory, and no temp dir (asserted on the
         call that would create one, since the shared temp directory holds
-        other test processes' run temp dirs). Returns stderr."""
+        other test processes' run temp dirs). `sandbox_value` is the flag's
+        value (this test's base policy by default). Returns stderr."""
+        value = str(self.base_policy) if sandbox_value is None else sandbox_value
         with mock.patch.object(sandbox_mod, "make_tmpdir", wraps=sandbox_mod.make_tmpdir) as make_tmpdir:
-            code, _out, err = self._init(plan_path, harness, extra=["--sandbox", str(self.base_policy)])
+            code, _out, err = self._init(plan_path, harness, extra=["--sandbox", value])
         self.assertEqual(code, 2, err)
         make_tmpdir.assert_not_called()
         state_root = self.repo / ".git" / "pm"
@@ -1973,6 +1990,16 @@ class TestInitSandbox(_SandboxedRun):
         ):
             err = self._init_refused(plan_path, harness)
         self.assertIn(sandbox_mod.SRT_MISSING, err)
+
+    def test_init_sandbox_with_an_empty_value_refuses_creating_nothing(self) -> None:
+        """A sandbox that was asked for is established or refused, never
+        dropped: an empty value is not the flag's absence."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+        for value in ("", "  "):
+            with self.subTest(value=value), self._srt_stand_in():
+                err = self._init_refused(plan_path, harness, sandbox_value=value)
+                self.assertIn("--sandbox needs an srt base policy file", err)
 
     def test_init_sandbox_refuses_an_invalid_policy_creating_nothing(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
@@ -2453,6 +2480,123 @@ class TestSandboxedRunEnds(_SandboxedRun):
         with sessions.scoped_environ("PM_RUN_TOKEN", None):
             subprocess.run(["tmux", "-L", self.socket, "new-session", "-d", "-s", "keep", "sleep 600"], check=True)
         self._stop_under_another_tmpdir()
+
+    def test_a_stop_under_another_tmpdir_reports_its_temp_dir_already_gone_when_it_is(self) -> None:
+        self._sandboxed_run()
+        shutil.rmtree(self.tmpdir)
+        other = self.repo.parent / "other-tmp"
+        other.mkdir()
+        with self.on_socket(self.socket), mock.patch.object(tempfile, "tempdir", str(other)):
+            code, out, err = self.run_cli_in_repo(["stop", "--reason", "pause", "--token", self.token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"sandbox: sandbox temp dir already gone: {self.tmpdir}", out)
+        self.assertNotIn("left sandbox temp dir", out)
+        self.assertFalse(os.path.lexists(self.control))
+
+    # A teardown that leaves a session listed: what stop_server returns
+    # when its kill did not take, with a note of what it did do.
+    _SURVIVOR = mock.patch.object(
+        sandbox_mod, "stop_server", return_value=(["survivor"], ["stand-in: removed sandbox temp dir"])
+    )
+
+    def _start_plain_server(self) -> None:
+        """A plain server on the run's socket stands in for the sandboxed one."""
+        with sessions.scoped_environ("PM_RUN_TOKEN", None):
+            subprocess.run(["tmux", "-L", self.socket, "new-session", "-d", "-s", "keep", "sleep 600"], check=True)
+
+    def _assert_incomplete(self, text: str) -> None:
+        """The message names what remains and keeps the teardown's notes."""
+        self.assertIn(f"the teardown of the sandbox on socket {self.socket!r} is incomplete", text)
+        self.assertIn(f"sessions still listed on socket {self.socket}: survivor", text)
+        self.assertIn(f"sandbox control dir {self.control} is still there", text)
+        self.assertIn("stand-in: removed sandbox temp dir", text)
+
+    def test_a_stop_whose_teardown_leaves_a_session_exits_non_zero_and_a_later_stop_finishes_it(self) -> None:
+        self._sandboxed_run()
+        self._start_plain_server()
+        with self.on_socket(self.socket):
+            with self._SURVIVOR:
+                code, out, err = self.run_cli_in_repo(["stop", "--reason", "pause", "--token", self.token])
+            self.assertEqual(code, 2, out + err)
+            self._assert_incomplete(err)
+            self.assertEqual(self._events("sandbox-stopped"), [])
+            self.assertEqual(state_mod.load_state(self.run_dir, self.token)["status"], "stopped")
+            self.assertTrue(sessions.server_running(self.socket))
+
+            code, out, err = self.run_cli_in_repo(["stop", "--reason", "pause", "--token", self.token])
+        self.assertEqual(code, 0, out + err)
+        self.assert_torn_down()
+
+    def test_an_all_attested_start_slice_whose_teardown_leaves_a_session_is_retried(self) -> None:
+        self._sandboxed_run(extra=["--attest", "Slice 1"])
+        self._start_plain_server()
+        with self.on_socket(self.socket):
+            with self._SURVIVOR:
+                code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+            self.assertEqual(code, 2, out + err)
+            self._assert_incomplete(err)
+            self.assertEqual(self._events("sandbox-stopped"), [])
+            self.assertEqual(state_mod.load_state(self.run_dir, self.token)["status"], "complete")
+
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("all slices complete", out)
+        self.assert_torn_down()
+
+    def test_a_token_scavenge_whose_teardown_leaves_a_session_exits_non_zero_naming_it(self) -> None:
+        self._sandboxed_run()
+        self._start_plain_server()
+        with self.on_socket(self.socket), self._SURVIVOR:
+            code, out, err = self.run_cli_in_repo(
+                ["stop", "--reason", "emergency", "--scavenge", "--token", self.token]
+            )
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("pm: scavenge: stop recorded but teardown failed", out)
+        self._assert_incomplete(out)
+        # The fallback's own kill takes the stand-in server down; the
+        # control dir the stand-in teardown left is named as remaining.
+        self.assertIn(f"pm: scavenge: sandboxed tmux server {self.socket} killed", out)
+        self.assertIn(f"{self.control} remains", err)
+        self.assertEqual(self._events("sandbox-stopped"), [])
+
+    def test_a_tokenless_scavenge_whose_teardown_leaves_a_session_exits_non_zero_naming_it(self) -> None:
+        self._sandboxed_run()
+        self._start_plain_server()
+        state_before = (self.run_dir / "run.json").read_bytes()
+        with self.on_socket(self.socket), sessions.scoped_environ("PM_RUN_TOKEN", None), self._SURVIVOR:
+            code, out, err = self.run_cli_in_repo(["stop", "--reason", "emergency", "--scavenge"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("could not tear its sandbox down", err)
+        self._assert_incomplete(err)
+        self.assertEqual((self.run_dir / "run.json").read_bytes(), state_before)
+        self.assertEqual(self._events("sandbox-stopped"), [])
+
+    def test_a_failure_after_a_token_scavenge_s_stop_succeeded_is_not_relabelled(self) -> None:
+        self._sandboxed_run()
+        sweep = mock.Mock(side_effect=PmError("stand-in: the sweep failed"))
+        with self.on_socket(self.socket), mock.patch.object(slice_ops, "stop_scavenge_sweep", sweep):
+            code, out, err = self.run_cli_in_repo(
+                ["stop", "--reason", "emergency", "--scavenge", "--token", self.token]
+            )
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("pm: error: stand-in: the sweep failed", err)
+        self.assertNotIn("state unavailable", out + err)
+        sweep.assert_called_once_with(run_id=self.run_id)
+        self.assert_torn_down()
+
+    def test_a_truncated_event_log_is_refused_naming_it_when_a_lost_event_is_checked(self) -> None:
+        self._sandboxed_run(extra=["--attest", "Slice 1"])
+        with self.on_socket(self.socket):
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+            self.assertEqual(code, 0, out + err)
+            self.assert_torn_down()
+            log = self.run_dir / "events.jsonl"
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write('{"kind": "sandbox-st')
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", self.token])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"the event log {log} is unreadable or corrupt", err)
+        self.assertNotIn("Traceback", err)
 
     def test_a_token_scavenge_whose_teardown_fails_sweeps_the_state_s_run_and_exits_non_zero(self) -> None:
         self._sandboxed_run()
