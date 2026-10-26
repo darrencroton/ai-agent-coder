@@ -323,7 +323,7 @@ def campaign_preflight(
             else:
                 ok("sandbox.json matches its pin")
                 try:
-                    policy, warnings = sandbox.load_base_policy(policy_file)
+                    policy, warnings, _sha256 = sandbox.load_pinned_policy(policy_file, sandbox_pin)
                 except PmError as exc:
                     fail(
                         "sandbox.json is a valid sandbox policy",

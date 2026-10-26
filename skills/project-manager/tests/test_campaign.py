@@ -1395,20 +1395,51 @@ class TestStopChildSandboxTeardown(SandboxLaunchTestCase):
         self.assertEqual(err, "")
         return code, out
 
-    def test_each_teardown_note_that_leaves_the_sandbox_up_exits_2(self) -> None:
+    def test_a_surviving_srt_keeps_the_record_and_every_run_exits_2_until_it_has_gone(self) -> None:
+        # A process of this test's own stands in for an srt that outlives its server.
+        srt = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(srt.wait)
+        self.addCleanup(srt.kill)
+        sandbox.write_record(
+            self.control, worktree=str(self.child), socket=CHILD_SOCKET, tmpdir=str(self.tmpdir), srt_pid=srt.pid
+        )
+        with mock.patch.object(sandbox, "SRT_EXIT_WAIT_SECONDS", 0.2):
+            code, out = self.stop()
+            self.assertEqual(code, 2, out)
+            self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+            self.assertIn(f"\nsrt still running: {srt.pid}\n", out)
+            self.assertTrue((self.control / "record.json").is_file())
+            # The record survived the first run, so a re-run still sees the srt.
+            code, out = self.stop()
+            self.assertEqual(code, 2, out)
+            self.assertIn(f"\nsrt still running: {srt.pid}\n", out)
+        srt.kill()
+        srt.wait()
+        code, out = self.stop()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"removed sandbox control dir {self.control}\n", out)
+        self.assertFalse(self.control.exists())
+
+    def test_a_stop_under_another_tmpdir_removes_the_control_dir_and_leaves_the_temp_dir_for_a_rerun(self) -> None:
+        """A `TMPDIR` other than the launch's: the server killed and the
+        control dir removed, the temp dir left with a note and exit 2; a
+        re-run under the launch's `TMPDIR` removes it."""
         self.write_record()
-        for note in (
-            "srt still running: 4242",
-            f"refused to remove sandbox control dir {self.control}: not a directory; it was left in place",
-        ):
-            with self.subTest(note=note):
-                notes = [note, f"removed sandbox temp dir {self.tmpdir}"]
-                with mock.patch.object(campaign.sandbox_mod, "stop_server", return_value=([], notes)) as stop:
-                    code, out = self.stop()
-                self.assertEqual(code, 2, out)
-                stop.assert_called_once()
-                self.assertIn(f"\n{note}\n", out)
-                self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+        other = self.repo.parent / "other-tmp"
+        other.mkdir()
+        with mock.patch.object(tempfile, "tempdir", str(other)):
+            code, out = self.stop()
+        self.assertEqual(code, 2, out)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+        self.assertIn(f"left sandbox temp dir {self.tmpdir} in place", out)
+        self.assertIn("TMPDIR differs from the one the run's sandbox was set up under", out)
+        self.assertNotIn("refusing to remove", out)
+        self.assertFalse(self.control.exists())
+        self.assertTrue(self.tmpdir.is_dir())
+        code, out = self.stop()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"removed sandbox temp dir {self.tmpdir}\n", out)
+        self.assertFalse(self.tmpdir.exists())
 
     def test_a_teardown_that_raises_exits_2_naming_the_failure(self) -> None:
         self.write_record()
@@ -1432,41 +1463,37 @@ class TestStopChildSandboxTeardown(SandboxLaunchTestCase):
         self.assertTrue((self.control / "record.json").is_file())
         self.assertTrue(self.tmpdir.is_dir())
 
-    def test_a_control_dir_without_a_readable_record_is_stopped_and_left_for_removal_by_hand(self) -> None:
-        # A teardown that failed partway: the record is gone, the directory and the log are not.
-        (self.control / "srt.log").write_text("log\n", encoding="utf-8")
+    def test_a_control_dir_whose_record_cannot_be_read_is_stopped_and_left_for_removal_by_hand(self) -> None:
+        (self.control / "record.json").write_text("not json\n", encoding="utf-8")
         code, out = self.stop()
         self.assertEqual(code, 2, out)
         self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
         self.assertFalse(sessions.server_running(CHILD_SOCKET))
         self.assertTrue((campaign.campaign_dir(self.child) / "pane.txt").is_file())
-        self.assertIn(f"sandbox control dir {self.control} left in place: sandbox record is missing", out)
-        self.assertIn(f"rm -rf {self.control}\n", out)
-        self.assertIn(f"sandbox temp dir {self.tmpdir} left in place", out)
-        self.assertIn(f"rm -rf {self.tmpdir}\n", out)
-        self.assertIn(f"sandbox: not torn down (no readable sandbox record in {self.control}", out)
-        self.assertTrue((self.control / "srt.log").is_file())
+        self.assertIn(f"sandbox: not torn down (no readable sandbox record in {self.control} (", out)
+        self.assertIn(f"remove it by hand: rm -rf {self.control})\n", out)
+        self.assertTrue((self.control / "record.json").is_file())
         self.assertTrue(self.tmpdir.is_dir())
         # A re-run is not blocked by it either.
         code, out = self.stop()
         self.assertEqual(code, 2, out)
-        self.assertIn(f"rm -rf {self.control}\n", out)
+        self.assertIn(f"rm -rf {self.control})\n", out)
 
-    def test_a_temp_dir_left_after_the_control_dir_is_gone_exits_2(self) -> None:
-        shutil.rmtree(self.control)
+    def test_a_record_less_control_dir_is_torn_down_from_what_the_launch_created(self) -> None:
+        # A teardown that failed partway, or a launch that never wrote the record: the log alone.
+        (self.control / "srt.log").write_text("log\n", encoding="utf-8")
         code, out = self.stop()
-        self.assertEqual(code, 2, out)
+        self.assertEqual(code, 0, out)
         self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
-        self.assertIn(f"sandbox temp dir {self.tmpdir} remains, but no record names it", out)
-        self.assertIn(f"rm -rf {self.tmpdir}\n", out)
-        self.assertIn(f"sandbox control dir already gone: {self.control}\n", out)
-        self.assertIn(f"sandbox: not torn down (sandbox temp dir {self.tmpdir} was left in place)\n", out)
-        self.assertTrue(self.tmpdir.is_dir())
-        # Once it is removed, the re-run reports both gone and exits 0.
-        shutil.rmtree(self.tmpdir)
+        self.assertIn(f"removed sandbox temp dir {self.tmpdir}\n", out)
+        self.assertIn(f"removed sandbox control dir {self.control}\n", out)
+        self.assertFalse(self.control.exists())
+        self.assertFalse(self.tmpdir.exists())
+        # A re-run reports both already gone.
         code, out = self.stop()
         self.assertEqual(code, 0, out)
         self.assertIn(f"sandbox temp dir already gone: {self.tmpdir}\n", out)
+        self.assertIn(f"sandbox control dir already gone: {self.control}\n", out)
 
     def test_an_unsandboxed_child_meeting_a_leftover_record_is_refused_naming_the_remedy(self) -> None:
         manifest = json.loads(campaign.manifest_path(self.child).read_text(encoding="utf-8"))
@@ -1573,7 +1600,7 @@ class TestStopChildTempDirLookup(CampaignTestCase):
         failure = FileNotFoundError("No usable temporary directory found")
         with (
             mock.patch.multiple(campaign.sessions, **tmux) as fakes,
-            mock.patch.object(campaign.tempfile, "gettempdir", side_effect=failure) as gettempdir,
+            mock.patch.object(tempfile, "gettempdir", side_effect=failure) as gettempdir,
         ):
             fakes["list_sessions_on"].return_value = [self.manifest["session"]]
             fakes["server_environment"].return_value = str(self.child)
@@ -1605,10 +1632,6 @@ class TestStopChildTempDirLookup(CampaignTestCase):
         self.assertTrue(outcome.server_gone)
         self.assertFalse(outcome.sandbox_stopped)
         self.assertIn("no temp directory is usable (No usable temporary directory found)", outcome.sandbox_error)
-        self.assertIn(f"sandbox control dir already gone: {self.control_path()}", outcome.sandbox_notes)
-
-    def control_path(self) -> Path:
-        return sandbox.control_dir(Path(os.path.realpath(self.repo / ".git")), CHILD_SOCKET)
 
 
 _SANDBOX_SOCKET_NUMBERS = iter(range(1, 1000))

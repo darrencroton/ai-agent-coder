@@ -927,7 +927,8 @@ def start_slice(
     its notes in `sandbox_notes`; on a run already complete the teardown is
     retried whenever anything of its sandbox is left, or its `sandbox-stopped`
     event was lost (`sandbox.sandbox_left`), so a teardown that failed at the
-    run end can be finished.
+    run end can be finished. A teardown that fails raises PmError saying the
+    run's completion is recorded.
     """
     state = load_writable_state(run_dir, token)
     sandbox.require_run_socket(state)
@@ -972,7 +973,9 @@ def start_slice(
             # anything of the sandbox is left or its event is missing.
             if completing or sandbox.sandbox_left(state, repo=repo, run_dir=run_dir):
                 try:
-                    sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
+                    sandbox_notes = sandbox.teardown_run(
+                        state, repo=repo, run_dir=run_dir, recorded="the run's completion is recorded"
+                    )
                 finally:
                     regenerate_report(repo, run_dir, state)
             return StartSliceOutcome(kind="all_complete", sandbox_notes=sandbox_notes)
@@ -1864,7 +1867,8 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     the run also tears the run's sandbox down (`sandbox.teardown_run`: the
     server, its temp and control directories, a `sandbox-stopped` event) and
     returns what that did in `sandbox_notes`. A teardown that fails there
-    leaves the run complete; the next `start-slice` retries it.
+    leaves the slice accepted and the run complete, and raises PmError saying
+    so; the next `start-slice` retries it.
     """
     stripped_reasoning = reasoning.strip()
     if len(stripped_reasoning) < _ACCEPT_REASONING_MIN_CHARS:
@@ -1979,7 +1983,12 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         if run_complete:
             state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
             # The run end takes a sandboxed run's server down with it.
-            sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
+            sandbox_notes = sandbox.teardown_run(
+                state,
+                repo=repo,
+                run_dir=run_dir,
+                recorded=f"the acceptance of {slice_id} and the run's completion are recorded",
+            )
     finally:
         regenerate_report(repo, run_dir, state)
 
@@ -2373,7 +2382,7 @@ def stop(
     )
     # The run end takes a sandboxed run's server down with it.
     try:
-        sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
+        sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir, recorded="the stop is recorded")
     except (PmError, OSError) as exc:
         raise StopTeardownError(str(exc)) from exc
     finally:

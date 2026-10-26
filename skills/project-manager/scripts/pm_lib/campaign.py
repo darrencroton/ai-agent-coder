@@ -47,7 +47,6 @@ import shlex
 import shutil
 import signal
 import subprocess
-import tempfile
 import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -539,7 +538,7 @@ def _check_launch_preconditions(
     if base_policy is None:
         control_dir = None
     else:
-        tmpdir = Path(tempfile.gettempdir()) / f"{sandbox_mod.TMPDIR_PREFIX}{socket}"
+        tmpdir = sandbox_mod.run_tmpdir(socket)
         if os.path.lexists(tmpdir):
             raise PmError(f"sandbox temp dir already exists: {tmpdir}; another child may own socket {socket}")
     return _ChildLaunch(
@@ -783,9 +782,10 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
         try:
             if srt_pid is not None:
                 record = {"srt_pid": srt_pid, "tmpdir": str(tmpdir), "control": str(control)}
-                remaining, notes = sandbox_mod.stop_server(socket=socket, record=record)
+                outcome = sandbox_mod.stop_server(socket=socket, record=record)
+                remaining = outcome.remaining
                 killed = "was killed" if remaining == [] else f"still lists sessions: {', '.join(remaining)}"
-                return f"; the sandboxed tmux server {socket} {killed}; {'; '.join(notes)}"
+                return f"; the sandboxed tmux server {socket} {killed}; {'; '.join(outcome.notes)}"
             notes = []
             if server_pending:
                 # The socket is this launch's, so a server answering there is
@@ -929,7 +929,10 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
                 # A sandboxed server goes with its temp and control directories.
                 teardown = sandbox_teardown()
                 if not isinstance(exc, Exception):
-                    exc.add_note(f"child launch failed after its session started; {pane_note}{teardown}")
+                    exc.add_note(
+                        f"child launch failed after its session started; {pane_note}{teardown}; "
+                        f"{_left_behind(branch, worktree)}"
+                    )
                     raise
                 raise PmError(
                     f"child launch failed after its session started ({exc}); {pane_note}{teardown}; "
@@ -1118,21 +1121,25 @@ class StopChildOutcome:
     # Set when the post-kill probe failed: the kill is then unconfirmed, and
     # `server_gone` is False with `remaining` empty.
     kill_error: str | None = None
-    # For a sandboxed child: one line per teardown step (`sandbox.stop_server`'s
-    # notes, that both directories were already gone, or that they were left
-    # for removal by hand), and why the teardown did not run or failed, when
-    # it did not complete.
-    sandbox_notes: list[str] = field(default_factory=list)
+    # For a sandboxed child: what the teardown found and did (`sandbox.tear_down`),
+    # and why it did not run or failed, when it did not complete.
+    sandbox_teardown: sandbox_mod.TeardownOutcome | None = None
     sandbox_error: str | None = None
 
     @property
+    def sandbox_notes(self) -> list[str]:
+        """One line per teardown step (`TeardownOutcome.notes`), for printing."""
+        return self.sandbox_teardown.notes if self.sandbox_teardown is not None else []
+
+    @property
     def sandbox_stopped(self) -> bool:
-        """False when a sandbox teardown was skipped, failed, left `srt`
-        running or refused to remove the control directory."""
-        return self.sandbox_error is None and not any(
-            note.startswith(("srt still running", "refused to remove sandbox control dir"))
-            for note in self.sandbox_notes
-        )
+        """False when a sandbox teardown was skipped or failed, left anything
+        up (`TeardownOutcome.left`: a session, `srt`, the control directory)
+        or left a temp dir under another `TMPDIR` in place."""
+        teardown = self.sandbox_teardown
+        if self.sandbox_error is not None:
+            return False
+        return teardown is None or (not teardown.left and teardown.tmpdir_state != "foreign")
 
 
 def stop_child(worktree: Path) -> StopChildOutcome:
@@ -1172,15 +1179,23 @@ def stop_child(worktree: Path) -> StopChildOutcome:
     (nothing inside the sandbox can write under the control root), so one
     naming another worktree or socket, which is what a manifest pointed at
     another child's socket meets, is refused before anything is captured or
-    killed. After a confirmed kill, `sandbox.stop_server` waits for the
-    recorded `srt` to exit and removes the record's temp directory and the
-    control directory; with the control directory already gone, both are
-    reported gone (a temp dir still at the conventional path is left for a
-    by-hand check: no record names it). A control directory holding no
-    readable record (a teardown that failed partway leaves one) is checked
-    by the server mark alone, the server captured and killed as usual, and
-    the directory and any temp dir at the conventional path left in place,
-    each reported with the command that removes it by hand.
+    killed. After a confirmed kill the sandbox goes through `sandbox.tear_down`,
+    the teardown a Mode B run end shares: the recorded `srt` waited for, the
+    record's temp directory and the control directory removed, and the
+    control root once nothing else is left in it. With no record (an earlier
+    stop removed it, or a launch never wrote it) the sandbox is torn down
+    from what `launch-child` created, the temp dir `make_tmpdir` names and
+    the control directory, each reported gone when it already is; such a
+    control directory is checked by the server mark alone. The control
+    directory and its record are kept while a session is listed or `srt`
+    still runs, so a re-run sees what is left and exits non-zero until it
+    has gone. A record's temp dir under another `TMPDIR` is left in place
+    with a note and the stop exits non-zero; the control directory goes, so
+    a re-run under the record's `TMPDIR` removes the temp dir, while one
+    under this `TMPDIR` finds no record and cannot see it. A control
+    directory whose record cannot be read is checked by the server mark
+    alone, the server captured and killed as usual, and the directory left
+    in place, with the command that removes it by hand.
     """
     worktree = worktree.expanduser().resolve()
     manifest = load_manifest(worktree)
@@ -1211,7 +1226,7 @@ def stop_child(worktree: Path) -> StopChildOutcome:
                 f"the child's manifest records a sandbox, but its control directory cannot be derived from {worktree} "
                 f"({common_error}); refusing to kill the server"
             )
-        if os.path.lexists(control):
+        if os.path.lexists(control / sandbox_mod.RECORD_NAME):
             try:
                 record = sandbox_mod.read_record(control)
             except PmError as exc:
@@ -1267,59 +1282,24 @@ def stop_child(worktree: Path) -> StopChildOutcome:
         kill_error = str(exc)
         remaining = []
     server_gone = kill_error is None and not remaining
-    sandbox_notes: list[str] = []
+    teardown: sandbox_mod.TeardownOutcome | None = None
     sandbox_error: str | None = None
-
-    def conventional_tmpdir() -> Path:
-        """Where `sandbox.make_tmpdir` puts the temp dir, for when no record
-        names it; OSError when no temp directory is usable."""
-        return Path(os.path.realpath(tempfile.gettempdir())) / f"{sandbox_mod.TMPDIR_PREFIX}{socket}"
-
-    if record is not None and control is not None:
+    if sandboxed and control is not None:
         if not server_gone:
             sandbox_error = (
                 f"the server was not confirmed gone, so its sandbox temp dir and {control} were left in place; "
                 "re-run stop-child"
             )
+        elif record_error is not None:
+            sandbox_error = (
+                f"no readable sandbox record in {control} ({record_error}), so nothing of the sandbox was removed; "
+                f"once no server runs on socket {socket}, remove it by hand: rm -rf {shlex.quote(str(control))}"
+            )
         else:
             try:
-                _remaining, sandbox_notes = sandbox_mod.stop_server(
-                    socket=socket, record={**record, "control": str(control)}
-                )
-            except PmError as exc:
+                teardown = sandbox_mod.tear_down(socket=socket, control=control, record=record)
+            except (PmError, OSError) as exc:
                 sandbox_error = str(exc)
-    elif record_error is not None and control is not None:
-        sandbox_notes.append(
-            f"sandbox control dir {control} left in place: {record_error}; once no server runs on socket {socket}, "
-            f"remove it by hand: rm -rf {shlex.quote(str(control))}"
-        )
-        try:
-            tmpdir = conventional_tmpdir()
-        except OSError as exc:
-            sandbox_notes.append(f"sandbox temp dir not looked for: no temp directory is usable ({exc})")
-        else:
-            if os.path.lexists(tmpdir):
-                sandbox_notes.append(
-                    f"sandbox temp dir {tmpdir} left in place: no record names it; once no child runs on socket "
-                    f"{socket}, remove it by hand: rm -rf {shlex.quote(str(tmpdir))}"
-                )
-        sandbox_error = f"no readable sandbox record in {control}, so nothing of the sandbox was removed"
-    elif sandboxed and control is not None:
-        # An earlier stop removed the control directory and its record.
-        try:
-            tmpdir = conventional_tmpdir()
-        except OSError as exc:
-            sandbox_error = f"the sandbox temp dir could not be looked for: no temp directory is usable ({exc})"
-        else:
-            if os.path.lexists(tmpdir):
-                sandbox_notes.append(
-                    f"sandbox temp dir {tmpdir} remains, but no record names it; remove it by hand once no child "
-                    f"runs on socket {socket}: rm -rf {shlex.quote(str(tmpdir))}"
-                )
-                sandbox_error = f"sandbox temp dir {tmpdir} was left in place"
-            else:
-                sandbox_notes.append(f"sandbox temp dir already gone: {tmpdir}")
-        sandbox_notes.append(f"sandbox control dir already gone: {control}")
     return StopChildOutcome(
         session=session,
         socket=socket,
@@ -1332,6 +1312,6 @@ def stop_child(worktree: Path) -> StopChildOutcome:
         remaining=remaining,
         runs_error=runs_error,
         kill_error=kill_error,
-        sandbox_notes=sandbox_notes,
+        sandbox_teardown=teardown,
         sandbox_error=sandbox_error,
     )

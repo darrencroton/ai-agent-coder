@@ -1096,21 +1096,28 @@ class TestStopServerRecord(TempDirTestCase):
             mock.patch.object(sandbox.sessions, "kill_server", return_value=[]),
             mock.patch.object(sandbox, "_common_dir_of", side_effect=AssertionError("git was asked")),
         ):
-            remaining, notes = sandbox.stop_server(socket=self.socket, record=record)
-        self.assertEqual(remaining, [])
-        self.assertIn(f"removed sandbox control dir {self.control}", notes)
+            outcome = sandbox.stop_server(socket=self.socket, record=record)
+        self.assertEqual(outcome.remaining, [])
+        self.assertEqual(outcome.control_state, "removed")
+        self.assertIn(f"removed sandbox control dir {self.control}", outcome.notes)
         self.assertFalse(self.control.exists())
         self.assertFalse(self.tmpdir.exists())
 
-    def test_a_srt_that_outlives_the_wait_is_noted(self) -> None:
+    def test_a_srt_that_outlives_the_wait_keeps_the_record_for_a_retry(self) -> None:
         with (
             mock.patch.object(sandbox.sessions, "kill_server", return_value=[]),
             mock.patch.object(sandbox, "_pid_alive", return_value=True),
             mock.patch.object(sandbox, "SRT_EXIT_WAIT_SECONDS", 0.2),
         ):
-            _remaining, notes = sandbox.stop_server(socket=self.socket, record=self.record(srt_pid=999999))
-        self.assertIn("srt still running: 999999", notes)
-        self.assertIn(f"removed sandbox temp dir {self.tmpdir}", notes)
+            outcome = sandbox.stop_server(socket=self.socket, record=self.record(srt_pid=999999))
+        self.assertTrue(outcome.srt_alive)
+        self.assertEqual(outcome.control_state, "kept")
+        self.assertEqual(
+            outcome.left, ["srt still running: 999999", f"sandbox control dir {self.control} is still there"]
+        )
+        self.assertIn("srt still running: 999999", outcome.notes)
+        self.assertIn(f"removed sandbox temp dir {self.tmpdir}", outcome.notes)
+        self.assertTrue(self.control.is_dir())
 
     def test_a_missing_or_malformed_field_is_refused_before_anything_is_stopped(self) -> None:
         linked = self.tmp / "pm-sandbox-linked"
@@ -1125,6 +1132,7 @@ class TestStopServerRecord(TempDirTestCase):
             (self.record(srt_pid=2**31), "srt_pid is not a pid"),
             (self.record(srt_pid=2**100), "srt_pid is not a pid"),
             (self.record(tmpdir=_ABSENT), "tmpdir is missing"),
+            (self.record(tmpdir=None), "tmpdir is null"),
             (self.record(tmpdir=7), "tmpdir is not a path"),
             (self.record(tmpdir=str(self.tmp / "elsewhere")), "refusing to remove"),
             (self.record(tmpdir=str(linked)), f"refusing to remove {linked}: not a directory"),
@@ -1164,7 +1172,9 @@ class TestStopServerRecord(TempDirTestCase):
                     self.tmpdir.mkdir()
                 make()
                 with mock.patch.object(sandbox.sessions, "kill_server", return_value=[]):
-                    _remaining, notes = sandbox.stop_server(socket=self.socket, record=self.record())
+                    outcome = sandbox.stop_server(socket=self.socket, record=self.record())
+                notes = outcome.notes
+                self.assertEqual(outcome.control_state, "refused")
                 self.assertIn(
                     f"refused to remove sandbox control dir {self.control}: not a directory; it was left in place",
                     notes,
@@ -1532,20 +1542,23 @@ class TestSandboxedServer(SandboxServerTestCase):
         )
         record = sandbox.read_record(self.control)
 
-        remaining, notes = sandbox.stop_server(socket=self.socket, record=record)
-        self.assertEqual(remaining, [])
+        outcome = sandbox.stop_server(socket=self.socket, record=record)
+        self.assertEqual(outcome.remaining, [])
+        self.assertFalse(outcome.srt_alive)
+        self.assertEqual(outcome.left, [])
         self.assertFalse(sessions.server_running(self.socket))
         self.assertFalse(self.tmpdir.exists())
         self.assertFalse(self.control.exists())
-        self.assertNotIn(f"srt still running: {srt_pid}", notes)
-        self.assertIn(f"removed sandbox temp dir {self.tmpdir}", notes)
-        self.assertIn(f"removed sandbox control dir {self.control}", notes)
+        self.assertNotIn(f"srt still running: {srt_pid}", outcome.notes)
+        self.assertIn(f"removed sandbox temp dir {self.tmpdir}", outcome.notes)
+        self.assertIn(f"removed sandbox control dir {self.control}", outcome.notes)
         with self.assertRaises(ProcessLookupError):
             os.kill(srt_pid, 0)
 
-        _remaining, notes = sandbox.stop_server(socket=self.socket, record=record)
-        self.assertIn(f"sandbox temp dir already gone: {self.tmpdir}", notes)
-        self.assertIn(f"sandbox control dir already gone: {self.control}", notes)
+        outcome = sandbox.stop_server(socket=self.socket, record=record)
+        self.assertEqual((outcome.tmpdir_state, outcome.control_state), ("gone", "gone"))
+        self.assertIn(f"sandbox temp dir already gone: {self.tmpdir}", outcome.notes)
+        self.assertIn(f"sandbox control dir already gone: {self.control}", outcome.notes)
 
     def test_a_session_through_the_server_is_confined_and_carries_no_token(self) -> None:
         self.start(self.write_policy())

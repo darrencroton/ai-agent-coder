@@ -163,21 +163,28 @@ class FinalizeTestCase(TmuxRunTestCase):
 
 @requires_srt
 class TestSandboxedAcceptCompletesTheRun(SandboxedRunTestCase):
-    def test_accepting_the_last_slice_tears_the_sandbox_down(self) -> None:
-        """The fake Developer commits inside the sandbox; the accept that
-        completes the run leaves no server, temp dir or control dir."""
+    def _ready_to_accept(self) -> tuple[str, str, Path]:
+        """A sandboxed one-slice run whose fake Developer has committed inside
+        the sandbox and been judged; returns (token, socket, run dir)."""
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0)
         )
         run_id, token, socket, run_dir = self._init_sandboxed(plan_path, harness)
-        control = sandbox_mod.control_dir((self.repo / ".git").resolve(), socket)
-        tmpdir = Path(sandbox_mod.read_record(control)["tmpdir"])
         with self.on_socket(socket):
             code, out, err = self.run_cli_in_repo(["start-slice", "--token", token])
             self.assertEqual(code, 0, out + err)
             self.assertTrue(self._wait_for_result(run_id, token))
             judge_current_developer(self, token, run_dir)
+        return token, socket, run_dir
+
+    def test_accepting_the_last_slice_tears_the_sandbox_down(self) -> None:
+        """The accept that completes the run leaves no server, temp dir or
+        control dir."""
+        token, socket, run_dir = self._ready_to_accept()
+        control = sandbox_mod.control_dir((self.repo / ".git").resolve(), socket)
+        tmpdir = Path(sandbox_mod.read_record(control)["tmpdir"])
+        with self.on_socket(socket):
             code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, out + err)
         self.assertIn("ACCEPTED Slice 1", out)
@@ -193,6 +200,24 @@ class TestSandboxedAcceptCompletesTheRun(SandboxedRunTestCase):
         kinds = [event["kind"] for event in state_mod.read_events(run_dir)]
         self.assertEqual(kinds.count("sandbox-stopped"), 1)
         self.assertLess(kinds.index("complete"), kinds.index("sandbox-stopped"))
+
+    def test_an_accept_whose_teardown_fails_exits_2_saying_the_acceptance_is_recorded(self) -> None:
+        token, socket, run_dir = self._ready_to_accept()
+        failure = OSError("stand-in: the teardown failed")
+        with self.on_socket(socket), mock.patch.object(sandbox_mod, "stop_server", side_effect=failure):
+            code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(
+            "pm: error: stand-in: the teardown failed; the acceptance of Slice 1 and the run's completion are"
+            " recorded, but no sandbox-stopped event was written",
+            err,
+        )
+        self.assertNotIn("Traceback", err)
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual((state["status"], state["slices"][0]["status"]), ("complete", "accepted"))
+        kinds = [event["kind"] for event in state_mod.read_events(run_dir)]
+        self.assertEqual(kinds.count("accept"), 1)
+        self.assertNotIn("sandbox-stopped", kinds)
 
 
 # --- full end-to-end acceptance ----------------------------------------------
