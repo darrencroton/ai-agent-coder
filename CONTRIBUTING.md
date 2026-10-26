@@ -25,6 +25,7 @@ Each contract lives in exactly one place; everything else points at it. Before e
 | Campaign-mode (Mode C) operating contract and the campaign launcher | `skills/project-manager/references/campaign-mode.md` |
 | Dossier layout and templates | `skills/project-manager/references/dossier-template.md` |
 | Sandbox contract (the boundary, what enforces what, limitations, base-policy refusals and warnings, derived policies, example policy, per-harness facts) | `skills/project-manager/references/sandbox.md` |
+| Guarded `.pm/` access rule | `skills/project-manager/scripts/pm_lib/pm_paths.py` module docstring |
 | Developer and Reviewer prompt contracts | `skills/project-manager/references/developer-prompt.md`, `…/reviewer-prompt.md` |
 | Harness profile table | `skills/project-manager/scripts/pm_lib/profiles.py` |
 | Delegate request contract and access-mode semantics | `skills/orchestrator/references/delegate-contract.md` |
