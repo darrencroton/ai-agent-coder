@@ -240,6 +240,20 @@ class TestGitFacts(PmTestCase):
         self.assertIn("new-file.txt", content)
         self.assertFalse((destination.parent / "git-diff-error.txt").exists())
 
+    def test_gitlink_in_index_is_refused_by_status_and_worktree_diff(self) -> None:
+        # A gitlink makes the host's `git status` and ref-less `git diff` execute
+        # the submodule's configuration, so both refuse before running anything.
+        # `--cacheinfo` plants the entry without a populated submodule.
+        head = git_ops.git_head(self.repo)
+        self._git("update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+        self.assertEqual(git_ops.gitlinks(self.repo), ["sub"])
+        with self.assertRaisesRegex(PmError, "submodules are not supported.*sub"):
+            git_ops.git_status_text(self.repo)
+        destination = self.repo / "diff.patch"
+        with self.assertRaisesRegex(PmError, "submodules are not supported.*sub"):
+            git_ops.write_git_diff(self.repo, None, None, destination)
+        self.assertFalse(destination.exists())
+
     def test_write_git_diff_writes_error_sidecar_on_bad_ref(self) -> None:
         destination = self.repo / "diff.patch"
         git_ops.write_git_diff(self.repo, "0" * 40, "1" * 40, destination)

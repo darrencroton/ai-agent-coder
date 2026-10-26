@@ -1,7 +1,9 @@
 """Git facts: process invocation, status parsing, ancestry, surface matching.
 
 Every function here computes a fact from git or normalizes a path string; none
-of them judge anything. Surface matching uses segment-aware glob matching via
+of them judge anything. The two host-side commands that recurse into
+submodules, `git status` and the worktree-mode `git diff`, refuse a repository
+whose index holds a gitlink (see `refuse_gitlinks`). Surface matching uses segment-aware glob matching via
 ``PurePosixPath.full_match`` (Python 3.13+), not ``fnmatch``, so a single ``*``
 never silently crosses a ``/``.
 """
@@ -64,13 +66,66 @@ def git_bytes(repo: Path, *args: str) -> bytes | None:
     return result.stdout if result.returncode == 0 else None
 
 
+def gitlinks(repo: Path) -> list[str]:
+    """Paths of the index's gitlinks (mode-160000 entries, i.e. submodules).
+
+    Read from `git ls-files --stage -z`, which lists the index and executes no
+    repository configuration, unlike `git status` and `git diff`, which
+    recurse into a populated submodule and run its configuration (for example
+    `core.fsmonitor`) on the host. `-z` keeps unusual path names unquoted.
+    Raises PmError when git fails, so a caller never reads a failed listing
+    as "no gitlinks".
+    """
+    returncode, stdout, stderr = git_result(repo, "ls-files", "--stage", "-z")
+    if returncode != 0:
+        raise PmError(stderr.strip() or stdout.strip() or "git ls-files failed")
+    paths: list[str] = []
+    for entry in stdout.split("\0"):
+        # Each entry is "<mode> <object> <stage>\t<path>"; the metadata holds
+        # no tab, so the first tab ends it even when the path has spaces.
+        metadata, _tab, path = entry.partition("\t")
+        if path and metadata.split(" ", 1)[0] == "160000":
+            paths.append(path)
+    return paths
+
+
+def refuse_gitlinks(repo: Path) -> None:
+    """Fail closed, before a host-side recursing git command runs, when the index holds a gitlink.
+
+    `git status` and the worktree-mode `git diff` recurse into a populated
+    submodule and execute its configuration on the host, and a gitlink planted
+    by a sandboxed process can point at a repository whose configuration it
+    controls. Repositories with submodules are therefore not supported, sandboxed
+    or not. Residuals: the window between this check and the command that
+    follows it (a detached sandboxed process could add a gitlink in between),
+    and the PM and Campaign Manager agents' own git commands, which this
+    check does not reach.
+    """
+    paths = gitlinks(repo)
+    if paths:
+        raise PmError(
+            "repositories with submodules are not supported: the index holds "
+            + ", ".join(paths)
+            + ", and the host's `git status` would execute the submodule's configuration"
+        )
+
+
 def git_status_text(repo: Path) -> str:
-    # Deliberately not the git() helper above: that strips stdout, and
-    # `status --short` output is positional — a leading space on the first
-    # line (" M file", an unstaged modify) is part of the status code.
-    # Stripping it would shift that line's path parse by one character.
-    # `--no-renames` reports a dirty rename as a delete plus an add, so both
-    # sides reach the surface check, as they do for a committed rename.
+    """The repository's `git status --short` text, unstripped.
+
+    This is the one host-side `git status` in the toolkit, so every status
+    read goes through it. It refuses (PmError) a repository whose index holds a
+    gitlink, before `status` runs, because `status` would recurse into the
+    submodule and execute its configuration on the host; see `refuse_gitlinks`.
+
+    Deliberately not the git() helper above: that strips stdout, and
+    `status --short` output is positional — a leading space on the first
+    line (" M file", an unstaged modify) is part of the status code.
+    Stripping it would shift that line's path parse by one character.
+    `--no-renames` reports a dirty rename as a delete plus an add, so both
+    sides reach the surface check, as they do for a committed rename.
+    """
+    refuse_gitlinks(repo)
     returncode, stdout, stderr = git_result(repo, "status", "--short", "--untracked-files=all", "--no-renames")
     if returncode != 0:
         raise PmError(stderr.strip() or stdout.strip() or "git status failed")
@@ -131,6 +186,11 @@ def write_git_diff(repo: Path, before_head: str | None, after_head: str | None, 
     zero-change) diff, and the error is recorded in a sidecar file next to
     it — so the artifact is never a diff-shaped file that is actually a git
     error message.
+
+    The worktree-mode diff (no refs) recurses into submodules like `git
+    status`, so it refuses (PmError) a repository whose index holds a gitlink
+    before running; see `refuse_gitlinks`. Tree-to-tree diffs and `git show`
+    spawn no submodule process and are not checked.
     """
     if before_head and after_head and before_head != after_head:
         returncode, stdout, stderr = git_result(repo, "diff", "--binary", before_head, after_head)
@@ -141,6 +201,7 @@ def write_git_diff(repo: Path, before_head: str | None, after_head: str | None, 
         # artifact is not silently empty.
         returncode, stdout, stderr = git_result(repo, "show", "--binary", "--format=", after_head)
     else:
+        refuse_gitlinks(repo)
         returncode, stdout, stderr = git_result(repo, "diff", "--binary")
     if returncode == 0:
         destination.write_text(stdout, encoding="utf-8")
