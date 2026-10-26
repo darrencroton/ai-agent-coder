@@ -262,8 +262,9 @@ class TestBriefSandboxPin(unittest.TestCase):
 
     def test_find_brief_is_the_dossier_root_s_brief(self) -> None:
         """The brief is `brief.md` at the launcher's git toplevel: a nearer one
-        is ignored, a launcher outside any repository has none, and one
-        symlinked in from elsewhere is refused."""
+        is ignored, a launcher outside any repository has none, one symlinked
+        in from elsewhere is refused, and so is one whose dossier git cannot
+        read (a broken configuration is not "no repository")."""
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(os.path.realpath(directory.name))
@@ -287,6 +288,12 @@ class TestBriefSandboxPin(unittest.TestCase):
         with self.assertRaises(PmError) as raised:
             sandbox.find_brief(linked)
         self.assertIn(f"its real path {outside} lies in no git repository", str(raised.exception))
+
+        (dossier / ".git" / "config").write_text("[core\n", encoding="utf-8")
+        with self.assertRaises(PmError) as raised:
+            sandbox.find_brief(launcher)
+        self.assertIn(f"which repository {launcher.parent} lies in", str(raised.exception))
+        self.assertIn("config", str(raised.exception))
 
 
 class TestPreflightSandbox(PreflightTestCase):

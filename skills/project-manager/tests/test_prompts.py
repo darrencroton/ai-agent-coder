@@ -394,25 +394,31 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
 
     def test_two_blocks_with_a_malformed_first_closer_raise_even_when_unsandboxed(self) -> None:
         """A closer the pattern does not recognise lets it run on to the second
-        block's closer; the prose between them must not be dropped silently."""
-        body = (
-            "[sandboxed]\nFirst boundary.\n[/sandboxed ]\n\nProse that must survive {slice_id}.\n\n"
-            "[sandboxed]\nSecond boundary.\n[/sandboxed]\n\nSlice {slice_id}."
-        )
+        block's closer; the prose between them must not be dropped silently.
+        A block whose markers are both malformed matches nothing, and must not
+        ship with its marker text either."""
+        bodies = {
+            "malformed first closer": (
+                "[sandboxed]\nFirst boundary.\n[/sandboxed ]\n\nProse that must survive {slice_id}.\n\n"
+                "[sandboxed]\nSecond boundary.\n[/sandboxed]\n\nSlice {slice_id}."
+            ),
+            "both markers malformed": "[sandboxed ]\nBoundary.\n[/sandboxed ]\n\nSlice {slice_id}.",
+        }
         with tempfile.TemporaryDirectory() as tmp:
             reference = Path(tmp) / "developer-prompt.md"
-            reference.write_text(f"# T\n\n```md\n{body}\n```\n", encoding="utf-8")
-            with self.assertRaises(PmError) as ctx:
-                prompts.render_developer_prompt(
-                    _make_plan_slice(3),
-                    plan_path=Path("/p"),
-                    artifact_dir=Path("/a"),
-                    notes_path=Path("/n"),
-                    result_path=Path("/r"),
-                    reference_path=reference,
-                )
-        self.assertIn("malformed [sandboxed] block", str(ctx.exception))
-        self.assertIn(str(reference), str(ctx.exception))
+            for shape, body in bodies.items():
+                reference.write_text(f"# T\n\n```md\n{body}\n```\n", encoding="utf-8")
+                with self.subTest(shape=shape), self.assertRaises(PmError) as ctx:
+                    prompts.render_developer_prompt(
+                        _make_plan_slice(3),
+                        plan_path=Path("/p"),
+                        artifact_dir=Path("/a"),
+                        notes_path=Path("/n"),
+                        result_path=Path("/r"),
+                        reference_path=reference,
+                    )
+                self.assertIn("malformed [sandboxed] block", str(ctx.exception))
+                self.assertIn(str(reference), str(ctx.exception))
 
     def test_an_empty_sandbox_block_counts_as_missing_when_sandboxed(self) -> None:
         """An empty paragraph would announce no boundary at all; unsandboxed,

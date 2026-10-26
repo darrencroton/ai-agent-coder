@@ -1754,6 +1754,53 @@ class TestStop(SliceOpsTestCase):
         self.assertEqual(stops[-1]["data"], {"slice_status": "stopped"})
         self.assertEqual(state_mod.load_state(run_dir, token)["slices"][0]["status"], "stopped")
 
+    def _start_idle_slice(self) -> tuple[str, str, str, Path, Path]:
+        """An initialised run with its first slice's session up: (run id,
+        token, session, run dir, artifact dir)."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script(sleep_seconds=30.0))
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        code, _out, _err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0)
+        session = self._track_current_session(run_id, token)
+        self.assertTrue(self._wait_for(lambda: sessions.session_exists(session), timeout=10.0))
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        return run_id, token, session, run_dir, artifact_dir
+
+    def test_a_link_planted_at_pane_txt_is_reported_and_does_not_block_the_stop(self) -> None:
+        run_id, token, session, run_dir, artifact_dir = self._start_idle_slice()
+        victim = self.repo.parent / "victim.txt"
+        victim.write_text("operator\n", encoding="utf-8")
+        (artifact_dir / "pane.txt").symlink_to(victim)
+
+        code, out, err = self.run_cli_in_repo(["stop", "--reason", "operator stop", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("pane: (not captured — refused ", out)
+        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
+        self.assertEqual(victim.read_text(encoding="utf-8"), "operator\n")
+        self.assertEqual(state_mod.load_state(run_dir, token)["status"], "stopped")
+        self.assertEqual(len([e for e in state_mod.read_events(run_dir) if e["kind"] == "stop"]), 1)
+
+    def test_a_gitlink_planted_in_the_repository_does_not_block_the_stop(self) -> None:
+        """`stop` never runs the host's `git status`, so the gitlink refusal
+        that guards it cannot stand between an operator and a stop."""
+        run_id, token, session, run_dir, _artifact_dir = self._start_idle_slice()
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(self.repo), "update-index", "--add", "--cacheinfo", f"160000,{head},planted"], check=True
+        )
+
+        code, out, err = self.run_cli_in_repo(["stop", "--reason", "operator stop", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self._wait_for(lambda: not sessions.session_exists(session), timeout=10.0))
+        self.assertEqual(state_mod.load_state(run_dir, token)["status"], "stopped")
+        self.assertEqual(len([e for e in state_mod.read_events(run_dir) if e["kind"] == "stop"]), 1)
+
     def test_an_unsandboxed_tokenless_scavenge_keeps_the_original_sweep(self) -> None:
         """Readable unsandboxed state does not narrow the sweep to its run:
         without `--run` it is the every-PM-session sweep, as before Mode B."""

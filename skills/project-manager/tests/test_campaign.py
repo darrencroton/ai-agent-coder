@@ -710,6 +710,16 @@ class TestManifestErrors(CampaignTestCase):
         self.assertEqual(code, 0, out + err)
         self.assertIn("pane: not captured (disk full)", out)
         self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+        # A link planted at pane.txt: the dead session's presence check is
+        # refused, reported as the capture's error, and the stop completes.
+        victim = self.repo.parent / "victim.txt"
+        victim.write_text("operator\n", encoding="utf-8")
+        (campaign.campaign_dir(self.worktree) / "pane.txt").symlink_to(victim)
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(self.worktree), "--reason", "again"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("pane: not captured (refused ", out)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "operator\n")
 
     def test_answer_child_refuses_with_no_live_session_leaving_the_files_unchanged(self) -> None:
         self.worktree.mkdir()
@@ -1422,14 +1432,15 @@ class TestStopChildSandboxTeardown(SandboxLaunchTestCase):
 
     def test_a_stop_under_another_tmpdir_removes_the_control_dir_and_leaves_the_temp_dir_for_a_rerun(self) -> None:
         """A `TMPDIR` other than the launch's: the server killed and the
-        control dir removed, the temp dir left with a note and exit 2; a
-        re-run under the launch's `TMPDIR` removes it."""
+        control dir removed, the temp dir left with a note and exit 0 (a
+        retry cannot fix it); a re-run under the launch's `TMPDIR` removes
+        it."""
         self.write_record()
         other = self.repo.parent / "other-tmp"
         other.mkdir()
         with mock.patch.object(tempfile, "tempdir", str(other)):
             code, out = self.stop()
-        self.assertEqual(code, 2, out)
+        self.assertEqual(code, 0, out)
         self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
         self.assertIn(f"left sandbox temp dir {self.tmpdir} in place", out)
         self.assertIn("TMPDIR differs from the one the run's sandbox was set up under", out)

@@ -50,6 +50,12 @@ class PmPathsTestCase(unittest.TestCase):
         self.assertIn("sandbox-writable .pm/", message)
         self.assertEqual(self.victim.read_text(encoding="utf-8"), "original\n")
 
+    def access(self, path: Path, *, write: bool):
+        """The guarded write (of attacker text) or read of `path`, as a callable."""
+        if write:
+            return lambda: pm_paths.write_pm_text(self.repo, path, "attacker\n")
+        return lambda: pm_paths.read_pm_text(self.repo, path)
+
 
 class TestGuardedWrite(PmPathsTestCase):
     def test_a_write_creates_missing_directories_and_round_trips(self) -> None:
@@ -82,8 +88,13 @@ class TestGuardedWrite(PmPathsTestCase):
     def test_a_symlinked_leaf_is_refused_and_its_target_untouched(self) -> None:
         pm = self.repo / ".pm"
         pm.mkdir()
-        (pm / "pane.txt").symlink_to(self.victim)
-        self.assert_refused(lambda: pm_paths.write_pm_text(self.repo, pm / "pane.txt", "attacker\n"), "pane.txt")
+        leaf = pm / "pane.txt"
+        leaf.symlink_to(self.victim)
+        for write in (True, False):
+            with self.subTest(write=write):
+                self.assert_refused(self.access(leaf, write=write), "pane.txt")
+        self.assert_refused(lambda: pm_paths.read_pm_bytes(self.repo, leaf), "pane.txt")
+        self.assert_refused(lambda: pm_paths.pm_file_present(self.repo, leaf), "pane.txt")
 
     def test_a_dangling_symlinked_leaf_is_refused_and_not_created(self) -> None:
         pm = self.repo / ".pm"
@@ -98,7 +109,9 @@ class TestGuardedWrite(PmPathsTestCase):
         (pm / "runs").mkdir(parents=True)
         (pm / "runs" / "r1").symlink_to(self.outside)
         target = pm / "runs" / "r1" / "victim.txt"
-        self.assert_refused(lambda: pm_paths.write_pm_text(self.repo, target, "attacker\n"), "r1")
+        for write in (True, False):
+            with self.subTest(write=write):
+                self.assert_refused(self.access(target, write=write), "r1")
 
     def test_a_symlinked_pm_root_is_refused_and_nothing_is_created_below_it(self) -> None:
         (self.repo / ".pm").symlink_to(self.outside)
@@ -107,11 +120,13 @@ class TestGuardedWrite(PmPathsTestCase):
         self.assert_refused(lambda: pm_paths.ensure_pm_dir(self.repo, self.repo / ".pm" / "runs" / "r1"), ".pm")
         self.assertEqual(sorted(path.name for path in self.outside.iterdir()), ["victim.txt"])
 
-    def test_a_hard_linked_leaf_is_refused_before_it_is_truncated(self) -> None:
+    def test_a_hard_linked_leaf_is_refused_before_it_is_truncated_or_read(self) -> None:
         pm = self.repo / ".pm"
         pm.mkdir()
         os.link(self.victim, pm / "pane.txt")
-        self.assert_refused(lambda: pm_paths.write_pm_text(self.repo, pm / "pane.txt", "attacker\n"), "pane.txt")
+        for write in (True, False):
+            with self.subTest(write=write):
+                self.assert_refused(self.access(pm / "pane.txt", write=write), "pane.txt")
 
     def test_a_directory_at_the_leaf_is_refused(self) -> None:
         pm = self.repo / ".pm"
@@ -132,26 +147,6 @@ class TestGuardedWrite(PmPathsTestCase):
 
 
 class TestGuardedRead(PmPathsTestCase):
-    def test_a_read_through_a_symlinked_leaf_is_refused(self) -> None:
-        pm = self.repo / ".pm"
-        pm.mkdir()
-        (pm / "pane-live.txt").symlink_to(self.victim)
-        self.assert_refused(lambda: pm_paths.read_pm_text(self.repo, pm / "pane-live.txt"), "pane-live.txt")
-        self.assert_refused(lambda: pm_paths.read_pm_bytes(self.repo, pm / "pane-live.txt"), "pane-live.txt")
-        self.assert_refused(lambda: pm_paths.pm_file_present(self.repo, pm / "pane-live.txt"), "pane-live.txt")
-
-    def test_a_read_below_a_symlinked_directory_is_refused(self) -> None:
-        pm = self.repo / ".pm"
-        pm.mkdir()
-        (pm / "campaign").symlink_to(self.outside)
-        self.assert_refused(lambda: pm_paths.read_pm_text(self.repo, pm / "campaign" / "victim.txt"), "campaign")
-
-    def test_a_read_of_a_hard_linked_leaf_is_refused(self) -> None:
-        pm = self.repo / ".pm"
-        pm.mkdir()
-        os.link(self.victim, pm / "result.json")
-        self.assert_refused(lambda: pm_paths.read_pm_text(self.repo, pm / "result.json"), "result.json")
-
     def test_an_absent_file_is_file_not_found_and_not_present(self) -> None:
         missing = self.repo / ".pm" / "runs" / "r1" / "pane-live.txt"
         with self.assertRaises(FileNotFoundError):

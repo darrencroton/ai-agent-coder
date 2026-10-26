@@ -902,7 +902,10 @@ def _run_finalize(args: argparse.Namespace) -> int:
         outcome = slice_ops.finalize_stop(repo, run_dir, token, reason=args.stop, cause=args.cause, risk=args.risk)
         print(f"STOPPED {outcome.slice_id}")
         _print_floor_facts(outcome.report)
-        _print_pane_tail(repo, outcome.pane_path)
+        if outcome.pane_error is not None:
+            print(f"pane: (not captured — {outcome.pane_error})")
+        else:
+            _print_pane_tail(repo, outcome.pane_path)
         print(f"assessment: {outcome.assessment_path}")
         return 0
 
@@ -1060,6 +1063,8 @@ def _run_stop(args: argparse.Namespace) -> int:
         extra_killed = slice_ops.stop_scavenge_sweep(run_id=outcome.run_id)
         all_killed = outcome.killed + [name for name in extra_killed if name not in outcome.killed]
         print(f"stopped run {outcome.run_id}; killed sessions: {all_killed}")
+        if outcome.pane_error is not None:
+            print(f"pane: (not captured — {outcome.pane_error})")
         for note in outcome.sandbox_notes or []:
             print(f"sandbox: {note}")
         return 0
@@ -1068,6 +1073,8 @@ def _run_stop(args: argparse.Namespace) -> int:
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     outcome = slice_ops.stop(repo, run_dir, token, reason=args.reason, slice_status=args.slice_status)
     print(f"stopped run {outcome.run_id}; killed sessions: {outcome.killed}")
+    if outcome.pane_error is not None:
+        print(f"pane: (not captured — {outcome.pane_error})")
     for note in outcome.sandbox_notes or []:
         print(f"sandbox: {note}")
     return 0

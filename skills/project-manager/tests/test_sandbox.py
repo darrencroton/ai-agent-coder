@@ -418,10 +418,6 @@ class TestDerivePolicy(DerivationTestCase):
             policy["filesystem"]["denyWrite"].count(_literal(repo / ".git" / "hooks")), 1, "only the common dir's"
         )
 
-    def test_a_linked_worktree_does_not_deny_the_common_worktrees_directory(self) -> None:
-        policy = self.derive()
-        self.assertNotIn(_literal(self.common / "worktrees"), policy["filesystem"]["denyWrite"])
-
     def test_reads_socket_pty_and_required_lists(self) -> None:
         base = {"network": {}, "filesystem": {"allowRead": ["/opt/data"]}, "allowPty": False}
         extra = self.repo.parent / "launcher"

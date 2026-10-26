@@ -1133,13 +1133,15 @@ class StopChildOutcome:
 
     @property
     def sandbox_stopped(self) -> bool:
-        """False when a sandbox teardown was skipped or failed, left anything
-        up (`TeardownOutcome.left`: a session, `srt`, the control directory)
-        or left a temp dir under another `TMPDIR` in place."""
+        """False when a sandbox teardown was skipped or failed, or left
+        anything up (`TeardownOutcome.left`: a session, `srt`, the control
+        directory). A temp dir left under another `TMPDIR` is not among them,
+        as in a Mode B run end: a retry under this `TMPDIR` cannot remove it,
+        so its note names it for the operator."""
         teardown = self.sandbox_teardown
         if self.sandbox_error is not None:
             return False
-        return teardown is None or (not teardown.left and teardown.tmpdir_state != "foreign")
+        return teardown is None or not teardown.left
 
 
 def stop_child(worktree: Path) -> StopChildOutcome:
@@ -1190,9 +1192,10 @@ def stop_child(worktree: Path) -> StopChildOutcome:
     directory and its record are kept while a session is listed or `srt`
     still runs, so a re-run sees what is left and exits non-zero until it
     has gone. A record's temp dir under another `TMPDIR` is left in place
-    with a note and the stop exits non-zero; the control directory goes, so
-    a re-run under the record's `TMPDIR` removes the temp dir, while one
-    under this `TMPDIR` finds no record and cannot see it. A control
+    with a note and does not make the stop exit non-zero, as in a Mode B
+    run end: the control directory goes, so a re-run under the record's
+    `TMPDIR` removes the temp dir, while one under this `TMPDIR` finds no
+    record and cannot see it; the note asks the operator. A control
     directory whose record cannot be read is checked by the server mark
     alone, the server captured and killed as usual, and the directory left
     in place, with the command that removes it by hand.
@@ -1246,7 +1249,7 @@ def stop_child(worktree: Path) -> StopChildOutcome:
                     f"{record.get('socket')!r}, not {worktree} on {socket}; refusing to kill the server{remedy}"
                 )
     listed = sessions.list_sessions_on(socket)
-    owner = sessions.server_environment(socket, _OWNER_ENV_VAR)
+    owner = sessions.server_environment(socket, _OWNER_ENV_VAR, timeout=sandbox_mod.PROBE_TIMEOUT_SECONDS)
     if (listed or owner is not None) and owner != str(worktree):
         raise PmError(
             f"tmux server {socket} was not launched for {worktree} (it carries "
@@ -1260,6 +1263,8 @@ def stop_child(worktree: Path) -> StopChildOutcome:
         )
     pane_path = campaign_dir(worktree) / "pane.txt"
     pane_error: str | None = None
+    # Bound before the try: a refused pane.txt raises from the presence check.
+    pane_kept = False
     with _tmux_socket(socket):
         was_running = sessions.session_exists(session)
         # A re-run against a server already gone would overwrite the first

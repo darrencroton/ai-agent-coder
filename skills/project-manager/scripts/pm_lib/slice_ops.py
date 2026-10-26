@@ -13,15 +13,8 @@ through the CLI (never inferred from evidence alone), gated by the floor
 (never waivable) and, on elevated slices, by review freshness. Assessment
 text assembles facts around the PM's own reasoning; it never invents it.
 
-Guarded `.pm/` access (the rule). `<worktree>/.pm/` is writable by the
-sandboxed Developer, and `Path.read_text`/`write_text` follow symlinks, so a
-planted link would turn a host write of Developer-chosen text into a write
-anywhere the operator can write, and a host read into a read of a file the
-sandbox is denied. Host code therefore never opens a path under `.pm/`
-except through `pm_paths` (`open_pm_file` and its wrappers), which refuses
-any symlink, non-regular file or multi-link file with a `PmError`; that
-module's docstring is the rule's home and gives the mechanism. The rule binds
-`campaign`, `review`, `floor` and `cli` as well as this module.
+Host code here opens paths under the sandbox-writable `.pm/` tree only
+through `pm_paths`, whose module docstring is the rule's home.
 """
 
 from __future__ import annotations
@@ -891,10 +884,12 @@ def _restore_rotated_attempt(artifact_dir: Path, superseded_attempt: int, names:
             # against an existing destination (unlike exists()-then-rename),
             # so a fresh file the live session writes in this same window
             # (e.g. it finishes right as send_line's dead-session recheck
-            # fires) can never be clobbered by the stale archived copy.
-            # Best-effort: any failure here (including that FileExistsError)
-            # must not mask the proven-undelivered PmError being raised.
-            os.link(source_path, destination)
+            # fires) can never be clobbered by the stale archived copy, and
+            # `follow_symlinks=False` links a planted link as itself, never
+            # the file it names. Best-effort: any failure here (including
+            # that FileExistsError) must not mask the proven-undelivered
+            # PmError being raised.
+            os.link(source_path, destination, follow_symlinks=False)
             source_path.unlink()
         except OSError:
             continue
@@ -1466,7 +1461,8 @@ def deliver_answer(repo: Path, directory: Path, prefix: str, session: str, text:
     On any other `PmError` from the send nothing was typed, so the question is
     linked back and the archived copy and answer file are removed, and the
     error propagates. The restore uses link-then-unlink, as
-    `_restore_rotated_attempt` does, so a fresh `question.md` the Developer
+    `_restore_rotated_attempt` does (never following a link at the archived
+    name), so a fresh `question.md` the Developer
     wrote in the window is never overwritten: the archived copy then stays.
     Whatever this cleanup could not undo is appended to the raised message
     rather than swallowed, because a stranded file makes the next `answer`
@@ -1493,7 +1489,7 @@ def deliver_answer(repo: Path, directory: Path, prefix: str, session: str, text:
     except PmError as exc:
         left_behind: list[str] = []
         try:
-            os.link(archived_path, question_path)
+            os.link(archived_path, question_path, follow_symlinks=False)
         except FileExistsError:
             left_behind.append(f"{archived_path} kept because a new {question_path} was written meanwhile")
         except OSError as link_exc:
@@ -1624,34 +1620,46 @@ def _floor_note(report: FloorReport) -> str:
     return "failed: " + ", ".join(fact.name for fact in report.facts if not fact.passed)
 
 
-def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[str, Any]) -> tuple[FloorReport, Path]:
+def _collect_finalize_evidence(
+    repo: Path, state: dict[str, Any], current: dict[str, Any], *, tolerate_pane_error: bool = False
+) -> tuple[FloorReport, Path, str | None]:
     """Shared by bare `finalize` and every decision path: capture pane +
     status-after + diff evidence under the slice's artifact dir, then
-    evaluate the seven-fact floor. Never mutates or saves state.
+    evaluate the seven-fact floor. Never mutates or saves state. Returns
+    (floor report, artifact dir, pane error).
 
     The pane capture is evidence for the PM agent to read, not an input to
     the floor: whether a visible prompt or usage banner means this run must
-    stop is its judgement, recorded in the assessment."""
+    stop is its judgement, recorded in the assessment. A capture that fails
+    (PmError or OSError: a link planted at pane.txt or pane-live.txt is
+    refused by the guard) raises, unless `tolerate_pane_error` (`finalize
+    --stop`, which must not be blocked by its pane evidence): then it is
+    returned as the pane error, None otherwise."""
     slice_id = current["id"]
     artifact_dir = Path(current["artifact_dir"])
     session = current.get("tmux_session")
-    if session and sessions.session_exists(session):
-        pane_text = sessions.pane_text(session)
-    else:
-        # Falls back to the last screen `observe` recorded. The Developer
-        # session has normally already exited by finalize — it writes
-        # result.json and stops — so capturing only a live pane left pane.txt
-        # empty in the common case, which is exactly when PM is required to
-        # say what the pane showed.
-        # Read through the guard: a symlink planted at pane-live.txt must not
-        # turn this host read into a read of a file the sandbox is denied,
-        # which the copy into pane.txt would then hand back to it.
-        try:
-            pane_text = pm_paths.read_pm_text(repo, artifact_dir / "pane-live.txt", errors="replace")
-        except FileNotFoundError:
-            pane_text = ""
-
-    pm_paths.write_pm_text(repo, artifact_dir / "pane.txt", pane_text)
+    pane_error: str | None = None
+    try:
+        if session and sessions.session_exists(session):
+            pane_text = sessions.pane_text(session)
+        else:
+            # Falls back to the last screen `observe` recorded. The Developer
+            # session has normally already exited by finalize — it writes
+            # result.json and stops — so capturing only a live pane left pane.txt
+            # empty in the common case, which is exactly when PM is required to
+            # say what the pane showed.
+            # Read through the guard: a symlink planted at pane-live.txt must not
+            # turn this host read into a read of a file the sandbox is denied,
+            # which the copy into pane.txt would then hand back to it.
+            try:
+                pane_text = pm_paths.read_pm_text(repo, artifact_dir / "pane-live.txt", errors="replace")
+            except FileNotFoundError:
+                pane_text = ""
+        pm_paths.write_pm_text(repo, artifact_dir / "pane.txt", pane_text)
+    except (PmError, OSError) as exc:
+        if not tolerate_pane_error:
+            raise
+        pane_error = str(exc)
     pm_paths.write_pm_text(repo, artifact_dir / "status-after.txt", git_ops.git_status_text(repo))
 
     after_head = git_ops.git_head(repo)
@@ -1662,7 +1670,7 @@ def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[
 
     slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
     report = evaluate_floor(repo, state, slices, slice_id, artifact_dir=artifact_dir)
-    return report, artifact_dir
+    return report, artifact_dir, pane_error
 
 
 def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) -> FinalizeOutcome:
@@ -1681,7 +1689,7 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
                 run_dir, "risk-raise", slice_id=slice_id, note="risk raised via bare finalize --risk elevated"
             )
 
-    report, artifact_dir = _collect_finalize_evidence(repo, state, current)
+    report, artifact_dir, _pane_error = _collect_finalize_evidence(repo, state, current)
 
     state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
     # updated_at bump (and, when --risk was given, the ratchet) only — no
@@ -1893,7 +1901,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=stripped_reasoning.splitlines()[0][:120])
     _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
-    report, artifact_dir = _collect_finalize_evidence(repo, state, current)
+    report, artifact_dir, _pane_error = _collect_finalize_evidence(repo, state, current)
     state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
 
     if not report.passed:
@@ -2159,6 +2167,8 @@ class StopDecisionOutcome:
     # A stop records an assessment, so it gets the same pane evidence an
     # acceptance does — often more relevant, since the pane is frequently why.
     pane_path: Path
+    # Why the pane was not captured (a refused pane.txt, say), when it was not.
+    pane_error: str | None = None
 
 
 def finalize_stop(
@@ -2200,7 +2210,7 @@ def finalize_stop(
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
     _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
-    report, artifact_dir = _collect_finalize_evidence(repo, state, current)
+    report, artifact_dir, pane_error = _collect_finalize_evidence(repo, state, current, tolerate_pane_error=True)
     state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
 
     head = git_ops.git_head(repo)
@@ -2255,6 +2265,7 @@ def finalize_stop(
         assessment_path=assessment_original,
         report=report,
         pane_path=artifact_dir / "pane.txt",
+        pane_error=pane_error,
     )
 
 
@@ -2319,6 +2330,8 @@ class StopOutcome:
     killed: list[str]
     # What the sandbox teardown did (None for an unsandboxed run).
     sandbox_notes: list[str] | None = None
+    # Why the pane was not captured (a refused pane.txt, say), when it was not.
+    pane_error: str | None = None
 
 
 def stop(
@@ -2338,17 +2351,25 @@ def stop(
     what that did in `sandbox_notes`; a teardown that fails (PmError or
     OSError) raises `StopTeardownError`, a PmError, so a caller can tell a
     recorded stop from one refused before it was recorded.
+
+    A pane capture that cannot be written (PmError or OSError: a link
+    planted at pane.txt is refused by the guard) is returned in `pane_error`
+    and never blocks the stop, as in `campaign.stop_child`.
     """
     state = load_writable_state(run_dir, token)
     sandbox.require_run_socket(state)
     run_id = state["run_id"]
     current = state.get("current_slice")
 
+    pane_error: str | None = None
     if current and current.get("artifact_dir"):
         artifact_dir = Path(current["artifact_dir"])
         session = current.get("tmux_session")
         pane_text = sessions.pane_text(session) if session else ""
-        pm_paths.write_pm_text(repo, artifact_dir / "pane.txt", pane_text)
+        try:
+            pm_paths.write_pm_text(repo, artifact_dir / "pane.txt", pane_text)
+        except (PmError, OSError) as exc:
+            pane_error = str(exc)
 
     # Applies whenever state is readable, including the
     # --scavenge-with-readable-state path (cli.py routes that through here).
@@ -2387,7 +2408,7 @@ def stop(
         raise StopTeardownError(str(exc)) from exc
     finally:
         regenerate_report(repo, run_dir, state)
-    return StopOutcome(run_id=run_id, killed=killed, sandbox_notes=sandbox_notes)
+    return StopOutcome(run_id=run_id, killed=killed, sandbox_notes=sandbox_notes, pane_error=pane_error)
 
 
 def stop_scavenge_sweep(*, run_id: str | None) -> list[str]:

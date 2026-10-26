@@ -7,7 +7,9 @@ temporary repository with actual commits rather than string fixtures.
 
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -247,6 +249,20 @@ class TestGitFacts(PmTestCase):
             git_ops.git_status_text(self.repo)
         with self.assertRaisesRegex(PmError, "submodules are not supported.*sub"):
             git_ops.git_diff_text(self.repo, None, None)
+
+    def test_a_gitlink_whose_name_is_not_utf8_is_listed_not_a_decode_error(self) -> None:
+        # The listing is read as bytes: a non-UTF-8 path reaches the refusal
+        # (surrogate-escaped) instead of raising UnicodeDecodeError.
+        name = b"sub\xff".decode("utf-8", "surrogateescape")
+        head = git_ops.git_head(self.repo)
+        argv = ["git", "-C", str(self.repo), "update-index", "--add", "--cacheinfo", f"160000,{head},{name}"]
+        # os.fsencode restores the raw byte from its surrogate escape.
+        planted = subprocess.run([os.fsencode(arg) for arg in argv], capture_output=True, check=False)
+        if planted.returncode != 0:
+            self.skipTest(f"git refused a non-UTF-8 index path here: {planted.stderr!r}")
+        self.assertEqual(git_ops.gitlinks(self.repo), [name])
+        with self.assertRaisesRegex(PmError, "submodules are not supported"):
+            git_ops.git_status_text(self.repo)
 
     def test_git_diff_text_returns_empty_diff_and_error_text_on_bad_ref(self) -> None:
         content, error = git_ops.git_diff_text(self.repo, "0" * 40, "1" * 40)

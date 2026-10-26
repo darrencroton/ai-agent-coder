@@ -94,6 +94,7 @@ from typing import Any, Callable, Iterable, Literal
 from . import PmError
 from . import git_ops
 from . import ledger
+from . import pm_paths
 from . import sessions
 from . import state as state_mod
 
@@ -317,7 +318,26 @@ def _write_entries(policy: dict[str, Any]) -> list[Any]:
 
 
 def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
-    """Load the operator's base policy; return `(policy, warnings)`.
+    """`load_pinned_policy` without a pin or the digest: `(policy,
+    warnings)`, with every refusal and warning that function names."""
+    policy, warnings, _sha256 = load_pinned_policy(path)
+    return policy, warnings
+
+
+def _policy_refusal(path: Path) -> Callable[[str], PmError]:
+    """A builder of the PmError `sandbox policy <path>: <reason>`, the path
+    quoted when it holds a character that would garble the message."""
+    label = repr(str(path)) if _BAD_PATH_CHARS.search(str(path)) else str(path)
+    return lambda reason: PmError(f"sandbox policy {label}: {reason}")
+
+
+def load_pinned_policy(path: Path | str, expected_sha256: str | None = None) -> tuple[dict[str, Any], list[str], str]:
+    """Load the operator's base policy; return `(policy, warnings, sha256)`,
+    the digest being of the very bytes parsed: the file is read once, so no
+    swap between a hash and a parse can put a policy under the server other
+    than the one hashed. With `expected_sha256`, PmError before any parse
+    when the digest differs (the file no longer has the SHA-256 the run
+    recorded).
 
     PmError, naming the file and the reason, for: an unreadable or non-JSON
     file, or a path that cannot name one; a top level that is not an object
@@ -339,26 +359,6 @@ def load_base_policy(path: Path | str) -> tuple[dict[str, Any], list[str]]:
     `network.allowLocalBinding`, when set, each naming what the option opens;
     the caller prints them. The policy is returned as parsed: deriving from
     it never mutates it, and `srt` applies its own schema check on top.
-    """
-    policy, warnings, _sha256 = load_pinned_policy(path)
-    return policy, warnings
-
-
-def _policy_refusal(path: Path) -> Callable[[str], PmError]:
-    """A builder of the PmError `sandbox policy <path>: <reason>`, the path
-    quoted when it holds a character that would garble the message."""
-    label = repr(str(path)) if _BAD_PATH_CHARS.search(str(path)) else str(path)
-    return lambda reason: PmError(f"sandbox policy {label}: {reason}")
-
-
-def load_pinned_policy(path: Path | str, expected_sha256: str | None = None) -> tuple[dict[str, Any], list[str], str]:
-    """Load the operator's base policy as `load_base_policy` does and return
-    `(policy, warnings, sha256)`, the digest being of the very bytes parsed:
-    the file is read once, so no swap between a hash and a parse can put a
-    policy under the server other than the one hashed. With
-    `expected_sha256`, PmError before any parse when the digest differs
-    (the file no longer has the SHA-256 the run recorded). PmError for every
-    `load_base_policy` refusal.
     """
     path = Path(path)
     refuse = _policy_refusal(path)
@@ -384,7 +384,7 @@ def load_pinned_policy(path: Path | str, expected_sha256: str | None = None) -> 
 
 def _validate_base_policy(text: str, path: Path) -> tuple[dict[str, Any], list[str]]:
     """`(policy, warnings)` from the base policy `text` read from `path`;
-    PmError for every refusal `load_base_policy` names but an unreadable file."""
+    PmError for every refusal `load_pinned_policy` names but an unreadable file."""
     refuse = _policy_refusal(path)
     try:
         policy = json.loads(text)
@@ -993,7 +993,9 @@ def verify_server(*, socket: str, worktree: Path) -> None:
     3. the positive probe: a `run-shell` touch of `<worktree>/.pm/sandbox-probe`
        must succeed and leave the file, which is then removed, so a policy
        that does not grant the worktree is caught here. The host creates
-       `<worktree>/.pm` first when it is absent (and removes it again).
+       `<worktree>/.pm` first when it is absent (and removes it again),
+       and creates and checks it through `pm_paths`, which refuses a
+       planted link (PmError).
 
     Each of the three probes must return within 10 s, or verification
     fails with PmError, so a wedged server cannot hang it. PmError at once
@@ -1042,15 +1044,17 @@ def verify_server(*, socket: str, worktree: Path) -> None:
         )
 
     probe_dir = Path(worktree) / PROBE_DIR_NAME
-    created = not probe_dir.exists()
+    created = not os.path.lexists(probe_dir)
     inside = probe_dir / PROBE_FILE_NAME
     try:
-        probe_dir.mkdir(exist_ok=True)
+        # Through the `.pm/` guard (`pm_paths`), which refuses a planted link;
+        # `unlink` follows none, so it needs no guard.
+        pm_paths.ensure_pm_dir(worktree, probe_dir)
         inside.unlink(missing_ok=True)
         returncode, output = sessions.run_shell(
             socket, f"touch {shlex.quote(str(inside))}", timeout=PROBE_TIMEOUT_SECONDS
         )
-        found = inside.is_file()
+        found = pm_paths.pm_file_present(worktree, inside)
         inside.unlink(missing_ok=True)
     except OSError as exc:
         raise PmError(f"positive probe could not run: {exc}") from exc
@@ -1214,7 +1218,9 @@ class TeardownOutcome:
     def left(self) -> list[str]:
         """What makes the teardown incomplete, one line each: sessions still
         listed, an `srt` still running, the control dir still there. A
-        foreign temp dir is not among them: each mode weighs it itself."""
+        foreign temp dir is not among them, in either mode: a retry under
+        this `TMPDIR` cannot remove it, so its note names it for the
+        operator."""
         left = _still_up(self.socket, self.remaining, self.srt_pid, self.srt_alive)
         if self.control_state in ("refused", "kept"):
             left.append(f"sandbox control dir {self.control} is still there")
@@ -1460,7 +1466,7 @@ def _refuse_foreign_server(socket: str, record: dict[str, Any] | None, record_pa
             f"a tmux server answers on this run's socket {socket!r}, but the run's sandbox record {record_path}"
             f" is gone, so its ownership cannot be established; refusing to start a session there ({stop_hint})"
         )
-    value = sessions.server_environment(socket, "SANDBOX_RUNTIME")
+    value = sessions.server_environment(socket, "SANDBOX_RUNTIME", timeout=PROBE_TIMEOUT_SECONDS)
     if value != "1":
         raise PmError(
             f"a tmux server answers on this run's socket {socket!r} without SANDBOX_RUNTIME=1 (found {value!r}):"
@@ -1851,22 +1857,39 @@ def scavenge_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
 
 
 def _git_toplevel(directory: Path) -> Path | None:
-    """The real path of the git toplevel `directory` lies in, or None when it
-    lies in no repository (or git cannot say)."""
-    code, top, _err = git_ops.git_result(directory, "rev-parse", "--show-toplevel")
-    return _real(top.strip()) if code == 0 and top.strip() else None
+    """The real path of the git toplevel `directory` lies in, or None when
+    git reports that it lies in no repository (exit 128, "not a git
+    repository").
+
+    Any other failure raises PmError naming `directory` and git's stderr: a
+    dossier whose git configuration is broken must not read as no
+    repository, which would drop its brief's pin and accept an unsandboxed
+    launch."""
+    # `LC_ALL=C`: the "not a git repository" text below must not be localised.
+    code, top, err = git_ops.git_result(directory, "rev-parse", "--show-toplevel", env={"LC_ALL": "C"})
+    if code == 0 and top.strip():
+        return _real(top.strip())
+    if code == 128 and "not a git repository" in err:
+        return None
+    raise PmError(
+        f"git could not say which repository {directory} lies in (exit {code}):"
+        f" {err.strip() or 'no output'}; refusing to read it as no repository"
+    )
 
 
 def find_brief(path: Path | str) -> Path | None:
     """The dossier brief a campaign launcher at `path` sits under: `brief.md`
     at the root of the dossier, which is the git toplevel of the directory
-    holding the launcher. None when that root holds no `brief.md`, or the
-    launcher lies in no git repository (an unpinned launch, as when no brief
-    is found). A `brief.md` anywhere below the root is not the brief.
+    holding the launcher. None when that root holds no `brief.md`, or git
+    reports that the launcher lies in no repository (an unpinned launch, as
+    when no brief is found). A `brief.md` anywhere below the root is not the
+    brief.
 
-    PmError when the toplevel of the launcher's directory as given differs
-    from that of its real path's (a launcher symbolically linked in from
-    another place): which brief governs it would depend on the spelling."""
+    PmError when git fails to find the toplevel for any other reason (a
+    broken git configuration, say; see `_git_toplevel`), and when the
+    toplevel of the launcher's directory as given differs from that of its
+    real path's (a launcher symbolically linked in from another place):
+    which brief governs it would depend on the spelling."""
     given = Path(path).expanduser()
     real = _real(given)
     toplevel, real_toplevel = (

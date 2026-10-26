@@ -1986,6 +1986,24 @@ class TestReviewInsideSandbox(SandboxedReviewTestCase):
             err,
         )
 
+    def test_recorded_sandbox_without_its_control_dir_or_record_refuses_before_any_artifact(self) -> None:
+        """No record in the control directory, then no control directory:
+        nothing to wrap the reviewer from, so each commission is refused
+        before it writes (and so leaves the run as it found it)."""
+        token, run_dir = self._ready_run()
+        control = self._record_sandbox(token, run_dir, socket="pm-run-x", tmpdir=self.repo.parent / "tmp")
+        for missing in ("record", "control dir"):
+            with self.subTest(missing=missing):
+                if missing == "record":
+                    (control / sandbox_mod.RECORD_NAME).unlink()
+                else:
+                    shutil.rmtree(control)
+                code, _out, err, launched = self._review(token, sandbox_runtime=False)
+                self.assertEqual(code, 2, err)
+                self.assertIn(f"sandbox record is missing: {control / sandbox_mod.RECORD_NAME}", err)
+                self.assertIsNone(launched)
+                self.assertEqual(list((run_dir / "slices" / "slice-001").glob("review-*")), [])
+
     def test_recorded_sandbox_without_srt_on_path_refuses_before_launching(self) -> None:
         """Only the `srt` lookup fails, so every other tool still resolves."""
         token, run_dir = self._ready_run()

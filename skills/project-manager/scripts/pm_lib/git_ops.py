@@ -11,6 +11,7 @@ never silently crosses a ``/``.
 from __future__ import annotations
 
 import re
+import os
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -28,14 +29,17 @@ def git(repo: Path, *args: str) -> str:
     return stdout.strip()
 
 
-def git_result(repo: Path, *args: str) -> tuple[int, str, str]:
-    """Run git, never raising. Returns (returncode, stdout, stderr) unstripped."""
+def git_result(repo: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    """Run git, never raising. Returns (returncode, stdout, stderr) unstripped.
+    `env` is added to the inherited environment (a caller that must read
+    git's message pins `LC_ALL=C`, so the text is not localised)."""
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env={**os.environ, **env} if env else None,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -72,13 +76,22 @@ def gitlinks(repo: Path) -> list[str]:
     Read from `git ls-files --stage -z`, which lists the index and executes no
     repository configuration, unlike `git status` and `git diff`, which
     recurse into a populated submodule and run its configuration (for example
-    `core.fsmonitor`) on the host. `-z` keeps unusual path names unquoted.
-    Raises PmError when git fails, so a caller never reads a failed listing
-    as "no gitlinks".
+    `core.fsmonitor`) on the host. `-z` keeps unusual path names unquoted,
+    and the listing is read as bytes, each path decoded with
+    `surrogateescape`: a tracked path that is not UTF-8 must not make every
+    status read raise. Raises PmError when git fails, so a caller never
+    reads a failed listing as "no gitlinks".
     """
-    returncode, stdout, stderr = git_result(repo, "ls-files", "--stage", "-z")
-    if returncode != 0:
-        raise PmError(stderr.strip() or stdout.strip() or "git ls-files failed")
+    result = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--stage", "-z"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise PmError(stderr or "git ls-files failed")
+    stdout = result.stdout.decode("utf-8", "surrogateescape")
     paths: list[str] = []
     for entry in stdout.split("\0"):
         # Each entry is "<mode> <object> <stage>\t<path>"; the metadata holds
