@@ -24,7 +24,6 @@ import re
 import shlex
 import shutil
 import signal
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -354,8 +353,10 @@ def init_run(
     outside, the plan's directory readable), `reviewer-policy.json`,
     `attach-policy.json` and the record (no pids yet), the temp dir is
     created, and run state gains the MAC-protected `sandbox` block. The
-    server is not started here: `start-slice` starts it. A failure after the
-    run directory exists removes the control and temp directories this call
+    server is not started here: `start-slice` starts it. A failure at any
+    step after the run directory exists, in the sandbox setup or in the
+    steps every init ends with (the `.pm` gitignore, the artifact directory,
+    the `init` event), removes the control and temp directories this call
     created and leaves the run directory, whose token was never printed.
     """
     if not _executable_exists("tmux"):
@@ -454,30 +455,24 @@ def init_run(
         socket = f"{sandbox.RUN_SOCKET_PREFIX}{run_id}"
         common = Path(git_ops.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
         control = sandbox.control_dir(common, socket)
-        planned_tmpdir = Path(tempfile.gettempdir()) / f"{sandbox.TMPDIR_PREFIX}{socket}"
+        planned_tmpdir = sandbox.run_tmpdir(socket)
         for path, what in ((control, "control dir"), (planned_tmpdir, "temp dir")):
             if os.path.lexists(path):
                 raise PmError(f"sandbox {what} already exists: {path}; another run may own socket {socket}")
-        control_root = control.parent  # <common git dir>/pm-sandbox, which every policy denies
-        derived[sandbox.POLICY_NAME] = sandbox.derive_policy(
+        derived = sandbox.derive_run_policies(
             sandbox_base,
-            worktree=repo,
+            repo=repo,
             branch=resolved_branch,
             socket=socket,
             tmpdir=planned_tmpdir,
-            control_root=control_root,
-            pm_inside=False,
-            extra_read=[plan_path.parent],
+            control_root=control.parent,  # <common git dir>/pm-sandbox, which every policy denies
+            plan_dir=plan_path.parent,
         )
-        derived[sandbox.REVIEWER_POLICY_NAME] = sandbox.derive_reviewer_policy(
-            sandbox_base, worktree=repo, tmpdir=planned_tmpdir, control_root=control_root, extra_read=[plan_path.parent]
-        )
-        derived[sandbox.ATTACH_POLICY_NAME] = sandbox.derive_attach_policy(
-            sandbox_base, socket=socket, control_root=control_root
-        )
-        sandbox.check_binaries(derived[sandbox.POLICY_NAME])
-        sandbox.check_binaries(derived[sandbox.REVIEWER_POLICY_NAME])
 
+    note = (
+        f"harness={harness} branch={resolved_branch} slices={len(slices)} "
+        f"protected={len(policy_block['protected_paths'])}"
+    )
     state, token, run_dir = state_mod.create_run(
         repo,
         plan_path=plan_path,
@@ -492,7 +487,9 @@ def init_run(
         run_tag=run_tag,
     )
 
-    if sandbox_base is not None:
+    if sandbox_base is None:
+        _finish_init(repo, run_dir, state["run_id"], note)
+    else:
         # What this call created, and so may remove on failure.
         control_created = False
         tmpdir: Path | None = None
@@ -504,7 +501,7 @@ def init_run(
             control_created = True
             tmpdir = sandbox.make_tmpdir(socket)
             for name, content in derived.items():
-                (control / name).write_text(json.dumps(content, indent=2) + "\n", encoding="utf-8")
+                sandbox.write_control_file(control, name, content)
             sandbox.write_record(
                 control,
                 worktree=str(repo),
@@ -525,6 +522,7 @@ def init_run(
                 "control_dir": str(control),
             }
             state_mod.save_state(run_dir, state, token)
+            _finish_init(repo, run_dir, state["run_id"], f"{note} sandbox={socket}")
         except BaseException as exc:
             # Cleanup must never replace the failure it is cleaning up after.
             removed: list[str] = []
@@ -546,16 +544,6 @@ def init_run(
                 raise
             raise PmError(f"{exc}; {left}") from exc
 
-    write_pm_gitignore(repo)
-    (run_artifact_dir(repo, state["run_id"]) / "slices").mkdir(parents=True, exist_ok=True)
-    note = (
-        f"harness={harness} branch={resolved_branch} slices={len(slices)} "
-        f"protected={len(policy_block['protected_paths'])}"
-    )
-    if sandbox_base is not None:
-        note += f" sandbox={socket}"
-    state_mod.append_event(run_dir, "init", note=note)
-
     return InitResult(
         run_id=state["run_id"],
         run_dir=run_dir,
@@ -565,6 +553,14 @@ def init_run(
         branch=resolved_branch,
         sandbox_warnings=sandbox_warnings,
     )
+
+
+def _finish_init(repo: Path, run_dir: Path, run_id: str, note: str) -> None:
+    """`init`'s last steps once run state is saved: the `.pm` gitignore, the
+    run's artifact directory and the `init` event."""
+    write_pm_gitignore(repo)
+    (run_artifact_dir(repo, run_id) / "slices").mkdir(parents=True, exist_ok=True)
+    state_mod.append_event(run_dir, "init", note=note)
 
 
 def _executable_exists(executable: str) -> bool:
@@ -916,9 +912,12 @@ def start_slice(
     when the server on the socket is not this run's), and then creates the
     session through that server (`sessions.start_session_via_server`), never
     with a bare `new-session`; the outcome's `server_started_on` names the
-    socket when this call started the server. An all-attested run is
+    socket when this call started the server; after a `stop` removed the
+    run's sandbox, that call rebuilds it first. An all-attested run is
     completed here, and a sandboxed one torn down (`sandbox.teardown_run`),
-    its notes in `sandbox_notes`.
+    its notes in `sandbox_notes`; on a run already complete the teardown is
+    retried whenever anything of its sandbox is left (`sandbox.sandbox_left`),
+    so a teardown that failed at the run end can be finished.
     """
     state = load_writable_state(run_dir, token)
     sandbox.require_run_socket(state)
@@ -952,12 +951,16 @@ def start_slice(
             # so an all-attested run reaches completion here rather than
             # idling as "active" forever.
             sandbox_notes: list[str] | None = None
-            if state.get("status") != "complete":
+            completing = state.get("status") != "complete"
+            if completing:
                 state["status"] = "complete"
                 state["stop_reason"] = None
                 state_mod.save_state(run_dir, state, token)
                 state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
-                # The run end takes a sandboxed run's server down with it.
+            # The run end takes a sandboxed run's server down with it; on a run
+            # already complete, a teardown that failed before is retried while
+            # anything of the sandbox is left.
+            if completing or sandbox.sandbox_left(state, repo=repo):
                 try:
                     sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir)
                 finally:
@@ -1834,7 +1837,8 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     unless `PM_TMUX_SOCKET` names the run's socket. The accept that completes
     the run also tears the run's sandbox down (`sandbox.teardown_run`: the
     server, its temp and control directories, a `sandbox-stopped` event) and
-    returns what that did in `sandbox_notes`.
+    returns what that did in `sandbox_notes`. A teardown that fails there
+    leaves the run complete; the next `start-slice` retries it.
     """
     stripped_reasoning = reasoning.strip()
     if len(stripped_reasoning) < _ACCEPT_REASONING_MIN_CHARS:

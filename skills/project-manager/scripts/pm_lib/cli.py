@@ -503,6 +503,8 @@ def _run_status(args: argparse.Namespace) -> int:
 
     if args.report:
         state = state_mod.load_state(run_dir, token)
+        # Refused like plain `status`, so the two forms never disagree.
+        sandbox.require_run_socket(state)
         report_path = slice_ops.regenerate_report(repo, run_dir, state)
         print(f"run report regenerated: {report_path}")
         mirror_path = slice_ops.run_artifact_dir(repo, state["run_id"]) / "run-report.md"
@@ -1005,7 +1007,8 @@ def _run_stop(args: argparse.Namespace) -> int:
         # never falls through to the sweep below: that sweep would reach
         # whichever server PM_TMUX_SOCKET names, not the run's.
         try:
-            readable = state_mod.load_state(state_mod.resolve_run_dir(repo, args.run))
+            readable_dir = state_mod.resolve_run_dir(repo, args.run)
+            readable = state_mod.load_state(readable_dir)
         except PmError:
             readable = None
         if readable is not None:
@@ -1014,6 +1017,8 @@ def _run_stop(args: argparse.Namespace) -> int:
             except PmError as exc:
                 print(f"pm: scavenge: refused ({exc}); nothing was swept", file=sys.stderr)
                 return 2
+            if sandbox.records_sandbox(readable) and not _resolve_token(args):
+                return _scavenge_without_token(repo, readable_dir, readable)
         try:
             token = _require_token(args)
             run_dir = state_mod.resolve_run_dir(repo, args.run)
@@ -1049,6 +1054,24 @@ def _run_stop(args: argparse.Namespace) -> int:
     outcome = slice_ops.stop(repo, run_dir, token, reason=args.reason, slice_status=args.slice_status)
     print(f"stopped run {outcome.run_id}; killed sessions: {outcome.killed}")
     for note in outcome.sandbox_notes or []:
+        print(f"sandbox: {note}")
+    return 0
+
+
+def _scavenge_without_token(repo: Path, run_dir: Path, state: dict) -> int:
+    """`stop --scavenge` on a sandboxed run with readable state but no token:
+    the run's sessions swept and its sandbox torn down from the host-written
+    control record (`sandbox.scavenge_run`, which kills `pm-run-<run id>`),
+    with nothing written to run state, which cannot be signed without the
+    token. The run id is the run directory's own name, which `scavenge_run`
+    holds the state to, so `--run` is not needed."""
+    killed = slice_ops.stop_scavenge_sweep(run_id=run_dir.name)
+    print(f"pm: scavenge: no token, so run state was read but not updated (no stop recorded); swept sessions: {killed}")
+    try:
+        notes = sandbox.scavenge_run(state, repo=repo, run_dir=run_dir)
+    except PmError as exc:
+        raise PmError(f"scavenge: swept the run's sessions, but could not tear its sandbox down: {exc}") from exc
+    for note in notes or []:
         print(f"sandbox: {note}")
     return 0
 
