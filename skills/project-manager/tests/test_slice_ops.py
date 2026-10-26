@@ -2118,7 +2118,7 @@ class TestRunSocketRefusals(_SandboxedRun):
             code, _out, err = self.run_cli_in_repo(["status", "--report"])
         self.assertEqual(code, 0, err)
         report = (self.run_dir / "run-report.md").read_text(encoding="utf-8")
-        self.assertIn(f"- {line}\n", report)
+        self.assertIn(f"- S{line[1:]}\n", report)
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")

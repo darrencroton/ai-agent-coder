@@ -662,7 +662,7 @@ class TestRunReportHeader(PlanTestCase):
         text = self._header(sandbox=sandbox)
         self.assertIn(
             "- Plan: /plan.md (sha256 aaaaaaaaaaaa…)\n"
-            f"- sandbox: /ops/sandbox.json (sha256 {'b' * 12}) socket pm-run-20260729T000000Z-abcdef\n",
+            f"- Sandbox: /ops/sandbox.json (sha256 {'b' * 12}) socket pm-run-20260729T000000Z-abcdef\n",
             text,
         )
         self.assertNotIn("sandbox", self._header().lower())

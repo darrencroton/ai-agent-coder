@@ -605,9 +605,9 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     lines.append(f"- Plan: {plan_info.get('path')} (sha256 {plan_sha}…)")
     sandbox_info = state.get("sandbox")
     if isinstance(sandbox_info, dict):
-        # The same line `status` prints for a sandboxed run.
+        # The line `status` prints for a sandboxed run, capitalised like its neighbours.
         lines.append(
-            f"- sandbox: {sandbox_info.get('policy')} (sha256 {(sandbox_info.get('policy_sha256') or '')[:12]}) "
+            f"- Sandbox: {sandbox_info.get('policy')} (sha256 {(sandbox_info.get('policy_sha256') or '')[:12]}) "
             f"socket {sandbox_info.get('socket')}"
         )
     lines.append(
