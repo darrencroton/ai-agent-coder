@@ -11,6 +11,8 @@ PM commissions every independent review itself, after implementation, against a 
 > this file, including the authorization statement, so no reviewer-facing
 > prose lives in `prompts.py`.
 
+The `[sandboxed]` … `[/sandboxed]` marker contract is the one stated in `developer-prompt.md`: it applies to this template unchanged.
+
 ```md
 REVIEWER MODE: you are a read-only independent Reviewer commissioned by Project Manager. No edits, no file creation, no Git or state-changing commands, no re-delegation, no acceptance decisions — report findings and stop.
 

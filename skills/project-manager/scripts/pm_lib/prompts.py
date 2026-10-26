@@ -45,6 +45,10 @@ _SANDBOX_BLOCK_RE = re.compile(r"^\[sandboxed\]\n(?P<body>.*?)\n\[/sandboxed\]\n
 # whose paragraph would otherwise reach the seat unannounced or with its
 # markers.
 _SANDBOX_MARKERS = ("[sandboxed]", "[/sandboxed]")
+# A block body holding either marker, even a slightly malformed one such as
+# `[/sandboxed ]`, means the pattern ran past a closer it did not recognise
+# and swallowed the prose of the next block; `_apply_sandbox_block` refuses it.
+_SANDBOX_MARKER_PREFIX_RE = re.compile(r"\[/?sandboxed")
 
 _STEER_MESSAGE_HEADING = "## Steer Message Template"
 _LAUNCH_POINTER_HEADING = "## Launch Pointer"
@@ -123,6 +127,29 @@ def _render(template: str, path: Path, what: str, **fields: Any) -> str:
         ) from exc
 
 
+def _apply_sandbox_block(source: str, path: Path, label: str, sandboxed: bool) -> str:
+    """Resolve the template's `[sandboxed]` paragraphs for one render.
+
+    Returns `source` with every matched block replaced by its body (when
+    `sandboxed`) or removed. Refuses, in both modes and naming `path`, a
+    template whose markers do not pair up: a match whose body holds another
+    marker (a malformed closer let the non-greedy pattern swallow the prose
+    between two blocks) or a marker left after the substitution. Refuses a
+    sandboxed render of a template with no block or an empty one, since the
+    session would run inside a boundary it was never told about. `label`
+    names the template in the error text.
+    """
+    matches = list(_SANDBOX_BLOCK_RE.finditer(source))
+    template = _SANDBOX_BLOCK_RE.sub(r"\g<body>\n\n" if sandboxed else "", source)
+    if any(_SANDBOX_MARKER_PREFIX_RE.search(match.group("body")) for match in matches) or any(
+        marker in template for marker in _SANDBOX_MARKERS
+    ):
+        raise PmError(f"{label} template has a malformed [sandboxed] block: {path}")
+    if sandboxed and not (matches and all(match.group("body").strip() for match in matches)):
+        raise PmError(f"{label} template has an empty or no [sandboxed] paragraph for a sandboxed render: {path}")
+    return template
+
+
 def render_developer_prompt(
     plan_slice: PlanSlice,
     *,
@@ -166,15 +193,7 @@ def render_developer_prompt(
     """
     template_path = reference_path or _DEFAULT_REFERENCE_PATH
     source = load_template(template_path)
-    bodies = [match.group("body") for match in _SANDBOX_BLOCK_RE.finditer(source)]
-    template = _SANDBOX_BLOCK_RE.sub(r"\g<body>\n\n" if sandboxed else "", source)
-    if any(marker in template for marker in _SANDBOX_MARKERS):
-        raise PmError(f"developer prompt template has a malformed [sandboxed] block: {template_path}")
-    if sandboxed and not (bodies and all(body.strip() for body in bodies)):
-        raise PmError(
-            f"developer prompt template has an empty or no [sandboxed] paragraph "
-            f"for a sandboxed launch: {template_path}"
-        )
+    template = _apply_sandbox_block(source, template_path, "developer prompt", sandboxed)
     sections = plan_slice.sections
     lint_script = (skills_root or _DEFAULT_SKILLS_ROOT) / "lint" / "scripts" / "lint.py"
     fields: dict[str, Any] = {
@@ -366,14 +385,7 @@ def render_reviewer_prompt(
     """
     template_path = reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH
     source = load_template(template_path)
-    bodies = [match.group("body") for match in _SANDBOX_BLOCK_RE.finditer(source)]
-    template = _SANDBOX_BLOCK_RE.sub(r"\g<body>\n\n" if sandboxed else "", source)
-    if any(marker in template for marker in _SANDBOX_MARKERS):
-        raise PmError(f"reviewer prompt template has a malformed [sandboxed] block: {template_path}")
-    if sandboxed and not (bodies and all(body.strip() for body in bodies)):
-        raise PmError(
-            f"reviewer prompt template has an empty or no [sandboxed] paragraph for a sandboxed review: {template_path}"
-        )
+    template = _apply_sandbox_block(source, template_path, "reviewer prompt", sandboxed)
     skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root)
     changed_files_text = "\n".join(f"  - {path}" for path in changed_files) if changed_files else "  - (none)"
     fields: dict[str, Any] = {

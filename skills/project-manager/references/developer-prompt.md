@@ -10,6 +10,8 @@ PM renders this template for each slice launch and delivers it to a fresh Develo
 > example, a shell `${{var}}`) must be escaped as `{{`/`}}` or rendering will
 > raise at runtime.
 
+A paragraph between a line that is exactly `[sandboxed]` and a line that is exactly `[/sandboxed]`, followed by a blank line, is the template's sandbox notice. `prompts` renders it, markers removed, only for a sandboxed run and removes the whole block otherwise, so an unsandboxed render is exactly the template without it. The markers must pair up as exact lines of their own (no prefix, no trailing space, and a blank line after the closer) or rendering refuses, sandboxed or not, naming this file; a sandboxed render also refuses a template with no such paragraph or an empty one. `prompts` renders only the fenced block, so a marker outside it has no effect. `reviewer-prompt.md` uses the same markers.
+
 ```md
 You are the Developer for one slice of a frozen implementation plan, supervised by Project Manager.
 
