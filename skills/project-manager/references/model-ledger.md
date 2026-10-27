@@ -58,10 +58,11 @@ Either judgment is corrected by recording a superseding one, and reviewer rating
 
 ```bash
 pm ledger render                                             # every run → <ledger dir>/leaderboard.md
-pm ledger render --run-tag bench-q4 --out ~/boards/bench-q4.md   # only runs tagged bench-q4, in a file of its own
+pm ledger render --run-tag bench-q4                          # only runs tagged bench-q4 → <ledger dir>/leaderboard-bench-q4.md
+pm ledger render --run-tag bench-q4 --out ~/boards/bench-q4.md   # the same, in a file of your choosing
 ```
 
-**Each render replaces its output file.** Without `--out` it always writes `<ledger dir>/leaderboard.md`, so a tag-filtered render overwrites the full board there. Give each board you want to keep its own `--out`. Nothing is lost by overwriting, because the board is rebuilt from the per-run files every time. A filtered board names its tags in a "Run tags:" line at the top, and runs without a run tag are left out of it. Repeat `--run-tag` to include runs carrying any of several tags.
+**Each render replaces its output file.** Without `--out` an unfiltered render writes `<ledger dir>/leaderboard.md`, and a tag-filtered one writes `<ledger dir>/leaderboard-<tags joined by +>.md` beside it (tags sorted, characters other than letters, digits, `_`, `.` and `-` replaced by `_`), so a filtered view never overwrites the full board; the command says so. Give a board you want elsewhere its own `--out`. Nothing is lost by overwriting, because the board is rebuilt from the per-run files every time. A filtered board names its tags in a "Run tags:" line at the top, and runs without a run tag are left out of it. Repeat `--run-tag` to include runs carrying any of several tags.
 
 The output depends only on the files and the output location, never on the clock, so the same files rendered to the same place always give the same bytes. The location matters because the board's History link is written relative to it. The write is atomic, so a failed render leaves the previous board intact. The command exits 2, naming the directory it searched, when it finds no files or no run carries any of the given tags.
 
@@ -70,7 +71,7 @@ The output depends only on the files and the output location, never on the clock
 - Score (PM), mean; first-submission criteria met as Σk/Σn; first-submission P0+P1 and P2+P3 defects, mean; Developer time per submission, median (from the submission's start to the next floor check, decision or submission: a proxy that includes whatever waiting happened before the PM's first check).
 - Windows; accepted share; accepted on the first submission; scored submissions per window; steers plus nudges per window; wall time per window, median; Δ lines per category (code/comment/blank medians); Δ complexity. These window-level columns count a window only when all its scored submissions share one identity; mixed windows are counted in a footnote.
 
-**Reviewer tables**, one per skill, group rows the same way plus whether a custom command ran the review: commissions; usable share (rated over rated plus unavailable plus failed); Score (PM), mean; panels; pairwise win share across every panel order the reviewer appeared in (a close call is still a full win); close-call win share. Two commissions of one configuration in the same panel are never paired against each other. Code-review tables rank by pairwise wins, drift-audit tables by PM score.
+**Reviewer tables**, one per skill, group rows the same way plus whether a custom command ran the review: commissions; usable share (rated over rated plus unavailable plus failed); Score (PM), mean; review time, median seconds (the review record's `at` minus `launched_at`, `n/a` for reviews recorded without a `launched_at`, so a panel can be chosen with its cost beside its ratings); panels; pairwise win share across every panel order the reviewer appeared in (a close call is still a full win); close-call win share. Two commissions of one configuration in the same panel are never paired against each other. Code-review tables rank by pairwise wins, drift-audit tables by PM score.
 
 Rows with fewer than three windows (Developers) or three commissions (Reviewers) are listed unranked under "Insufficient data". The "As of" line is the latest decision in the kept files. An "Errors" section names any file that was skipped and why.
 

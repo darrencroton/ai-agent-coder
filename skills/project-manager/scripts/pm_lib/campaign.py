@@ -51,7 +51,7 @@ import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import PmError
 from . import git_ops
@@ -89,6 +89,8 @@ _SOCKET_NAME_MAX = 64
 # What a child's server may host: its own `campaign-*` session and the
 # `pm-*` Developer sessions the child launches. Anything else is a bystander.
 _OWNED_SESSION_RE = re.compile(r"^(campaign|pm)-")
+# Matches `cm-answer-<n>.md`; `answer-child --redeliver` re-sends the highest `<n>`.
+_ANSWER_FILE_RE = re.compile(r"^cm-answer-(\d+)\.md$")
 # The server-environment mark `launch-child` sets on a child's server: the
 # worktree it was launched for. `stop-child` kills no server without it.
 _OWNER_ENV_VAR = "PM_CHILD_WORKTREE"
@@ -256,6 +258,12 @@ class LaunchChildOutcome:
     control_dir: Path | None = None
     # What `sandbox.load_pinned_policy` warned about, for the caller to print.
     sandbox_warnings: list[str] = field(default_factory=list)
+    # The new worktree's own git directory (where its run state lives), and the
+    # launcher's node directory with the dossier HEAD it was clean at (None
+    # when the launcher lies in no repository).
+    git_dir: Path | None = None
+    node_dir: Path | None = None
+    dossier_commit: str | None = None
 
 
 @dataclass
@@ -283,6 +291,9 @@ class _ChildLaunch:
     srt_version: str | None = None
     control_dir: Path | None = None
     launcher_dir: Path | None = None
+    # The launcher's directory and the dossier HEAD, when it lies in a repository.
+    node_dir: Path | None = None
+    dossier_commit: str | None = None
 
 
 # A worktree setup script that has not finished in this long is hung, and a
@@ -338,6 +349,12 @@ def launch_child(
     attach under the attach policy. When the launcher's dossier brief pins a
     policy (`## Sandbox`), `sandbox` is required and must match the pin.
 
+    The launcher's directory (the node directory of the dossier) must be
+    committed: when it lies in a git repository, uncommitted or untracked files
+    there refuse the launch, naming them, and the manifest records that
+    directory and the dossier HEAD (`node_dir`, `dossier_commit`). A launcher
+    in no repository records both as null and is not refused.
+
     There is no rollback: a failure after the worktree exists names the
     branch and worktree left behind for the CM to remove by hand, and a
     failure after the session started also captures the pane to `pane.txt`
@@ -374,6 +391,9 @@ def launch_child(
     if launch.control_dir is not None:
         watch = f"srt -s {shlex.quote(str(launch.control_dir / _ATTACH_POLICY_FILE))} {watch}"
     return LaunchChildOutcome(
+        git_dir=git_ops.worktree_git_dir(launch.worktree),
+        node_dir=launch.node_dir,
+        dossier_commit=launch.dossier_commit,
         session=launch.session,
         socket=launch.socket,
         worktree=launch.worktree,
@@ -453,6 +473,7 @@ def _check_launch_preconditions(
             raise PmError(f"the launcher's dossier brief could not be read: {brief} ({exc})") from exc
         except PmError as exc:
             raise PmError(f"{exc} (in {brief})") from exc
+    node_dir, dossier_commit = _committed_node_dir(prompt_file)
     if pin is not None and sandbox is None:
         raise PmError(
             f"the launcher's dossier brief {brief} pins a sandbox policy, SHA-256 `{pin}`; launch with --sandbox "
@@ -560,7 +581,50 @@ def _check_launch_preconditions(
         srt_version=srt_version,
         control_dir=control_dir,
         launcher_dir=prompt_file.expanduser().resolve().parent,
+        node_dir=node_dir,
+        dossier_commit=dossier_commit,
     )
+
+
+def _committed_node_dir(prompt_file: Path) -> tuple[Path | None, str | None]:
+    """`(node dir, dossier HEAD)` for a launcher whose directory is committed.
+
+    The node directory is the launcher's own directory. `(None, None)` when it
+    lies in no git repository (git's exit 128, "not a git repository"); every
+    other git failure raises, because a broken repository must not read as none.
+    PmError naming the files when the directory holds uncommitted or untracked
+    ones: the plan the child is given must be the plan on record.
+    """
+    node_dir = prompt_file.expanduser().resolve().parent
+    # `LC_ALL=C`: the "not a git repository" text below must not be localised.
+    code, _top, err = git_ops.git_result(node_dir, "rev-parse", "--show-toplevel", env={"LC_ALL": "C"})
+    if code == 128 and "not a git repository" in err:
+        return None, None
+    if code != 0:
+        raise PmError(
+            f"git could not say which repository {node_dir} lies in (exit {code}): {err.strip() or 'no output'}; "
+            "refusing to read it as no repository"
+        )
+    git_ops.refuse_gitlinks(node_dir)
+    code, status, err = git_ops.git_result(
+        node_dir, "status", "--short", "--untracked-files=all", "--no-renames", "--", "."
+    )
+    if code != 0:
+        raise PmError(f"git status of {node_dir} failed: {err.strip() or status.strip() or 'no output'}")
+    dirty = [line for line in status.splitlines() if line.strip()]
+    if dirty:
+        raise PmError(
+            f"the launcher's node directory {node_dir} has uncommitted or untracked files; commit them before "
+            "launching, so the child's plan is the recorded one: " + "; ".join(dirty)
+        )
+    # `status` never lists an ignored file, so the launcher itself must be tracked.
+    code, _out, err = git_ops.git_result(node_dir, "ls-files", "--error-unmatch", "--", prompt_file.name)
+    if code != 0:
+        raise PmError(
+            f"the launcher {prompt_file} is not tracked in its repository (ignored, or never added); commit it "
+            f"before launching, so the child's plan is the recorded one: {err.strip() or 'no output'}"
+        )
+    return node_dir, git_ops.git_head(node_dir)
 
 
 def _create_node_worktree(launch: _ChildLaunch) -> Path:
@@ -905,6 +969,8 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
         try:
             sessions.set_server_environment(socket, _OWNER_ENV_VAR, str(worktree))
             manifest["launched_at"] = state_mod.utc_now_iso()
+            manifest["dossier_commit"] = launch.dossier_commit
+            manifest["node_dir"] = str(launch.node_dir) if launch.node_dir is not None else None
             if control is not None:
                 manifest["sandbox"] = {
                     "policy": str(launch.sandbox),
@@ -983,14 +1049,16 @@ def _result_status(worktree: Path, path: Path) -> str | None:
     return status if isinstance(status, str) else None
 
 
-def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome:
+def wait_child(worktree: Path, *, wait: float | None = None, seen_markers: Sequence[str] = ()) -> WaitChildOutcome:
     """`observe`'s loop for a child, without run state: evidence, never a decision.
 
     Polls every two seconds, writing the visible pane to `pane-live.txt` on
     each poll, and returns early only on session death, `child-result.json`
     or `cm-question.md` appearing, or a dialog marker on the visible pane —
-    never on a pane change, which a working TUI produces constantly. Without
-    `wait` it polls once. Once the manifest has loaded nothing here raises
+    never on a pane change, which a working TUI produces constantly. A marker
+    whose matched literal equals one of `seen_markers` does not end the wait
+    (any other marker does) but is still reported on return. Without `wait` it
+    polls once. Once the manifest has loaded nothing here raises
     for an ordinary failure: a read that fails is reported in the outcome
     instead. The one exception is a symlink, hard link or non-regular file
     planted under `.pm/` at `child-result.json` or `cm-question.md`: the
@@ -1027,7 +1095,7 @@ def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome
             dialog_markers = observation.dialog_markers
             running = sessions.session_exists(session)
             if (
-                dialog_markers["present"]
+                sessions.unseen_markers(dialog_markers, seen_markers)
                 or not running
                 or pm_paths.pm_file_present(worktree, result_path)
                 or pm_paths.pm_file_present(worktree, question_path)
@@ -1041,7 +1109,13 @@ def wait_child(worktree: Path, *, wait: float | None = None) -> WaitChildOutcome
 
     result_present = pm_paths.pm_file_present(worktree, result_path)
     question_present = pm_paths.pm_file_present(worktree, question_path)
-    no_signal = bool(wait) and running and not result_present and not question_present and not dialog_markers["present"]
+    no_signal = (
+        bool(wait)
+        and running
+        and not result_present
+        and not question_present
+        and not sessions.unseen_markers(dialog_markers, seen_markers)
+    )
     runs, runs_error = _runs_or_error(worktree)
     return WaitChildOutcome(
         session=session,
@@ -1068,35 +1142,83 @@ class AnswerChildOutcome:
     answer_path: Path
     question_archived_path: Path
     answer_number: int
+    # False when the pane did not change after the pointer's Enter (see `sessions.Delivery`).
+    delivered: bool = True
 
 
-def answer_child(worktree: Path, *, text: str) -> AnswerChildOutcome:
-    """Deliver the CM's answer to the child's open `cm-question.md`.
+def answer_child(worktree: Path, *, text: str | None = None, redeliver: bool = False) -> AnswerChildOutcome:
+    """Deliver the CM's answer to the child's open `cm-question.md`, or re-send the last one.
 
-    Refused, before any file is touched, with no live session, no open
-    question, a completion file already present, or blank text. Delivery is
-    `slice_ops.deliver_answer` with the `cm-` prefix — the helper behind
+    With `text`: refused, before any file is touched, with no live session, no
+    open question, a completion file already present, or blank text. Delivery
+    is `slice_ops.deliver_answer` with the `cm-` prefix — the helper behind
     `pm answer`, with its numbering and its failure handling.
+
+    With `redeliver` (and no `text`): re-sends the pointer for the
+    highest-numbered `cm-answer-<n>.md` through `sessions.send_line` and writes
+    nothing. Refused with no live session, an open `cm-question.md` (a newer
+    question the answer does not address), a completion file, or no answer file.
     """
+    if redeliver == (text is not None):
+        raise PmError("answer-child takes exactly one of --text (answer the open question) and --redeliver")
     worktree = worktree.expanduser().resolve()
     manifest = load_manifest(worktree)
     session = manifest["session"]
     directory = campaign_dir(worktree)
     question_path = directory / "cm-question.md"
+    result_path = directory / "child-result.json"
     with _tmux_socket(manifest["socket"]):
         if not sessions.session_exists(session):
             raise PmError(f"no live child session {session} on tmux server {manifest['socket']}")
+        if redeliver:
+            return _redeliver_answer(worktree, directory, session)
+        assert text is not None
         if not pm_paths.pm_file_present(worktree, question_path):
             raise PmError(f"no open child question: {question_path} does not exist")
-        if pm_paths.pm_file_present(worktree, directory / "child-result.json"):
-            raise PmError(
-                f"the child has written its completion file ({directory / 'child-result.json'}); "
-                "an answer cannot reach a finished run"
-            )
+        _refuse_if_child_finished(worktree, result_path)
         if not text.strip():
             raise PmError("--text answer must be non-empty (there is nothing to deliver)")
-        answer_path, archived_path, number = slice_ops.deliver_answer(worktree, directory, "cm-", session, text)
-    return AnswerChildOutcome(answer_path=answer_path, question_archived_path=archived_path, answer_number=number)
+        answer_path, archived_path, number, delivery = slice_ops.deliver_answer(
+            worktree, directory, "cm-", session, text
+        )
+    return AnswerChildOutcome(
+        answer_path=answer_path,
+        question_archived_path=archived_path,
+        answer_number=number,
+        delivered=bool(delivery.confirmed),
+    )
+
+
+def _refuse_if_child_finished(worktree: Path, result_path: Path) -> None:
+    if pm_paths.pm_file_present(worktree, result_path):
+        raise PmError(
+            f"the child has written its completion file ({result_path}); an answer cannot reach a finished run"
+        )
+
+
+def _redeliver_answer(worktree: Path, directory: Path, session: str) -> AnswerChildOutcome:
+    """Re-send the pointer for the highest-numbered answer; `answer_child` has checked the session."""
+    question_path = directory / "cm-question.md"
+    if pm_paths.pm_file_present(worktree, question_path):
+        raise PmError(
+            f"{question_path} is open: a newer question is waiting for an answer, not a re-send of the last one"
+        )
+    _refuse_if_child_finished(worktree, directory / "child-result.json")
+    matches = (_ANSWER_FILE_RE.match(path.name) for path in directory.glob("cm-answer-*.md"))
+    numbers = [int(match.group(1)) for match in matches if match]
+    if not numbers:
+        raise PmError(f"no answer to re-send: {directory} holds no cm-answer-<n>.md")
+    number = max(numbers)
+    answer_path = directory / f"cm-answer-{number}.md"
+    if not pm_paths.pm_file_present(worktree, answer_path):
+        raise PmError(f"no answer to re-send: {answer_path} is not a regular file")
+    delivery = sessions.send_line(session, prompts.render_answer_pointer(answer_path))
+    return AnswerChildOutcome(
+        answer_path=answer_path,
+        question_archived_path=directory / f"cm-question-{number}.md",
+        answer_number=number,
+        delivered=bool(delivery.confirmed),
+    )
 
 
 # --- stop-child -----------------------------------------------------------------

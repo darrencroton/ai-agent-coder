@@ -638,6 +638,38 @@ class TestFactCleanWorktree(FloorTestCase):
         self.assertTrue(_facts_by_name(report)["clean-worktree"].passed)
 
 
+class TestFailureData(FloorTestCase):
+    """`FloorReport.failure_data` is what the `floor` event records: only failing facts, each with its evidence."""
+
+    def _report(self, *, commit: bool, stray: bool) -> floor_mod.FloorReport:
+        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
+        if commit:
+            self._commit_authorized_change()
+        self._write_result()
+        if stray:
+            (self.repo / "stray.txt").write_text("oops\n", encoding="utf-8")
+        state = self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        )
+        self.before_head = before_head
+        return floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
+
+    def test_a_passing_floor_has_no_failure_data(self) -> None:
+        self.assertIsNone(self._report(commit=True, stray=False).failure_data())
+
+    def test_failing_facts_carry_their_heads_and_status_lines_and_serialise(self) -> None:
+        data = self._report(commit=False, stray=True).failure_data()
+
+        # The stray file is also outside the authorized surface, so the surface fact fails with it named.
+        self.assertEqual([item["fact"] for item in data["failed"]], ["surface", "commit-ancestry", "clean-worktree"])
+        surface, ancestry, worktree = data["failed"]
+        self.assertEqual(surface["evidence"]["unauthorized_files"], ["stray.txt"])
+        self.assertEqual(ancestry["evidence"]["before_head"], self.before_head)
+        self.assertEqual(ancestry["evidence"]["head"], self.before_head)
+        self.assertEqual(worktree["evidence"]["dirty_lines"], ["?? stray.txt"])
+        json.dumps(data)
+
+
 class TestFloorNeverMutates(FloorTestCase):
     def test_evaluate_floor_does_not_write_state_or_files(self) -> None:
         _plan_path, state, token, run_dir, before_head, slices = self._happy_path()

@@ -696,6 +696,111 @@ class DelegateContractTests(unittest.TestCase):
         self.assertEqual(launch_contract["parent_label"], parent["label"])
         self.assertEqual(launch_contract["parent_session_id"], parent["session_id"])
 
+    def launch(self, policy: dict, request: dict) -> tuple[int, mock.Mock]:
+        """Run ``command_launch`` with the process start mocked; return its exit code and the start mock."""
+        policy_path = self.repo / "delegate-policy.json"
+        request_path = self.repo / "delegate-request.json"
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        args = mock.Mock(run_dir=str(self.run_dir), policy=str(policy_path), request=str(request_path))
+        with mock.patch.dict(os.environ, {delegate_jobs.ARTIFACT_ROOT_ENV: str(self.artifact_root)}), mock.patch.object(
+            delegate_jobs,
+            "start_tracked_delegate",
+            return_value={"label": request["label"], "pid": 123, "run_dir": str(self.run_dir)},
+        ) as start, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = delegate_jobs.command_launch(args)
+        return code, start
+
+    def write_plan(self) -> tuple[Path, str]:
+        plan = self.repo / "plan.md"
+        plan.write_text("# frozen plan\n", encoding="utf-8")
+        return plan, delegate_contract.sha256_path(plan)
+
+    def test_policy_plan_path_accepts_the_files_digest_and_records_it(self):
+        plan, digest = self.write_plan()
+        policy = {key: value for key, value in self.policy.items() if key != "plan_sha256"}
+        policy["plan_path"] = "plan.md"
+        request = dict(self.request, plan_sha256=digest)
+        code, start = self.launch(policy, request)
+        self.assertEqual(code, 0)
+        evidence = start.call_args.kwargs["launch_contract"]
+        self.assertEqual(evidence["plan_sha256"], digest)
+        self.assertEqual(evidence["plan_path"], str(plan.resolve()))
+
+    def test_policy_plan_path_lets_the_request_omit_the_digest(self):
+        _, digest = self.write_plan()
+        policy = {key: value for key, value in self.policy.items() if key != "plan_sha256"}
+        policy["plan_path"] = str(self.repo / "plan.md")
+        request = {key: value for key, value in self.request.items() if key != "plan_sha256"}
+        code, start = self.launch(policy, request)
+        self.assertEqual(code, 0)
+        self.assertEqual(start.call_args.kwargs["launch_contract"]["plan_sha256"], digest)
+
+    def test_policy_plan_path_rejects_a_mismatching_digest_naming_the_computed_one(self):
+        _, digest = self.write_plan()
+        policy = dict(self.policy, plan_path="plan.md")
+        policy.pop("plan_sha256")
+        with self.assertRaises(delegate_contract.DelegateContractError) as raised:
+            delegate_contract.validate_contract(policy, dict(self.request, plan_sha256="b" * 64), self.run_dir)
+        issues = {issue.code: issue for issue in raised.exception.issues}
+        self.assertIn(digest, issues["plan-digest-mismatch"].message)
+        self.assertIn(digest, issues["plan-digest-mismatch"].correction)
+        # A policy digest beside plan_path must agree with the file too.
+        with self.assertRaises(delegate_contract.DelegateContractError) as raised:
+            delegate_contract.validate_contract(
+                dict(policy, plan_sha256="b" * 64), dict(self.request, plan_sha256=digest), self.run_dir
+            )
+        self.assertEqual({issue.field for issue in raised.exception.issues}, {"policy.plan_sha256"})
+
+    def test_policy_plan_path_to_a_missing_file_fails_closed(self):
+        policy = dict(self.policy, plan_path="absent.md")
+        with self.assertRaises(delegate_contract.DelegateContractError) as raised:
+            delegate_contract.validate_contract(policy, self.request, self.run_dir)
+        self.assertIn("plan_path", {issue.field for issue in raised.exception.issues})
+
+    def test_policy_without_plan_path_still_requires_and_compares_the_digest(self):
+        no_digest = {key: value for key, value in self.request.items() if key != "plan_sha256"}
+        with self.assertRaises(delegate_contract.DelegateContractError) as raised:
+            delegate_contract.validate_contract(self.policy, no_digest, self.run_dir)
+        self.assertEqual([issue.code for issue in raised.exception.issues], ["missing-field"])
+        with self.assertRaises(delegate_contract.DelegateContractError) as raised:
+            delegate_contract.validate_contract(self.policy, dict(self.request, plan_sha256="b" * 64), self.run_dir)
+        self.assertEqual([issue.code for issue in raised.exception.issues], ["plan-digest-mismatch"])
+        self.assertNotIn("plan_path", delegate_contract.validate_contract(self.policy, self.request, self.run_dir))
+
+    def continuation_prompt(self, parent_skills: list[str], skills: list[str]) -> tuple[str, dict]:
+        parent = self.add_terminal_parent(delegate_jobs)
+        manifest = delegate_jobs.load_manifest(self.run_dir)
+        manifest["delegates"][parent["label"]]["launch_contract"] = {"required_skills": parent_skills}
+        delegate_jobs.save_manifest(self.run_dir, manifest)
+        request = dict(
+            self.request, label="01-opencode-review-r1", parent_label=parent["label"], required_skills=skills
+        )
+        code, start = self.launch(self.policy, request)
+        self.assertEqual(code, 0)
+        prompt = (self.run_dir / "01-opencode-review-r1-prompt.md").read_text(encoding="utf-8")
+        return prompt, start.call_args.kwargs["launch_contract"]
+
+    def test_continuation_with_the_parents_skills_omits_the_skill_bundle(self):
+        prompt, evidence = self.continuation_prompt(["drift-audit"], ["drift-audit"])
+        self.assertNotIn("EMBEDDED SKILL INSTRUCTIONS", prompt)
+        self.assertIs(evidence["skills_embedded"], False)
+        for section in ("TASK:", "ACCESS:", "FILES:", "CONTEXT:", "CONSTRAINTS:", "RETURN:"):
+            self.assertIn(section, prompt)
+        self.assertIn("  - drift-audit", prompt)
+
+    def test_continuation_with_different_skills_embeds_them(self):
+        prompt, evidence = self.continuation_prompt([], ["drift-audit"])
+        self.assertIn("EMBEDDED SKILL INSTRUCTIONS", prompt)
+        self.assertIs(evidence["skills_embedded"], True)
+
+    def test_first_launch_embeds_its_skills(self):
+        code, start = self.launch(self.policy, dict(self.request, required_skills=["drift-audit"]))
+        self.assertEqual(code, 0)
+        self.assertIs(start.call_args.kwargs["launch_contract"]["skills_embedded"], True)
+        prompt = (self.run_dir / f"{self.request['label']}-prompt.md").read_text(encoding="utf-8")
+        self.assertIn("EMBEDDED SKILL INSTRUCTIONS", prompt)
+
     def test_continuation_rejects_unauthorized_access_before_start(self):
         parent = self.add_terminal_parent(delegate_jobs)
         request = dict(

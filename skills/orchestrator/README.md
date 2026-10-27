@@ -27,7 +27,7 @@ Developer self-audit fallback is allowed on default slices when no read-only del
 - `scripts/delegate_sessions.py` — launch-bound session-ID discovery, all-harness activity signals, and transcript extraction
 - `tests/` — contract, launcher, lifecycle, and transcript tests
 
-Every launch records a `session_id` field and exposes source-labelled activity for all five harnesses, falling back to captured output when no owned transcript or session-store signal is available. A fresh request can continue a terminal same-run delegate by naming `parent_label` and advancing its `-rN` lineage; the helper re-validates policy and parent identity, uses only the captured parent ID, and records the lineage. See [`references/delegate-contract.md`](references/delegate-contract.md#validated-continuation).
+Every launch records a `session_id` field and exposes source-labelled activity for all five harnesses, falling back to captured output when no owned transcript or session-store signal is available. A fresh request can continue a terminal same-run delegate by naming `parent_label` and advancing its `-rN` lineage; the helper re-validates policy and parent identity, uses only the captured parent ID, and records the lineage; it embeds the skill bundle again only when the continuation's skills differ from the parent's. A policy may bind its digest to a file with `plan_path`, which the launcher hashes at launch. See [`references/delegate-contract.md`](references/delegate-contract.md#validated-continuation).
 
 ## Quick verification
 

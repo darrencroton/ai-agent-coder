@@ -259,7 +259,8 @@ class TestGuardCaptureFailureWithholdsTheEnter(unittest.TestCase):
             lambda: sessions.send_prompt("pm-mocked", "read your contract at /x/prompt.md"),
         ):
             with self.subTest(call=call):
-                codes = iter([0, 0, 1])
+                # send_line takes a fourth capture, the delivery check after its second Enter.
+                codes = iter([0, 0, 1, 0])
                 sent: list[tuple[str, ...]] = []
 
                 def fake_tmux(*args, _codes=codes, _sent=sent):
@@ -282,6 +283,33 @@ class TestGuardCaptureFailureWithholdsTheEnter(unittest.TestCase):
                     call()
 
                 self.assertEqual(sum("C-m" in argv for argv in sent), 1, sent)
+
+
+class TestDeliveryAfterEnter(unittest.TestCase):
+    """`send_line`'s delivery is confirmed only by a changed visible pane."""
+
+    def _send(self, captures: list[tuple[int, str]]) -> sessions.Delivery:
+        codes = iter(captures)
+
+        def fake_tmux(*args):
+            if args[0] == "capture-pane":
+                code, text = next(codes)
+                return subprocess.CompletedProcess(args=list(args), returncode=code, stdout=text, stderr="")
+            return subprocess.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(sessions, "_run_tmux", side_effect=fake_tmux),
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions.time, "sleep"),
+        ):
+            return sessions.send_line("pm-mocked", "please continue")
+
+    def test_a_changed_pane_confirms_and_an_unchanged_one_does_not(self) -> None:
+        self.assertTrue(self._send([(0, "before"), (0, "before"), (0, "before"), (0, "after")]).confirmed)
+        self.assertFalse(self._send([(0, "before"), (0, "before"), (0, "before"), (0, "before")]).confirmed)
+
+    def test_a_final_capture_that_fails_is_unconfirmed(self) -> None:
+        self.assertFalse(self._send([(0, "before"), (0, "before"), (0, "before"), (1, "")]).confirmed)
 
 
 class TestSendPromptToleratesFastFinishBeforePresubmitScan(unittest.TestCase):
@@ -677,6 +705,55 @@ class TestSendLine(TmuxSessionTestCase):
 
         self.assertTrue(self._wait_for(lambda: "NO_SECOND_ENTER" in sessions.pane_text(name), timeout=8.0))
         self.assertNotIn("GOT_SECOND_ENTER", sessions.pane_text(name))
+
+
+class TestSendLineDelivery(TmuxSessionTestCase):
+    """`send_line`'s `Delivery`: the visible pane before the typing against the pane after the second Enter."""
+
+    def test_a_line_the_pane_reacts_to_is_confirmed(self) -> None:
+        name = "pm-test-sendline-confirmed-s01a0"
+        self._start(name, "sh -c 'read line; echo SUBMITTED:$line; sleep 30'")
+        self.assertTrue(self._wait_for(lambda: sessions.session_exists(name)))
+
+        delivery = sessions.send_line(name, "please continue")
+
+        self.assertTrue(delivery.confirmed)
+        self.assertIn("SUBMITTED:please continue", sessions.pane_text(name))
+
+    def test_a_pane_that_swallows_the_line_is_unconfirmed(self) -> None:
+        name = "pm-test-sendline-swallowed-s01a0"
+        # No tty echo and no reader: the keystrokes reach tmux, nothing on screen changes.
+        self._start(name, "sh -c 'stty -echo; echo SWALLOWER_READY; sleep 30'")
+        self.assertTrue(self._wait_for(lambda: "SWALLOWER_READY" in sessions.pane_text(name)))
+
+        delivery = sessions.send_line(name, "please continue")
+
+        self.assertFalse(delivery.confirmed)
+        self.assertNotIn("please continue", sessions.pane_text(name))
+
+    def test_the_transcript_view_is_a_blocking_marker_and_refuses_before_typing(self) -> None:
+        name = "pm-test-sendline-transcript-s01a0"
+        self._start(name, "sh -c 'echo Showing detailed transcript; sleep 30'")
+        self.assertTrue(self._wait_for(lambda: "Showing detailed transcript" in sessions.pane_text(name)))
+
+        markers = sessions.scan_visible_pane(name).dialog_markers
+        self.assertEqual(markers["kinds"], ["transcript_view"])
+        self.assertEqual(markers["markers"], ["Showing detailed transcript"])
+        with self.assertRaises(PmError) as ctx:
+            sessions.send_line(name, "please continue")
+        self.assertNotIsInstance(ctx.exception, TypedNotSubmitted)
+        self.assertIn("transcript_view", str(ctx.exception))
+        self.assertNotIn("please continue", sessions.pane_text(name), "nothing may be typed into the transcript view")
+
+
+class TestUnseenMarkers(unittest.TestCase):
+    def test_only_markers_not_named_by_their_exact_literal_remain(self) -> None:
+        found = sessions.scan_dialog_markers("Showing detailed transcript. Enter API key to continue")
+        self.assertEqual(sessions.unseen_markers(found, []), ["Enter API key", "Showing detailed transcript"])
+        self.assertEqual(sessions.unseen_markers(found, ["Showing detailed transcript"]), ["Enter API key"])
+        self.assertEqual(sessions.unseen_markers(found, ["Showing detailed transcript", "Enter API key"]), [])
+        # An exact literal, not a substring or another case.
+        self.assertEqual(len(sessions.unseen_markers(found, ["showing detailed transcript", "Showing"])), 2)
 
 
 class TestStartSessionStripsInheritedToken(TmuxSessionTestCase):

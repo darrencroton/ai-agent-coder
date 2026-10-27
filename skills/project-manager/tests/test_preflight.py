@@ -296,6 +296,119 @@ class TestBriefSandboxPin(unittest.TestCase):
         self.assertIn("config", str(raised.exception))
 
 
+class TestPreflightPins(PreflightTestCase):
+    """Every `` `<file>` … SHA-256 `<digest>` `` line the dedicated checks do not
+    read, and the toolkit commit pin."""
+
+    def commit_head_file(self, name: str, text: str) -> None:
+        """A product file committed on the integration branch only."""
+        (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / name).write_text(text, encoding="utf-8")
+        self._git("add", name)
+        self._git("commit", "-q", "-m", f"add {name}")
+        self._git("branch", "-f", "integration/t", "HEAD")
+        self._git("reset", "-q", "--hard", self.base)
+
+    def pin_line(self, name: str, text: str) -> str:
+        return f"\n- Owner script: `{name}`, SHA-256 `{_sha(text)}`."
+
+    def test_each_pin_is_checked_in_the_dossier_then_at_the_head_and_reported_ok(self) -> None:
+        (self.dossier / "probe.sh").write_text("echo probe\n", encoding="utf-8")
+        self.commit_head_file("tools/check.sh", "echo check\n")
+        self.write_brief(
+            extra=self.pin_line("probe.sh", "echo probe\n") + self.pin_line("tools/check.sh", "echo check\n")
+        )
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ok    pinned file probe.sh matches its pin (in the dossier)", out)
+        self.assertIn("ok    pinned file tools/check.sh matches its pin (in the integration head)", out)
+        self.assertEqual(
+            out.count("pinned file"), 2, "the policy and setup pins keep their own checks, not a second one"
+        )
+
+    def test_a_pin_that_does_not_match_or_names_a_file_found_nowhere_fails_naming_it(self) -> None:
+        (self.dossier / "probe.sh").write_text("echo changed\n", encoding="utf-8")
+        self.write_brief(extra=self.pin_line("probe.sh", "echo probe\n") + self.pin_line("ghost.sh", "echo ghost\n"))
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(
+            self.failures(out),
+            [
+                "pinned file probe.sh matches its pin",
+                "pinned file ghost.sh is in the dossier or at the integration head",
+            ],
+        )
+        self.assertIn(_sha("echo changed\n"), out)
+
+    def test_a_pin_naming_a_path_outside_the_dossier_is_not_read_from_there(self) -> None:
+        (self.dossier.parent / "outside.sh").write_text("echo outside\n", encoding="utf-8")
+        self.write_brief(extra=self.pin_line("../outside.sh", "echo outside\n"))
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.failures(out), ["pinned file ../outside.sh is in the dossier or at the integration head"])
+
+    def toolkit_line(self, commit: str) -> str:
+        return f"\n- Campaign toolkit: `{self.repo}` at `{commit}`"
+
+    def preflight_with_toolkit_at_repo(self) -> tuple[int, str, str]:
+        with mock.patch.object(preflight.sandbox, "toolkit_root", return_value=self.repo):
+            return self.preflight()
+
+    def test_a_toolkit_commit_pin_must_equal_the_checkouts_head(self) -> None:
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+        self.write_brief(extra=self.toolkit_line(head))
+        self._commit_dossier()
+        code, out, err = self.preflight_with_toolkit_at_repo()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"ok    toolkit checkout HEAD is its pinned commit {head[:12]}", out)
+
+        self.write_brief(extra=self.toolkit_line("a" * 40))
+        self._commit_dossier()
+        code, out, err = self.preflight_with_toolkit_at_repo()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.failures(out), ["toolkit checkout is at its pinned commit"])
+        self.assertIn(head[:12], out)
+
+    def test_a_short_toolkit_commit_pin_fails_rather_than_reading_as_unpinned(self) -> None:
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+        self.write_brief(extra=self.toolkit_line(head[:7]))
+        self._commit_dossier()
+        code, out, err = self.preflight_with_toolkit_at_repo()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.failures(out), ["brief pins the campaign toolkit by its full commit"])
+
+    def test_a_pin_inside_the_worktree_setup_section_is_checked_too(self) -> None:
+        (self.dossier / "helper.sh").write_text("echo changed\n", encoding="utf-8")
+        self.write_brief()
+        brief = self.dossier / "brief.md"
+        text = brief.read_text(encoding="utf-8")
+        setup_line = next(line for line in text.splitlines() if "`setup.sh` in this dossier" in line)
+        brief.write_text(
+            text.replace(setup_line, setup_line + "\n" + self.pin_line("helper.sh", "echo helper\n").strip()),
+            encoding="utf-8",
+        )
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.failures(out), ["pinned file helper.sh matches its pin"])
+
+    def test_a_pin_sharing_setup_shs_digest_is_still_checked_by_its_own_line(self) -> None:
+        (self.dossier / "helper.sh").write_text("echo changed\n", encoding="utf-8")
+        self.write_brief(extra=self.pin_line("helper.sh", self.setup))  # pinned at setup.sh's digest
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.failures(out), ["pinned file helper.sh matches its pin"])
+
+    def test_a_brief_without_a_toolkit_line_gets_a_note_not_a_failure(self) -> None:
+        code, out, err = self.preflight_with_toolkit_at_repo()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("note  brief does not pin the campaign toolkit", out)
+
+
 class TestPreflightSandbox(PreflightTestCase):
     """The brief's `## Sandbox` section: `none`, or a pinned `sandbox.json`
     checked against its pin, `load_base_policy`, launch-child's own `srt`

@@ -26,7 +26,8 @@ So the default question is **not** "is this code clean?" but:
 > **Does this change introduce a finding that was not there before?**
 
 `check --base <ref>` lints the changed files at the current head, lints the same
-files at `<ref>` in a throwaway worktree, and reports only the difference.
+files at `<ref>` from a copy of its tree written under `$TMPDIR` (no checkout, so it
+works where the git dir is read-only), and reports only the difference.
 Pre-existing debt cannot block; a newly added unused import cannot pass.
 
 Use `--all` for absolute mode when you genuinely want every finding — a
@@ -73,6 +74,10 @@ These are load-bearing. Do not work around them.
    one finding per file — the formatters — cannot show a *second* regression in a
    file already unformatted at base. Absolute mode (`--all`) is the escape hatch
    when you need the whole picture.
+7. **One formatter owns Python.** When the project configures black
+   (`[tool.black]` in `pyproject.toml`, or a `black` call in a top-level
+   `Makefile`), `ruff format --check` is skipped and reported as black-owned,
+   never as checked.
 
 ## Commands
 
@@ -90,7 +95,7 @@ python3 <skill-dir>/scripts/lint.py check --all             # absolute: every fi
 range, so `--base HEAD` before a commit is the correct pre-commit call — but only
 before: once the work is committed, `--base HEAD` scopes nothing, which exits `3`
 rather than reporting a hollow pass. There is
-deliberately no `--staged` mode: listing staged paths but linting worktree
+deliberately no `--staged` mode: listing staged paths but linting working-tree
 content would let a staged defect pass behind an unstaged fix.
 
 Exit codes: `0` pass · `1` new findings · `2` error · `3` coverage gap (with

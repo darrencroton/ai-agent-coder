@@ -34,6 +34,14 @@ CODE_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.S)
 SHA256 = re.compile(r"SHA-256 `([0-9a-f]{64})`")
 BASE = re.compile(r"^\s*-\s+[^\n]*?campaign base: `([^`]+)` at `([0-9a-f]{7,40})`", re.IGNORECASE | re.M)
 BACKTICKED = re.compile(r"`([^`]+)`")
+# A pin line: `<name>` … SHA-256 `<digest>`, the name being the last code span
+# before the digest. A list item opening "Previous" is history, not a pin
+# (the rule `_pin_line` applies to the policy pin).
+PIN_LINE = re.compile(r"`([^`\n]+)`[^`\n]*?SHA-256 `([0-9a-f]{64})`")
+HISTORICAL_ITEM = re.compile(r"^\s*-\s+previous\b", re.I)
+# The dossier template's `- Campaign toolkit: <checkout path> at `<commit>``.
+TOOLKIT_PIN = re.compile(r"^\s*-\s+campaign toolkit:[^\n]*?`([0-9a-f]{7,40})`", re.I | re.M)
+TOOLKIT_LINE = re.compile(r"^\s*-\s+campaign toolkit:", re.I | re.M)
 # The owner's files: brief.md always; the others only when present (the
 # brief's own sections say whether each is required).
 OWNER_FILES = ("brief.md", "setup.sh", sandbox.DOSSIER_POLICY_NAME)
@@ -75,6 +83,51 @@ def _pin_line(text: str, label: str, following: int = 2) -> str:
 def _section(text: str, heading: str) -> str | None:
     match = re.search(rf"^##\s+{re.escape(heading)}\s*$(.*?)(?=^##\s|\Z)", text, re.M | re.S | re.I)
     return match.group(1) if match else None
+
+
+def _generic_pins(brief: str, dedicated: set[str]) -> list[tuple[str, str]]:
+    """(name, SHA-256) for every pin line of the brief that no dedicated check
+    reads: every `` `<name>` … SHA-256 `<digest>` `` line except the lines in
+    `dedicated` (the policy file's, `setup.sh`'s and `sandbox.json`'s, which
+    have their own checks) and a historical (`Previous …`) item."""
+    pins: list[tuple[str, str]] = []
+    for line in brief.splitlines():
+        if line in dedicated or HISTORICAL_ITEM.match(line):
+            continue
+        match = PIN_LINE.search(line)
+        if match:
+            pins.append((match.group(1), match.group(2)))
+    return pins
+
+
+def _dedicated_pins(brief: str) -> set[str]:
+    """The pin lines the dedicated checks read: the policy file's, and the first pin line of the
+    `Worktree setup` and `Sandbox` sections (`setup.sh`'s and `sandbox.json`'s), each identified by
+    its line, so the generic pass skips exactly those lines and checks every other pin."""
+    lines: set[str] = set()
+    policy_line = _pin_line(brief, "Protected-paths policy file", 0)
+    if policy_line:
+        lines.add(policy_line)
+    for heading in ("Worktree setup", "Sandbox"):
+        section = _section(brief, heading) or ""
+        first = next((line for line in section.splitlines() if SHA256.search(line)), None)
+        if first is not None:
+            lines.add(first)
+    return lines
+
+
+def _pinned_file_bytes(name: str, dossier: Path, repo: Path, head: str) -> tuple[bytes, str] | None:
+    """(content, where it was found) for a pinned file: the dossier first, then
+    the integration head; None when neither holds it. A name that leaves the
+    dossier is looked for at the head only."""
+    candidate = (dossier / name).resolve()
+    if candidate.is_relative_to(dossier) and candidate.is_file():
+        return candidate.read_bytes(), "the dossier"
+    if head:
+        blob = git_ops.git_bytes(repo, "cat-file", "blob", f"{head}:{name}")
+        if blob is not None:
+            return blob, "the integration head"
+    return None
 
 
 def campaign_preflight(
@@ -347,6 +400,44 @@ def campaign_preflight(
                             "sandboxing is supported on this host",
                             "sandboxing is implemented for macOS only; launch-child refuses a sandboxed launch here",
                         )
+
+    # Every other file the brief pins by SHA-256, in the dossier or at the head.
+    for name, pinned in _generic_pins(brief, _dedicated_pins(brief)):
+        found = _pinned_file_bytes(name, dossier, repo, head)
+        if found is None:
+            fail(
+                f"pinned file {name} is in the dossier or at the integration head",
+                "the brief pins it by SHA-256 but it is in neither; commit it, or correct the brief",
+            )
+        elif hashlib.sha256(found[0]).hexdigest() != pinned:
+            fail(
+                f"pinned file {name} matches its pin",
+                f"its SHA-256 in {found[1]} is {hashlib.sha256(found[0]).hexdigest()}; "
+                "a changed pinned file is a question to the owner",
+            )
+        else:
+            ok(f"pinned file {name} matches its pin (in {found[1]})")
+
+    # The toolkit checkout, when the brief pins one.
+    toolkit_pin = TOOLKIT_PIN.search(brief)
+    if not toolkit_pin and not TOOLKIT_LINE.search(brief):
+        note("brief does not pin the campaign toolkit: its checkout is unpinned, so a changed toolkit goes unseen")
+    elif not toolkit_pin or len(toolkit_pin.group(1)) != 40:
+        fail(
+            "brief pins the campaign toolkit by its full commit",
+            f"the Campaign toolkit line carries `{toolkit_pin.group(1) if toolkit_pin else 'no readable commit'}`; "
+            "write the full 40-hex commit in backticks",
+        )
+    else:
+        toolkit_head = git_ops.git_head(sandbox.toolkit_root())
+        if toolkit_head == toolkit_pin.group(1):
+            ok(f"toolkit checkout HEAD is its pinned commit {toolkit_head[:12]}")
+        else:
+            fail(
+                "toolkit checkout is at its pinned commit",
+                f"the toolkit is at {(toolkit_head or 'no readable commit')[:12]}, the brief pins "
+                f"{toolkit_pin.group(1)[:12]}; check out the pinned commit, or ask the owner to re-pin",
+            )
 
     # The node worktree parent.
     parent_text = _pin_line(brief, "Node worktree parent", 0)

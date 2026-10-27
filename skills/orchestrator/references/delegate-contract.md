@@ -34,6 +34,8 @@ The Developer (or its launcher) writes `delegate-policy.json` for a slice from t
 
 Schema v3 accepts only the documented policy fields. Retired Worker keys, role/access allow-lists under other names, authorized write surfaces, and unknown extension fields are rejected. `required_access` is a non-empty list drawn from `read-only` and `read-write`; authorize `read-write` only for a policy that genuinely intends to let a delegate edit files.
 
+A policy may instead bind the digest to the plan file: set `plan_path` (absolute, or relative to `repo_path`) and the launcher hashes that file at launch. A request's `plan_sha256` must then equal the computed SHA-256, or may be omitted; a mismatch is rejected as `plan-digest-mismatch` and names the computed digest. A policy `plan_sha256` given beside `plan_path` must agree with the file. The computed digest, not a copied one, is what the launch artifact records (with `plan_path`). Without `plan_path`, `plan_sha256` stays required in the policy and the request and is compared as written; there is no allow-list of digests.
+
 ## Request
 
 A delegate request contains intent, tool selection, and the access mode it needs — never a role name, and never a write grant broader than the policy authorizes:
@@ -124,7 +126,9 @@ Before launching, the helper verifies that the named parent:
 - owns a non-empty captured `session_id`
 - shares the new label's root, with a new `rN` number greater than the parent's
 
-Failure of any check rejects the request with structured feedback and starts no process. In particular, an unavailable parent ID produces `continuation-session-unavailable`; the helper never substitutes a global “resume last” session. A successful continuation uses the explicit parent ID in the harness-specific resume command and records `parent_label`, `parent_session_id`, and `continuation_index` in the new manifest entry. `status` and `activity` expose the continued session ID like any other managed launch.
+Failure of any check rejects the request with structured feedback and starts no process. In particular, an unavailable parent ID produces `continuation-session-unavailable`; the helper never substitutes a global “resume last” session. A successful continuation uses the explicit parent ID in the harness-specific resume command and records `parent_label`, `parent_session_id`, and `continuation_index` in the new manifest entry.
+
+A continuation renders the request envelope in full (task, access, files, context, constraints, expected output) but embeds the skill bundle only when its `required_skills` differs from the parent's recorded `required_skills`, because the resumed session already holds the parent's bundle; a parent with no recorded skills is treated as different. The launch evidence and manifest record `skills_embedded: true|false` for every launch. `status` and `activity` expose the continued session ID like any other managed launch.
 
 ## Harness profiles
 

@@ -20,12 +20,14 @@ import shlex
 import shutil
 import signal
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from . import PmError
 from . import git_ops
+from . import pm_paths
 from . import plan as plan_mod
 from . import profiles
 from . import prompts
@@ -35,6 +37,16 @@ from . import slice_ops
 from . import state as state_mod
 
 _STDERR_TAIL_CHARS = 4000
+# `validation.md` is Developer-written and reaches the reviewer through argv,
+# so it is bounded; the full file stays readable at its own path.
+_VALIDATION_RECORD_MAX_CHARS = 20000
+# Languages whose changes make the code-review skill's language-priorities
+# resource relevant; the resource is dropped from the embedded bundle otherwise.
+_PRIORITIES_REFERENCE = "scientific-and-language-priorities.md"
+_PRIORITIES_SUFFIXES = frozenset(
+    {".py", ".pyi", ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx"}
+    | {".f", ".for", ".f77", ".f90", ".f95", ".f03", ".f08"}
+)
 
 
 # --- one-shot reviewer command composition (this module's own table) ---------
@@ -223,6 +235,29 @@ def _commission_origin(run_dir: Path, slice_id: str) -> dict[str, Any]:
         if event.get("slice") == slice_id and event.get("kind") in {"launch", "relaunch", "steer"}:
             return {"index": index, "kind": event["kind"], "slice": slice_id}
     raise PmError(f"cannot commission {slice_id}: no launch, relaunch, or steer event records its current attempt")
+
+
+def _reference_filter(changed_files: list[str]) -> Callable[[Path], bool]:
+    """Predicate for `prompts.compile_skill_bundle`: every linked skill file is
+    kept except the language-priorities one, which is kept only when the pinned
+    diff touches C, C++, Fortran or Python."""
+    relevant = any(Path(name).suffix.lower() in _PRIORITIES_SUFFIXES for name in changed_files)
+    return lambda path: relevant or path.name != _PRIORITIES_REFERENCE
+
+
+def _read_validation_record(repo: Path, artifact_dir: Path) -> str | None:
+    """The Developer's `validation.md` for this slice, or None when absent.
+
+    Read through the `.pm/` guard (`pm_paths`): the directory is Developer-writable,
+    so a planted link there is refused (PmError), never followed."""
+    path = artifact_dir / "validation.md"
+    try:
+        text = pm_paths.read_pm_text(repo, path, errors="replace").strip()
+    except FileNotFoundError:
+        return None
+    if len(text) > _VALIDATION_RECORD_MAX_CHARS:
+        text = f"{text[:_VALIDATION_RECORD_MAX_CHARS]}\n[truncated; the full file is at {path}]"
+    return text or None
 
 
 def _tail(path: Path, max_chars: int = _STDERR_TAIL_CHARS) -> str:
@@ -495,6 +530,9 @@ def run_review(
         authorized_surface=sections.get("Authorized Surface", "").rstrip(),
         explicit_non_goals=sections.get("Explicit Non-Goals", "").rstrip(),
         risk_flags=sections.get("Risk Flags", "").rstrip(),
+        validation_plan=sections.get("Validation Plan", "").rstrip(),
+        validation_record=_read_validation_record(repo, slice_ops.slice_artifact_dir(repo, run_id, slice_id)),
+        include_reference=_reference_filter(changed_files),
         sandboxed=sandboxed,
     )
 
@@ -566,6 +604,7 @@ def run_review(
         # leader, so its pgid equals its pid at creation time — no
         # getpgid() race against a fast-exiting process.
         pgid = process.pid
+        launched_at = state_mod.utc_now_iso()
         # Persist before waiting so `stop` can reap every parallel reviewer.
         with state_mod.locked_update(run_dir, token) as live_state:
             live_current = live_state.get("current_slice")
@@ -577,6 +616,22 @@ def run_review(
         print(
             f"reviewer launched: pgid={pgid} report={report_original} stderr={stderr_path}",
             flush=True,
+        )
+        # Durable counterpart of the line above: lets a later reader tell how
+        # long a reviewer ran, and that one was started even if it never finishes.
+        state_mod.append_event(
+            run_dir,
+            "review-launched",
+            slice_id=slice_id,
+            note=f"{skill} via {resolved_tool}",
+            data={
+                "skill": skill,
+                "tool": resolved_tool,
+                "model": resolved_model,
+                "effort": recorded_effort,
+                "sequence": seq,
+                "pgid": pgid,
+            },
         )
         timed_out = False
         try:
@@ -697,6 +752,7 @@ def run_review(
                     "before_head": before_head,
                     "artifact": str(report_original),
                     "sha256": sha256,
+                    "launched_at": launched_at,
                     "at": state_mod.utc_now_iso(),
                     # How many surface grants this reviewer's prompt showed.
                     # `is_review_fresh` stales the review as soon as the slice

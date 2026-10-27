@@ -22,9 +22,9 @@ never the inspector — the 32 measured polls used 7 different ones (grep,
 cat, head, git log, test, tail, ls), so an inspector allowlist would miss
 most.
 
-Scope: both require `.pm/` in cwd. `Read` additionally requires Claude
+Scope: both require `.pm/` (a PM run) or `brief.md` (a campaign dossier) in cwd. `Read` additionally requires Claude
 Code's own scratchpad task-output path. `Bash` additionally requires
-`run_in_background: true` plus a wait; `pm.py review`/`observe --wait` are
+`run_in_background: true` plus a wait; `pm.py review`/`observe`/`wait-child` are
 exempt as the toolkit's own legitimate waiters. Foreground is always
 allowed — no second wake, and the escape hatch when no notification is
 coming.
@@ -67,11 +67,14 @@ _BOUNDARY = r"""(?<![^\s;&|()<>"'/])"""
 _PM_ARTIFACT_RE = re.compile(
     rf"{_BOUNDARY}\.git/(?:worktrees/[^/\s]+/)?pm/{_RUN_ID}/"
     rf"|{_BOUNDARY}\.pm/runs/{_RUN_ID}/"
+    # A campaign child's channel files (`child-result.json`, `cm-question.md`, `pane-live.txt`).
+    rf"|{_BOUNDARY}\.pm/campaign/"
 )
 
-# Toolkit's own waiters — `observe --wait`, `review` — exempt so a compound
-# command like `pm.py review …; sleep 5; cat <report>` still works.
-_PM_COMMAND_RE = re.compile(r"pm\.py\s+(?:review|observe)\b")
+# Toolkit's own waiters — `observe --wait`, `wait-child --wait`, `review` —
+# exempt so a compound command like `pm.py review …; sleep 5; cat <report>`
+# still works.
+_PM_COMMAND_RE = re.compile(r"pm\.py\s+(?:review|observe|wait-child)\b")
 
 # Stripped before matching: an appended `# pm.py review` would otherwise
 # satisfy the exemption above and disable the guard. Quote-unaware by
@@ -125,8 +128,10 @@ def _deny(reason: str) -> None:
 
 
 def _in_pm_run(payload: dict) -> bool:
+    """A PM run directory (`.pm/`) or a campaign dossier (`brief.md` at its root,
+    where a Campaign Manager works and no `.pm/` exists)."""
     cwd = payload.get("cwd")
-    return bool(cwd) and (Path(cwd) / ".pm").is_dir()
+    return bool(cwd) and ((Path(cwd) / ".pm").is_dir() or (Path(cwd) / "brief.md").is_file())
 
 
 def _check_bash(payload: dict) -> None:

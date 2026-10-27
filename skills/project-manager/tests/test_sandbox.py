@@ -841,6 +841,7 @@ class TestWrapCommandAndDetection(unittest.TestCase):
                     "env",
                     "TMPDIR=/t/run",
                     "CLAUDE_CODE_TMPDIR=/t/run",
+                    "TMPPREFIX=/t/run/zsh",
                     f"SSL_CERT_FILE={certs.name}",
                     "codex",
                     "exec",
@@ -850,7 +851,17 @@ class TestWrapCommandAndDetection(unittest.TestCase):
         with mock.patch.object(sandbox, "SSL_CERT_FILE", Path("/nonexistent/cert.pem")):
             self.assertEqual(
                 sandbox.wrap_command(Path("/c/policy.json"), ["true"], tmpdir=Path("/t/run")),
-                ["srt", "-s", "/c/policy.json", "--", "env", "TMPDIR=/t/run", "CLAUDE_CODE_TMPDIR=/t/run", "true"],
+                [
+                    "srt",
+                    "-s",
+                    "/c/policy.json",
+                    "--",
+                    "env",
+                    "TMPDIR=/t/run",
+                    "CLAUDE_CODE_TMPDIR=/t/run",
+                    "TMPPREFIX=/t/run/zsh",
+                    "true",
+                ],
             )
 
     def test_inside_sandbox_reads_sandbox_runtime(self) -> None:
@@ -1638,6 +1649,17 @@ class TestSandboxedServer(SandboxServerTestCase):
         self.assertFalse(leak.exists())
         self.assertTrue((self.worktree / "inside").is_file())
         self.assertIsNone(sessions.server_environment(self.socket, "PM_RUN_TOKEN"))
+
+    def test_a_zsh_here_document_works_inside_the_server(self) -> None:
+        # zsh writes a here-document's text to a file under `$TMPPREFIX`
+        # (`/tmp/zsh` by default, unwritable inside); the wrap points it at the temp dir.
+        self.start(self.write_policy())
+        out = self.worktree / "heredoc.txt"
+        quoted = shlex.quote(str(out))
+        command = shlex.join(["zsh", "-c", f"cat <<EOF > {quoted}\nx\nEOF\necho done >> {quoted}"])
+        sessions.start_session_via_server(self.socket, "pm-test-sb-hd01a", self.worktree, command, {})
+        self.assertTrue(self.wait_for(lambda: out.is_file() and "done" in out.read_text(encoding="utf-8")))
+        self.assertEqual(out.read_text(encoding="utf-8").splitlines(), ["x", "done"])
 
     def test_start_server_refuses_a_socket_with_a_live_server(self) -> None:
         policy_path = self.write_policy()

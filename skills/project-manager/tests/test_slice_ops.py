@@ -88,12 +88,15 @@ class TestInitHappyPath(SliceOpsTestCase):
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["requirements.txt"]}])
         harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
 
-        code, out, _err = self._init(plan_path, harness)
+        code, out, err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
 
         run_id, token = parse_init_output(out)
         self.assertEqual(out.count("PM_RUN_TOKEN="), 1)
-        self.assertIn("Keep this token out of Developer sessions", out)
+        # The warning goes to stderr so the token line is the only stdout line
+        # that mentions a token (a PM that greps stdout cannot catch the warning).
+        self.assertIn("Keep this token out of Developer sessions", err)
+        self.assertNotIn("Keep this token out", out)
         # A dependency-shaped surface entry is a warning, not an error —
         # the run proceeds and the warning is still printed.
         self.assertIn("WARNING", out)
@@ -1064,6 +1067,36 @@ class TestObserveWaitSemantics(SliceOpsTestCase):
         self.assertIn("Enter API key", result["out"])
         self.assertNotIn("note:", result["out"], "a dialog marker is a signal, not a no-signal wait")
 
+    def test_a_seen_marker_does_not_end_the_wait_but_is_printed_and_another_marker_does(self) -> None:
+        from pm_lib.slice_ops import _OBSERVE_POLL_SECONDS
+
+        trigger = self.repo.parent / "seen_trigger"
+        self._launch(trigger_gated_credential_prompt_script(trigger))
+        trigger.write_text("go\n", encoding="utf-8")
+        self.assertTrue(
+            self._wait_for(lambda: "dialog marker: credential_prompt" in self.run_cli_in_repo(["observe"])[1]),
+            "the marker never appeared",
+        )
+        wait_seconds = 2 * _OBSERVE_POLL_SECONDS
+
+        start = time.monotonic()
+        code, out, _err = self.run_cli_in_repo(
+            ["observe", "--wait", str(wait_seconds), "--seen-marker", "Enter API key"]
+        )
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(time.monotonic() - start, wait_seconds - 0.5, "a seen marker must not end the wait")
+        self.assertIn("dialog marker: credential_prompt (matched 'Enter API key')", out)
+        self.assertIn("note: this wait returned no signal", out)
+
+        start = time.monotonic()
+        code, out, _err = self.run_cli_in_repo(
+            ["observe", "--wait", str(wait_seconds), "--seen-marker", "Enter password"]
+        )
+        self.assertEqual(code, 0)
+        self.assertLess(time.monotonic() - start, wait_seconds - 0.5, "an unnamed marker must still end the wait")
+        self.assertIn("matched 'Enter API key'", out)
+        self.assertNotIn("note:", out)
+
     def test_a_wait_with_no_signal_prints_a_note(self) -> None:
         """A requested wait that elapses with the session still running, no
         result, and no dialog marker is exactly the pattern worth flagging: the
@@ -1508,6 +1541,38 @@ class TestAnswerWithoutTmux(PmTestCase):
         self.assertEqual(event["data"], {"question": "question-1.md", "delivered": False})
         self.assertEqual(event["note"], "answer text")
         self.assertEqual(event["evidence"], str(artifact_dir / "answer-1.md"))
+
+    def _answer_delivering(self, confirmed: bool) -> tuple[str, slice_ops.AnswerOutcome, list[dict]]:
+        token, run_dir, artifact_dir = self._run_with_question()
+        with (
+            mock.patch.object(sessions, "session_exists", return_value=True),
+            mock.patch.object(sessions, "send_line", return_value=sessions.Delivery(confirmed=confirmed)),
+        ):
+            outcome = slice_ops.answer(self.repo, run_dir, token, text="answer text")
+        return token, outcome, self._answer_events(run_dir)
+
+    def _answer_output(self, token: str, outcome: slice_ops.AnswerOutcome) -> str:
+        with mock.patch.object(slice_ops, "answer", return_value=outcome):
+            code, out, err = self.run_cli_in_repo(["answer", "--text", "answer text", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        return out
+
+    def test_an_unconfirmed_delivery_is_recorded_on_the_answer_event_and_printed(self) -> None:
+        token, outcome, [event] = self._answer_delivering(confirmed=False)
+        self.assertFalse(outcome.delivered)
+        self.assertEqual(event["data"], {"question": "question-1.md", "delivery": "unconfirmed"})
+        out = self._answer_output(token, outcome)
+        self.assertIn(
+            "delivery: unconfirmed (the pane did not change after Enter; re-check with observe/wait-child, "
+            "then --redeliver if the child did not react)",
+            out,
+        )
+
+    def test_a_confirmed_delivery_is_printed_and_leaves_the_event_as_it_was(self) -> None:
+        token, outcome, [event] = self._answer_delivering(confirmed=True)
+        self.assertTrue(outcome.delivered)
+        self.assertEqual(event["data"], {"question": "question-1.md"})
+        self.assertIn("delivery: confirmed\n", self._answer_output(token, outcome))
 
     def test_an_untyped_send_failure_restores_the_question_and_removes_the_answer(self) -> None:
         run_dir, artifact_dir, _send_line = self._answer_with_send(PmError("refusing to send into a dialog"))

@@ -30,7 +30,7 @@ import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import IntegrityError, PmError, TypedNotSubmitted
 from . import code_metrics
@@ -1277,7 +1277,19 @@ def read_question_head(repo: Path, path: Path) -> str | None:
     return f"{shown}\n{marker}"
 
 
-def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str | None = None) -> ObserveOutcome:
+def observe(
+    repo: Path,
+    run_dir: Path,
+    *,
+    wait: float | None = None,
+    token: str | None = None,
+    seen_markers: Sequence[str] = (),
+) -> ObserveOutcome:
+    """Evidence of the live session's progress; with `wait`, polls until a signal.
+
+    A dialog marker whose matched literal equals one of `seen_markers` does not
+    end the wait (any other marker does); it is still reported on return.
+    """
     # Same opportunistic verification as status(): see the comment there.
     state = state_mod.load_state(run_dir, token)
     current = state.get("current_slice")
@@ -1312,7 +1324,7 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     marker_observation: sessions.PaneObservation | None = None
     while deadline is not None and time.monotonic() < deadline:
         visible = sessions.scan_visible_pane(session)
-        if visible.dialog_markers["present"]:
+        if sessions.unseen_markers(visible.dialog_markers, seen_markers):
             # Retain the marker and the exact screen that produced it. A second
             # capture could observe a redraw and recreate the old mismatch:
             # marker reported, but marker absent from the tail and pane-live.
@@ -1379,7 +1391,13 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     # A full requested wait that ended in none of the above is exactly the
     # pattern worth telling the caller about: re-asking at the same length
     # cannot return anything a longer wait would not have.
-    no_signal = bool(wait) and running and not result_present and not question_present and not dialog_markers["present"]
+    no_signal = (
+        bool(wait)
+        and running
+        and not result_present
+        and not question_present
+        and not sessions.unseen_markers(dialog_markers, seen_markers)
+    )
     changed = pane_changed or liveness_changed or result_newly_appeared or question_newly_appeared
     if changed or no_signal:
         note = (
@@ -1417,15 +1435,18 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
 # --- send ---------------------------------------------------------------------
 
 
-def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> None:
+def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> sessions.Delivery:
+    """Type one line into the live session; the returned delivery says whether the pane reacted."""
     state = load_writable_state(run_dir, token)
     _refuse_if_budget_exhausted(state)
     current = state.get("current_slice")
     session = current.get("tmux_session") if current else None
     if not current or not session or not sessions.session_exists(session):
         raise PmError("no live session — not driving a dead pane")
-    sessions.send_line(session, text)
-    state_mod.append_event(run_dir, "send", slice_id=current.get("id"), note=reason)
+    delivery = sessions.send_line(session, text)
+    data = None if delivery.confirmed else {"delivery": "unconfirmed"}
+    state_mod.append_event(run_dir, "send", slice_id=current.get("id"), note=reason, data=data)
+    return delivery
 
 
 # --- answer -------------------------------------------------------------------
@@ -1442,7 +1463,9 @@ def _answer_paths(directory: Path, prefix: str) -> tuple[int, Path, Path, Path]:
     )
 
 
-def deliver_answer(repo: Path, directory: Path, prefix: str, session: str, text: str) -> tuple[Path, Path, int]:
+def deliver_answer(
+    repo: Path, directory: Path, prefix: str, session: str, text: str
+) -> tuple[Path, Path, int, sessions.Delivery]:
     """Deliver a supervisor's answer to the open question in `directory`.
 
     `directory` is under `<repo>/.pm/`; the answer is written through
@@ -1452,7 +1475,7 @@ def deliver_answer(repo: Path, directory: Path, prefix: str, session: str, text:
     renames `<prefix>question.md` to `<prefix>question-<n>.md`; then injects
     the one-line answer pointer into `session` through `sessions.send_line`,
     so the dialog guard applies. Returns the answer path, the archived
-    question path, and `n`.
+    question path, `n` and the send's `sessions.Delivery`.
 
     The caller checks that the question exists and that the session is live.
     On `TypedNotSubmitted` both files stay in place and the error propagates:
@@ -1483,7 +1506,7 @@ def deliver_answer(repo: Path, directory: Path, prefix: str, session: str, text:
         answer_path.unlink(missing_ok=True)
         raise PmError(f"could not archive {question_path} as {archived_path}: {exc}") from exc
     try:
-        sessions.send_line(session, prompts.render_answer_pointer(answer_path))
+        delivery = sessions.send_line(session, prompts.render_answer_pointer(answer_path))
     except TypedNotSubmitted:
         raise
     except PmError as exc:
@@ -1506,7 +1529,7 @@ def deliver_answer(repo: Path, directory: Path, prefix: str, session: str, text:
         if left_behind:
             raise PmError(f"{exc}; left behind: {'; '.join(left_behind)}") from exc
         raise
-    return answer_path, archived_path, number
+    return answer_path, archived_path, number, delivery
 
 
 @dataclass
@@ -1515,6 +1538,8 @@ class AnswerOutcome:
     answer_path: Path
     question_archived_path: Path
     answer_number: int
+    # False when the pane did not change after the pointer's Enter (see `sessions.Delivery`).
+    delivered: bool = True
 
 
 def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome:
@@ -1554,7 +1579,7 @@ def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome
     # number has moved on, and the undelivered event below needs this one.
     _number, _question, pending_answer, pending_archive = _answer_paths(artifact_dir, "")
     try:
-        answer_path, archived_path, number = deliver_answer(repo, artifact_dir, "", session, text)
+        answer_path, archived_path, number, delivery = deliver_answer(repo, artifact_dir, "", session, text)
     except TypedNotSubmitted:
         # The pointer is typed and names the answer file, but that file is
         # Developer-writable; this event is the durable record.
@@ -1573,13 +1598,14 @@ def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome
         slice_id=slice_id,
         note=text,
         evidence=str(answer_path),
-        data={"question": archived_path.name},
+        data={"question": archived_path.name, **({} if delivery.confirmed else {"delivery": "unconfirmed"})},
     )
     return AnswerOutcome(
         slice_id=slice_id,
         answer_path=answer_path,
         question_archived_path=archived_path,
         answer_number=number,
+        delivered=bool(delivery.confirmed),
     )
 
 
@@ -1691,7 +1717,14 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
 
     report, artifact_dir, _pane_error = _collect_finalize_evidence(repo, state, current)
 
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
+    state_mod.append_event(
+        run_dir,
+        "floor",
+        slice_id=slice_id,
+        note=_floor_note(report),
+        evidence=str(artifact_dir),
+        data=report.failure_data(),
+    )
     # updated_at bump (and, when --risk was given, the ratchet) only — no
     # other semantic field changes in bare finalize.
     state_mod.save_state(run_dir, state, token)
@@ -1787,7 +1820,9 @@ def _grants_text(grants: list[dict[str, Any]]) -> str:
 def _attempts_summary(run_dir: Path, slice_id: str, attempts: int) -> str:
     events = state_mod.read_events(run_dir)
     steer_events = [event for event in events if event.get("kind") == "steer" and event.get("slice") == slice_id]
-    lines = [f"Attempts: {attempts}"]
+    # `attempts` is 0 on the first launch, so it counts steers and relaunches, not submissions; the
+    # judgments number submissions from 1 and this line says which it is.
+    lines = [f"Steers/relaunches: {attempts}"]
     if steer_events:
         lines.append(f"Steer interventions: {len(steer_events)}")
         for event in steer_events:
@@ -1796,6 +1831,22 @@ def _attempts_summary(run_dir: Path, slice_id: str, attempts: int) -> str:
             for note_line in note_lines:
                 lines.append(f"      {note_line}")
     return "\n".join(lines)
+
+
+def _criteria_note(run_dir: Path, entry: dict[str, Any], slice_id: str) -> str | None:
+    """`criteria met: N of M (...)` when the current submission's Developer judgment met fewer than the slice's M.
+
+    None when the judgment met them all, is `unavailable` (it records no count) or the slice has no recorded total.
+    """
+    from . import judgments
+
+    origin = judgments.latest_developer_origin(judgments.read_events_or_raise(run_dir), slice_id)
+    judgment = judgments.active_developer_judgment(entry, origin["index"]) if origin else None
+    met = judgment.get("criteria_met") if judgment else None
+    total = entry.get("criteria_total")
+    if type(met) is not int or type(total) is not int or met >= total:
+        return None
+    return f"criteria met: {met} of {total} (accepted with {total - met} unmet; see the assessment)"
 
 
 def _render_assessment(
@@ -1808,6 +1859,7 @@ def _render_assessment(
     reviews_text: str,
     attempts_summary: str,
     grants_text: str,
+    criteria_note: str | None = None,
 ) -> str:
     lines = [
         f"# Assessment: {entry.get('id')} - {entry.get('title')}",
@@ -1815,6 +1867,10 @@ def _render_assessment(
         f"Decision: {decision}",
         f"Timestamp: {state_mod.utc_now_iso()}",
         f"Commit: {head}",
+    ]
+    if criteria_note:
+        lines.append(criteria_note[0].upper() + criteria_note[1:])
+    lines += [
         "",
         "## Floor",
         "",
@@ -1860,6 +1916,8 @@ class AcceptOutcome:
     code_warning: str | None = None
     # What the run-end sandbox teardown did (None when none ran).
     sandbox_notes: list[str] | None = None
+    # `criteria met: N of M (...)` when the accept took a submission that met fewer criteria than the slice has.
+    criteria_note: str | None = None
 
 
 def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, risk: str | None = None) -> AcceptOutcome:
@@ -1902,7 +1960,14 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
     report, artifact_dir, _pane_error = _collect_finalize_evidence(repo, state, current)
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
+    state_mod.append_event(
+        run_dir,
+        "floor",
+        slice_id=slice_id,
+        note=_floor_note(report),
+        evidence=str(artifact_dir),
+        data=report.failure_data(),
+    )
 
     if not report.passed:
         state_mod.save_state(run_dir, state, token)
@@ -1948,6 +2013,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     reviews_text = _reviews_consulted_text(reviews, head, effective_risk, grant_count)
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
     grants_text = _grants_text(plan_mod.slice_grants(state, slice_id))
+    criteria_note = _criteria_note(run_dir, entry, slice_id)
     assessment_text = _render_assessment(
         entry,
         report,
@@ -1957,13 +2023,15 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         reviews_text=reviews_text,
         attempts_summary=attempts_summary,
         grants_text=grants_text,
+        criteria_note=criteria_note,
     )
     assessment_relative = f"{slice_relative_dir(slice_id)}/assessment.md"
     assessment_original = write_controller_artifact(
         repo, run_dir, state["run_id"], assessment_relative, assessment_text
     )
 
-    first_line = stripped_reasoning.splitlines()[0][:120]
+    # In full: the decision is the run report's and the ledger's one-line record of why the slice was accepted.
+    first_line = stripped_reasoning.splitlines()[0]
     entry["status"] = "accepted"
     entry["commit"] = head
     entry["decision"] = first_line
@@ -2009,6 +2077,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         pane_path=artifact_dir / "pane.txt",
         code_warning=code_warning,
         sandbox_notes=sandbox_notes,
+        criteria_note=criteria_note,
     )
 
 
@@ -2022,6 +2091,8 @@ class SteerOutcome:
     attempts: int | None = None
     message: str = ""
     correction_path: Path | None = None
+    # True unless the pane was unchanged after the pointer's Enter (sessions.Delivery).
+    delivered: bool = True
 
 
 def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, risk: str | None = None) -> SteerOutcome:
@@ -2122,7 +2193,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
                 "not overwrite it"
             ) from exc
         try:
-            sessions.send_line(session, prompts.render_steer_pointer(correction_path))
+            delivery = sessions.send_line(session, prompts.render_steer_pointer(correction_path))
         except TypedNotSubmitted:
             # Deliberately NOT unlinked: the pointer to this file is sitting typed
             # in the Developer's input line, so deleting it would leave the pane
@@ -2145,7 +2216,13 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # The note carries the complete verbatim correction and stays the
     # authoritative record; `correction_path` is a delivery artifact, not a
     # second source of truth, so no evidence path is recorded.
-    state_mod.append_event(run_dir, "steer", slice_id=slice_id, note=correction)
+    state_mod.append_event(
+        run_dir,
+        "steer",
+        slice_id=slice_id,
+        note=correction,
+        data=None if delivery.confirmed else {"delivery": "unconfirmed"},
+    )
 
     return SteerOutcome(
         kind="steered",
@@ -2153,6 +2230,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
         attempts=attempts,
         message=f"steered {slice_id} (attempt {attempts})",
         correction_path=correction_path,
+        delivered=delivery.confirmed,
     )
 
 
@@ -2211,7 +2289,14 @@ def finalize_stop(
     _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
     report, artifact_dir, pane_error = _collect_finalize_evidence(repo, state, current, tolerate_pane_error=True)
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
+    state_mod.append_event(
+        run_dir,
+        "floor",
+        slice_id=slice_id,
+        note=_floor_note(report),
+        evidence=str(artifact_dir),
+        data=report.failure_data(),
+    )
 
     head = git_ops.git_head(repo)
     reviews = list(entry.get("reviews") or [])

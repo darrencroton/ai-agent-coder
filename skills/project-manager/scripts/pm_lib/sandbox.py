@@ -737,9 +737,10 @@ def inside_sandbox() -> bool:
 
 def wrap_command(policy_path: Path | str, argv: list[str], *, tmpdir: Path | str) -> list[str]:
     """`argv` run under `srt` with `policy_path`, with `TMPDIR` and
-    `CLAUDE_CODE_TMPDIR` set to `tmpdir` and, when the file exists,
-    `SSL_CERT_FILE` pointed at the system bundle (some harnesses verify TLS
-    through `trustd`, which Seatbelt blocks).
+    `CLAUDE_CODE_TMPDIR` set to `tmpdir`, `TMPPREFIX` to `<tmpdir>/zsh` (where
+    zsh writes here-document files, by default under the unwritable `/tmp`)
+    and, when the file exists, `SSL_CERT_FILE` pointed at the system bundle
+    (some harnesses verify TLS through `trustd`, which Seatbelt blocks).
 
     The `--` ends `srt`'s own options: without it `srt` (0.0.81) parses its
     `-s`, `--settings`, `-c` and `-d` anywhere in the line, so a wrapped
@@ -758,6 +759,7 @@ def wrap_command(policy_path: Path | str, argv: list[str], *, tmpdir: Path | str
         "env",
         f"TMPDIR={tmpdir}",
         f"CLAUDE_CODE_TMPDIR={tmpdir}",
+        f"TMPPREFIX={tmpdir}/zsh",
         *certs,
         *argv,
     ]
@@ -915,8 +917,8 @@ def _kill_group(process: subprocess.Popen) -> None:
 
 
 def start_server(*, socket: str, policy_path: Path, worktree: Path, tmpdir: Path, log_path: Path) -> tuple[int, int]:
-    """Start `srt -s <policy> -- env TMPDIR=<tmpdir> CLAUDE_CODE_TMPDIR=<tmpdir> [SSL_CERT_FILE=...] tmux -L <socket> -D`
-    and return `(srt_pid, server_pid)` once the server answers.
+    """Start `srt -s <policy> -- env TMPDIR=<tmpdir> CLAUDE_CODE_TMPDIR=<tmpdir> TMPPREFIX=<tmpdir>/zsh
+    [SSL_CERT_FILE=...] tmux -L <socket> -D` and return `(srt_pid, server_pid)` once the server answers.
 
     `-D` keeps tmux in the foreground, so `srt` stays its parent and `srt`'s
     egress proxy lives exactly as long as the server. The process runs with

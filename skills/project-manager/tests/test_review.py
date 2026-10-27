@@ -30,6 +30,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -75,6 +76,19 @@ class TestCompileSkillBundle(unittest.TestCase):
         # The literal review-matrix.md content, not just a reference to it.
         self.assertIn("Use this as a required checklist", bundle)
         self.assertIn("review-matrix.md", bundle)
+
+    def test_reference_predicate_drops_a_rejected_file_and_keeps_the_rest(self) -> None:
+        def without_priorities(path: Path) -> bool:
+            return path.name != "scientific-and-language-priorities.md"
+
+        narrowed = prompts.compile_skill_bundle(
+            "code-review", skills_root=_REAL_SKILLS_ROOT, include_reference=without_priorities
+        )
+        full = prompts.compile_skill_bundle("code-review", skills_root=_REAL_SKILLS_ROOT)
+        self.assertIn("name: code-review", narrowed)
+        self.assertIn("Use this as a required checklist", narrowed)
+        self.assertIn("# Scientific And Language-Specific Priorities", full)
+        self.assertNotIn("# Scientific And Language-Specific Priorities", narrowed)
 
     def test_drift_audit_bundle_embeds_its_own_contract(self) -> None:
         """A second, resource-free skill. The assertions are drift-audit's own
@@ -315,6 +329,7 @@ class TestRenderReviewerPrompt(unittest.TestCase):
             authorized_surface="- a.py",
             explicit_non_goals="Nothing else.",
             risk_flags="- Risky surfaces touched: none.",
+            validation_plan="Run the tests.",
             skills_root=_REAL_SKILLS_ROOT,
         )
         fields.update(overrides)
@@ -369,6 +384,25 @@ class TestRenderReviewerPrompt(unittest.TestCase):
             "a boundary, not a bug to work around",
         ):
             self.assertIn(phrase, paragraph)
+
+    def test_the_rules_state_what_is_actually_required_of_the_reviewer(self) -> None:
+        rendered = self._render()
+        # Read-only Git and TMPDIR-only commands are expected, not forbidden.
+        self.assertIn("Read-only Git (`log`, `diff`, `show`, `blame`, `ls-files`)", rendered)
+        self.assertIn("writes nothing outside `$TMPDIR`", rendered)
+        self.assertIn("run it and report what you saw", rendered)
+        self.assertNotIn("no Git or state-changing commands", rendered)
+        for forbidden in ("tracked file", "inside the repository", "commit, branch, push, stash", "re-delegate"):
+            self.assertIn(forbidden, rendered.split("Task:")[0], f"REVIEWER MODE must name: {forbidden}")
+
+    def test_the_sandbox_paragraph_carries_the_heredoc_and_pycache_sentences(self) -> None:
+        plain, sandboxed = self._render(), self._render(sandboxed=True)
+        for sentence in (
+            "Write multi-line content with the harness's file tool or `printf`",
+            "Run Python with `-B` or from `$TMPDIR`",
+        ):
+            self.assertIn(sentence, sandboxed)
+            self.assertNotIn(sentence, plain)
 
     def test_a_malformed_sandbox_block_raises_whether_sandboxed_or_not(self) -> None:
         malformed = {
@@ -508,6 +542,7 @@ class TestRenderReviewerPrompt(unittest.TestCase):
                     authorized_surface="x",
                     explicit_non_goals="x",
                     risk_flags="x",
+                    validation_plan="x",
                     reference_path=path,
                     skills_root=_REAL_SKILLS_ROOT,
                 )
@@ -644,6 +679,132 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
 
         events = state_mod.read_events(run_dir)
         self.assertTrue(any(e["kind"] == "review" for e in events))
+
+    def test_review_records_launched_at_and_logs_review_launched_before_review(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+        fake = _write_fake_reviewer(self.repo.parent / "fake_launched.sh", 'echo "report"\nexit 0')
+
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 0, err)
+
+        record = state_mod.load_state(run_dir, token)["slices"][0]["reviews"][0]
+        # UTC ISO 8601, and the launch cannot postdate the completion stamp.
+        launched_at = datetime.fromisoformat(record["launched_at"])
+        self.assertIsNotNone(launched_at.utcoffset())
+        self.assertLessEqual(launched_at, datetime.fromisoformat(record["at"]))
+
+        events = state_mod.read_events(run_dir)
+        kinds = [event["kind"] for event in events]
+        self.assertEqual(kinds.count("review-launched"), 1)
+        self.assertLess(kinds.index("review-launched"), kinds.index("review"))
+        launched = events[kinds.index("review-launched")]
+        self.assertEqual(launched["slice"], "Slice 1")
+        self.assertEqual(
+            set(launched["data"]), {"skill", "tool", "model", "effort", "sequence", "pgid"}, "the documented data keys"
+        )
+        self.assertEqual((launched["data"]["skill"], launched["data"]["tool"]), ("code-review", "faketool"))
+        self.assertEqual(launched["data"]["sequence"], 1)
+        self.assertIsInstance(launched["data"]["pgid"], int)
+
+    def _commission_and_read_prompt(self, *, changed: str, validation_md: str | None, plan_validation: str) -> str:
+        token, before_head, run_dir = self._init_and_advance(
+            slices=[{"files": [changed], "validation": plan_validation}]
+        )
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head(changed)
+        if validation_md is not None:
+            artifact_dir = self.repo / ".pm" / "runs" / state["run_id"] / "slices" / "slice-001"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "validation.md").write_text(validation_md, encoding="utf-8")
+        fake = _write_fake_reviewer(self.repo.parent / "fake_prompt_reader.sh", 'echo "report"\nexit 0')
+        code, _out, err = self.run_cli_in_repo(
+            ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "faketool"]
+            + ["--reviewer-command", str(fake), "--token", token]
+        )
+        self.assertEqual(code, 0, err)
+        return (run_dir / "slices" / "slice-001" / "review-1-code-review-faketool-prompt.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_reviewer_prompt_carries_the_validation_plan_and_the_developers_record(self) -> None:
+        prompt = self._commission_and_read_prompt(
+            changed="a.py", validation_md="- AC1: `unittest` passed", plan_validation="Run the frobnicator self-test."
+        )
+        self.assertIn("Run the frobnicator self-test.", prompt)
+        heading = (
+            "Developer's validation record (validation.md, written by the Developer; evidence pointers, not a verdict)"
+        )
+        self.assertIn(heading, prompt)
+        self.assertLess(prompt.index(heading), prompt.index("- AC1: `unittest` passed"))
+
+    def test_reviewer_prompt_says_none_when_the_developer_wrote_no_validation_md(self) -> None:
+        prompt = self._commission_and_read_prompt(changed="a.py", validation_md=None, plan_validation="Run it.")
+        self.assertIn("instead of taking it as established:\nnone\n", prompt)
+
+    def test_an_oversized_validation_record_is_truncated_with_a_pointer_to_the_file(self) -> None:
+        prompt = self._commission_and_read_prompt(
+            changed="a.py",
+            validation_md="x" * (review_mod._VALIDATION_RECORD_MAX_CHARS + 500),
+            plan_validation="Run it.",
+        )
+        self.assertIn("[truncated; the full file is at ", prompt)
+        self.assertNotIn("x" * (review_mod._VALIDATION_RECORD_MAX_CHARS + 1), prompt)
+
+    def test_the_language_priorities_reach_a_python_diff_but_not_a_markdown_one(self) -> None:
+        marker = "# Scientific And Language-Specific Priorities"
+        python_prompt = self._commission_and_read_prompt(changed="a.py", validation_md=None, plan_validation="Run it.")
+        self.assertIn(marker, python_prompt)
+        self.assertIn("Use this as a required checklist", python_prompt)
+
+    def test_a_markdown_only_diff_leaves_the_language_priorities_out_but_keeps_the_matrix(self) -> None:
+        marker = "# Scientific And Language-Specific Priorities"
+        prompt = self._commission_and_read_prompt(changed="notes.md", validation_md=None, plan_validation="Run it.")
+        self.assertNotIn(marker, prompt)
+        self.assertIn("Use this as a required checklist", prompt)
+
+    def test_a_failing_reviewer_still_logs_review_launched(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+        fake = _write_fake_reviewer(self.repo.parent / "fake_launched_fail.sh", "exit 3")
+
+        code, _out, _err = self.run_cli_in_repo(
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(fake),
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 2)
+        kinds = [event["kind"] for event in state_mod.read_events(run_dir)]
+        self.assertLess(kinds.index("review-launched"), kinds.index("review-failed"))
 
     def test_inherited_effort_on_a_zero_variant_model_commissions_at_default(self) -> None:
         """The mechanical bug this diff exists to fix: a run-level default
@@ -1040,6 +1201,61 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
             prompt.index("- third ruling"),
             "file-sourced rulings must render before --adjudicated flag rulings",
         )
+
+    def test_adjudicated_file_with_no_ruling_fails_closed_naming_the_file(self) -> None:
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+        passing = _write_fake_reviewer(self.repo.parent / "fake_rv_empty_adj.sh", 'echo "## Verdict\n- PASS"')
+
+        for name, content in (("empty.txt", ""), ("blank-and-comments.txt", "\n   \n# only a comment\n  # indented\n")):
+            with self.subTest(file=name):
+                adjudications_file = self.repo.parent / name
+                adjudications_file.write_text(content, encoding="utf-8")
+                code, _out, err = self.run_cli_in_repo(
+                    [
+                        "review",
+                        "--slice",
+                        "Slice 1",
+                        "--skill",
+                        "code-review",
+                        "--tool",
+                        "faketool",
+                        "--reviewer-command",
+                        str(passing),
+                        "--adjudicated-file",
+                        str(adjudications_file),
+                        "--token",
+                        token,
+                    ]
+                )
+                self.assertEqual(code, 2)
+                self.assertIn(name, err)
+                # Refused before any reviewer was commissioned.
+                self.assertFalse(any(e["kind"].startswith("review") for e in state_mod.read_events(run_dir)))
+
+        # One ruling is enough.
+        one = self.repo.parent / "one.txt"
+        one.write_text("# header\nthe only ruling\n", encoding="utf-8")
+        code, _out, err = self.run_cli_in_repo(
+            [
+                "review",
+                "--slice",
+                "Slice 1",
+                "--skill",
+                "code-review",
+                "--tool",
+                "faketool",
+                "--reviewer-command",
+                str(passing),
+                "--adjudicated-file",
+                str(one),
+                "--token",
+                token,
+            ]
+        )
+        self.assertEqual(code, 0, err)
 
     def test_adjudicated_file_missing_fails_closed(self) -> None:
         token, before_head, run_dir = self._init_and_advance()

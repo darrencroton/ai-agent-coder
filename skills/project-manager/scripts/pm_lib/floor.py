@@ -70,6 +70,24 @@ class FloorReport:
     def passed(self) -> bool:
         return all(fact.passed for fact in self.facts)
 
+    def failure_data(self) -> dict[str, Any] | None:
+        """What each failing fact found, for the `floor` event's `data`; None when the floor passed.
+
+        `{"failed": [{"fact", "detail", "evidence"}, ...]}` in fact order. The evidence is the fact's own (the
+        surface fact's offending and protected paths, the ancestry fact's heads, the worktree fact's status lines)
+        less the surface fact's full changed-file list, which can be large and is recoverable from the diff.
+        """
+        failed = [
+            {
+                "fact": fact.name,
+                "detail": fact.detail,
+                "evidence": {key: value for key, value in fact.evidence.items() if key != "changed_files"},
+            }
+            for fact in self.facts
+            if not fact.passed
+        ]
+        return {"failed": failed} if failed else None
+
 
 def _fact_plan_digest(state: dict[str, Any]) -> FloorFact:
     plan_info = state.get("plan") if isinstance(state.get("plan"), dict) else {}

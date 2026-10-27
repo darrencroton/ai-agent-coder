@@ -50,7 +50,7 @@ which binaries are missing. No linter runs. `--json` for machine output.
 - otherwise: uncommitted tracked modifications plus untracked files.
 
 There is no `--staged` mode. It would have listed staged paths while linting
-worktree content, so a staged defect could pass behind an unstaged fix, and it
+working-tree content, so a staged defect could pass behind an unstaged fix, and it
 had no base ref so it could also block on pre-existing debt. `check --base HEAD`
 before staging is the correct pre-commit call and covers the same ground.
 
@@ -81,7 +81,7 @@ Default tier runs whenever a matching file is in scope. Opt-in tier needs
 | Tool | Tier | Languages | Binary | Catches |
 |---|---|---|---|---|
 | `ruff-check` | default | Python | `ruff` | Unused imports/variables, undefined names, unsorted imports, and the rest of the pyflakes/pycodestyle/isort/pyupgrade superset |
-| `ruff-format` | default | Python | `ruff` | Formatting drift (Black-compatible) |
+| `ruff-format` | default | Python | `ruff` | Formatting drift (Black-compatible); skipped, and reported as black-owned, when the project configures black (`[tool.black]` in `pyproject.toml` or a `black` call in a top-level `Makefile`) |
 | `markdownlint` | default | Markdown | `markdownlint-cli2` | Malformed tables (**MD056** — wrong cell count, where the extra cell is silently dropped when rendered), heading structure, list and spacing errors |
 | `codespell` | default | any text | `codespell` | Misspellings in comments, strings, prose, and whole-word identifiers (snake_case parts inside a longer identifier can be missed) |
 | `shellcheck` | default | Shell (`.sh`, `.bash`) | `shellcheck` | Unquoted expansions that word-split (**SC2086**), misused `test` operators, unreachable code, `$?` read after the wrong command |
@@ -177,9 +177,10 @@ reported. Formatters emit one finding per file, so a file already unformatted at
 base cannot show a second formatting regression. Use `--all` when you need the
 complete picture rather than the delta.
 
-The base side is linted in a detached `git worktree` created under the system temp
-directory and removed afterwards. The working tree is never checked out, stashed,
-or otherwise disturbed.
+The base side is linted in a copy of the base ref's tree, written byte for byte under
+`$TMPDIR` from `git ls-tree` and `git cat-file` (so it needs no write access to the
+git dir and ignores `export-ignore`) and removed afterwards. The working tree is
+never checked out, stashed, or otherwise disturbed.
 
 ## Install safety
 

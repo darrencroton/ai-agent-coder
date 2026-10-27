@@ -157,6 +157,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     observe = subparsers.add_parser("observe", help="Show evidence of the live session's progress")
     observe.add_argument("--wait", type=_positive_seconds)
+    observe.add_argument(
+        "--seen-marker",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="a dialog marker (its matched literal, as printed after `dialog marker:`) that is already read and judged: "
+        "it does not end the wait, and is still printed on return; repeatable. Any other marker ends the wait",
+    )
     observe.add_argument("--run")
     observe.add_argument("--token")
 
@@ -306,6 +314,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wait_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree")
     wait_child.add_argument("--wait", type=_positive_seconds)
+    wait_child.add_argument(
+        "--seen-marker",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="a dialog marker (its matched literal, as printed after `dialog marker:`) that is already read and judged: "
+        "it does not end the wait, and is still printed on return; repeatable. Any other marker ends the wait",
+    )
 
     answer_child = subparsers.add_parser(
         "answer-child",
@@ -313,7 +329,14 @@ def build_parser() -> argparse.ArgumentParser:
         "question as cm-question-<n>.md, and sends a one-line pointer into the child's session",
     )
     answer_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree")
-    answer_child.add_argument("--text", required=True, help="the answer, delivered verbatim through a file")
+    answer_child_mode = answer_child.add_mutually_exclusive_group(required=True)
+    answer_child_mode.add_argument("--text", help="the answer, delivered verbatim through a file")
+    answer_child_mode.add_argument(
+        "--redeliver",
+        action="store_true",
+        help="re-send the pointer for the latest cm-answer-<n>.md when the child did not react to it; writes "
+        "nothing; refused when a newer question or the completion file exists, or there is no answer",
+    )
 
     stop_child = subparsers.add_parser(
         "stop-child",
@@ -349,7 +372,10 @@ def build_parser() -> argparse.ArgumentParser:
     ledger_parser = subparsers.add_parser("ledger", help="Work with the cross-run model ledger")
     ledger_commands = ledger_parser.add_subparsers(dest="ledger_command", required=True)
     render = ledger_commands.add_parser("render", help="Render every per-run ledger file into one leaderboard")
-    render.add_argument("--out", help="output path (default: <ledger dir>/leaderboard.md)")
+    render.add_argument(
+        "--out",
+        help="output path (default: <ledger dir>/leaderboard.md, or leaderboard-<run tags joined by +>.md with --run-tag)",
+    )
     render.add_argument(
         "--run-tag",
         action="append",
@@ -403,7 +429,12 @@ def _print_protected_line(policy: dict | None, report: dict) -> None:
 
 
 def _run_check_plan(args: argparse.Namespace) -> int:
-    plan_path = Path(args.plan)
+    try:
+        plan_path = git_ops.resolve_plan(Path(args.plan))
+    except PmError:
+        # Same shape as the plan's own ERROR lines: a missing file is a plan defect, not a crash.
+        print(f"ERROR: plan file not found: {Path(args.plan).expanduser().resolve()}")
+        return 2
     # Resolved to the toplevel as init does, so a subdirectory finds the same
     # repository and a policy file inside it protects itself the same way.
     repo_path = git_ops.resolve_repo(Path(args.repo)) if args.repo else None
@@ -494,14 +525,16 @@ def _run_init(args: argparse.Namespace) -> int:
     sandbox_block = result.state.get("sandbox")
     if sandbox_block:
         print(f"sandbox: control dir {sandbox_block['control_dir']}")
+    # The warning is on stderr so stdout carries the token line and nothing that reads as prose after it.
+    print(
+        "Keep this token out of Developer sessions — it authorizes PM state writes; "
+        "the operator or PM agent should hold it, never the harness being supervised.",
+        file=sys.stderr,
+    )
     print(f"PM_RUN_TOKEN={result.token}")
     if sandbox_block:
         # Every later command of this run refuses without it.
         print(f"export PM_TMUX_SOCKET={sandbox_block['socket']}")
-    print(
-        "Keep this token out of Developer sessions — it authorizes PM state writes; "
-        "the operator or PM agent should hold it, never the harness being supervised."
-    )
     return 0
 
 
@@ -752,11 +785,24 @@ def _print_no_signal_note(outcome, actions: str) -> None:
         )
 
 
+def _print_delivery(delivered: bool) -> None:
+    """The one line saying whether a pointer's Enter visibly reached the pane (`sessions.Delivery`)."""
+    if delivered:
+        print("delivery: confirmed")
+    else:
+        print(
+            "delivery: unconfirmed (the pane did not change after Enter; re-check with observe/wait-child, "
+            "then --redeliver if the child did not react)"
+        )
+
+
 def _run_observe(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     sandbox.require_run_socket(state_mod.load_state(run_dir))
-    outcome = slice_ops.observe(repo, run_dir, wait=args.wait, token=_resolve_token(args))
+    outcome = slice_ops.observe(
+        repo, run_dir, wait=args.wait, token=_resolve_token(args), seen_markers=args.seen_marker
+    )
 
     if not outcome.has_current_slice:
         print("no current slice")
@@ -786,8 +832,9 @@ def _run_send(args: argparse.Namespace) -> int:
     repo = _repo_from_cwd()
     run_dir = state_mod.resolve_run_dir(repo, args.run)
     sandbox.require_run_socket(state_mod.load_state(run_dir))
-    slice_ops.send(repo, run_dir, token, text=args.text, reason=args.reason)
+    delivery = slice_ops.send(repo, run_dir, token, text=args.text, reason=args.reason)
     print(f"sent: {args.text!r} ({args.reason})")
+    _print_delivery(delivery.confirmed)
     return 0
 
 
@@ -802,6 +849,7 @@ def _run_answer(args: argparse.Namespace) -> int:
     outcome = slice_ops.answer(repo, run_dir, token, text=args.text)
     print(f"answered {outcome.slice_id}: {outcome.answer_path}")
     print(f"question archived: {outcome.question_archived_path}")
+    _print_delivery(outcome.delivered)
     return 0
 
 
@@ -882,6 +930,8 @@ def _run_finalize(args: argparse.Namespace) -> int:
             if outcome.code_warning:
                 print(f"pm: code metrics: {outcome.code_warning}", file=sys.stderr)
             print(f"ACCEPTED {outcome.slice_id}")
+            if outcome.criteria_note:
+                print(outcome.criteria_note)
             print(f"assessment: {outcome.assessment_path}")
             for note in outcome.sandbox_notes or []:
                 print(f"sandbox: {note}")
@@ -893,6 +943,7 @@ def _run_finalize(args: argparse.Namespace) -> int:
         outcome = slice_ops.finalize_steer(repo, run_dir, token, correction=args.steer, risk=args.risk)
         if outcome.kind == "steered":
             print(f"steered {outcome.slice_id} (attempt {outcome.attempts})")
+            _print_delivery(outcome.delivered)
             print(f"correction: {outcome.correction_path}")
             return 0
         print(f"pm: error: {outcome.message}", file=sys.stderr)
@@ -937,7 +988,14 @@ def _load_adjudications(args: argparse.Namespace) -> list[str]:
             lines = Path(args.adjudicated_file).read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeDecodeError) as exc:
             raise PmError(f"could not read --adjudicated-file {args.adjudicated_file}: {exc}") from exc
-        items.extend(line for line in lines if line.strip() and not line.strip().startswith("#"))
+        rulings = [line for line in lines if line.strip() and not line.strip().startswith("#")]
+        # Fail closed: a named file with no ruling would commission a panel member
+        # with an adjudication context that silently differs from its siblings'.
+        if not rulings:
+            raise PmError(
+                f"--adjudicated-file {args.adjudicated_file} holds no ruling (it is empty or only blank and # lines)"
+            )
+        items.extend(rulings)
     if args.adjudicated:
         items.extend(args.adjudicated)
     return items
@@ -1205,6 +1263,11 @@ def _run_launch_child(args: argparse.Namespace) -> int:
     )
     if outcome.control_dir is not None:
         print(f"sandbox: control dir {outcome.control_dir}")
+    print(f"git dir: {outcome.git_dir}")
+    if outcome.node_dir is not None:
+        print(f"node dir: {outcome.node_dir} at dossier commit {outcome.dossier_commit}")
+    else:
+        print("node dir: none (the launcher lies in no git repository; no dossier commit recorded)")
     print(f"watch: {outcome.watch}")
     return 0
 
@@ -1236,11 +1299,14 @@ def _run_campaign_preflight(args: argparse.Namespace) -> int:
 
 
 def _run_wait_child(args: argparse.Namespace) -> int:
-    outcome = campaign.wait_child(Path(args.worktree), wait=args.wait)
+    outcome = campaign.wait_child(Path(args.worktree), wait=args.wait, seen_markers=args.seen_marker)
     if args.wait:
         print(f"waited: {outcome.elapsed_seconds:.1f}s (requested {args.wait:g}s)")
     print(f"session running: {outcome.running}")
-    status_note = f" (status={outcome.result_status})" if outcome.result_status else ""
+    # `child-result.json` is written by the child, whose sandbox can write it.
+    status_note = (
+        f" (status={outcome.result_status}; unverified: written by the child)" if outcome.result_status else ""
+    )
     print(f"result present: {outcome.result_present}{status_note}")
     _print_question(outcome)
     _print_dialog_marker(outcome)
@@ -1257,9 +1323,13 @@ def _run_wait_child(args: argparse.Namespace) -> int:
 
 
 def _run_answer_child(args: argparse.Namespace) -> int:
-    outcome = campaign.answer_child(Path(args.worktree), text=args.text)
-    print(f"answered: {outcome.answer_path}")
-    print(f"question archived: {outcome.question_archived_path}")
+    outcome = campaign.answer_child(Path(args.worktree), text=args.text, redeliver=args.redeliver)
+    if args.redeliver:
+        print(f"redelivered: {outcome.answer_path}")
+    else:
+        print(f"answered: {outcome.answer_path}")
+        print(f"question archived: {outcome.question_archived_path}")
+    _print_delivery(outcome.delivered)
     return 0
 
 
@@ -1325,7 +1395,14 @@ def _run_ledger_render(args: argparse.Namespace) -> int:
     files = leaderboard.load_run_files(root)
     if not files:
         raise PmError(f"no per-run ledger files found under {root}")
-    out = Path(args.out) if args.out else root / "leaderboard.md"
+    if args.out:
+        out = Path(args.out)
+    elif run_tags:
+        # A filtered view beside the default leaderboard, never over it.
+        joined = "+".join(re.sub(r"[^\w.-]+", "_", tag) for tag in sorted(run_tags))
+        out = root / f"leaderboard-{joined}.md"
+    else:
+        out = root / "leaderboard.md"
     # The write replaces `out` itself, never a symlink's target, so the
     # History link is relative to the directory `out` is named in.
     try:
@@ -1337,6 +1414,8 @@ def _run_ledger_render(args: argparse.Namespace) -> int:
     except OSError as exc:
         raise PmError(f"cannot write the leaderboard to {out}: {exc}") from exc
     print(f"leaderboard: {out}")
+    if run_tags and not args.out:
+        print(f"filtered by run tag; the default {root / 'leaderboard.md'} is untouched")
     for error in errors:
         print(f"WARNING: excluded {error}")
     return 0

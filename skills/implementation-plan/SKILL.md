@@ -92,7 +92,7 @@ Use this shape for every implementation slice:
 
 ## Writing Acceptance Criteria
 
-`Acceptance Criteria` is the shared behavioural checklist: it reaches the implementer and a `project-manager`-commissioned reviewer verbatim, as the pinned contract the change must satisfy. Requirements that must bind both seats belong in the slice's own sections — plan text outside them reaches neither.
+`Acceptance Criteria` is the shared behavioural checklist: it reaches the implementer and a `project-manager`-commissioned reviewer verbatim, as the pinned contract the change must satisfy. Under `project-manager` the Developer receives all seven sections of its slice; a reviewer receives Intended Change, Acceptance Criteria, Authorized Surface, Explicit Non-Goals, Risk Flags and Validation Plan, plus the Developer's `validation.md`; plan-level text outside a slice reaches neither. Requirements that must bind both seats belong in those slice sections.
 
 Write them as an enumerable checklist, one verifiable assertion per line, rather than as paragraphs. The `- [ ]` checkbox lines are required, not advice: `project-manager` counts them (the count is the denominator of the Developer judgment's `criteria_met`), and a slice with none fails `check-plan`. `Inputs:` and `Behaviour that must not change:` may remain as plain context bullets, but they are not counted. Requirements buried mid-paragraph get lost even by strong models, and a checklist is what lets a reviewer or supervisor check completeness at a glance:
 
@@ -171,7 +171,7 @@ End the plan with two copyable launchers for the next chat: the Mode A launcher,
 - **Mode A — human-managed plan.** One agent session acts as the Developer over the slices in scope; the human holds the gates. Its `Supervision:` line selects one of two usages, and the plan recommends one:
   - *Checkpointed* (default) — when slices are risky, touch flagged surfaces, or you want a checkpoint between them. You stay in the loop, approve before approval-flagged slices, review findings, and approve each commit. One slice (or a few tightly-coupled slices) per chat, then a handoff to the next session.
   - *Autonomous* — the same session runs over all remaining slices, for when the plan is straightforward, the selected models are suitable, the work fits one session, and you do not want to stand up an external supervisor. The launcher is standing authorization to commit each slice that clears every gate; the gates are promises kept in-session, not externally verified, and you assess at the end.
-- **Mode B — PM-managed plan.** The alternative when the plan is long, the run is unattended, models are weaker or cheaper, or you want external verification with a durable audit trail. Include the launcher below — this file is its only copy — with the plan file and repository paths filled in. Every slice must remain independently gateable because PM ignores batches, and the plan should pass `check-plan` cleanly.
+- **Mode B — PM-managed plan.** The alternative when the plan is long, the run is unattended, models are weaker or cheaper, or you want external verification with a durable audit trail. Include the launcher below — this file is its only copy — with the plan file and repository paths filled in and exactly one of its two mode paragraphs kept: the human-present paragraph by default, the campaign-child paragraph only when a Campaign Manager launches the run. Every slice must remain independently gateable because PM ignores batches, and the plan should pass `check-plan` cleanly.
 
 Every launcher keeps two non-negotiables: a slice whose Risk Flags mark approval-needed pauses a checkpointed Mode A run and stops an autonomous Mode A or Mode B run, and each slice reports its authorization-gate result before quality review.
 
@@ -216,35 +216,34 @@ Drift auditor: <harness> <full model id> <effort>
 Code reviewers: <harness> <full model id> <effort>; <harness> <full model id> <effort>
 Run tag (optional): <tag>
 Sandbox policy (optional, macOS): <absolute path to an srt base policy, per project-manager's references/sandbox.md; omit the line for a campaign child, whose server the Campaign Manager sandboxes>
-Campaign child (include this paragraph only when a Campaign Manager launched this run; delete it otherwise; the contract it serves is project-manager's references/campaign-mode.md):
-- Nobody is present: confirm nothing with a human.
-- The plan is committed in the dossier at the path given, which meets the "plan committed" requirement; it is not in the product repository.
-- Skip the confirm step. After `check-plan` and the repo check, run `init` yourself with `--branch <branch>`, `--policy <protected-paths policy file, when given>`, `--run-tag <campaign tag>`, `--max-attempts <N>` and full model ids, and hold the token.
+Use the project-manager skill. You are the PM: the accountable supervisor of this run. You never write slice code.
+
+Handoff: HANDOFF.md in the repo root, git-ignored (add it to .git/info/exclude if it is not; a campaign child's is already excluded), is the sole entry point for a restart and for my post-run review. Create it after init and update it after every slice decision and before any stop with: run identity (never the token), seats, branch, commit authorisation, review protocol, slice log, plan decisions, residuals and follow-ups, and PM lessons.
+
+Starting the run: keep exactly one of the two mode paragraphs below and delete the other. Either way, `init` takes full model ids, efforts where the harness supports them, the run tag and, when a sandbox policy is given, `--sandbox <path>`; set `PM_TMUX_SOCKET` exactly as the `export PM_TMUX_SOCKET=…` line init prints, for every later command of the run.
+
+Human present (the default):
+- If HANDOFF.md names an unfinished run of this plan, read it fully and resume that run (I will supply the token). Otherwise prepare, then confirm with me once:
+  - Read the whole plan, run check-plan with repo context, and check that the repo still matches what the plan assumes. Init freezes the plan, so raise any drift or warning now.
+  - Require a clean worktree with the plan committed. Propose the plan's feature branch, or a new branch name to create.
+  - Confirm: plan read, check-plan result, seats, branch, first slice, any approval-flagged slices (each stops the run until I approve it), and my standing authorisation for Developers to commit each slice.
+- After my go-ahead, run init. Give me the run id and token, then begin.
+
+Campaign child (a Campaign Manager launched this run; the contract this serves is project-manager's references/campaign-mode.md):
+- Nobody is present: confirm nothing with a human. The plan is committed in the dossier at the path given, which meets the "plan committed" requirement; it is not in the product repository.
+- If HANDOFF.md names an unfinished run of this plan, read it fully and resume that run with the token you kept. Otherwise, after `check-plan` and the repo check, run `init` yourself with `--branch <branch>`, `--policy <protected-paths policy file, when given>`, `--run-tag <campaign tag>` and `--max-attempts <N>`, and hold the token.
 - The Campaign Manager's launcher carries the owner's standing authorisation for each Developer to commit each slice on `<branch>`; never merge: the Campaign Manager merges.
-- Keep HANDOFF.md as usual (launch-child has already excluded it in the worktree's git exclude file); it is archived with your run.
-- Resolve natural plan defects yourself, as the Plan defects paragraph below says.
 - A decision the Campaign Manager can give in a line (a reading the plan leaves genuinely open, a tolerance) goes to `.pm/campaign/cm-question.md` with the options and your recommendation; then wait for the one-line pointer to the answer.
 - For an evidence node, the "full test suite" in the per-slice steps below is reading the files the node's pinned script wrote, never running it again, and a measured `fail` or `error` faithfully reported is acceptable slice work.
 - A human gate, a floor failure you cannot steer within budget, an integrity stop, a dialog or an exhausted budget ends the run.
-- When the run is decided, run `status --report`, confirm the ledger was written, write `.pm/campaign/child-result.json` as `{"status": "complete" | "stopped" | "needs-human", "run_id": "<run id, or null when init never succeeded>", "summary": "<one paragraph>"}`, write the final report as your last message, and stay idle.
-- Where this paragraph contradicts the confirm or resume steps below, it wins.
-
-Use the project-manager skill. You are the PM: the accountable supervisor of this run. You never write slice code.
-
-Handoff: HANDOFF.md in the repo root, git-ignored (add it to .git/info/exclude if it is not), is the sole entry point for a restart and for my post-run review. If it names an unfinished run of this plan, read it fully and resume that run (I will supply the token). Otherwise create it after init. Update it after every slice decision and before any stop with: run identity (never the token), seats, branch, commit authorisation, review protocol, slice log, plan decisions, residuals and follow-ups, and PM lessons.
-
-For a new run, prepare, then confirm with me once:
-- Read the whole plan, run check-plan with repo context, and check that the repo still matches what the plan assumes. Init freezes the plan, so raise any drift or warning now.
-- Require a clean worktree with the plan committed. Propose the plan's feature branch, or a new branch name to create.
-- Confirm: plan read, check-plan result, seats, branch, first slice, any approval-flagged slices (each stops the run until I approve it), and my standing authorisation for Developers to commit each slice.
-After my go-ahead, run init with full model ids, efforts where the harness supports them, the run tag and, when a sandbox policy is given, `--sandbox <path>`; then set `PM_TMUX_SOCKET` exactly as the `export PM_TMUX_SOCKET=…` line init prints, for every later command of the run. Give me the run id and token, then begin.
+- When the run is decided, run `status --report`, confirm the ledger was written, write `.pm/campaign/child-result.json` as `{"status": "complete" | "stopped" | "needs-human", "run_id": "<run id, or null when init never succeeded>", "summary": "<one paragraph>"}`, make the Finish report your last message, and stay idle.
 
 Per slice, in plan order:
 1. start-slice with the Developer seat's model and effort. Wait with one long background `observe --wait`; never poll.
 2. Run finalize, then your own checks: pane, diff, validation output, full test suite, lint, differential code-health if the structure changed, and a style-guide audit (the project's guide, otherwise the baseline). Treat newly introduced, in-contract style deviations as cleanup to steer.
-3. Run the review panel when the plan or risk calls for it. Run the drift audit first, then read and rate it. Then start all code reviewers ~90 s apart, sharing one `--adjudicated-file`. Let reviews run to completion without watching them.
-4. Rate every report, order the code panel, and score the Developer (criteria met, confirmed defects).
-5. Decide: accept, steer or stop. Steer only once every review is in, with all findings batched into one correction. Each follow-up round re-runs the panel, focused on the change since the last round through an adjudication line.
+3. Review as project-manager's *Risk* section sets: on a standard slice your own checks in step 2 are the review, and commissioning more is your recorded review-depth discretion; an elevated slice (`Independent audit required: yes` or a risky surface) commissions the drift audit first, which you read and rate, then the code reviewers, who share one `--adjudicated-file`. Let reviews run to completion without watching them.
+4. Rate every commissioned report, order the code panel when there is one, and score the Developer (criteria met, confirmed defects).
+5. Decide: accept, steer or stop. Steer only once every review is in, with all findings batched into one correction. Each follow-up round re-runs what the change needs: on an elevated slice, both reviews fresh at the new head, focused on the change since the last round through an adjudication line.
 6. Update `pm notes` for the next Developer, and HANDOFF.md for me.
 
 Plan defects: where the plan's goals make one resolution natural and its impact stays within the slice or touches only a few slices, decide it yourself and record it as a delegated plan decision. Never edit the plan, widen the surface except by grant, or relax a floor fact. Stop for anything serious, contested or cross-cutting, and whenever the floor or a plan gate needs a human.

@@ -62,6 +62,7 @@ from pm_test_helpers import (
 from pm_lib import PmError
 from pm_lib import campaign
 from pm_lib import cli
+from pm_lib import git_ops
 from pm_lib import prompts
 from pm_lib import sandbox
 from pm_lib import sessions
@@ -229,8 +230,8 @@ class TestCampaignParsers(unittest.TestCase):
             "--setup",
             "--sandbox",
         },
-        "wait-child": {"--worktree", "--wait"},
-        "answer-child": {"--worktree", "--text"},
+        "wait-child": {"--worktree", "--wait", "--seen-marker"},
+        "answer-child": {"--worktree", "--text", "--redeliver"},
         "stop-child": {"--worktree", "--reason"},
     }
 
@@ -815,7 +816,12 @@ class TestChildLifecycle(CampaignTestCase):
         self.assertTrue((worktree / ".pm" / ".gitignore").is_file())
         self.assertEqual(launcher.read_bytes(), self.prompt_file.read_bytes())
         manifest = json.loads((directory / "child.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(manifest), set(campaign._MANIFEST_FIELDS))
+        self.assertEqual(set(manifest), {*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir"})
+        # The launcher sits in no git repository: nothing is refused and both are null.
+        self.assertIsNone(manifest["dossier_commit"])
+        self.assertIsNone(manifest["node_dir"])
+        self.assertIn(f"\ngit dir: {git_ops.worktree_git_dir(worktree)}\n", out)
+        self.assertIn("\nnode dir: none (the launcher lies in no git repository", out)
         self.assertEqual(manifest["socket"], CHILD_SOCKET)
         self.assertEqual(manifest["branch"], "node-1")
         self.assertEqual(manifest["base"], self.base_commit)
@@ -887,6 +893,7 @@ class TestChildLifecycle(CampaignTestCase):
         self.assertFalse((directory / "cm-question.md").exists())
         self.assertIn(f"answered: {answer_path}", out)
         self.assertIn(f"question archived: {directory / 'cm-question-1.md'}", out)
+        self.assertIn("delivery: confirmed\n", out)
         answer_pointer = prompts.render_answer_pointer(answer_path)
         self.assertTrue(self._wait_for(lambda: answer_pointer in self._input_lines()), self._input_lines())
         self.assert_socket_untouched()
@@ -896,7 +903,7 @@ class TestChildLifecycle(CampaignTestCase):
         code, out, err = self.run_cli(["wait-child", "--worktree", str(worktree), "--wait", "30"])
         self.assertLess(time.monotonic() - start, 20.0)
         self.assertEqual(code, 0, err)
-        self.assertIn("result present: True (status=complete)", out)
+        self.assertIn("result present: True (status=complete; unverified: written by the child)", out)
         self.assertIn("question present: no", out)
 
         # With the completion file in, a fresh question cannot be answered.
@@ -1059,8 +1066,16 @@ class SandboxLaunchTestCase(CampaignTestCase):
         subprocess.run(["git", "init", "-q", str(self.dossier)], check=True)
         self.prompt_file = self.dossier / "nodes" / "n1" / "launcher.md"
         self.prompt_file.write_text("# Launcher\n\nRun the node plan.\n", encoding="utf-8")
+        self.commit_dossier()
         self.policy = write_base_policy(self.dossier / "sandbox.json")
         self.harness = write_fake_harness(self.repo.parent / "fake-child.sh", "echo FAKE_HARNESS_READY\nexec cat -")
+
+    def commit_dossier(self) -> str:
+        """Commit everything in the dossier (a launch refuses an uncommitted node directory); its HEAD."""
+        git = ["git", "-C", str(self.dossier), "-c", "user.email=t@example.invalid", "-c", "user.name=t"]
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "dossier"], check=True)
+        return subprocess.run([*git, "rev-parse", "HEAD"], check=True, text=True, capture_output=True).stdout.strip()
 
     def write_brief(self, section: str | None) -> Path:
         """`brief.md` in the dossier, with `section` as its `## Sandbox` body (none when None)."""
@@ -1188,7 +1203,7 @@ class TestUnsandboxedLaunchUnchanged(CampaignTestCase):
         self.assertEqual(code, 0, out + err)
         worktree = self.worktree.resolve()
         manifest = json.loads(campaign.manifest_path(worktree).read_text(encoding="utf-8"))
-        self.assertEqual(list(manifest), list(campaign._MANIFEST_FIELDS))
+        self.assertEqual(list(manifest), [*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir"])
         session = manifest["session"]
         self.assertIn(f"\nwatch: tmux -L {CHILD_SOCKET} attach -t {session}\n", out)
         self.assertNotIn("sandbox", out)
@@ -1198,6 +1213,223 @@ class TestUnsandboxedLaunchUnchanged(CampaignTestCase):
         self.assertEqual(code, 0, out + err)
         self.assertNotIn("sandbox", out)
         self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+
+
+class TestLaunchChildNodeDirectory(SandboxLaunchTestCase):
+    """The launcher's directory in the dossier must be committed; the launch records where and at what commit."""
+
+    def assert_dirty_refusal(self, *fragments: str) -> None:
+        branches, worktrees = self.branches(), self.worktrees()
+        harness = write_fake_harness(self.repo.parent / "fake-child.sh", "echo FAKE_HARNESS_READY\nsleep 30")
+        code, out, err = self.run_cli(self.launch_argv(harness))
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("uncommitted or untracked files", err)
+        for fragment in fragments:
+            self.assertIn(fragment, err)
+        self.assertEqual(self.branches(), branches)
+        self.assertEqual(self.worktrees(), worktrees)
+        self.assertFalse(self.worktree.exists(), "nothing may be created before the refusal")
+        self.assert_socket_untouched()
+
+    def test_an_untracked_file_in_the_node_directory_is_refused_by_name(self) -> None:
+        (self.prompt_file.parent / "notes.md").write_text("draft\n", encoding="utf-8")
+        self.assert_dirty_refusal("?? notes.md")
+
+    def test_a_modified_launcher_is_refused_by_name(self) -> None:
+        self.prompt_file.write_text("# Launcher\n\nEdited after the commit.\n", encoding="utf-8")
+        self.assert_dirty_refusal(" M launcher.md")
+
+    def test_a_dirty_file_outside_the_node_directory_is_not_this_directorys_business(self) -> None:
+        (self.dossier / "nodes" / "n2").mkdir()
+        (self.dossier / "nodes" / "n2" / "draft.md").write_text("draft\n", encoding="utf-8")
+        (self.dossier / "scratch.md").write_text("draft\n", encoding="utf-8")
+        head = subprocess.run(
+            ["git", "-C", str(self.dossier), "rev-parse", "HEAD"], check=True, text=True, capture_output=True
+        ).stdout.strip()
+        self.assertEqual(campaign._committed_node_dir(self.prompt_file), (self.prompt_file.resolve().parent, head))
+
+    def test_an_ignored_launcher_is_refused_because_status_never_lists_it(self) -> None:
+        (self.dossier / ".gitignore").write_text("launcher.md\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.dossier), "rm", "-q", "--cached", str(self.prompt_file)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.dossier),
+                "-c",
+                "user.email=t@x",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-am",
+                "ignore",
+            ],
+            check=True,
+        )
+        with self.assertRaises(PmError) as caught:
+            campaign._committed_node_dir(self.prompt_file)
+        self.assertIn("is not tracked", str(caught.exception))
+
+    def test_a_launcher_in_no_repository_records_nothing_and_is_not_refused(self) -> None:
+        self.assertEqual(campaign._committed_node_dir(self.repo.parent / "launcher-src.md"), (None, None))
+
+    @unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real child session")
+    def test_a_clean_node_directory_launches_and_records_the_dossier_commit_and_node_dir(self) -> None:
+        head = self.commit_dossier()
+        harness = write_fake_harness(self.repo.parent / "fake-child.sh", "echo FAKE_HARNESS_READY\nexec cat -")
+        code, out, err = self.run_cli(self.launch_argv(harness))
+        self.assertEqual(code, 0, out + err)
+        worktree = self.worktree.resolve()
+        node_dir = self.prompt_file.resolve().parent
+        manifest = json.loads(campaign.manifest_path(worktree).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["dossier_commit"], head)
+        self.assertEqual(manifest["node_dir"], str(node_dir))
+        self.assertIn(f"\ngit dir: {git_ops.worktree_git_dir(worktree)}\n", out)
+        self.assertIn(f"\nnode dir: {node_dir} at dossier commit {head}\n", out)
+        self.assertEqual(campaign.load_manifest(worktree)["session"], manifest["session"])
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(worktree), "--reason", "done"])
+        self.assertEqual(code, 0, out + err)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real child session")
+class TestWaitChildSeenMarker(CampaignTestCase):
+    """`--seen-marker` suppresses only the named literal, which is still printed on return."""
+
+    def test_a_seen_marker_does_not_end_the_wait_but_another_marker_does(self) -> None:
+        transcript, credential = self.repo.parent / "transcript", self.repo.parent / "credential"
+        body = "\n".join(
+            [
+                "echo FAKE_HARNESS_READY",
+                trigger_wait(transcript),
+                "echo 'Showing detailed transcript'",
+                trigger_wait(credential),
+                "echo 'Enter API key to continue'",
+                "sleep 60",
+            ]
+        )
+        code, out, err = self.run_cli(self.launch_argv(write_fake_harness(self.repo.parent / "fake-child.sh", body)))
+        self.assertEqual(code, 0, out + err)
+        argv = ["wait-child", "--worktree", str(self.worktree)]
+        seen = ["--seen-marker", "Showing detailed transcript"]
+
+        # The transcript view ends a wait, and is named.
+        transcript.write_text("go\n", encoding="utf-8")
+        code, out, err = self.run_cli([*argv, "--wait", "30"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("dialog marker: transcript_view (matched 'Showing detailed transcript')", out)
+        self.assertNotIn("note:", out)
+
+        # Named as seen, it no longer does: the wait runs out, still printing the marker.
+        start = time.monotonic()
+        code, out, err = self.run_cli([*argv, *seen, "--wait", "4"])
+        self.assertGreaterEqual(time.monotonic() - start, 3.5, "a seen marker must not end the wait")
+        self.assertIn("dialog marker: transcript_view (matched 'Showing detailed transcript')", out)
+        self.assertIn("note: this wait returned no signal", out)
+
+        # A different literal in the same pane ends it.
+        threading.Timer(1.0, credential.write_text, args=("go\n",), kwargs={"encoding": "utf-8"}).start()
+        start = time.monotonic()
+        code, out, err = self.run_cli([*argv, *seen, "--wait", "30"])
+        self.assertLess(time.monotonic() - start, 20.0)
+        self.assertIn("credential_prompt", out)
+        self.assertIn("(matched 'Enter API key'; 'Showing detailed transcript')", out)
+        self.assertNotIn("note:", out)
+        self.assert_socket_untouched()
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real child session")
+class TestAnswerChildDelivery(CampaignTestCase):
+    """A child whose pane never reacts (no tty echo) reads as an unconfirmed delivery,
+    which `answer-child --redeliver` can then repeat."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        body = "\n".join(
+            [
+                "echo FAKE_HARNESS_READY",
+                "stty -echo",
+                f'while IFS= read -r line; do printf \'%s\\n\' "$line" >> "{self.records}/input"; done',
+            ]
+        )
+        harness = write_fake_harness(self.repo.parent / "fake-child.sh", body)
+        code, out, err = self.run_cli(self.launch_argv(harness))
+        self.assertEqual(code, 0, out + err)
+        self.worktree = self.worktree.resolve()
+        self.directory = campaign.campaign_dir(self.worktree)
+        self.argv = ["answer-child", "--worktree", str(self.worktree)]
+
+    def inputs(self) -> list[str]:
+        path = self.records / "input"
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+    def pointer(self, number: int) -> str:
+        return prompts.render_answer_pointer(self.directory / f"cm-answer-{number}.md")
+
+    def files(self) -> list[str]:
+        return sorted(path.name for path in self.directory.glob("cm-*"))
+
+    def test_a_pane_that_does_not_react_is_unconfirmed_and_redeliver_resends_the_pointer(self) -> None:
+        (self.directory / "cm-question.md").write_text("which?\n", encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--text", "A"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(
+            "delivery: unconfirmed (the pane did not change after Enter; re-check with observe/wait-child, "
+            "then --redeliver if the child did not react)",
+            out,
+        )
+        self.assertTrue(self._wait_for(lambda: self.inputs().count(self.pointer(1)) == 1), self.inputs())
+        files = self.files()
+
+        code, out, err = self.run_cli([*self.argv, "--redeliver"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"redelivered: {self.directory / 'cm-answer-1.md'}", out)
+        self.assertIn("delivery: unconfirmed", out)
+        self.assertTrue(self._wait_for(lambda: self.inputs().count(self.pointer(1)) == 2), self.inputs())
+        self.assertEqual(self.files(), files, "a re-send writes nothing")
+        self.assert_socket_untouched()
+
+    def test_redeliver_sends_the_highest_numbered_answer_numerically(self) -> None:
+        for number in (2, 10):
+            (self.directory / f"cm-answer-{number}.md").write_text("x", encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--redeliver"])
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self._wait_for(lambda: self.pointer(10) in self.inputs()), self.inputs())
+        self.assertNotIn(self.pointer(2), self.inputs())
+
+    def test_redeliver_refuses_with_no_answer(self) -> None:
+        code, out, err = self.run_cli([*self.argv, "--redeliver"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("no answer to re-send", err)
+        self.assertEqual(self.inputs().count(self.pointer(1)), 0)
+
+    def test_redeliver_refuses_while_a_newer_question_is_open(self) -> None:
+        (self.directory / "cm-answer-1.md").write_text("x", encoding="utf-8")
+        (self.directory / "cm-question.md").write_text("and then?\n", encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--redeliver"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("a newer question is waiting", err)
+        time.sleep(1.0)
+        self.assertNotIn(self.pointer(1), self.inputs())
+
+    def test_redeliver_refuses_once_the_child_has_written_its_result(self) -> None:
+        (self.directory / "cm-answer-1.md").write_text("x", encoding="utf-8")
+        (self.directory / "child-result.json").write_text(_RESULT_JSON, encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--redeliver"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("completion file", err)
+        time.sleep(1.0)
+        self.assertNotIn(self.pointer(1), self.inputs())
+
+    def test_text_and_redeliver_are_exclusive_and_one_is_required(self) -> None:
+        for extra in (["--text", "A", "--redeliver"], []):
+            with self.subTest(extra=extra):
+                code, _out, err = self.run_cli([*self.argv, *extra])
+                self.assertEqual(code, 2, err)
+        with self.assertRaises(PmError):
+            campaign.answer_child(self.worktree, text="A", redeliver=True)
+        with self.assertRaises(PmError):
+            campaign.answer_child(self.worktree)
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required to host the marked server")
@@ -1655,6 +1887,15 @@ class TestStopChildTempDirLookup(CampaignTestCase):
 
 
 _SANDBOX_SOCKET_NUMBERS = iter(range(1, 1000))
+SANDBOX_PROBE = Path(__file__).resolve().parents[1] / "references" / "sandbox-probe.sh"
+
+
+class TestSandboxProbeFile(unittest.TestCase):
+    def test_the_probe_names_exactly_the_variables_the_toolkit_keeps_out_of_a_seat(self) -> None:
+        text = SANDBOX_PROBE.read_text(encoding="utf-8")
+        listed = re.search(r'^DROPPED="([^"]*)"', text, re.M).group(1).split()
+        self.assertEqual(listed, list(sessions.SEAT_ENV_DROPPED))
+        self.assertEqual(subprocess.run(["sh", "-n", str(SANDBOX_PROBE)]).returncode, 0)
 
 
 @requires_srt
@@ -1720,7 +1961,7 @@ class TestSandboxedChild(SandboxLaunchTestCase):
         record = sandbox.read_record(self.control)
         self.assertEqual(record["worktree"], str(worktree))
         manifest = json.loads(campaign.manifest_path(worktree).read_text(encoding="utf-8"))
-        self.assertEqual(list(manifest), [*campaign._MANIFEST_FIELDS, "sandbox"])
+        self.assertEqual(list(manifest), [*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir", "sandbox"])
         block = manifest["sandbox"]
         self.assertEqual(set(block), {"policy", "policy_sha256", "socket", "control_dir"})
         for key, value in block.items():
@@ -1766,6 +2007,46 @@ class TestSandboxedChild(SandboxLaunchTestCase):
         self.assertEqual(code, 0, out + err)
         self.assertIn(f"sandbox temp dir already gone: {record['tmpdir']}\n", out)
         self.assertIn(f"sandbox control dir already gone: {self.control}\n", out)
+
+    def test_the_toolkits_boundary_probe_passes_inside_a_sandboxed_child(self) -> None:
+        pm_dir = self.worktree_real / ".pm"
+        out_dir, status = pm_dir / "probe", pm_dir / "probe-status"
+        harness = write_fake_harness(
+            self.repo.parent / "fake-child.sh",
+            "\n".join(
+                [
+                    "echo FAKE_HARNESS_READY",
+                    f'mkdir -p "{pm_dir}"; sh "{SANDBOX_PROBE}" "{out_dir}" >/dev/null 2>&1; echo $? > "{status}"',
+                    "exec cat -",
+                ]
+            ),
+        )
+        subprocess.run(["git", "-C", str(self.dossier), "add", "-A"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.dossier),
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "d",
+            ],
+            check=True,
+        )
+        with mock.patch.dict(os.environ, {"PM_RUN_TOKEN": "caller-token-must-not-leak"}):
+            code, out, err = self.run_cli(self.sandbox_argv(harness))
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self._wait_for(lambda: status.is_file() and status.read_text(encoding="utf-8").strip()))
+        rows = [line.split("\t") for line in (out_dir / "results.tsv").read_text(encoding="utf-8").splitlines()[1:]]
+        checked = [row for row in rows if row[0] in {"ALLOW", "DENY"}]
+        self.assertEqual([row for row in checked if row[3] != "ok"], [], "every ALLOW and DENY row holds in a sandbox")
+        self.assertGreaterEqual({row[0] for row in checked}, {"ALLOW", "DENY"})
+        self.assertGreaterEqual(len(checked), 10)
+        self.assertEqual(status.read_text(encoding="utf-8").strip(), "0")
 
     def test_a_server_failing_verification_is_torn_down_and_the_leftovers_named(self) -> None:
         # Denying the worktree's .pm/ fails the positive probe.

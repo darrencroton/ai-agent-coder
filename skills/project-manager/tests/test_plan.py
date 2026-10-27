@@ -701,6 +701,17 @@ class TestProtectedOverlap(unittest.TestCase):
         self.assertIsNone(plan_mod.protected_overlap("src/x.py", []))
 
 
+class TestCheckPlanMissingFile(PlanTestCase):
+    def test_a_missing_plan_is_one_error_line_and_exit_2_not_a_traceback(self) -> None:
+        missing = self.repo.parent / "no-such-plan.md"
+
+        code, out, err = self.run_cli(["check-plan", "--plan", str(missing)])
+
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, f"ERROR: plan file not found: {missing.resolve()}\n")
+        self.assertNotIn("Traceback", err)
+
+
 class TestCheckPlanPolicy(PlanTestCase):
     """`check-plan --policy` refuses a surface reaching a protected path and
     still reports every other defect the plan carries."""

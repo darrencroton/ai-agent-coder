@@ -15,6 +15,7 @@ code with it and never imports from it.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -287,7 +288,12 @@ def render_child_launch_pointer(launcher_path: Path, *, reference_path: Path | N
 # --- Transitive skill-bundle embedding --------------------------------------
 
 
-def compile_skill_bundle(skill_name: str, *, skills_root: Path | None = None) -> str:
+def compile_skill_bundle(
+    skill_name: str,
+    *,
+    skills_root: Path | None = None,
+    include_reference: Callable[[Path], bool] | None = None,
+) -> str:
     """Embed `skills/<skill_name>/SKILL.md` plus every locally-linked
     Markdown resource it transitively references, breadth-first.
 
@@ -299,6 +305,10 @@ def compile_skill_bundle(skill_name: str, *, skills_root: Path | None = None) ->
     escaping path, checked before existence so an escape is never masked as
     a missing-file error. A missing linked file also raises `PmError`.
     Files are deduplicated (a diamond of links embeds its target once).
+    `include_reference`, when given, is asked about each linked file (never
+    `SKILL.md` itself) by its resolved path; a file it rejects is neither
+    embedded nor followed, so a caller can leave out the resources that do not
+    apply to the work at hand.
 
     Each file is rendered as a delimited block:
     ``BEGIN EMBEDDED SKILL FILE: <path>`` / content / ``END EMBEDDED SKILL
@@ -335,6 +345,8 @@ def compile_skill_bundle(skill_name: str, *, skills_root: Path | None = None) ->
             candidate = (path.parent / target).resolve()
             if candidate.suffix.lower() != ".md":
                 continue
+            if include_reference is not None and not include_reference(candidate):
+                continue
             pending.append(candidate)
     return "\n\n".join(rendered)
 
@@ -354,6 +366,9 @@ def render_reviewer_prompt(
     authorized_surface: str,
     explicit_non_goals: str,
     risk_flags: str,
+    validation_plan: str,
+    validation_record: str | None = None,
+    include_reference: Callable[[Path], bool] | None = None,
     drift_audit_report: str | None = None,
     pm_adjudications: str | None = None,
     pm_surface_grants: list[dict[str, Any]] | None = None,
@@ -380,13 +395,19 @@ def render_reviewer_prompt(
     same `_render_grant_lines` helper `render_developer_prompt` uses, so the
     Developer and the Reviewer read one identical list of what was granted.
 
+    `validation_plan` is the slice's *Validation Plan* text, as the Developer
+    reads it. `validation_record` is the Developer's own `validation.md`, or
+    None for the template's literal `none`; the template's heading calls it
+    evidence pointers, not a verdict. `include_reference` narrows the embedded
+    bundle's linked files (see `compile_skill_bundle`).
+
     `sandboxed` keeps the template's `[sandboxed]` paragraph, as for
     `render_developer_prompt`, and raises the same way when it is missing.
     """
     template_path = reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH
     source = load_template(template_path)
     template = _apply_sandbox_block(source, template_path, "reviewer prompt", sandboxed)
-    skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root)
+    skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root, include_reference=include_reference)
     changed_files_text = "\n".join(f"  - {path}" for path in changed_files) if changed_files else "  - (none)"
     fields: dict[str, Any] = {
         "skill_name": skill_name,
@@ -405,6 +426,8 @@ def render_reviewer_prompt(
         "authorized_surface": authorized_surface,
         "explicit_non_goals": explicit_non_goals,
         "risk_flags": risk_flags,
+        "validation_plan": validation_plan or "none",
+        "validation_record": validation_record or "none",
         "skill_bundle": skill_bundle,
     }
     return _render(template, template_path, "reviewer prompt", **fields)

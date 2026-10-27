@@ -545,6 +545,25 @@ def run_elapsed(events: list[dict[str, Any]]) -> tuple[str, str, str] | None:
     )
 
 
+def _developers_line(events: list[dict[str, Any]]) -> str | None:
+    """The report's line naming every Developer identity the run launched, in first-use order.
+
+    The `Harness` line is what `init` was given; a relaunch under `--tool`/`--model` changes the identity, and
+    each `launch` and `relaunch` event records the one it used. None when no launch recorded an identity.
+    """
+    seen: list[str] = []
+    for event in events:
+        developer = (event.get("data") or {}).get("developer") if event.get("kind") in {"launch", "relaunch"} else None
+        if not isinstance(developer, dict):
+            continue
+        model = developer.get("model")
+        label = f"{developer.get('tool')}/{model}" if model else str(developer.get("tool"))
+        label += f" effort={developer.get('effort') if developer.get('effort') is not None else 'unknown'}"
+        if label not in seen:
+            seen.append(label)
+    return f"- Developers (launched): {', '.join(seen)}" if seen else None
+
+
 def _reviewer_line(state: dict[str, Any]) -> str:
     """The report's reviewer line, derived from the reviews state recorded.
 
@@ -613,6 +632,9 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     lines.append(
         f"- Harness: {harness_info.get('name')} model={harness_info.get('model')} effort={harness_info.get('effort')}"
     )
+    developers = _developers_line(events)
+    if developers:
+        lines.append(developers)
     # Reviewer and budget are the run's other two comparability controls. The
     # budget mirrors the enforcement default so the report cannot state one the
     # toolkit would not apply.
@@ -633,7 +655,7 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
 
     lines.append("## Slices")
     lines.append("")
-    lines.append("| id | title | risk | status | attempts | commit | decision |")
+    lines.append("| id | title | risk | status | steers/relaunches | commit | decision |")
     lines.append("|---|---|---|---|---|---|---|")
     slices = state.get("slices") or []
     for entry in slices:

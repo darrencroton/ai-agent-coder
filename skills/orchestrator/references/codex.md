@@ -18,6 +18,8 @@ The read-only sandbox is the strongest mechanical read-only boundary among the c
 
 That boundary holds only while approvals cannot escalate out of the sandbox, so the launcher pins `approval_policy="never"` rather than inheriting the caller's policy. Under an `on-request` policy — a common setting in a personal `~/.codex/config.toml` — a delegate whose command is blocked by the sandbox may request escalated permissions, and an automated approvals reviewer can grant them with no human present. Verified against codex-cli 0.145.0: under `on-request` a `read-only` delegate escalated and wrote a file outside the repository; under `never` the same command was refused and the sandbox held.
 
+Inside codex's read-only sandbox the Xcode `git` shim cannot write its cache, so expect `xcrun_db` EPERM noise or call `/Library/Developer/CommandLineTools/usr/bin/git` directly; heredocs fail there too.
+
 ## Read-write delegate launch
 
 Only valid against a policy whose `required_access` includes `read-write`. The launcher composes the same base command with `sandbox_mode="workspace-write"` instead of `read-only`:

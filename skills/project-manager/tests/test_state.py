@@ -606,6 +606,57 @@ class TestRunReportHeader(PlanTestCase):
         self.assertIn("- Reviewers (completed): opencode/minimax-m3, qwen/qwen3.6-27b-bf16, copilot", text)
         self.assertNotIn("run default", text)
 
+    def test_header_lists_every_developer_identity_the_run_launched(self) -> None:
+        """`Harness` is what `init` was given; a relaunch under another tool or model is a second identity."""
+        state = self._state_for_events()
+        events = [
+            {
+                "kind": "launch",
+                "slice": "Slice 1",
+                "data": {"developer": {"tool": "opencode", "model": "qwen", "effort": None}},
+            },
+            {
+                "kind": "relaunch",
+                "slice": "Slice 1",
+                "data": {"developer": {"tool": "codex", "model": "gpt-6", "effort": "high"}},
+            },
+            {"kind": "steer", "slice": "Slice 1", "data": {"developer": {"tool": "ignored", "model": "x"}}},
+            {
+                "kind": "launch",
+                "slice": "Slice 2",
+                "data": {"developer": {"tool": "opencode", "model": "qwen", "effort": None}},
+            },
+        ]
+
+        text = state_mod.render_run_report(state, events, Path(self.repo))
+
+        self.assertIn("- Developers (launched): opencode/qwen effort=unknown, codex/gpt-6 effort=high\n", text)
+        self.assertNotIn("- Developers", state_mod.render_run_report(state, [], Path(self.repo)))
+
+    def test_slice_table_labels_the_attempts_column_for_what_it_counts(self) -> None:
+        state = self._state_for_events()
+        state["slices"] = [{"id": "Slice 1", "title": "t", "status": "accepted", "attempts": 0, "decision": "ok"}]
+
+        text = state_mod.render_run_report(state, [], Path(self.repo))
+
+        self.assertIn("| id | title | risk | status | steers/relaunches | commit | decision |", text)
+        self.assertNotIn("| attempts |", text)
+
+    def _state_for_events(self) -> dict:
+        return {
+            "run_id": "r",
+            "repo": "/repo",
+            "branch": "b",
+            "status": "active",
+            "plan": {"path": "/plan.md", "sha256": "a" * 64},
+            "harness": {"name": "opencode", "model": "qwen"},
+            "reviewer": {},
+            "policy": {},
+            "slices": [],
+            "approvals": {},
+            "stop_reason": None,
+        }
+
     def test_header_reports_total_run_time_with_its_endpoints(self) -> None:
         """The report is the single source for run time so PM never hand-parses
         events.jsonl; the endpoints ship with it so the figure is checkable."""

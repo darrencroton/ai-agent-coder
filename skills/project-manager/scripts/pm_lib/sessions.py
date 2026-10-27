@@ -33,7 +33,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator, NamedTuple
 
 from . import PmError
 from . import TypedNotSubmitted
@@ -82,6 +82,9 @@ _LITERAL_MARKERS: dict[str, tuple[str, ...]] = {
         "requires permission",
         "allow access",
     ),
+    # Claude Code's transcript view (Ctrl+O) replaces the input box, so a line
+    # typed into it goes nowhere and its Enter does not submit.
+    "transcript_view": ("Showing detailed transcript",),
 }
 
 
@@ -148,6 +151,16 @@ def dialog_marker_detail(dialog_markers: dict[str, Any]) -> str:
     kinds = ", ".join(dialog_markers["kinds"])
     markers = "; ".join(repr(marker) for marker in dialog_markers["markers"])
     return f"{kinds} (matched {markers})" if markers else kinds
+
+
+def unseen_markers(dialog_markers: dict[str, Any], seen: Iterable[str]) -> list[str]:
+    """The matched marker literals not named in `seen` (compared exactly).
+
+    `observe`/`wait-child --seen-marker TEXT` is how a supervisor says a marker
+    on a static screen is one it has read and judged; only the others end a wait.
+    """
+    seen_texts = set(seen)
+    return [marker for marker in dialog_markers["markers"] if marker not in seen_texts]
 
 
 # --- tmux process plumbing --------------------------------------------------
@@ -822,7 +835,21 @@ def send_prompt(session: str, pointer: str) -> None:
             _run_tmux("send-keys", "-t", session, "C-m")
 
 
-def send_line(session: str, text: str) -> None:
+class Delivery(NamedTuple):
+    """What `send_line` can say about a line it submitted.
+
+    `confirmed` is False when the visible pane was byte-identical before the
+    typing and after the second Enter, or could not be captured afterwards: the
+    keystrokes went to tmux, but nothing on screen is known to have reacted, so
+    the line may have been swallowed. It is evidence, not proof either way: an
+    echo alone changes the pane, and a pane that redraws to the same bytes reads
+    unchanged.
+    """
+
+    confirmed: bool
+
+
+def send_line(session: str, text: str) -> Delivery:
     """A single steering line — a free `send` nudge or a `finalize --steer`
     correction pointer: refuses newlines, a dead session, and a visible
     dialog marker; otherwise `send-keys -l -- <text>` then double-C-m.
@@ -841,12 +868,17 @@ def send_line(session: str, text: str) -> None:
     marker — the first C-m can itself surface a credential/approval/trust
     prompt, and a blind second would answer it. Withholding is safe: if the
     first already submitted, the second was redundant.
+
+    Returns a `Delivery`: the visible pane captured before the typing is
+    compared with one captured a second after the second Enter; identical bytes,
+    or no capture at all (the session ended on the line), are `confirmed=False`.
     """
     if "\n" in text or "\r" in text:
         raise PmError("send text must be a single line; write multi-line content to a file and send a one-line pointer")
     if not session_exists(session):
         raise PmError(f"tmux session is not running: {session}")
-    dialog_markers = scan_visible_pane(session, required=True).dialog_markers
+    before = scan_visible_pane(session, required=True)
+    dialog_markers = before.dialog_markers
     if dialog_markers["present"]:
         raise PmError(
             "refusing to send into a dialog on screen: "
@@ -886,3 +918,6 @@ def send_line(session: str, text: str) -> None:
         second_submit = scan_visible_pane(session)
         if second_submit.capture is not None and not second_submit.dialog_markers["present"]:
             _run_tmux("send-keys", "-t", session, "C-m")
+    time.sleep(1.0)
+    after = scan_visible_pane(session).capture
+    return Delivery(confirmed=after is not None and after != before.capture)
