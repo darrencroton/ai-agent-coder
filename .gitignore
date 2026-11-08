@@ -22,6 +22,7 @@ HANDOFF.md
 # the frozen pre-ledger history table beside them is tracked
 skills/project-manager/ledger/*/
 skills/project-manager/ledger/leaderboard.md
+skills/project-manager/ledger/leaderboard-*.md
 
 # Archived/superseded content (never deleted, not tracked by default)
 archive/
