@@ -111,6 +111,18 @@ def _changed_paths(repo: Path, base: str, commit: str) -> list[tuple[str, str]]:
     return sorted(names)
 
 
+def _category(health: ModuleType, path: str, language: str | None) -> str:
+    """The category of a changed file: code-health's, with this toolkit's own test-file names counted as test.
+
+    code-health recognises `test_*`, `*_test` and a `tests/` directory; a `selftest*` script (the convention here
+    for a script that tests itself) would otherwise count as production code.
+    """
+    category = health.category_for(path, language)[0]
+    if category == "production" and path.rsplit("/", 1)[-1].lower().startswith("selftest"):
+        return "test"
+    return category
+
+
 def _complexity(functions: list[dict]) -> dict[str, int]:
     values = [row["cyclomatic"] for row in functions]
     return {"sum": sum(values), "max": max(values, default=0)}
@@ -130,7 +142,7 @@ def _build_block(repo: Path, before_head: str | None, commit: str) -> dict:
     sides: dict[str, list] = {"before": [], "after": []}
     for path, git_path in _changed_paths(repo, base, commit):
         language = health.language_for(path)
-        category = health.category_for(path, language)[0]
+        category = _category(health, path, language)
         texts = {
             "before": _text_at(repo, before_rev, git_path),
             "after": _text_at(repo, commit, git_path),

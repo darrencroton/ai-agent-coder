@@ -15,6 +15,7 @@ code with it and never imports from it.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +33,27 @@ _DEFAULT_SKILLS_ROOT = Path(__file__).resolve().parents[3]
 _MD_FENCE_RE = re.compile(r"```md\n(?P<body>.*?)\n```", re.DOTALL)
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\((?P<target>[^)]+)\)")
 _HEADING_RE = re.compile(r"^#{1,6} .*$", re.MULTILINE)
+# The paragraph of a prompt template that renders only for a seat inside an
+# `srt` sandbox. A match runs from a line that is exactly `[sandboxed]`
+# through a line that is exactly `[/sandboxed]` and the blank line that must
+# follow it; `body` is the text between the two marker lines. Unsandboxed,
+# the whole match is removed, so the render is exactly the template without
+# it; sandboxed, it is replaced by `body` and that blank line. The wording
+# stays in the template, like every other prompt line.
+_SANDBOX_BLOCK_RE = re.compile(r"^\[sandboxed\]\n(?P<body>.*?)\n\[/sandboxed\]\n\n", re.DOTALL | re.MULTILINE)
+# A block body holding either marker, even a slightly malformed one such as
+# `[/sandboxed ]`, means the pattern ran past a closer it did not recognise
+# and swallowed the prose of the next block; and a marker, exact or
+# malformed, left anywhere after the substitution belongs to a block the
+# pattern could not match (a stray space or prefix, no blank line after it),
+# whose paragraph would otherwise reach the seat unannounced or with its
+# markers. `_apply_sandbox_block` refuses both.
+_SANDBOX_MARKER_PREFIX_RE = re.compile(r"\[/?sandboxed")
 
 _STEER_MESSAGE_HEADING = "## Steer Message Template"
 _LAUNCH_POINTER_HEADING = "## Launch Pointer"
+_ANSWER_POINTER_HEADING = "## Answer Pointer"
+_CHILD_LAUNCH_POINTER_HEADING = "## Child Launch Pointer"
 
 
 def _section_text(text: str, heading: str | None) -> str:
@@ -108,6 +127,30 @@ def _render(template: str, path: Path, what: str, **fields: Any) -> str:
         ) from exc
 
 
+def _apply_sandbox_block(source: str, path: Path, label: str, sandboxed: bool) -> str:
+    """Resolve the template's `[sandboxed]` paragraphs for one render.
+
+    Returns `source` with every matched block replaced by its body (when
+    `sandboxed`) or removed. Refuses, in both modes and naming `path`, a
+    template whose markers do not pair up: a match whose body holds another
+    marker (a malformed closer let the non-greedy pattern swallow the prose
+    between two blocks) or a marker, exact or malformed (`[sandboxed ]`),
+    left after the substitution. Refuses a
+    sandboxed render of a template with no block or an empty one, since the
+    session would run inside a boundary it was never told about. `label`
+    names the template in the error text.
+    """
+    matches = list(_SANDBOX_BLOCK_RE.finditer(source))
+    template = _SANDBOX_BLOCK_RE.sub(r"\g<body>\n\n" if sandboxed else "", source)
+    if any(_SANDBOX_MARKER_PREFIX_RE.search(match.group("body")) for match in matches) or (
+        _SANDBOX_MARKER_PREFIX_RE.search(template)
+    ):
+        raise PmError(f"{label} template has a malformed [sandboxed] block: {path}")
+    if sandboxed and not (matches and all(match.group("body").strip() for match in matches)):
+        raise PmError(f"{label} template has an empty or no [sandboxed] paragraph for a sandboxed render: {path}")
+    return template
+
+
 def render_developer_prompt(
     plan_slice: PlanSlice,
     *,
@@ -117,8 +160,10 @@ def render_developer_prompt(
     result_path: Path,
     before_head: str | None = None,
     granted_surface: list[dict[str, Any]] | None = None,
+    question_path: Path | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
+    sandboxed: bool = False,
 ) -> str:
     """Render the Developer prompt for one slice launch.
 
@@ -135,8 +180,21 @@ def render_developer_prompt(
     `lint_base` is interpolated for the same reason: the template used to
     hardcode `--base HEAD`, which is correct only until the Developer commits.
     The slice's `before_head` is correct on every attempt.
+
+    `question_path` is where the Developer writes a question for PM; it
+    defaults to `question.md` in `artifact_dir`, the path `start_slice` also
+    exports as `PM_QUESTION_PATH`.
+
+    `sandboxed` keeps the template's `[sandboxed]` paragraph (what an `srt`
+    sandbox denies the session); otherwise it is removed. A sandboxed render
+    of a template without one raises `PmError` rather than silently omitting
+    the boundary the session runs inside, as does one whose paragraph is
+    empty, and so does any render that leaves a marker behind (a malformed
+    block).
     """
-    template = load_template(reference_path)
+    template_path = reference_path or _DEFAULT_REFERENCE_PATH
+    source = load_template(template_path)
+    template = _apply_sandbox_block(source, template_path, "developer prompt", sandboxed)
     sections = plan_slice.sections
     lint_script = (skills_root or _DEFAULT_SKILLS_ROOT) / "lint" / "scripts" / "lint.py"
     fields: dict[str, Any] = {
@@ -149,6 +207,7 @@ def render_developer_prompt(
         "artifact_dir": str(artifact_dir),
         "notes_path": str(notes_path),
         "result_path": str(result_path),
+        "question_path": str(question_path or artifact_dir / "question.md"),
         "intended_change": sections.get("Intended Change", "").rstrip(),
         "acceptance_criteria": sections.get("Acceptance Criteria", "").rstrip(),
         "authorized_surface": sections.get("Authorized Surface", "").rstrip(),
@@ -158,7 +217,7 @@ def render_developer_prompt(
         "validation_plan": sections.get("Validation Plan", "").rstrip(),
         "rollback_path": sections.get("Rollback Path", "").rstrip(),
     }
-    return _render(template, reference_path or _DEFAULT_REFERENCE_PATH, "developer prompt", **fields)
+    return _render(template, template_path, "developer prompt", **fields)
 
 
 def render_launch_pointer(prompt_path: Path, *, reference_path: Path | None = None) -> str:
@@ -194,10 +253,47 @@ def render_steer_pointer(correction_path: Path, *, reference_path: Path | None =
     return _render(template, path, "steer message", correction_path=str(correction_path))
 
 
+def render_answer_pointer(answer_path: Path, *, reference_path: Path | None = None) -> str:
+    """Render the one-line pointer that tells a live session to read its
+    supervisor's answer to its question from `answer_path`.
+
+    The answer is written verbatim to `answer_path` for the reason a steer
+    correction is (see `render_steer_pointer`): it may be multi-line, and no
+    harness TUI is trusted with such a paste. Wording is sourced from the
+    "## Answer Pointer" section of `references/developer-prompt.md` so it
+    lives in exactly one place. The result must be one line —
+    `sessions.send_line` rejects a newline.
+    """
+    path = reference_path or _DEFAULT_REFERENCE_PATH
+    template = load_template(path, heading=_ANSWER_POINTER_HEADING)
+    return _render(template, path, "answer pointer", answer_path=str(answer_path))
+
+
+def render_child_launch_pointer(launcher_path: Path, *, reference_path: Path | None = None) -> str:
+    """Render the one-line pointer that tells a fresh child PM session to
+    read its Campaign Manager's launcher from `launcher_path`.
+
+    The child's counterpart of `render_launch_pointer`: `launch-child`
+    copies the launcher to `launcher.md` in the child worktree's
+    `.pm/campaign/` and injects only this line, for the same reason. Wording
+    is sourced from the "## Child Launch Pointer" section of
+    `references/developer-prompt.md` so it lives in exactly one place. The
+    result must be one line — `sessions.send_prompt` rejects a newline.
+    """
+    path = reference_path or _DEFAULT_REFERENCE_PATH
+    template = load_template(path, heading=_CHILD_LAUNCH_POINTER_HEADING)
+    return _render(template, path, "child launch pointer", launcher_path=str(launcher_path))
+
+
 # --- Transitive skill-bundle embedding --------------------------------------
 
 
-def compile_skill_bundle(skill_name: str, *, skills_root: Path | None = None) -> str:
+def compile_skill_bundle(
+    skill_name: str,
+    *,
+    skills_root: Path | None = None,
+    include_reference: Callable[[Path], bool] | None = None,
+) -> str:
     """Embed `skills/<skill_name>/SKILL.md` plus every locally-linked
     Markdown resource it transitively references, breadth-first.
 
@@ -209,6 +305,10 @@ def compile_skill_bundle(skill_name: str, *, skills_root: Path | None = None) ->
     escaping path, checked before existence so an escape is never masked as
     a missing-file error. A missing linked file also raises `PmError`.
     Files are deduplicated (a diamond of links embeds its target once).
+    `include_reference`, when given, is asked about each linked file (never
+    `SKILL.md` itself) by its resolved path; a file it rejects is neither
+    embedded nor followed, so a caller can leave out the resources that do not
+    apply to the work at hand.
 
     Each file is rendered as a delimited block:
     ``BEGIN EMBEDDED SKILL FILE: <path>`` / content / ``END EMBEDDED SKILL
@@ -245,6 +345,8 @@ def compile_skill_bundle(skill_name: str, *, skills_root: Path | None = None) ->
             candidate = (path.parent / target).resolve()
             if candidate.suffix.lower() != ".md":
                 continue
+            if include_reference is not None and not include_reference(candidate):
+                continue
             pending.append(candidate)
     return "\n\n".join(rendered)
 
@@ -264,11 +366,15 @@ def render_reviewer_prompt(
     authorized_surface: str,
     explicit_non_goals: str,
     risk_flags: str,
+    validation_plan: str,
+    validation_record: str | None = None,
+    include_reference: Callable[[Path], bool] | None = None,
     drift_audit_report: str | None = None,
     pm_adjudications: str | None = None,
     pm_surface_grants: list[dict[str, Any]] | None = None,
     reference_path: Path | None = None,
     skills_root: Path | None = None,
+    sandboxed: bool = False,
 ) -> str:
     """Render the Reviewer prompt for one commissioned review.
 
@@ -288,9 +394,20 @@ def render_reviewer_prompt(
     slice, or None for the template's literal `none`. Rendered through the
     same `_render_grant_lines` helper `render_developer_prompt` uses, so the
     Developer and the Reviewer read one identical list of what was granted.
+
+    `validation_plan` is the slice's *Validation Plan* text, as the Developer
+    reads it. `validation_record` is the Developer's own `validation.md`, or
+    None for the template's literal `none`; the template's heading calls it
+    evidence pointers, not a verdict. `include_reference` narrows the embedded
+    bundle's linked files (see `compile_skill_bundle`).
+
+    `sandboxed` keeps the template's `[sandboxed]` paragraph, as for
+    `render_developer_prompt`, and raises the same way when it is missing.
     """
-    template = load_template(reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH)
-    skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root)
+    template_path = reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH
+    source = load_template(template_path)
+    template = _apply_sandbox_block(source, template_path, "reviewer prompt", sandboxed)
+    skill_bundle = compile_skill_bundle(skill_name, skills_root=skills_root, include_reference=include_reference)
     changed_files_text = "\n".join(f"  - {path}" for path in changed_files) if changed_files else "  - (none)"
     fields: dict[str, Any] = {
         "skill_name": skill_name,
@@ -309,6 +426,8 @@ def render_reviewer_prompt(
         "authorized_surface": authorized_surface,
         "explicit_non_goals": explicit_non_goals,
         "risk_flags": risk_flags,
+        "validation_plan": validation_plan or "none",
+        "validation_record": validation_record or "none",
         "skill_bundle": skill_bundle,
     }
-    return _render(template, reference_path or _DEFAULT_REVIEWER_REFERENCE_PATH, "reviewer prompt", **fields)
+    return _render(template, template_path, "reviewer prompt", **fields)

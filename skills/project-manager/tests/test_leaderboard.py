@@ -203,6 +203,8 @@ def _by_name(table: list[dict[str, str]]) -> dict[str, dict[str, str]]:
     return {row["Developer (tool / model / effort / tag)"]: row for row in table}
 
 
+_CODEX_LABEL = "codex / gpt-6.1-sol / high / no override / untagged"
+_CLAUDE_LABEL = "claude / claude-opus-5-5 / high / no override / untagged"
 _OPUS_LABEL = "claude / claude-opus-5-5 / high / untagged"
 _SONNET_LABEL = "claude / claude-sonnet-5-5 / medium / untagged"
 
@@ -320,6 +322,18 @@ class TestLeaderboardColumns(unittest.TestCase):
             "No Developer-counted windows.",
         )
         self.assertIn(_OPUS_LABEL, _section(text, "### Difficulty: moderate"))
+
+    def test_reviewer_review_time_is_the_median_of_known_durations_and_n_a_without_any(self) -> None:
+        timed = [{**_rev(f"review-{n}", _CODEX, {"score": 1}), "elapsed_s": secs} for n, secs in ((1, 60), (2, 120))]
+        timed.append({**_rev("review-3", _CODEX, {"score": 1}), "elapsed_s": None})
+        untimed = [_rev(f"review-{n}", _CLAUDE, {"score": 1}) for n in (1, 2, 3)]
+        text = _render(("host/run-1.json", _file("run-1", [_row([_sub(OPUS)], reviews=[*timed, *untimed])])))
+
+        (ranked,) = _tables(_section(text, "### code-review"))
+        by_reviewer = {row["Reviewer (tool / model / effort / override / tag)"]: row for row in ranked}
+
+        self.assertEqual(by_reviewer[_CODEX_LABEL]["Review time, median s"], "90 (n=2)")
+        self.assertEqual(by_reviewer[_CLAUDE_LABEL]["Review time, median s"], "n/a")
 
     def test_reviewer_columns_match_hand_computed_values(self) -> None:
         tables = _tables(_section(self._text(), "### code-review"))
@@ -899,10 +913,13 @@ class TestLedgerRenderCommand(unittest.TestCase):
                 _file(run_id, [_row([_sub(OPUS)], decided_at=ledger_ts(5))], run_tag=tag)
             )
 
-        code, _stdout, err = self._main(["ledger", "render", "--run-tag", "beta", "--run-tag", "alpha"])
+        code, stdout, err = self._main(["ledger", "render", "--run-tag", "beta", "--run-tag", "alpha"])
 
         self.assertEqual(code, 0, err)
-        text = (self.root / "leaderboard.md").read_text(encoding="utf-8")
+        # Beside the default board, never over it, and the command says so.
+        self.assertFalse((self.root / "leaderboard.md").exists())
+        self.assertIn("leaderboard-alpha+beta.md", stdout)
+        text = (self.root / "leaderboard-alpha+beta.md").read_text(encoding="utf-8")
         self.assertIn(f"As of: {ledger_ts(5)}\n\nRun tags: alpha, beta\n", text)
         self.assertIn("Runs: 2; slice windows: 2.", text)
 
@@ -1015,7 +1032,7 @@ class TestLedgerTagCommand(unittest.TestCase):
         code, _stdout, err = self._main(["ledger", "render", "--run-tag", "bench"])
 
         self.assertEqual(code, 0, err)
-        text = (self.root / "leaderboard.md").read_text(encoding="utf-8")
+        text = (self.root / "leaderboard-bench.md").read_text(encoding="utf-8")
         self.assertIn("Runs: 1; slice windows: 1.", text)
         self.assertIn("None.", _section(text, "## Errors"))
         self.assertIn(" / hot |", text)

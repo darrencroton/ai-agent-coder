@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import PmError
-from .git_ops import normalize_authorized_entry
+from .git_ops import has_glob, is_protected_path, normalize_authorized_entry
 
 REQUIRED_SECTIONS: tuple[str, ...] = (
     "Intended Change",
@@ -155,6 +157,28 @@ class PlanSlice:
         return self._risk_flag("Risky surfaces touched") == "none"
 
     @property
+    def risk_reasons(self) -> list[str]:
+        """The flag lines that raise the slice's risk; empty when it is standard.
+
+        The risky-surfaces line quotes the value as read and normalised, so
+        prose after `none` (which reads as touched) is visible to the operator. A long
+        value is cut for display only; the derivation sees all of it.
+        """
+        reasons = []
+        if self.approval_needed is True:
+            reasons.append("Approval needed before implementation: yes")
+        if self.independent_audit_required:
+            reasons.append("Independent audit required: yes")
+        if not self.risky_surfaces_clear:
+            value = self._risk_flag("Risky surfaces touched")
+            if value is None:
+                reasons.append("Risky surfaces touched: line missing")
+            else:
+                shown = value if len(value) <= 60 else value[:60] + "..."
+                reasons.append(f"Risky surfaces touched: {shown!r}")
+        return reasons
+
+    @property
     def plan_risk(self) -> str:
         """Mechanical, immutable risk derivation.
 
@@ -164,9 +188,7 @@ class PlanSlice:
         derivation happens once, at parse time; later stages record it in
         state and may only raise it, never lower it.
         """
-        if self.approval_needed is True or self.independent_audit_required or not self.risky_surfaces_clear:
-            return "elevated"
-        return "standard"
+        return "elevated" if self.risk_reasons else "standard"
 
 
 def plan_digest(path: Path) -> str:
@@ -294,7 +316,7 @@ def directory_surface_lint(entry: str, repo: Path) -> str | None:
     normalized = normalize_authorized_entry(entry)
     if not normalized or normalized.endswith("/"):
         return None
-    if any(marker in normalized for marker in ("*", "?", "[")):
+    if has_glob(normalized):
         return None
     if (repo / normalized).is_dir():
         return (
@@ -337,7 +359,172 @@ def mask_fenced_blocks(text: str) -> tuple[str, bool]:
     return "\n".join(masked_lines), fence is not None
 
 
-def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
+def literal_prefix(entry: str) -> str:
+    """The literal directory part of one normalized authorized-surface entry.
+
+    A plain path is its own prefix; a subtree `dir/` gives `dir`; a glob gives
+    the `/`-joined segments before the first segment containing `*`, `?` or
+    `[`, which is the empty string when the first segment is already a
+    wildcard. The subtree test comes first, as in `git_ops.is_authorized_path`,
+    because that matcher reads a trailing-slash entry as a literal prefix even
+    when it contains a wildcard character.
+    """
+    if entry.endswith("/"):
+        return entry.rstrip("/")
+    literal: list[str] = []
+    for segment in entry.split("/"):
+        if has_glob(segment):
+            break
+        literal.append(segment)
+    return "/".join(literal)
+
+
+def protected_overlap(entry: str, protected: list[str]) -> str | None:
+    """The first protected entry whose literal prefix overlaps `entry`'s.
+
+    Two prefixes overlap when they are equal or one is a segment-wise prefix
+    of the other (`a/b` covers `a/b/c` but not `a/bc`); an empty prefix
+    overlaps everything. This deliberately over-refuses rather than computing
+    exact glob intersections: a refused author fixes it by writing a literal
+    directory disjoint from every protected path, while the floor's check on
+    actual changed files stays exact.
+    """
+    entry_parts = _prefix_segments(literal_prefix(entry))
+    for candidate in protected:
+        candidate_parts = _prefix_segments(literal_prefix(candidate))
+        shared = min(len(entry_parts), len(candidate_parts))
+        if entry_parts[:shared] == candidate_parts[:shared]:
+            return candidate
+    return None
+
+
+def _prefix_segments(prefix: str) -> list[str]:
+    return prefix.split("/") if prefix else []
+
+
+def load_policy(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
+    """Read a protected-paths policy file into its frozen form.
+
+    The file is untrusted operator input: a UTF-8 JSON object whose optional
+    `protected_paths` list holds authorized-surface entries (absent means
+    none). Every other key, `schema` included, is ignored. Each entry must
+    pass `authorized_entry_error` and have a non-empty `literal_prefix`, since
+    an entry such as `**/*.py` would overlap every surface and leave no
+    disjoint surface to write. A trailing-slash entry may not contain a
+    wildcard: the matcher reads it as a literal prefix, so it would protect
+    nothing. Entries are normalized and deduplicated in first-seen order. A
+    plain entry naming a directory ("instruments", no slash) is legal: at
+    `grant` and fact 5 `git_ops.is_protected_path` covers its subtree, in
+    agreement with the segment-wise overlap test `protected_overlap` applies
+    at plan time.
+
+    With `repo` given, a policy file inside the repository protects itself:
+    its repo-relative path is appended unless an entry already protects it
+    as `git_ops.is_protected_path` reads entries (so a plain directory entry
+    counts), and a later slice cannot loosen the policy by editing it. A
+    symlinked policy file is refused: it would be protected at its target,
+    not at the tracked link a later node could re-point. So is a path that
+    reaches the file through a symlinked directory inside the repository
+    (whether the link's target lies inside or outside it), for the same
+    reason; a repository that itself sits under a symlinked directory (macOS
+    `/tmp`) is fine, since the spelled path is measured from the ancestor
+    that resolves to the repository. So, last, is an in-repository path containing
+    a glob marker, which the matcher would read as a pattern and so protect
+    nothing (`policy[1].json`).
+    """
+    if path.is_symlink():
+        raise PmError(
+            f"protected-paths policy file {str(path)!r}: is a symbolic link; name the real file so the "
+            "protection lands on the path a later slice would edit"
+        )
+    resolved = path.resolve()
+    label = f"protected-paths policy file {str(resolved)!r}"
+    try:
+        raw = resolved.read_bytes()
+    except OSError as exc:
+        raise PmError(f"{label}: cannot be read: {exc.strerror or exc}") from exc
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise PmError(f"{label}: is not valid UTF-8: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise PmError(f"{label}: is not valid JSON: {exc}") from exc
+    except (ValueError, RecursionError) as exc:
+        # The decoder's own limits: an integer literal longer than
+        # sys.int_max_str_digits, or nesting deeper than the stack allows.
+        raise PmError(f"{label}: cannot be decoded as JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise PmError(f"{label}: top-level value must be a JSON object, got {type(document).__name__}")
+
+    raw_entries = document.get("protected_paths", [])
+    if not isinstance(raw_entries, list):
+        raise PmError(f"{label}: 'protected_paths' must be a list, got {type(raw_entries).__name__}")
+    entries: list[str] = []
+    for index, item in enumerate(raw_entries):
+        if not isinstance(item, str) or not item.strip():
+            raise PmError(f"{label}: 'protected_paths'[{index}] must be a non-empty string, got {item!r}")
+        entry_error = authorized_entry_error(item)
+        if entry_error:
+            raise PmError(f"{label}: invalid protected path: {entry_error}")
+        normalized = normalize_authorized_entry(item)
+        if normalized.endswith("/") and has_glob(normalized):
+            # The matcher reads a trailing-slash entry as a literal prefix, so
+            # a wildcard inside one matches no real path and protects nothing.
+            raise PmError(
+                f"{label}: protected path {normalized!r} ends with '/' and contains a wildcard, so it matches "
+                "no path and protects nothing; write a literal subtree such as 'src/' or a glob such as "
+                "'src/**/*.py'"
+            )
+        if not literal_prefix(normalized):
+            raise PmError(
+                f"{label}: protected path {normalized!r} has no literal directory prefix, so it would "
+                "overlap every authorized surface; begin it with a literal directory or name the file"
+            )
+        if normalized not in entries:
+            entries.append(normalized)
+
+    if repo is not None:
+        resolved_repo = repo.resolve()
+        try:
+            relative = resolved.relative_to(resolved_repo).as_posix()
+        except ValueError:
+            relative = None
+        # normpath, not resolve: it folds `..` without following links, so
+        # this is the path as spelled. The repository may be reached through
+        # a link itself (and the CLI passes it resolved), so the spelled
+        # in-repository path starts at the outermost ancestor that resolves to
+        # the repository; none means a policy named outside it.
+        spelled_path = Path(os.path.normpath(path.absolute()))
+        spelled = next(
+            (
+                spelled_path.relative_to(ancestor)
+                for ancestor in reversed(spelled_path.parents)
+                if ancestor.resolve() == resolved_repo
+            ),
+            None,
+        )
+        if spelled is not None and spelled.as_posix() != relative:
+            target = repr(relative) if relative is not None else "outside the repository"
+            raise PmError(
+                f"{label}: {str(path)!r} reaches the file through a symlink inside the repository "
+                f"({spelled.as_posix()!r} resolves to {target}); name the real path"
+            )
+        if relative is not None and has_glob(relative):
+            raise PmError(
+                f"{label}: its repo-relative path {relative!r} contains a glob character, so the matcher "
+                "would read the self-protection entry as a pattern and protect nothing; rename the file"
+            )
+        if relative is not None and not is_protected_path(relative, entries):
+            entries.append(relative)
+
+    return {
+        "path": str(resolved),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "protected_paths": entries,
+    }
+
+
+def plan_check_report(path: Path, repo: Path | None = None, protected: list[str] | None = None) -> dict[str, Any]:
     """Whole-plan pre-run sanity check.
 
     Validates every slice contract up front so a plan defect surfaces before
@@ -347,13 +534,16 @@ def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
     numbers, fenced or malformed slice headings). Warnings are lint for
     conditions PM cannot mechanically guard against mid-run (heuristic stop
     surfaces, Mode-A-only plan features). When `repo` is given, authorized
-    entries are additionally linted against the worktree.
+    entries are additionally linted against the worktree. When `protected`
+    is given (normalized entries from `load_policy`), every valid authorized
+    entry whose literal prefix overlaps a protected path is an error.
     """
     text = path.read_text(encoding="utf-8")
     slices = parse_plan(path)
     errors: list[str] = []
     warnings: list[str] = []
     approval_gated: list[str] = []
+    slice_risks: list[dict[str, Any]] = []
 
     masked_text, unclosed_fence = mask_fenced_blocks(text)
     if unclosed_fence:
@@ -401,6 +591,14 @@ def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
                 if entry_error:
                     errors.append(f"{prefix}: invalid authorized surface: {entry_error}")
                     continue
+                if protected:
+                    entry = normalize_authorized_entry(raw_entry)
+                    hit = protected_overlap(entry, protected)
+                    if hit is not None:
+                        errors.append(
+                            f"{prefix}: authorized entry {entry!r} reaches protected path {hit!r}; "
+                            "give it a literal prefix disjoint from every protected path"
+                        )
                 lint = surface_lint(raw_entry)
                 if lint:
                     warnings.append(f"{prefix}: {lint}")
@@ -416,6 +614,11 @@ def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
             )
         elif approval:
             approval_gated.append(plan_slice.slice_id)
+        # Shown before `init` freezes it: a slice's risk decides which reviews
+        # are mandatory, and a misread flag is otherwise invisible until then.
+        slice_risks.append(
+            {"slice": plan_slice.slice_id, "risk": plan_slice.plan_risk, "reasons": plan_slice.risk_reasons}
+        )
         if plan_slice.difficulty is None:
             errors.append(f"{prefix}: 'Difficulty:' must be exactly one of easy, moderate, hard")
         if plan_slice.criteria_total == 0:
@@ -433,6 +636,8 @@ def plan_check_report(path: Path, repo: Path | None = None) -> dict[str, Any]:
         "errors": errors,
         "warnings": warnings,
         "approval_gated": approval_gated,
+        "slice_risks": slice_risks,
+        "protected_count": len(protected or []),
     }
 
 
@@ -495,6 +700,21 @@ def slice_grants(state: dict[str, Any], slice_id: str) -> list[dict[str, Any]]:
         if entry["id"] == slice_id:
             return [g for g in entry.get("grants") or [] if isinstance(g, dict) and str(g.get("path") or "").strip()]
     return []
+
+
+def protected_paths(state: dict[str, Any]) -> list[str]:
+    """The run's frozen protected paths, copied from the policy file at `init`.
+
+    Tolerant: an absent or non-dict `policy`, or a policy without the key (a
+    run initialized before protected paths existed), protects nothing.
+    `state._validate_shape` already refuses a malformed list, so the entries
+    reaching here are non-empty strings. The policy file itself is never
+    re-read: what `init` froze is what the run enforces.
+    """
+    policy = state.get("policy")
+    if not isinstance(policy, dict):
+        return []
+    return list(policy.get("protected_paths") or [])
 
 
 def effective_authorized_files(plan_slice: PlanSlice, state: dict[str, Any]) -> list[str]:

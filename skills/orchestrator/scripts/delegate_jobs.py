@@ -921,9 +921,13 @@ def resolve_continuation_parent(run_dir: Path, contract: dict[str, Any]) -> dict
                 ]
             )
 
+        parent_contract = parent.get("launch_contract")
+        parent_skills = parent_contract.get("required_skills") if isinstance(parent_contract, dict) else None
         return {
             "parent_label": parent_label,
             "parent_session_id": parent_session_id.strip(),
+            # None when the parent recorded no skills (legacy entry): the caller then embeds.
+            "parent_required_skills": parent_skills if isinstance(parent_skills, list) else None,
             "parent_session_path": parent.get("session_path") if isinstance(parent.get("session_path"), str) else None,
             "continuation_index": continuation_index,
         }
@@ -944,7 +948,9 @@ def command_launch(args: argparse.Namespace) -> int:
         label = contract["label"]
         assert_opencode_variant_supported(contract)
         continuation = resolve_continuation_parent(run_dir, contract)
-        prompt = render_delegate_prompt(contract)
+        # A resumed session already holds the parent's skill bundle; re-embed only when the skills differ.
+        embed_skills = continuation is None or continuation["parent_required_skills"] != contract["required_skills"]
+        prompt = render_delegate_prompt(contract, embed_skills=embed_skills)
         command = compose_delegate_command(
             contract,
             prompt,
@@ -964,6 +970,7 @@ def command_launch(args: argparse.Namespace) -> int:
         "request_sha256": sha256_path(request_path),
         "slice_id": contract["slice_id"],
         "plan_sha256": contract["plan_sha256"],
+        **({"plan_path": contract["plan_path"]} if "plan_path" in contract else {}),
         "tool": contract["tool"],
         "model": contract["model"],
         "effort": contract["effort"],
@@ -974,6 +981,7 @@ def command_launch(args: argparse.Namespace) -> int:
         # that both gates were delegated, and to see exactly what surface a
         # read-write delegate was authorized to touch.
         "required_skills": list(contract["required_skills"]),
+        "skills_embedded": embed_skills and bool(contract["required_skills"]),
         "authorized_surface": list(contract["authorized_surface"]),
         "non_goals": list(contract["non_goals"]),
         "repo_path": contract["repo_path"],

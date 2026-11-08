@@ -10,6 +10,8 @@ The orchestrator is the workflow, not a person or model tier.
 - **Delegate (read-only)**: gathers evidence and performs read-only investigation, drift audit, and code review. Never edits, mutates the repository, commits, or re-delegates.
 - **Delegate (read-write)**: a bounded implementer. May create, edit, and run commands inside an explicit `authorized_surface`, never past its `non_goals`. Still never performs Git/GitHub mutations, commits, or re-delegates — the Developer reviews its diff and commits it.
 
+In campaign mode (Mode C) the Campaign Manager runs its task nodes — read-only investigations, plan reviews and audits — as read-only delegates through this skill; see `project-manager`'s `references/campaign-mode.md`.
+
 There are no senior/junior delegate variants and no harness ranking. Every supported tool is eligible for either role, in either access mode. Harness profiles describe command mechanics and the factual strength of enforcement for each access mode; they do not decide suitability.
 
 Developer self-audit fallback is allowed on default slices when no read-only delegate is configured or available; the final report must identify any self-performed audit and its fallback context. A plan that asks for independent review (`Independent audit required: yes`) deserves separate read-only delegate launches for `drift-audit` and `code-review`; if a delegate cannot be launched for such a slice, stop and report rather than self-audit.
@@ -25,7 +27,7 @@ Developer self-audit fallback is allowed on default slices when no read-only del
 - `scripts/delegate_sessions.py` — launch-bound session-ID discovery, all-harness activity signals, and transcript extraction
 - `tests/` — contract, launcher, lifecycle, and transcript tests
 
-Every launch records a `session_id` field and exposes source-labelled activity for all five harnesses, falling back to captured output when no owned transcript or session-store signal is available. A fresh request can continue a terminal same-run delegate by naming `parent_label` and advancing its `-rN` lineage; the helper re-validates policy and parent identity, uses only the captured parent ID, and records the lineage. See [`references/delegate-contract.md`](references/delegate-contract.md#validated-continuation).
+Every launch records a `session_id` field and exposes source-labelled activity for all five harnesses, falling back to captured output when no owned transcript or session-store signal is available. A fresh request can continue a terminal same-run delegate by naming `parent_label` and advancing its `-rN` lineage; the helper re-validates policy and parent identity, uses only the captured parent ID, and records the lineage; it embeds the skill bundle again only when the continuation's skills differ from the parent's. A policy may bind its digest to a file with `plan_path`, which the launcher hashes at launch. See [`references/delegate-contract.md`](references/delegate-contract.md#validated-continuation).
 
 ## Quick verification
 
@@ -34,4 +36,4 @@ python3 -m py_compile scripts/delegate_contract.py scripts/delegate_sessions.py 
 python3 -m unittest discover -s tests
 ```
 
-Delegate artifacts default to `.orchestrator/runs/`; set `ORCHESTRATOR_ARTIFACT_ROOT` to override. The retired `.ai-orchestrator/` path and schema-v1/v2 contracts are unsupported.
+Delegate artifacts default to `.orchestrator/runs/`; set `ORCHESTRATOR_ARTIFACT_ROOT` to override.

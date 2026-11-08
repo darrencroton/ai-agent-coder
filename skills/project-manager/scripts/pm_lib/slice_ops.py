@@ -12,6 +12,9 @@ Semantic judgement enters in `finalize_accept` / `finalize_steer` /
 through the CLI (never inferred from evidence alone), gated by the floor
 (never waivable) and, on elevated slices, by review freshness. Assessment
 text assembles facts around the PM's own reasoning; it never invents it.
+
+Host code here opens paths under the sandbox-writable `.pm/` tree only
+through `pm_paths`, whose module docstring is the rule's home.
 """
 
 from __future__ import annotations
@@ -19,22 +22,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import signal
 import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from . import IntegrityError, PmError, TypedNotSubmitted
 from . import code_metrics
 from . import git_ops
 from . import plan as plan_mod
+from . import pm_paths
 from . import profiles
 from . import prompts
+from . import sandbox
 from . import sessions
 from . import state as state_mod
 from .floor import FloorReport, evaluate_floor
@@ -44,6 +49,11 @@ _SLICE_ID_RE = re.compile(r"^Slice\s+(?P<number>\d+)$")
 # Artifact rotation / observe polling.
 _OBSERVE_POLL_SECONDS = 2.0
 _OBSERVE_TAIL_LINES = 40
+_OBSERVE_QUESTION_LINES = 40
+_OBSERVE_QUESTION_BYTES = 4096
+# How much of a question file is read at all: the caps above apply to the
+# excerpt, and this one keeps an oversized file out of memory.
+_QUESTION_READ_BYTES = 65536
 
 # Controller-owned notes.md tripwire: a hard cap kept as a non-fatal warning,
 # since a runaway notes file silently degrades every later Developer prompt.
@@ -149,11 +159,9 @@ def slice_artifact_dir(repo: Path, run_id: str, slice_id: str) -> Path:
 
 def write_pm_gitignore(repo: Path) -> None:
     """A self-ignoring `.pm/.gitignore` (a bare `*`) so the artifact tree never
-    needs individual entries in the repository's own `.gitignore`."""
-    directory = pm_dir(repo)
-    directory.mkdir(parents=True, exist_ok=True)
-    gitignore = directory / ".gitignore"
-    gitignore.write_text("*\n", encoding="utf-8")
+    needs individual entries in the repository's own `.gitignore`. Written
+    through `pm_paths.write_pm_text`, like every host write under `.pm/`."""
+    pm_paths.write_pm_text(repo, pm_dir(repo) / ".gitignore", "*\n")
 
 
 # --- Controller-owned originals + mirrors -------------------------------------
@@ -177,11 +185,12 @@ def mirror_artifact(repo: Path, run_dir: Path, run_id: str, relative_path: str) 
     """Copy an already-written ORIGINAL (under `run_dir`) to its `.pm/`
     mirror location, creating any missing mirror directories (this is what
     lets the report/mirror tree regenerate correctly after `.pm/` has been
-    deleted entirely). Returns the original path."""
+    deleted entirely). The mirror side is written through `pm_paths.write_pm_bytes`,
+    so a symlink planted in `.pm/` is refused (PmError), never followed.
+    Returns the original path."""
     original = run_dir / relative_path
     mirror = run_artifact_dir(repo, run_id) / relative_path
-    mirror.parent.mkdir(parents=True, exist_ok=True)
-    mirror.write_bytes(original.read_bytes())
+    pm_paths.write_pm_bytes(repo, mirror, original.read_bytes())
     return original
 
 
@@ -304,6 +313,8 @@ class InitResult:
     state: dict[str, Any]
     slices: list[plan_mod.PlanSlice]
     branch: str
+    # What `sandbox.load_pinned_policy` warned about, for the caller to print.
+    sandbox_warnings: list[str] = field(default_factory=list)
 
 
 def init_run(
@@ -323,6 +334,8 @@ def init_run(
     harness_command: str | None,
     model_tag: str | None,
     run_tag: str | None,
+    policy: dict[str, Any] | None = None,
+    sandbox_policy: Path | None = None,
 ) -> InitResult:
     """Preflight, branch setup, and state/artifact creation for `init`.
 
@@ -330,9 +343,40 @@ def init_run(
     stopped on errors (this function assumes the plan is clean); it does
     not re-check the plan. `model_tag` (the run's default Developer tag) and
     `run_tag` are stored as given, already validated by `state.tag_value`.
+    `policy` is `plan.load_policy`'s result (or None): its protected entries
+    and source digest are frozen into run state here, and the policy file is
+    never read again for the rest of the run.
+
+    `sandbox_policy`, an `srt` base policy, makes the run sandboxed (Mode B,
+    see `sandbox`): the policy is validated, `srt` required and the three
+    derived policies computed before anything is created, so a refusal
+    leaves no run directory, control directory, temp dir or new branch. The run's socket
+    is `pm-run-<run id>`; its control directory
+    `<common git dir>/pm-sandbox/<socket>/` receives `policy.json` (the PM
+    outside, the plan's directory readable), `reviewer-policy.json`,
+    `attach-policy.json` and the record (no pids yet), the temp dir is
+    created, and run state gains the MAC-protected `sandbox` block. The
+    server is not started here: `start-slice` starts it. A failure at any
+    step after the run directory exists, in the sandbox setup or in the
+    steps every init ends with (the `.pm` gitignore, the artifact directory,
+    the `init` event), removes the control and temp directories this call
+    created and leaves the run directory, whose token was never printed.
     """
     if not _executable_exists("tmux"):
         raise PmError("tmux is required to run PM; install it before running init")
+
+    sandbox_base: dict[str, Any] | None = None
+    sandbox_warnings: list[str] = []
+    if sandbox_policy is not None:
+        sandbox_policy = sandbox_policy.expanduser()
+        # The policy every later server start re-checks is the one hashed: one read.
+        sandbox_base, sandbox_warnings, policy_sha256 = sandbox.load_pinned_policy(sandbox_policy)
+        sandbox_policy = sandbox_policy.resolve()
+        # `check_binaries` refuses first when srt is absent.
+        sandbox.check_binaries(sandbox_base)
+        srt_version = sandbox.srt_version()
+        if platform.system() != "Darwin":
+            raise PmError("sandboxing is implemented for macOS only")
 
     if harness_command is None and harness not in profiles.SUPPORTED_HARNESSES:
         supported = ", ".join(profiles.SUPPORTED_HARNESSES)
@@ -347,6 +391,33 @@ def init_run(
         candidate_executable = profiles.HARNESS_PROFILES[harness]["base_command"][0]
     if not candidate_executable or not _executable_exists(candidate_executable):
         raise PmError(f"harness executable not found on PATH: {candidate_executable!r}")
+
+    # The run id is chosen here, before anything exists, because a sandboxed
+    # run's socket, control directory and temp dir are named after it.
+    root = state_mod.state_root(repo)
+    run_id = state_mod.new_run_id({child.name for child in root.iterdir() if child.is_dir()} if root.exists() else ())
+    derived: dict[str, dict[str, Any]] = {}
+    if sandbox_base is not None:
+        # Derived, and so refused, before `--create-branch` creates a branch or
+        # `--branch` checks one out: the branch is named by the arguments, or
+        # is the current one (that resolution is read-only).
+        planned_branch = create_branch or branch or _resolve_init_branch(repo, branch=None, create_branch=None)
+        socket = f"{sandbox.RUN_SOCKET_PREFIX}{run_id}"
+        common = Path(git_ops.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+        control = sandbox.control_dir(common, socket)
+        planned_tmpdir = sandbox.run_tmpdir(socket)
+        for path, what in ((control, "control dir"), (planned_tmpdir, "temp dir")):
+            if os.path.lexists(path):
+                raise PmError(f"sandbox {what} already exists: {path}; another run may own socket {socket}")
+        derived = sandbox.derive_run_policies(
+            sandbox_base,
+            repo=repo,
+            branch=planned_branch,
+            socket=socket,
+            tmpdir=planned_tmpdir,
+            control_root=control.parent,  # <common git dir>/pm-sandbox, which every policy denies
+            plan_dir=plan_path.parent,
+        )
 
     resolved_branch = _resolve_init_branch(repo, branch=branch, create_branch=create_branch)
     # Required in every case, including after a branch switch and on the
@@ -389,8 +460,16 @@ def init_run(
         "model": reviewer_model,
         "effort": reviewer_effort,
     }
-    policy_block = {"max_attempts": max_attempts if max_attempts is not None else 10}
+    policy_block = {
+        "max_attempts": max_attempts if max_attempts is not None else 10,
+        "protected_paths": policy["protected_paths"] if policy else [],
+        "protected_paths_source": {"path": policy["path"], "sha256": policy["sha256"]} if policy else None,
+    }
 
+    note = (
+        f"harness={harness} branch={resolved_branch} slices={len(slices)} "
+        f"protected={len(policy_block['protected_paths'])}"
+    )
     state, token, run_dir = state_mod.create_run(
         repo,
         plan_path=plan_path,
@@ -401,16 +480,84 @@ def init_run(
         reviewer=reviewer_block,
         policy=policy_block,
         slices=entries,
+        run_id=run_id,
         run_tag=run_tag,
     )
 
-    write_pm_gitignore(repo)
-    (run_artifact_dir(repo, state["run_id"]) / "slices").mkdir(parents=True, exist_ok=True)
-    state_mod.append_event(run_dir, "init", note=f"harness={harness} branch={resolved_branch} slices={len(slices)}")
+    if sandbox_base is None:
+        _finish_init(repo, run_dir, state["run_id"], note)
+    else:
+        # What this call created, and so may remove on failure.
+        control_created = False
+        tmpdir: Path | None = None
+        try:
+            try:
+                control.mkdir(parents=True)
+            except FileExistsError:
+                raise PmError(f"sandbox control dir already exists: {control}; another run created it") from None
+            control_created = True
+            tmpdir = sandbox.make_tmpdir(socket)
+            for name, content in derived.items():
+                sandbox.write_control_file(control, name, content)
+            sandbox.write_record(
+                control,
+                worktree=str(repo),
+                branch=resolved_branch,
+                socket=socket,
+                tmpdir=str(tmpdir),
+                policy=str(sandbox_policy),
+                policy_sha256=policy_sha256,
+                srt_version=srt_version,
+                srt_pid=None,
+                server_pid=None,
+                started_at=None,
+            )
+            state["sandbox"] = {
+                "policy": str(sandbox_policy),
+                "policy_sha256": policy_sha256,
+                "socket": socket,
+                "control_dir": str(control),
+            }
+            state_mod.save_state(run_dir, state, token)
+            _finish_init(repo, run_dir, state["run_id"], f"{note} sandbox={socket}")
+        except BaseException as exc:
+            # Cleanup must never replace the failure it is cleaning up after.
+            removed: list[str] = []
+            try:
+                if tmpdir is not None and sandbox.remove_tmpdir(tmpdir):
+                    removed.append(str(tmpdir))
+                if control_created and os.path.lexists(control):
+                    shutil.rmtree(control)
+                    removed.append(str(control))
+            except BaseException as cleanup_exc:
+                removed.append(f"(cleanup failed: {cleanup_exc})")
+            left = (
+                f"sandboxed init failed after creating run directory {run_dir}, which is unusable (its token was "
+                f"never printed); removed: {', '.join(removed) or 'nothing'}"
+            )
+            if not isinstance(exc, Exception):
+                # An interrupt propagates as itself, carrying what was removed.
+                exc.add_note(left)
+                raise
+            raise PmError(f"{exc}; {left}") from exc
 
     return InitResult(
-        run_id=state["run_id"], run_dir=run_dir, token=token, state=state, slices=slices, branch=resolved_branch
+        run_id=state["run_id"],
+        run_dir=run_dir,
+        token=token,
+        state=state,
+        slices=slices,
+        branch=resolved_branch,
+        sandbox_warnings=sandbox_warnings,
     )
+
+
+def _finish_init(repo: Path, run_dir: Path, run_id: str, note: str) -> None:
+    """`init`'s last steps once run state is saved: the `.pm` gitignore, the
+    run's artifact directory and the `init` event."""
+    write_pm_gitignore(repo)
+    pm_paths.ensure_pm_dir(repo, run_artifact_dir(repo, run_id) / "slices")
+    state_mod.append_event(run_dir, "init", note=note)
 
 
 def _executable_exists(executable: str) -> bool:
@@ -464,6 +611,9 @@ def status(repo: Path, run_dir: Path, token: str | None = None) -> StatusResult:
     # commands, so a tampered state should surface here, not one command
     # later. Tokenless (human) reads stay unverified, as documented.
     state = state_mod.load_state(run_dir, token)
+    # A sandboxed run's session lives on its own server only, so the socket
+    # refusal applies to tokenless (human) reads as well.
+    sandbox.require_run_socket(state)
     plan_error: str | None = None
     slices: list[plan_mod.PlanSlice] | None = None
     try:
@@ -603,7 +753,7 @@ def grant(repo: Path, run_dir: Path, token: str, *, slice_id: str, path: str, ev
         # making the dangerous-surface refusal below evadable. Checked before
         # that refusal, on `normalized`, so no glob or directory spelling can
         # survive to be shape-inspected as if it were a single file.
-        if normalized.endswith("/") or any(marker in normalized for marker in ("*", "?", "[")):
+        if normalized.endswith("/") or git_ops.has_glob(normalized):
             raise PmError(
                 f"grant refused: {normalized!r} is a directory or glob, and a grant authorizes one exact "
                 "file path. PM's evidence is about one discovered path, and a pattern authorizes files it "
@@ -628,6 +778,19 @@ def grant(repo: Path, run_dir: Path, token: str, *, slice_id: str, path: str, ev
         dir_lint = plan_mod.directory_surface_lint(path, repo)
         if dir_lint is not None:
             raise PmError(f"grant refused: {dir_lint}")
+
+        # Protected paths were frozen from the policy file at `init` and are
+        # read from run state only. Checked after the path-shape refusals
+        # above (invalid entry, glob or directory, dependency/license/whole-repo
+        # shape, existing directory), which keep their own messages, and
+        # before the already-authorized refusal, so a protected path is never
+        # reported as merely already authorized. `is_protected_path`, not
+        # `is_authorized_path`: a plain entry naming a directory protects its
+        # subtree, as the plan-time overlap check already treats it.
+        if git_ops.is_protected_path(normalized, plan_mod.protected_paths(state)):
+            raise PmError(
+                f"grant refused: {normalized!r} is a protected path (policy frozen at init); no grant can reach it"
+            )
 
         # A grant into a path already covered by the effective surface would still
         # ratchet the slice to elevated and mandate two reviews for nothing, so a
@@ -668,9 +831,14 @@ class StartSliceOutcome:
     reaped: list[str] = field(default_factory=list)
     message: str = ""
     notes_warning: str | None = None
+    # A sandboxed run: the socket of the server this launch started (None
+    # when it was already running or the run is unsandboxed), and what the
+    # all-complete teardown did (None when no teardown ran).
+    server_started_on: str | None = None
+    sandbox_notes: list[str] | None = None
 
 
-def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> list[str]:
+def _rotate_prior_attempt(repo: Path, artifact_dir: Path, superseded_attempt: int) -> list[str]:
     # `validation.md` rotates with the rest: it is Developer-authored evidence
     # PM assesses the attempt against, so a steer or relaunch that left the
     # prior attempt's copy in place would present stale evidence as this
@@ -679,12 +847,22 @@ def _rotate_prior_attempt(artifact_dir: Path, superseded_attempt: int) -> list[s
     # Returns the names actually moved (empty if there was nothing to rotate)
     # so a caller that later fails to deliver can restore exactly those names
     # with `_restore_rotated_attempt` — see finalize_steer.
-    names = ("result.json", "pane.txt", "pane-live.txt", "validation.md")
+    #
+    # An open `question.md` rotates too: it belongs to the attempt that asked
+    # it, and left in place it would read as the new attempt's question.
+    # Answered questions (`question-<n>.md`) and their `answer-<n>.md` files
+    # stay at the top level, numbered across the whole slice.
+    #
+    # The destination is created through `pm_paths.ensure_pm_dir`, so a symlink planted
+    # at `attempt-<n>` (or above it) is refused rather than moving the files
+    # into whatever it points at. The renames themselves move names, never
+    # content, and `rename` does not follow a leaf link.
+    names = ("result.json", "pane.txt", "pane-live.txt", "validation.md", "question.md")
     present = [name for name in names if (artifact_dir / name).exists()]
     if not present:
         return []
     destination = artifact_dir / f"attempt-{superseded_attempt}"
-    destination.mkdir(parents=True, exist_ok=True)
+    pm_paths.ensure_pm_dir(repo, destination)
     for name in present:
         (artifact_dir / name).rename(destination / name)
     return present
@@ -706,10 +884,12 @@ def _restore_rotated_attempt(artifact_dir: Path, superseded_attempt: int, names:
             # against an existing destination (unlike exists()-then-rename),
             # so a fresh file the live session writes in this same window
             # (e.g. it finishes right as send_line's dead-session recheck
-            # fires) can never be clobbered by the stale archived copy.
-            # Best-effort: any failure here (including that FileExistsError)
-            # must not mask the proven-undelivered PmError being raised.
-            os.link(source_path, destination)
+            # fires) can never be clobbered by the stale archived copy, and
+            # `follow_symlinks=False` links a planted link as itself, never
+            # the file it names. Best-effort: any failure here (including
+            # that FileExistsError) must not mask the proven-undelivered
+            # PmError being raised.
+            os.link(source_path, destination, follow_symlinks=False)
             source_path.unlink()
         except OSError:
             continue
@@ -727,7 +907,26 @@ def start_slice(
     harness_command: str | None = None,
     risk: str | None = None,
 ) -> StartSliceOutcome:
+    """`start-slice`: launch (or relaunch) the next eligible slice's Developer.
+
+    On a sandboxed run it refuses first, through `sandbox.require_run_socket`,
+    unless `PM_TMUX_SOCKET` names the run's socket. Before anything of the
+    launch is written it ensures the run's sandboxed server
+    (`sandbox.ensure_run_server`: started and verified when absent, refused
+    when the server on the socket is not this run's), and then creates the
+    session through that server (`sessions.start_session_via_server`), never
+    with a bare `new-session`; the outcome's `server_started_on` names the
+    socket when this call started the server; after a `stop` removed the
+    run's sandbox, that call rebuilds it first. An all-attested run is
+    completed here, and a sandboxed one torn down (`sandbox.teardown_run`),
+    its notes in `sandbox_notes`; on a run already complete the teardown is
+    retried whenever anything of its sandbox is left, or its `sandbox-stopped`
+    event was lost (`sandbox.sandbox_left`), so a teardown that failed at the
+    run end can be finished. A teardown that fails raises PmError saying the
+    run's completion is recorded.
+    """
     state = load_writable_state(run_dir, token)
+    sandbox.require_run_socket(state)
     run_id = state["run_id"]
     plan_path = Path(state["plan"]["path"])
 
@@ -757,13 +956,24 @@ def start_slice(
             # The run ends with a final state write and report regeneration,
             # so an all-attested run reaches completion here rather than
             # idling as "active" forever.
-            if state.get("status") != "complete":
+            sandbox_notes: list[str] | None = None
+            completing = state.get("status") != "complete"
+            if completing:
                 state["status"] = "complete"
                 state["stop_reason"] = None
                 state_mod.save_state(run_dir, state, token)
                 state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
-                regenerate_report(repo, run_dir, state)
-            return StartSliceOutcome(kind="all_complete")
+            # The run end takes a sandboxed run's server down with it; on a run
+            # already complete, a teardown that failed before is retried while
+            # anything of the sandbox is left or its event is missing.
+            if completing or sandbox.sandbox_left(state, repo=repo, run_dir=run_dir):
+                try:
+                    sandbox_notes = sandbox.teardown_run(
+                        state, repo=repo, run_dir=run_dir, recorded="the run's completion is recorded"
+                    )
+                finally:
+                    regenerate_report(repo, run_dir, state)
+            return StartSliceOutcome(kind="all_complete", sandbox_notes=sandbox_notes)
 
     assert plan_slice is not None
     approved_ids = frozenset((state.get("approvals") or {}).keys())
@@ -822,11 +1032,20 @@ def start_slice(
     else:
         attempts = 0
 
+    # A sandboxed run's server comes up (or is proven to be this run's) before
+    # anything of the launch is rotated, reaped or written.
+    run_socket: str | None = None
+    server_started_on: str | None = None
+    if sandbox.records_sandbox(state):
+        run_socket = state["sandbox"]["socket"]
+        if sandbox.ensure_run_server(state, repo=repo):
+            server_started_on = run_socket
+
     artifact_dir = slice_artifact_dir(repo, run_id, plan_slice.slice_id)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    pm_paths.ensure_pm_dir(repo, artifact_dir)
 
     if relaunch:
-        _rotate_prior_attempt(artifact_dir, attempts - 1)
+        _rotate_prior_attempt(repo, artifact_dir, attempts - 1)
 
     reaped: list[str] = []
     for name in sessions.sessions_for_run(run_id):
@@ -837,7 +1056,7 @@ def start_slice(
         before_head = current.get("before_head") if current else None
     else:
         before_head = git_ops.git_head(repo)
-        (artifact_dir / "status-before.txt").write_text(git_ops.git_status_text(repo), encoding="utf-8")
+        pm_paths.write_pm_text(repo, artifact_dir / "status-before.txt", git_ops.git_status_text(repo))
 
     # Controller-owned notes.md: the PM agent curates the ORIGINAL (under
     # run_dir) via the `notes` command (write_notes) — start-slice's job here
@@ -851,10 +1070,13 @@ def start_slice(
         original_notes.write_text("", encoding="utf-8")
     notes_warning = _notes_cap_warning(original_notes.stat().st_size)
     slice_notes_path = notes_path(repo, run_id)
-    slice_notes_path.parent.mkdir(parents=True, exist_ok=True)
-    slice_notes_path.write_bytes(original_notes.read_bytes())
+    pm_paths.write_pm_bytes(repo, slice_notes_path, original_notes.read_bytes())
 
     result_path = artifact_dir / "result.json"
+    question_path = artifact_dir / "question.md"
+    # Inside a sandbox: inherited, when this PM already runs under `srt` (a
+    # campaign child), or the run's own sandboxed server (Mode B).
+    sandboxed = sandbox.inside_sandbox() or sandbox.records_sandbox(state)
     prompt_text = prompts.render_developer_prompt(
         plan_slice,
         plan_path=plan_path,
@@ -863,19 +1085,19 @@ def start_slice(
         result_path=result_path,
         before_head=before_head,
         granted_surface=plan_mod.slice_grants(state, plan_slice.slice_id),
+        question_path=question_path,
+        sandboxed=sandboxed,
     )
     prompt_path = artifact_dir / "prompt.md"
-    prompt_path.write_text(prompt_text, encoding="utf-8")
+    pm_paths.write_pm_text(repo, prompt_path, prompt_text)
 
-    tmp_dir = artifact_dir / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
     env = {
         "PM_SLICE_ARTIFACT_DIR": str(artifact_dir),
         "PM_PLAN_PATH": str(plan_path),
         "PM_SLICE_ID": plan_slice.slice_id,
         "PM_NOTES_PATH": str(slice_notes_path),
         "PM_RESULT_PATH": str(result_path),
-        "TMPDIR": str(tmp_dir),
+        "PM_QUESTION_PATH": str(question_path),
     }
 
     harness_block = state.get("harness") or {}
@@ -885,24 +1107,21 @@ def start_slice(
     launch_effort = effort or harness_block.get("effort")
     launch_model_tag = model_tag or harness_block.get("model_tag")
 
-    expected_model_display: str | None = None
-    if effective_override:
-        command = effective_override
-    else:
-        session_id = str(uuid.uuid4()) if harness_name == "claude" else None
-        if harness_name == "opencode" and launch_model:
-            identity = profiles.query_model_identity(harness_name, launch_model)
-            if identity:
-                expected_model_display = identity["display_name"]
-        command = profiles.compose_command(
-            harness_name,
-            model=launch_model,
-            effort=launch_effort,
-            session_id=session_id,
-        )
+    command, expected_model_display = profiles.launch_command(
+        harness_name,
+        override=effective_override or None,
+        model=launch_model,
+        effort=launch_effort,
+        sandboxed=sandboxed,
+    )
 
     session_name = sessions.session_name(run_id, slice_number(plan_slice.slice_id), attempts)
-    sessions.start_session(session_name, repo, command, env)
+    if run_socket is None:
+        sessions.start_session(session_name, repo, command, env)
+    else:
+        # Through the server, never a bare new-session: with no server
+        # answering it fails instead of starting an unsandboxed one.
+        sessions.start_session_via_server(run_socket, session_name, repo, command, env)
     launch_executable = shlex.split(command)[0] if command.strip() else ""
     # The session is live from here but is not recorded in `current_slice`
     # until `save_state` succeeds, so anything that raises anywhere in between
@@ -996,6 +1215,7 @@ def start_slice(
         session=session_name,
         reaped=reaped,
         notes_warning=notes_warning,
+        server_started_on=server_started_on,
     )
 
 
@@ -1013,12 +1233,63 @@ class ObserveOutcome:
     tail: str = ""
     slice_id: str | None = None
     elapsed_seconds: float = 0.0
-    # True when a requested wait elapsed with no session-death, result, or
-    # dialog-marker signal — the caller should wait longer next time, not re-ask.
+    # True when a requested wait elapsed with no session-death, result,
+    # question, or dialog-marker signal — the caller should wait longer next
+    # time, not re-ask.
     no_signal: bool = False
+    # An open `question.md` in the slice artifact directory: the Developer is
+    # waiting on `pm answer`. `question_text` is `read_question_head`'s bounded excerpt.
+    question_present: bool = False
+    question_text: str | None = None
 
 
-def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str | None = None) -> ObserveOutcome:
+def read_question_head(repo: Path, path: Path) -> str | None:
+    """The head of a question file for PM's context, or None when unreadable.
+
+    `path` is under `<repo>/.pm/` and is read through `pm_paths.read_pm_bytes`, so a
+    planted symlink raises PmError (it is not "unreadable"); an absent or
+    otherwise unreadable file is None.
+
+    The file is Developer-written, so its size and line width are untrusted:
+    at most `_OBSERVE_QUESTION_LINES` lines and `_OBSERVE_QUESTION_BYTES`
+    bytes are returned, and a cut by either cap ends with a marker line stating
+    what was shown, so a truncated question cannot pass for a whole one. The
+    marker's line count is of the excerpt shown (a line cut by the byte cap
+    counts), `M` is the file's, and `K` is the excerpt's bytes. Only the
+    first `_QUESTION_READ_BYTES` of the file are read; past that `M` is a
+    lower bound and the marker says `of at least M lines`.
+    """
+    try:
+        raw = pm_paths.read_pm_bytes(repo, path, _QUESTION_READ_BYTES + 1)
+    except OSError:
+        return None
+    read_whole = len(raw) <= _QUESTION_READ_BYTES
+    lines = raw[:_QUESTION_READ_BYTES].decode("utf-8", errors="replace").splitlines()
+    head = "\n".join(lines[:_OBSERVE_QUESTION_LINES])
+    if read_whole and len(lines) <= _OBSERVE_QUESTION_LINES and len(head.encode("utf-8")) <= _OBSERVE_QUESTION_BYTES:
+        return head
+    # `ignore` drops a character the byte cap split, never the whole excerpt.
+    shown = head.encode("utf-8")[:_OBSERVE_QUESTION_BYTES].decode("utf-8", errors="ignore")
+    total = f"{len(lines)}" if read_whole else f"at least {len(lines)}"
+    marker = (
+        f"[question truncated: showing {len(shown.splitlines())} of {total} lines, {len(shown.encode('utf-8'))} bytes]"
+    )
+    return f"{shown}\n{marker}"
+
+
+def observe(
+    repo: Path,
+    run_dir: Path,
+    *,
+    wait: float | None = None,
+    token: str | None = None,
+    seen_markers: Sequence[str] = (),
+) -> ObserveOutcome:
+    """Evidence of the live session's progress; with `wait`, polls until a signal.
+
+    A dialog marker whose matched literal equals one of `seen_markers` does not
+    end the wait (any other marker does); it is still reported on return.
+    """
     # Same opportunistic verification as status(): see the comment there.
     state = state_mod.load_state(run_dir, token)
     current = state.get("current_slice")
@@ -1028,11 +1299,16 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     session = current["tmux_session"]
     artifact_dir = Path(current["artifact_dir"])
     pane_live_path = artifact_dir / "pane-live.txt"
-    previous_capture = pane_live_path.read_text(encoding="utf-8") if pane_live_path.exists() else ""
+    try:
+        previous_capture = pm_paths.read_pm_text(repo, pane_live_path, errors="replace")
+    except FileNotFoundError:
+        previous_capture = ""
     result_path = artifact_dir / "result.json"
+    question_path = artifact_dir / "question.md"
 
     initial_running = sessions.session_exists(session)
-    result_existed_before = result_path.is_file()
+    result_existed_before = pm_paths.pm_file_present(repo, result_path)
+    question_existed_before = pm_paths.pm_file_present(repo, question_path)
 
     deadline = time.monotonic() + wait if wait else None
     wait_start = time.monotonic()
@@ -1042,19 +1318,23 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
     # the evidence finalize falls back to after session exit.
     capture = activity["capture"] if activity["capture"] is not None else previous_capture
     # Wait exits early ONLY on a meaningful signal — session death, result.json
-    # appearing, or a dialog marker on the visible pane — never on a mere
-    # pane byte-change; TUI spinner/stream churn would otherwise defeat the
-    # wait almost immediately.
+    # or question.md appearing, or a dialog marker on the visible pane — never
+    # on a mere pane byte-change; TUI spinner/stream churn would otherwise
+    # defeat the wait almost immediately.
     marker_observation: sessions.PaneObservation | None = None
     while deadline is not None and time.monotonic() < deadline:
         visible = sessions.scan_visible_pane(session)
-        if visible.dialog_markers["present"]:
+        if sessions.unseen_markers(visible.dialog_markers, seen_markers):
             # Retain the marker and the exact screen that produced it. A second
             # capture could observe a redraw and recreate the old mismatch:
             # marker reported, but marker absent from the tail and pane-live.
             marker_observation = visible
             break
-        if not activity["running"] or result_path.is_file():
+        if (
+            not activity["running"]
+            or pm_paths.pm_file_present(repo, result_path)
+            or pm_paths.pm_file_present(repo, question_path)
+        ):
             break
         time.sleep(_OBSERVE_POLL_SECONDS)
         activity = sessions.detect_activity(session)
@@ -1079,18 +1359,20 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
 
     pane_changed = capture != previous_capture
     if pane_changed:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        pane_live_path.write_text(capture, encoding="utf-8")
+        pm_paths.write_pm_text(repo, pane_live_path, capture)
 
-    result_present = result_path.is_file()
+    result_present = pm_paths.pm_file_present(repo, result_path)
     result_status: str | None = None
     if result_present:
         try:
-            data = json.loads(result_path.read_text(encoding="utf-8"))
+            data = json.loads(pm_paths.read_pm_text(repo, result_path))
             if isinstance(data, dict):
                 result_status = data.get("status")
         except (OSError, json.JSONDecodeError):
             result_status = None
+
+    question_present = pm_paths.pm_file_present(repo, question_path)
+    question_text = read_question_head(repo, question_path) if question_present else None
 
     # Visible pane, not the scrollback `capture` above: an interactive dialog
     # is only actionable while it is on screen, and a dead session captures
@@ -1105,16 +1387,23 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
 
     liveness_changed = running != initial_running
     result_newly_appeared = result_present and not result_existed_before
+    question_newly_appeared = question_present and not question_existed_before
     # A full requested wait that ended in none of the above is exactly the
     # pattern worth telling the caller about: re-asking at the same length
     # cannot return anything a longer wait would not have.
-    no_signal = bool(wait) and running and not result_present and not dialog_markers["present"]
-    changed = pane_changed or liveness_changed or result_newly_appeared
+    no_signal = (
+        bool(wait)
+        and running
+        and not result_present
+        and not question_present
+        and not sessions.unseen_markers(dialog_markers, seen_markers)
+    )
+    changed = pane_changed or liveness_changed or result_newly_appeared or question_newly_appeared
     if changed or no_signal:
         note = (
             f"pane_changed={pane_changed} liveness_changed={liveness_changed} "
             f"running={running} result_present={result_present} "
-            f"elapsed={elapsed_seconds:.1f}s"
+            f"question_present={question_present} elapsed={elapsed_seconds:.1f}s"
         )
         evidence = str(pane_live_path) if pane_changed else None
         try:
@@ -1138,21 +1427,186 @@ def observe(repo: Path, run_dir: Path, *, wait: float | None = None, token: str 
         slice_id=current.get("id"),
         elapsed_seconds=elapsed_seconds,
         no_signal=no_signal,
+        question_present=question_present,
+        question_text=question_text,
     )
 
 
 # --- send ---------------------------------------------------------------------
 
 
-def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> None:
+def send(repo: Path, run_dir: Path, token: str, *, text: str, reason: str) -> sessions.Delivery:
+    """Type one line into the live session; the returned delivery says whether the pane reacted."""
     state = load_writable_state(run_dir, token)
     _refuse_if_budget_exhausted(state)
     current = state.get("current_slice")
     session = current.get("tmux_session") if current else None
     if not current or not session or not sessions.session_exists(session):
         raise PmError("no live session — not driving a dead pane")
-    sessions.send_line(session, text)
-    state_mod.append_event(run_dir, "send", slice_id=current.get("id"), note=reason)
+    delivery = sessions.send_line(session, text)
+    data = None if delivery.confirmed else {"delivery": "unconfirmed"}
+    state_mod.append_event(run_dir, "send", slice_id=current.get("id"), note=reason, data=data)
+    return delivery
+
+
+# --- answer -------------------------------------------------------------------
+
+
+def _answer_paths(directory: Path, prefix: str) -> tuple[int, Path, Path, Path]:
+    """`(n, question, answer, archived question)` for the next answer in `directory`."""
+    number = len(list(directory.glob(f"{prefix}answer-*.md"))) + 1
+    return (
+        number,
+        directory / f"{prefix}question.md",
+        directory / f"{prefix}answer-{number}.md",
+        directory / f"{prefix}question-{number}.md",
+    )
+
+
+def deliver_answer(
+    repo: Path, directory: Path, prefix: str, session: str, text: str
+) -> tuple[Path, Path, int, sessions.Delivery]:
+    """Deliver a supervisor's answer to the open question in `directory`.
+
+    `directory` is under `<repo>/.pm/`; the answer is written through
+    `pm_paths.write_pm_text`, so a planted symlink on its path is refused (PmError).
+    Writes `<prefix>answer-<n>.md` exclusively with `text` verbatim, where
+    `n` is one more than the number of existing `<prefix>answer-*.md` files;
+    renames `<prefix>question.md` to `<prefix>question-<n>.md`; then injects
+    the one-line answer pointer into `session` through `sessions.send_line`,
+    so the dialog guard applies. Returns the answer path, the archived
+    question path, `n` and the send's `sessions.Delivery`.
+
+    The caller checks that the question exists and that the session is live.
+    On `TypedNotSubmitted` both files stay in place and the error propagates:
+    the pointer is typed in the session's input line, so removing the file it
+    names would leave a dangling pointer (the rule `finalize_steer` follows).
+    On any other `PmError` from the send nothing was typed, so the question is
+    linked back and the archived copy and answer file are removed, and the
+    error propagates. The restore uses link-then-unlink, as
+    `_restore_rotated_attempt` does (never following a link at the archived
+    name), so a fresh `question.md` the Developer
+    wrote in the window is never overwritten: the archived copy then stays.
+    Whatever this cleanup could not undo is appended to the raised message
+    rather than swallowed, because a stranded file makes the next `answer`
+    fail on numbering.
+    """
+    number, question_path, answer_path, archived_path = _answer_paths(directory, prefix)
+    if pm_paths.pm_file_present(repo, archived_path):
+        raise PmError(f"{archived_path} already exists; the question and answer numbering disagree — read both by hand")
+    try:
+        pm_paths.write_pm_text(repo, answer_path, text, exclusive=True)
+    except FileExistsError as exc:
+        raise PmError(
+            f"{answer_path} already exists; the question and answer numbering disagree — read both by hand"
+        ) from exc
+    try:
+        question_path.rename(archived_path)
+    except OSError as exc:
+        answer_path.unlink(missing_ok=True)
+        raise PmError(f"could not archive {question_path} as {archived_path}: {exc}") from exc
+    try:
+        delivery = sessions.send_line(session, prompts.render_answer_pointer(answer_path))
+    except TypedNotSubmitted:
+        raise
+    except PmError as exc:
+        left_behind: list[str] = []
+        try:
+            os.link(archived_path, question_path, follow_symlinks=False)
+        except FileExistsError:
+            left_behind.append(f"{archived_path} kept because a new {question_path} was written meanwhile")
+        except OSError as link_exc:
+            left_behind.append(f"{archived_path} could not be restored to {question_path}: {link_exc}")
+        else:
+            try:
+                archived_path.unlink()
+            except OSError as unlink_exc:
+                left_behind.append(f"{archived_path} could not be removed after the restore: {unlink_exc}")
+        try:
+            answer_path.unlink(missing_ok=True)
+        except OSError as unlink_exc:
+            left_behind.append(f"{answer_path} could not be removed: {unlink_exc}")
+        if left_behind:
+            raise PmError(f"{exc}; left behind: {'; '.join(left_behind)}") from exc
+        raise
+    return answer_path, archived_path, number, delivery
+
+
+@dataclass
+class AnswerOutcome:
+    slice_id: str
+    answer_path: Path
+    question_archived_path: Path
+    answer_number: int
+    # False when the pane did not change after the pointer's Enter (see `sessions.Delivery`).
+    delivered: bool = True
+
+
+def answer(repo: Path, run_dir: Path, token: str, *, text: str) -> AnswerOutcome:
+    """`answer --text`: deliver PM's answer to the Developer's open question.
+
+    Free and recorded: no attempt is charged, no state is saved, and the
+    judgment gate does not apply, because an answer is not an exit from a
+    submission. The `answer` event's note carries the full answer verbatim
+    and is the durable record; `answer-<n>.md` sits in the Developer-writable
+    `.pm/` directory, so it is a delivery artifact, not a second source of
+    truth. A pointer typed but not submitted (`TypedNotSubmitted`) is recorded
+    the same way with `delivered` False before the error propagates, since
+    that answer would otherwise exist only in the Developer-writable file.
+    """
+    state = load_writable_state(run_dir, token)
+    _refuse_if_budget_exhausted(state)
+    current = state.get("current_slice")
+    if not current or not current.get("id"):
+        raise PmError("no current slice to answer")
+    slice_id = current["id"]
+    if not text.strip():
+        raise PmError("--text answer must be non-empty (there is nothing to deliver)")
+    artifact_dir = Path(current["artifact_dir"])
+    question_path = artifact_dir / "question.md"
+    if not pm_paths.pm_file_present(repo, question_path):
+        raise PmError(f"no open question for {slice_id}: {question_path} does not exist")
+    if pm_paths.pm_file_present(repo, artifact_dir / "result.json"):
+        raise PmError(
+            f"{slice_id}'s submission is in (result.json exists); an answer cannot reach it — "
+            "assess it with finalize, and deliver a correction with finalize --steer"
+        )
+    session = current.get("tmux_session")
+    if not session or not sessions.session_exists(session):
+        raise PmError(f"no live session to answer for {slice_id} — relaunch with start-slice")
+
+    # Named before the delivery: once the answer file exists the next free
+    # number has moved on, and the undelivered event below needs this one.
+    _number, _question, pending_answer, pending_archive = _answer_paths(artifact_dir, "")
+    try:
+        answer_path, archived_path, number, delivery = deliver_answer(repo, artifact_dir, "", session, text)
+    except TypedNotSubmitted:
+        # The pointer is typed and names the answer file, but that file is
+        # Developer-writable; this event is the durable record.
+        state_mod.append_event(
+            run_dir,
+            "answer",
+            slice_id=slice_id,
+            note=text,
+            evidence=str(pending_answer),
+            data={"question": pending_archive.name, "delivered": False},
+        )
+        raise
+    state_mod.append_event(
+        run_dir,
+        "answer",
+        slice_id=slice_id,
+        note=text,
+        evidence=str(answer_path),
+        data={"question": archived_path.name, **({} if delivery.confirmed else {"delivery": "unconfirmed"})},
+    )
+    return AnswerOutcome(
+        slice_id=slice_id,
+        answer_path=answer_path,
+        question_archived_path=archived_path,
+        answer_number=number,
+        delivered=bool(delivery.confirmed),
+    )
 
 
 # --- finalize -------------------------------------------------------------
@@ -1192,38 +1646,57 @@ def _floor_note(report: FloorReport) -> str:
     return "failed: " + ", ".join(fact.name for fact in report.facts if not fact.passed)
 
 
-def _collect_finalize_evidence(repo: Path, state: dict[str, Any], current: dict[str, Any]) -> tuple[FloorReport, Path]:
+def _collect_finalize_evidence(
+    repo: Path, state: dict[str, Any], current: dict[str, Any], *, tolerate_pane_error: bool = False
+) -> tuple[FloorReport, Path, str | None]:
     """Shared by bare `finalize` and every decision path: capture pane +
     status-after + diff evidence under the slice's artifact dir, then
-    evaluate the seven-fact floor. Never mutates or saves state.
+    evaluate the seven-fact floor. Never mutates or saves state. Returns
+    (floor report, artifact dir, pane error).
 
     The pane capture is evidence for the PM agent to read, not an input to
     the floor: whether a visible prompt or usage banner means this run must
-    stop is its judgement, recorded in the assessment."""
+    stop is its judgement, recorded in the assessment. A capture that fails
+    (PmError or OSError: a link planted at pane.txt or pane-live.txt is
+    refused by the guard) raises, unless `tolerate_pane_error` (`finalize
+    --stop`, which must not be blocked by its pane evidence): then it is
+    returned as the pane error, None otherwise."""
     slice_id = current["id"]
     artifact_dir = Path(current["artifact_dir"])
     session = current.get("tmux_session")
-    if session and sessions.session_exists(session):
-        pane_text = sessions.pane_text(session)
-    else:
-        # Falls back to the last screen `observe` recorded. The Developer
-        # session has normally already exited by finalize — it writes
-        # result.json and stops — so capturing only a live pane left pane.txt
-        # empty in the common case, which is exactly when PM is required to
-        # say what the pane showed.
-        pane_live = artifact_dir / "pane-live.txt"
-        pane_text = pane_live.read_text(encoding="utf-8") if pane_live.is_file() else ""
+    pane_error: str | None = None
+    try:
+        if session and sessions.session_exists(session):
+            pane_text = sessions.pane_text(session)
+        else:
+            # Falls back to the last screen `observe` recorded. The Developer
+            # session has normally already exited by finalize — it writes
+            # result.json and stops — so capturing only a live pane left pane.txt
+            # empty in the common case, which is exactly when PM is required to
+            # say what the pane showed.
+            # Read through the guard: a symlink planted at pane-live.txt must not
+            # turn this host read into a read of a file the sandbox is denied,
+            # which the copy into pane.txt would then hand back to it.
+            try:
+                pane_text = pm_paths.read_pm_text(repo, artifact_dir / "pane-live.txt", errors="replace")
+            except FileNotFoundError:
+                pane_text = ""
+        pm_paths.write_pm_text(repo, artifact_dir / "pane.txt", pane_text)
+    except (PmError, OSError) as exc:
+        if not tolerate_pane_error:
+            raise
+        pane_error = str(exc)
+    pm_paths.write_pm_text(repo, artifact_dir / "status-after.txt", git_ops.git_status_text(repo))
 
-    (artifact_dir / "pane.txt").write_text(pane_text, encoding="utf-8")
-    (artifact_dir / "status-after.txt").write_text(git_ops.git_status_text(repo), encoding="utf-8")
-
-    diff_path = artifact_dir / "diff.patch"
     after_head = git_ops.git_head(repo)
-    git_ops.write_git_diff(repo, current.get("before_head"), after_head, diff_path)
+    diff_text, diff_error = git_ops.git_diff_text(repo, current.get("before_head"), after_head)
+    pm_paths.write_pm_text(repo, artifact_dir / "diff.patch", diff_text)
+    if diff_error is not None:
+        pm_paths.write_pm_text(repo, artifact_dir / "git-diff-error.txt", diff_error)
 
     slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
     report = evaluate_floor(repo, state, slices, slice_id, artifact_dir=artifact_dir)
-    return report, artifact_dir
+    return report, artifact_dir, pane_error
 
 
 def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) -> FinalizeOutcome:
@@ -1242,9 +1715,16 @@ def finalize(repo: Path, run_dir: Path, token: str, *, risk: str | None = None) 
                 run_dir, "risk-raise", slice_id=slice_id, note="risk raised via bare finalize --risk elevated"
             )
 
-    report, artifact_dir = _collect_finalize_evidence(repo, state, current)
+    report, artifact_dir, _pane_error = _collect_finalize_evidence(repo, state, current)
 
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
+    state_mod.append_event(
+        run_dir,
+        "floor",
+        slice_id=slice_id,
+        note=_floor_note(report),
+        evidence=str(artifact_dir),
+        data=report.failure_data(),
+    )
     # updated_at bump (and, when --risk was given, the ratchet) only — no
     # other semantic field changes in bare finalize.
     state_mod.save_state(run_dir, state, token)
@@ -1340,7 +1820,9 @@ def _grants_text(grants: list[dict[str, Any]]) -> str:
 def _attempts_summary(run_dir: Path, slice_id: str, attempts: int) -> str:
     events = state_mod.read_events(run_dir)
     steer_events = [event for event in events if event.get("kind") == "steer" and event.get("slice") == slice_id]
-    lines = [f"Attempts: {attempts}"]
+    # `attempts` is 0 on the first launch, so it counts steers and relaunches, not submissions; the
+    # judgments number submissions from 1 and this line says which it is.
+    lines = [f"Steers/relaunches: {attempts}"]
     if steer_events:
         lines.append(f"Steer interventions: {len(steer_events)}")
         for event in steer_events:
@@ -1349,6 +1831,22 @@ def _attempts_summary(run_dir: Path, slice_id: str, attempts: int) -> str:
             for note_line in note_lines:
                 lines.append(f"      {note_line}")
     return "\n".join(lines)
+
+
+def _criteria_note(run_dir: Path, entry: dict[str, Any], slice_id: str) -> str | None:
+    """`criteria met: N of M (...)` when the current submission's Developer judgment met fewer than the slice's M.
+
+    None when the judgment met them all, is `unavailable` (it records no count) or the slice has no recorded total.
+    """
+    from . import judgments
+
+    origin = judgments.latest_developer_origin(judgments.read_events_or_raise(run_dir), slice_id)
+    judgment = judgments.active_developer_judgment(entry, origin["index"]) if origin else None
+    met = judgment.get("criteria_met") if judgment else None
+    total = entry.get("criteria_total")
+    if type(met) is not int or type(total) is not int or met >= total:
+        return None
+    return f"criteria met: {met} of {total} (accepted with {total - met} unmet; see the assessment)"
 
 
 def _render_assessment(
@@ -1361,6 +1859,7 @@ def _render_assessment(
     reviews_text: str,
     attempts_summary: str,
     grants_text: str,
+    criteria_note: str | None = None,
 ) -> str:
     lines = [
         f"# Assessment: {entry.get('id')} - {entry.get('title')}",
@@ -1368,6 +1867,10 @@ def _render_assessment(
         f"Decision: {decision}",
         f"Timestamp: {state_mod.utc_now_iso()}",
         f"Commit: {head}",
+    ]
+    if criteria_note:
+        lines.append(criteria_note[0].upper() + criteria_note[1:])
+    lines += [
         "",
         "## Floor",
         "",
@@ -1411,6 +1914,10 @@ class AcceptOutcome:
     assessment_path: Path | None = None
     message: str = ""
     code_warning: str | None = None
+    # What the run-end sandbox teardown did (None when none ran).
+    sandbox_notes: list[str] | None = None
+    # `criteria met: N of M (...)` when the accept took a submission that met fewer criteria than the slice has.
+    criteria_note: str | None = None
 
 
 def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, risk: str | None = None) -> AcceptOutcome:
@@ -1420,6 +1927,14 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     an elevated slice additionally requires both a drift-audit and a
     code-review entry recorded fresh against the current HEAD before
     acceptance is recorded.
+
+    On a sandboxed run it refuses first, through `sandbox.require_run_socket`,
+    unless `PM_TMUX_SOCKET` names the run's socket. The accept that completes
+    the run also tears the run's sandbox down (`sandbox.teardown_run`: the
+    server, its temp and control directories, a `sandbox-stopped` event) and
+    returns what that did in `sandbox_notes`. A teardown that fails there
+    leaves the slice accepted and the run complete, and raises PmError saying
+    so; the next `start-slice` retries it.
     """
     stripped_reasoning = reasoning.strip()
     if len(stripped_reasoning) < _ACCEPT_REASONING_MIN_CHARS:
@@ -1429,6 +1944,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         )
 
     state = load_writable_state(run_dir, token)
+    sandbox.require_run_socket(state)
     _refuse_if_budget_exhausted(state)
     current = state.get("current_slice")
     if not current:
@@ -1443,8 +1959,15 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=stripped_reasoning.splitlines()[0][:120])
     _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
-    report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
+    report, artifact_dir, _pane_error = _collect_finalize_evidence(repo, state, current)
+    state_mod.append_event(
+        run_dir,
+        "floor",
+        slice_id=slice_id,
+        note=_floor_note(report),
+        evidence=str(artifact_dir),
+        data=report.failure_data(),
+    )
 
     if not report.passed:
         state_mod.save_state(run_dir, state, token)
@@ -1490,6 +2013,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     reviews_text = _reviews_consulted_text(reviews, head, effective_risk, grant_count)
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
     grants_text = _grants_text(plan_mod.slice_grants(state, slice_id))
+    criteria_note = _criteria_note(run_dir, entry, slice_id)
     assessment_text = _render_assessment(
         entry,
         report,
@@ -1499,13 +2023,15 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         reviews_text=reviews_text,
         attempts_summary=attempts_summary,
         grants_text=grants_text,
+        criteria_note=criteria_note,
     )
     assessment_relative = f"{slice_relative_dir(slice_id)}/assessment.md"
     assessment_original = write_controller_artifact(
         repo, run_dir, state["run_id"], assessment_relative, assessment_text
     )
 
-    first_line = stripped_reasoning.splitlines()[0][:120]
+    # In full: the decision is the run report's and the ledger's one-line record of why the slice was accepted.
+    first_line = stripped_reasoning.splitlines()[0]
     entry["status"] = "accepted"
     entry["commit"] = head
     entry["decision"] = first_line
@@ -1528,9 +2054,19 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
 
     state_mod.save_state(run_dir, state, token)
     state_mod.append_event(run_dir, "accept", slice_id=slice_id, note=first_line, evidence=str(assessment_original))
-    if run_complete:
-        state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
-    regenerate_report(repo, run_dir, state)
+    sandbox_notes: list[str] | None = None
+    try:
+        if run_complete:
+            state_mod.append_event(run_dir, "complete", note="all slices accepted or attested")
+            # The run end takes a sandboxed run's server down with it.
+            sandbox_notes = sandbox.teardown_run(
+                state,
+                repo=repo,
+                run_dir=run_dir,
+                recorded=f"the acceptance of {slice_id} and the run's completion are recorded",
+            )
+    finally:
+        regenerate_report(repo, run_dir, state)
 
     return AcceptOutcome(
         kind="accepted",
@@ -1540,6 +2076,8 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
         message=f"{slice_id} accepted",
         pane_path=artifact_dir / "pane.txt",
         code_warning=code_warning,
+        sandbox_notes=sandbox_notes,
+        criteria_note=criteria_note,
     )
 
 
@@ -1553,6 +2091,8 @@ class SteerOutcome:
     attempts: int | None = None
     message: str = ""
     correction_path: Path | None = None
+    # True unless the pane was unchanged after the pointer's Enter (sessions.Delivery).
+    delivered: bool = True
 
 
 def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, risk: str | None = None) -> SteerOutcome:
@@ -1630,7 +2170,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # line later), so restoring would risk the same race this ordering
     # exists to avoid.
     artifact_dir = Path(current["artifact_dir"])
-    rotated = _rotate_prior_attempt(artifact_dir, attempts - 1)
+    rotated = _rotate_prior_attempt(repo, artifact_dir, attempts - 1)
 
     # File plus one-line pointer, the split `start_slice` uses for prompt.md:
     # no harness TUI is trusted with long multi-line input (sessions.send_prompt).
@@ -1644,8 +2184,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     correction_path = artifact_dir / f"steer-attempt-{attempts}.md"
     try:
         try:
-            with correction_path.open("x", encoding="utf-8") as handle:
-                handle.write(correction)
+            pm_paths.write_pm_text(repo, correction_path, correction, exclusive=True)
         except FileExistsError as exc:
             raise PmError(
                 f"{correction_path} already exists: a correction for attempt {attempts} was written but "
@@ -1654,7 +2193,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
                 "not overwrite it"
             ) from exc
         try:
-            sessions.send_line(session, prompts.render_steer_pointer(correction_path))
+            delivery = sessions.send_line(session, prompts.render_steer_pointer(correction_path))
         except TypedNotSubmitted:
             # Deliberately NOT unlinked: the pointer to this file is sitting typed
             # in the Developer's input line, so deleting it would leave the pane
@@ -1677,7 +2216,13 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # The note carries the complete verbatim correction and stays the
     # authoritative record; `correction_path` is a delivery artifact, not a
     # second source of truth, so no evidence path is recorded.
-    state_mod.append_event(run_dir, "steer", slice_id=slice_id, note=correction)
+    state_mod.append_event(
+        run_dir,
+        "steer",
+        slice_id=slice_id,
+        note=correction,
+        data=None if delivery.confirmed else {"delivery": "unconfirmed"},
+    )
 
     return SteerOutcome(
         kind="steered",
@@ -1685,6 +2230,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
         attempts=attempts,
         message=f"steered {slice_id} (attempt {attempts})",
         correction_path=correction_path,
+        delivered=delivery.confirmed,
     )
 
 
@@ -1699,6 +2245,8 @@ class StopDecisionOutcome:
     # A stop records an assessment, so it gets the same pane evidence an
     # acceptance does — often more relevant, since the pane is frequently why.
     pane_path: Path
+    # Why the pane was not captured (a refused pane.txt, say), when it was not.
+    pane_error: str | None = None
 
 
 def finalize_stop(
@@ -1740,8 +2288,15 @@ def finalize_stop(
         state_mod.append_event(run_dir, "risk-raise", slice_id=slice_id, note=note)
     _require_judged(repo, run_dir, token, state, slice_id, ratcheted=ratcheted)
 
-    report, artifact_dir = _collect_finalize_evidence(repo, state, current)
-    state_mod.append_event(run_dir, "floor", slice_id=slice_id, note=_floor_note(report), evidence=str(artifact_dir))
+    report, artifact_dir, pane_error = _collect_finalize_evidence(repo, state, current, tolerate_pane_error=True)
+    state_mod.append_event(
+        run_dir,
+        "floor",
+        slice_id=slice_id,
+        note=_floor_note(report),
+        evidence=str(artifact_dir),
+        data=report.failure_data(),
+    )
 
     head = git_ops.git_head(repo)
     reviews = list(entry.get("reviews") or [])
@@ -1795,6 +2350,7 @@ def finalize_stop(
         assessment_path=assessment_original,
         report=report,
         pane_path=artifact_dir / "pane.txt",
+        pane_error=pane_error,
     )
 
 
@@ -1847,10 +2403,20 @@ def _kill_reviewer_pgid(pgid: int) -> None:
         pass
 
 
+class StopTeardownError(PmError):
+    """`stop` recorded the stop (state saved, event appended), but the
+    sandbox teardown after it failed: what is left of the run's sandbox must
+    still be torn down."""
+
+
 @dataclass
 class StopOutcome:
     run_id: str
     killed: list[str]
+    # What the sandbox teardown did (None for an unsandboxed run).
+    sandbox_notes: list[str] | None = None
+    # Why the pane was not captured (a refused pane.txt, say), when it was not.
+    pane_error: str | None = None
 
 
 def stop(
@@ -1861,16 +2427,34 @@ def stop(
     reason: str,
     slice_status: str | None = None,
 ) -> StopOutcome:
+    """`stop`: end the run, capturing the pane and killing its sessions.
+
+    On a sandboxed run it refuses first, through `sandbox.require_run_socket`,
+    unless `PM_TMUX_SOCKET` names the run's socket; once the stop is recorded
+    it tears the run's sandbox down (`sandbox.teardown_run`: the server, its
+    temp and control directories, a `sandbox-stopped` event) and returns
+    what that did in `sandbox_notes`; a teardown that fails (PmError or
+    OSError) raises `StopTeardownError`, a PmError, so a caller can tell a
+    recorded stop from one refused before it was recorded.
+
+    A pane capture that cannot be written (PmError or OSError: a link
+    planted at pane.txt is refused by the guard) is returned in `pane_error`
+    and never blocks the stop, as in `campaign.stop_child`.
+    """
     state = load_writable_state(run_dir, token)
+    sandbox.require_run_socket(state)
     run_id = state["run_id"]
     current = state.get("current_slice")
 
+    pane_error: str | None = None
     if current and current.get("artifact_dir"):
         artifact_dir = Path(current["artifact_dir"])
         session = current.get("tmux_session")
         pane_text = sessions.pane_text(session) if session else ""
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        (artifact_dir / "pane.txt").write_text(pane_text, encoding="utf-8")
+        try:
+            pm_paths.write_pm_text(repo, artifact_dir / "pane.txt", pane_text)
+        except (PmError, OSError) as exc:
+            pane_error = str(exc)
 
     # Applies whenever state is readable, including the
     # --scavenge-with-readable-state path (cli.py routes that through here).
@@ -1902,8 +2486,14 @@ def stop(
         # ledger reads it from the event, never from the mutable entry.
         data={"slice_status": applied_status} if applied_status else None,
     )
-    regenerate_report(repo, run_dir, state)
-    return StopOutcome(run_id=run_id, killed=killed)
+    # The run end takes a sandboxed run's server down with it.
+    try:
+        sandbox_notes = sandbox.teardown_run(state, repo=repo, run_dir=run_dir, recorded="the stop is recorded")
+    except (PmError, OSError) as exc:
+        raise StopTeardownError(str(exc)) from exc
+    finally:
+        regenerate_report(repo, run_dir, state)
+    return StopOutcome(run_id=run_id, killed=killed, sandbox_notes=sandbox_notes, pane_error=pane_error)
 
 
 def stop_scavenge_sweep(*, run_id: str | None) -> list[str]:

@@ -35,6 +35,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from pm_test_helpers import (
     UNAVAILABLE_DEVELOPER,
     PmTestCase,
+    SandboxedRunTestCase,
     TmuxRunTestCase,
     commit_and_result_script,
     current_origin_index,
@@ -43,6 +44,7 @@ from pm_test_helpers import (
     judge_reviews,
     parse_init_output,
     rate_reviews,
+    requires_srt,
     result_heredoc,
     result_only_script,
     stdin_draining_idle_script,
@@ -53,6 +55,7 @@ from pm_test_helpers import (
 from pm_lib import PmError
 from pm_lib import cli
 from pm_lib import code_metrics
+from pm_lib import sandbox as sandbox_mod
 from pm_lib import judgments
 from pm_lib import TypedNotSubmitted
 from pm_lib import sessions
@@ -155,6 +158,68 @@ class FinalizeTestCase(TmuxRunTestCase):
                     pass
 
 
+# --- the accept that completes a sandboxed run --------------------------------
+
+
+@requires_srt
+class TestSandboxedAcceptCompletesTheRun(SandboxedRunTestCase):
+    def _ready_to_accept(self) -> tuple[str, str, Path]:
+        """A sandboxed one-slice run whose fake Developer has committed inside
+        the sandbox and been judged; returns (token, socket, run dir)."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(
+            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=30.0)
+        )
+        run_id, token, socket, run_dir = self._init_sandboxed(plan_path, harness)
+        with self.on_socket(socket):
+            code, out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(self._wait_for_result(run_id, token))
+            judge_current_developer(self, token, run_dir)
+        return token, socket, run_dir
+
+    def test_accepting_the_last_slice_tears_the_sandbox_down(self) -> None:
+        """The accept that completes the run leaves no server, temp dir or
+        control dir."""
+        token, socket, run_dir = self._ready_to_accept()
+        control = sandbox_mod.control_dir((self.repo / ".git").resolve(), socket)
+        tmpdir = Path(sandbox_mod.read_record(control)["tmpdir"])
+        with self.on_socket(socket):
+            code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ACCEPTED Slice 1", out)
+        self.assertIn(f"sandbox: removed sandbox control dir {control}", out)
+
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual(state["status"], "complete")
+        self.assertEqual(state["slices"][0]["commit"], self._git("rev-parse", "HEAD").stdout.strip())
+        self.assertFalse(sessions.server_running(socket))
+        self.assertFalse(os.path.lexists(tmpdir))
+        self.assertFalse(os.path.lexists(control))
+        self.assertFalse(os.path.lexists(control.parent))
+        kinds = [event["kind"] for event in state_mod.read_events(run_dir)]
+        self.assertEqual(kinds.count("sandbox-stopped"), 1)
+        self.assertLess(kinds.index("complete"), kinds.index("sandbox-stopped"))
+
+    def test_an_accept_whose_teardown_fails_exits_2_saying_the_acceptance_is_recorded(self) -> None:
+        token, socket, run_dir = self._ready_to_accept()
+        failure = OSError("stand-in: the teardown failed")
+        with self.on_socket(socket), mock.patch.object(sandbox_mod, "stop_server", side_effect=failure):
+            code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(
+            "pm: error: stand-in: the teardown failed; the acceptance of Slice 1 and the run's completion are"
+            " recorded, but no sandbox-stopped event was written",
+            err,
+        )
+        self.assertNotIn("Traceback", err)
+        state = state_mod.load_state(run_dir, token)
+        self.assertEqual((state["status"], state["slices"][0]["status"]), ("complete", "accepted"))
+        kinds = [event["kind"] for event in state_mod.read_events(run_dir)]
+        self.assertEqual(kinds.count("accept"), 1)
+        self.assertNotIn("sandbox-stopped", kinds)
+
+
 # --- full end-to-end acceptance ----------------------------------------------
 
 
@@ -218,11 +283,18 @@ class TestFullAcceptance(FinalizeTestCase):
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 0, err)
         self.assertIn("ACCEPTED", out)
+        # The judgment (the helper's default) met none of the plan's criteria: said on the accept itself.
+        total = state_mod.load_state(run_dir, token)["slices"][0]["criteria_total"]
+        unmet = f"criteria met: 0 of {total} (accepted with {total} unmet; see the assessment)"
+        self.assertIn(unmet, out)
 
         head = self._git("rev-parse", "HEAD").stdout.strip()
         state = state_mod.load_state(run_dir, token)
         entry = state["slices"][0]
         self.assertEqual(entry["status"], "accepted")
+        # The first line of the reasoning is stored whole, never cut at 120 characters.
+        self.assertGreater(len(_LONG_REASONING), 120)
+        self.assertEqual(entry["decision"], _LONG_REASONING)
         self.assertEqual(entry["commit"], head)
         self.assertIsInstance(entry["code"], dict)
         self.assertIn("lines", entry["code"])
@@ -242,6 +314,12 @@ class TestFullAcceptance(FinalizeTestCase):
         self.assertIn(_LONG_REASONING, assessment_text)
         self.assertIn("PM assessment only (standard risk)", assessment_text)
         self.assertEqual(assessment_text.count(": PASS"), 7)
+        self.assertIn(unmet.replace("criteria", "Criteria", 1), assessment_text.split("## Floor")[0])
+        self.assertIn("Steers/relaunches: 0", assessment_text)
+        # A passing floor event records no failure data.
+        floor_events = [event for event in events if event["kind"] == "floor"]
+        self.assertTrue(floor_events)
+        self.assertTrue(all("data" not in event for event in floor_events))
 
         mirror_path = self.repo / ".pm" / "runs" / run_id / "slices" / "slice-001" / "assessment.md"
         self.assertTrue(mirror_path.is_file())
@@ -251,6 +329,8 @@ class TestFullAcceptance(FinalizeTestCase):
         self.assertTrue(report_path.is_file())
         report_text = report_path.read_text(encoding="utf-8")
         self.assertIn(_LONG_REASONING, report_text)
+        self.assertIn("| steers/relaunches |", report_text)
+        self.assertRegex(report_text, r"- Developers \(launched\): \S+")
         # The report must render the run as complete, not merely exist — this
         # is the human-facing statement that the run finished.
         self.assertIn("complete", report_text)
@@ -317,6 +397,13 @@ class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
         code, out, err = self.run_cli_in_repo(["finalize", "--accept", _LONG_REASONING, "--token", token])
         self.assertEqual(code, 1, out + err)
         self.assertIn("5 surface FAIL", out)
+
+        # The event log alone explains the failure: which fact, and the offending path.
+        (floor_event,) = [event for event in state_mod.read_events(run_dir) if event["kind"] == "floor"]
+        (failed,) = floor_event["data"]["failed"]
+        self.assertEqual(failed["fact"], "surface")
+        self.assertEqual(failed["evidence"]["unauthorized_files"], ["b.py"])
+        self.assertNotIn("changed_files", failed["evidence"])
 
         state = state_mod.load_state(run_dir, token)
         entry = state["slices"][0]
@@ -779,7 +866,7 @@ class TestSteerTypedStateCleanup(PmTestCase):
     def test_typed_not_submitted_preserves_the_correction_file(self) -> None:
         plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
-        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir = self.repo.resolve() / ".pm" / "runs" / run_dir.name / "slices" / "slice-001"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         self.launch_current_slice(
             state,
@@ -1582,7 +1669,7 @@ class TestCurrentSubmissionGaps(PmTestCase):
         plan_path = self.write_plan(self.repo.parent / "plan.md", slices=[{"files": ["a.py"]}])
         state, token, run_dir = self.make_run(plan_path=plan_path)
         head = self._git("rev-parse", "HEAD").stdout.strip()
-        artifact_dir = run_dir / "slices" / "slice-001"
+        artifact_dir = self.repo.resolve() / ".pm" / "runs" / run_dir.name / "slices" / "slice-001"
         artifact_dir.mkdir(parents=True, exist_ok=True)
         self.launch_current_slice(
             state,
@@ -2116,11 +2203,13 @@ class TestPaneTailPrinter(unittest.TestCase):
 
     def _render(self, text: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
-            pane = Path(tmp) / "pane.txt"
+            repo = Path(tmp)
+            pane = repo / ".pm" / "pane.txt"
+            pane.parent.mkdir()
             pane.write_text(text, encoding="utf-8")
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
-                cli._print_pane_tail(pane)
+                cli._print_pane_tail(repo, pane)
             return buffer.getvalue()
 
     def test_a_capture_prints_its_tail_bounded_to_the_last_lines(self) -> None:
@@ -2138,8 +2227,52 @@ class TestPaneTailPrinter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
-                cli._print_pane_tail(Path(tmp) / "absent.txt")
+                cli._print_pane_tail(Path(tmp), Path(tmp) / ".pm" / "absent.txt")
         self.assertIn("not captured", buffer.getvalue())
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
+class TestInitTokenStreams(FinalizeTestCase):
+    def test_the_warning_is_on_stderr_and_stdout_ends_at_the_token_line_without_prose(self) -> None:
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+
+        code, out, err = self._init(plan_path, harness)
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("Keep this token out of Developer sessions", err)
+        self.assertNotIn("Keep this token", out)
+        lines = out.splitlines()
+        (token_index,) = [index for index, line in enumerate(lines) if line.startswith("PM_RUN_TOKEN=")]
+        self.assertFalse(any("token" in line.lower() for line in lines[token_index + 1 :]))
+        parse_init_output(out)
+
+
+class TestCriteriaNote(unittest.TestCase):
+    """`_criteria_note` speaks only when the current submission's judgment met fewer criteria than the slice has."""
+
+    def _note(self, judgment: dict | None, total: int | None = 3) -> str | None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            state_mod.append_event(run_dir, "launch", slice_id="Slice 1", note="attempt 0")
+            entry = {"id": "Slice 1", "criteria_total": total}
+            if judgment is not None:
+                entry["developer_judgments"] = [
+                    {"judgment_id": "judgment-1", "submission": {"origin_event": {"index": 0}}, **judgment}
+                ]
+            return slice_ops._criteria_note(run_dir, entry, "Slice 1")
+
+    def test_fewer_met_than_total_is_named_with_the_unmet_count(self) -> None:
+        self.assertEqual(
+            self._note({"criteria_met": 2}),
+            "criteria met: 2 of 3 (accepted with 1 unmet; see the assessment)",
+        )
+
+    def test_all_met_an_unavailable_judgment_and_an_unknown_total_say_nothing(self) -> None:
+        self.assertIsNone(self._note({"criteria_met": 3}))
+        self.assertIsNone(self._note({"status": "unavailable"}))
+        self.assertIsNone(self._note({"criteria_met": 0}, total=None))
+        self.assertIsNone(self._note(None))
 
 
 class TestAttemptsSummaryFormatting(unittest.TestCase):
@@ -2155,7 +2288,7 @@ class TestAttemptsSummaryFormatting(unittest.TestCase):
             ts = events[0]["ts"]
             expected = "\n".join(
                 [
-                    "Attempts: 1",
+                    "Steers/relaunches: 1",
                     "Steer interventions: 1",
                     f"  - {ts}:",
                     "      line one",
@@ -2170,7 +2303,7 @@ class TestAttemptsSummaryFormatting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             summary = slice_ops._attempts_summary(run_dir, "Slice 1", attempts=0)
-            self.assertEqual(summary, "Attempts: 0")
+            self.assertEqual(summary, "Steers/relaunches: 0")
 
 
 if __name__ == "__main__":

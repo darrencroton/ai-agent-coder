@@ -96,8 +96,10 @@ jobs:
       # exit >1 (a broken pattern/pathspec/invocation) both fail the step —
       # a bare `! git grep` would silently convert fatal errors into a pass.
       # Retired PM-side path tokens are banned everywhere active, including
-      # the orchestrator; the orchestrator's own policy-file and artifact-root
-      # names are permitted only inside skills/orchestrator.
+      # the orchestrator; the orchestrator's own artifact-root name is
+      # permitted only inside skills/orchestrator. The `reviewer-policy.json`
+      # name is no longer banned: it now belongs to the sandbox's Mode B
+      # reviewer policy.
       - name: No-baggage greps (terminology, signatures, retired paths)
         run: |
           check() {
@@ -120,7 +122,7 @@ jobs:
           check "deterministic-batch|model-supervised|repair round|circuit breaker|operational_round|session_generation|reserved_skill_sets|PM_AUDIT_VERDICT|audit_provenance|developer-self-audit|prior-slice-context|residual_findings|continuation_notes|assumed-complete|\.ai-pm|schema_version[\"']?[[:space:]]*:[[:space:]]*[\"']?5|pm-reconciliation|stop-with-evidence|run-next|allow-unattended-default|assume-complete" "${HIST[@]}"
           check "reviewer-evidence|unauthorized-files|changed-files-mismatch|result-malformed|residual-ledger-mismatch|commit-missing|dirty-worktree|developer-repairable|context-budget|transient-service-unavailable|idle-no-progress|ledger-retention|integrity-head|slice-id-mismatch|reviewer-unavailable|prior-context-integrity" "${HIST[@]}"
           check "\.ai-pm|pm-slice-contract|PM_REVIEWER_" "${HIST[@]}"
-          check "reviewer-policy|ORCHESTRATOR_ARTIFACT_ROOT" "${HIST[@]}" ':!skills/orchestrator'
+          check "ORCHESTRATOR_ARTIFACT_ROOT" "${HIST[@]}" ':!skills/orchestrator'
           echo "all no-baggage greps clean"
 
       - name: Doc-link reachability (root README and CONTRIBUTING)

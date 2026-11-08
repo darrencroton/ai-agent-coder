@@ -1,7 +1,9 @@
 """Git facts: process invocation, status parsing, ancestry, surface matching.
 
 Every function here computes a fact from git or normalizes a path string; none
-of them judge anything. Surface matching uses segment-aware glob matching via
+of them judge anything. The two host-side commands that recurse into
+submodules, `git status` and the worktree-mode `git diff`, refuse a repository
+whose index holds a gitlink (see `refuse_gitlinks`). Surface matching uses segment-aware glob matching via
 ``PurePosixPath.full_match`` (Python 3.13+), not ``fnmatch``, so a single ``*``
 never silently crosses a ``/``.
 """
@@ -9,6 +11,7 @@ never silently crosses a ``/``.
 from __future__ import annotations
 
 import re
+import os
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -26,14 +29,17 @@ def git(repo: Path, *args: str) -> str:
     return stdout.strip()
 
 
-def git_result(repo: Path, *args: str) -> tuple[int, str, str]:
-    """Run git, never raising. Returns (returncode, stdout, stderr) unstripped."""
+def git_result(repo: Path, *args: str, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+    """Run git, never raising. Returns (returncode, stdout, stderr) unstripped.
+    `env` is added to the inherited environment (a caller that must read
+    git's message pins `LC_ALL=C`, so the text is not localised)."""
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env={**os.environ, **env} if env else None,
     )
     return result.returncode, result.stdout, result.stderr
 
@@ -55,12 +61,87 @@ def current_branch(repo: Path) -> str | None:
     return branch
 
 
+def git_bytes(repo: Path, *args: str) -> bytes | None:
+    """Run git and return its raw stdout bytes, or None when it fails: for
+    content that is hashed, where text decoding would alter the bytes."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def gitlinks(repo: Path) -> list[str]:
+    """Paths of the index's gitlinks (mode-160000 entries, i.e. submodules).
+
+    Read from `git ls-files --stage -z`, which lists the index and executes no
+    repository configuration, unlike `git status` and `git diff`, which
+    recurse into a populated submodule and run its configuration (for example
+    `core.fsmonitor`) on the host. `-z` keeps unusual path names unquoted,
+    and the listing is read as bytes, each path decoded with
+    `surrogateescape`: a tracked path that is not UTF-8 must not make every
+    status read raise. Raises PmError when git fails, so a caller never
+    reads a failed listing as "no gitlinks".
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--stage", "-z"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise PmError(stderr or "git ls-files failed")
+    stdout = result.stdout.decode("utf-8", "surrogateescape")
+    paths: list[str] = []
+    for entry in stdout.split("\0"):
+        # Each entry is "<mode> <object> <stage>\t<path>"; the metadata holds
+        # no tab, so the first tab ends it even when the path has spaces.
+        metadata, _tab, path = entry.partition("\t")
+        if path and metadata.split(" ", 1)[0] == "160000":
+            paths.append(path)
+    return paths
+
+
+def refuse_gitlinks(repo: Path) -> None:
+    """Fail closed, before a host-side recursing git command runs, when the index holds a gitlink.
+
+    `git status` and the worktree-mode `git diff` recurse into a populated
+    submodule and execute its configuration on the host, and a gitlink planted
+    by a sandboxed process can point at a repository whose configuration it
+    controls. Repositories with submodules are therefore not supported, sandboxed
+    or not. Residuals: the window between this check and the command that
+    follows it (a detached sandboxed process could add a gitlink in between),
+    and the PM and Campaign Manager agents' own git commands, which this
+    check does not reach.
+    """
+    paths = gitlinks(repo)
+    if paths:
+        raise PmError(
+            "repositories with submodules are not supported: the index holds "
+            + ", ".join(paths)
+            + ", and the host's `git status` would execute the submodule's configuration"
+        )
+
+
 def git_status_text(repo: Path) -> str:
-    # Deliberately not the git() helper above: that strips stdout, and
-    # `status --short` output is positional — a leading space on the first
-    # line (" M file", an unstaged modify) is part of the status code.
-    # Stripping it would shift that line's path parse by one character.
-    returncode, stdout, stderr = git_result(repo, "status", "--short", "--untracked-files=all")
+    """The repository's `git status --short` text, unstripped.
+
+    This is the one host-side `git status` on a repository a sandbox can
+    write (`campaign-preflight`'s status on the dossier, the Campaign
+    Manager's own repository, is the exception), so every such status read
+    goes through it. It refuses (PmError) a repository whose index holds a
+    gitlink, before `status` runs, because `status` would recurse into the
+    submodule and execute its configuration on the host; see `refuse_gitlinks`.
+
+    Deliberately not the git() helper above: that strips stdout, and
+    `status --short` output is positional — a leading space on the first
+    line (" M file", an unstaged modify) is part of the status code.
+    Stripping it would shift that line's path parse by one character.
+    `--no-renames` reports a dirty rename as a delete plus an add, so both
+    sides reach the surface check, as they do for a committed rename.
+    """
+    refuse_gitlinks(repo)
+    returncode, stdout, stderr = git_result(repo, "status", "--short", "--untracked-files=all", "--no-renames")
     if returncode != 0:
         raise PmError(stderr.strip() or stdout.strip() or "git status failed")
     return stdout
@@ -69,7 +150,8 @@ def git_status_text(repo: Path) -> str:
 def status_path(line: str) -> str:
     """Extract the path from one `git status --short` line.
 
-    A rename line ("R  a -> b") takes the target (b). Surrounding quotes
+    `git_status_text` asks for `--no-renames`, so a rename line ("R  a -> b")
+    should not occur; one handed in from elsewhere takes the target (b). Surrounding quotes
     (git quotes paths containing unusual characters) are stripped, but the
     quoted content is not C-unescaped — an unusual path simply won't
     string-match an authorized entry, which fails closed rather than open.
@@ -105,20 +187,28 @@ def changed_files_between(repo: Path, before_head: str | None, after_head: str |
     """Union of committed changes (before_head..after_head) and dirty-tree changes."""
     files: set[str] = set()
     if before_head and after_head and before_head != after_head:
-        files.update(git(repo, "diff", "--name-only", before_head, after_head).splitlines())
+        files.update(git(repo, "diff", "--no-renames", "--name-only", before_head, after_head).splitlines())
     elif after_head and before_head is None:
-        files.update(git(repo, "show", "--name-only", "--format=", after_head).splitlines())
+        files.update(git(repo, "show", "--no-renames", "--name-only", "--format=", after_head).splitlines())
     files.update(status_changed_files(after_status))
     return {path for path in files if path}
 
 
-def write_git_diff(repo: Path, before_head: str | None, after_head: str | None, destination: Path) -> None:
-    """Write a binary-safe diff patch to destination.
+def git_diff_text(repo: Path, before_head: str | None, after_head: str | None) -> tuple[str, str | None]:
+    """A binary-safe diff patch as `(diff text, error text)`; the caller writes it.
 
-    On git failure, destination is still written as an empty (but valid,
-    zero-change) diff, and the error is recorded in a sidecar file next to
-    it — so the artifact is never a diff-shaped file that is actually a git
-    error message.
+    On git failure the diff text is empty (a valid, zero-change diff) and the
+    error text is git's stderr, so a caller records the error beside the
+    artifact and the artifact is never a diff-shaped file that is actually a
+    git error message; on success the error text is None. This function
+    writes nothing: the callers own the destination, and finalize's destination
+    is under the sandbox-writable `.pm/` tree, which host code may write only
+    through `pm_paths.write_pm_text`.
+
+    The worktree-mode diff (no refs) recurses into submodules like `git
+    status`, so it refuses (PmError) a repository whose index holds a gitlink
+    before running; see `refuse_gitlinks`. Tree-to-tree diffs and `git show`
+    spawn no submodule process and are not checked.
     """
     if before_head and after_head and before_head != after_head:
         returncode, stdout, stderr = git_result(repo, "diff", "--binary", before_head, after_head)
@@ -129,12 +219,11 @@ def write_git_diff(repo: Path, before_head: str | None, after_head: str | None, 
         # artifact is not silently empty.
         returncode, stdout, stderr = git_result(repo, "show", "--binary", "--format=", after_head)
     else:
+        refuse_gitlinks(repo)
         returncode, stdout, stderr = git_result(repo, "diff", "--binary")
     if returncode == 0:
-        destination.write_text(stdout, encoding="utf-8")
-    else:
-        destination.write_text("", encoding="utf-8")
-        (destination.parent / "git-diff-error.txt").write_text(stderr, encoding="utf-8")
+        return stdout, None
+    return "", stderr
 
 
 def is_full_commit_hash(value: str | None) -> bool:
@@ -167,13 +256,18 @@ def normalize_authorized_entry(entry: str) -> str:
     return stripped.strip("`").rstrip(".")
 
 
+def has_glob(entry: str) -> bool:
+    """True when `entry` carries a glob marker, so `is_authorized_path` reads it as a pattern."""
+    return any(marker in entry for marker in ("*", "?", "["))
+
+
 def is_authorized_path(path: str, authorized_entries: list[str]) -> bool:
     for raw_entry in authorized_entries:
         entry = normalize_authorized_entry(raw_entry)
         if entry.endswith("/"):
             if path.startswith(entry):
                 return True
-        elif any(marker in entry for marker in ("*", "?", "[")):
+        elif has_glob(entry):
             # PurePosixPath.full_match is path-segment aware: a single "*"
             # does not cross "/", so "*.md" matches only top-level markdown,
             # not "deep/nested/anything.md". Authors who want a recursive
@@ -183,6 +277,26 @@ def is_authorized_path(path: str, authorized_entries: list[str]) -> bool:
                 return True
         elif path == entry:
             return True
+    return False
+
+
+def is_protected_path(path: str, protected: list[str]) -> bool:
+    """True when `path` falls under a protected entry.
+
+    Protection fails closed, so a plain entry naming a directory
+    ("instruments", no trailing slash) covers its whole subtree as well as the
+    path itself. `is_authorized_path` must not do the same: it decides what a
+    slice may change, and a surface that widened from `src` to `src/**` would
+    grant more than the plan froze. Slash, glob and exact entries behave as in
+    `is_authorized_path`.
+    """
+    if is_authorized_path(path, protected):
+        return True
+    for raw_entry in protected:
+        entry = normalize_authorized_entry(raw_entry)
+        if entry and not entry.endswith("/") and not has_glob(entry):
+            if path == entry or path.startswith(entry + "/"):
+                return True
     return False
 
 

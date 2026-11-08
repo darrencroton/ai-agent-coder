@@ -88,6 +88,7 @@ POLICY_FIELDS = {
     "run_id",
     "slice_id",
     "plan_sha256",
+    "plan_path",
     "repo_path",
     "delegate_artifact_root",
     "required_tools",
@@ -259,6 +260,36 @@ def _resolve_repo_file(repo: Path, value: str, field: str, issues: list[Contract
     return resolved
 
 
+def _hash_policy_plan(
+    repo: Path, value: str, policy_digest: str, issues: list[ContractIssue]
+) -> tuple[str, Path | None]:
+    """Hash the policy's ``plan_path`` now; a policy ``plan_sha256`` must agree with the file."""
+    candidate = Path(value).expanduser()
+    plan_file = (candidate if candidate.is_absolute() else repo / candidate).resolve()
+    try:
+        digest = sha256_path(plan_file)
+    except OSError as exc:
+        issues.append(
+            ContractIssue(
+                "missing-input",
+                "plan_path",
+                f"policy plan_path cannot be read: {plan_file} ({exc.strerror or exc})",
+                "Point plan_path at the frozen plan file, absolute or relative to repo_path.",
+            )
+        )
+        return policy_digest, None
+    if policy_digest and policy_digest != digest:
+        issues.append(
+            ContractIssue(
+                "plan-digest-mismatch",
+                "policy.plan_sha256",
+                f"policy plan_sha256 does not match the SHA-256 of {plan_file} (computed {digest})",
+                "Remove plan_sha256 from the policy, or set it to the computed digest.",
+            )
+        )
+    return digest, plan_file
+
+
 def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     """Return a normalized contract or raise with field-specific corrections."""
     issues: list[ContractIssue] = []
@@ -269,7 +300,11 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
 
     run_id = _required_string(policy, "run_id", issues)
     slice_id = _required_string(policy, "slice_id", issues)
-    plan_sha256 = _required_string(policy, "plan_sha256", issues)
+    plan_path_text = _optional_string(policy, "plan_path", issues)
+    if plan_path_text is None:
+        plan_sha256 = _required_string(policy, "plan_sha256", issues)
+    else:
+        plan_sha256 = _optional_string(policy, "plan_sha256", issues) or ""
     repo_text = _required_string(policy, "repo_path", issues)
     artifact_text = _required_string(policy, "delegate_artifact_root", issues)
     required_tools = _string_list(policy, "required_tools", issues, required=True)
@@ -347,8 +382,15 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
             )
         )
 
+    plan_file: Path | None = None
+    if plan_path_text is not None:
+        plan_sha256, plan_file = _hash_policy_plan(repo, plan_path_text, plan_sha256, issues)
+
     request_slice = _required_string(request, "slice_id", issues)
-    request_digest = _required_string(request, "plan_sha256", issues)
+    if plan_path_text is None:
+        request_digest = _required_string(request, "plan_sha256", issues)
+    else:
+        request_digest = _optional_string(request, "plan_sha256", issues) or ""
     if request_slice and slice_id and request_slice != slice_id:
         issues.append(
             ContractIssue(
@@ -359,14 +401,13 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
             )
         )
     if request_digest and plan_sha256 and request_digest != plan_sha256:
-        issues.append(
-            ContractIssue(
-                "plan-digest-mismatch",
-                "plan_sha256",
-                "delegate request plan digest does not match the frozen PM policy",
-                f"Copy the exact plan_sha256 from the current delegate policy ({plan_sha256}).",
-            )
-        )
+        if plan_file is None:
+            message = "delegate request plan digest does not match the frozen PM policy"
+            correction = f"Copy the exact plan_sha256 from the current delegate policy ({plan_sha256})."
+        else:
+            message = f"delegate request plan digest does not match the SHA-256 of {plan_file} (computed {plan_sha256})"
+            correction = f"Set plan_sha256 to the computed digest ({plan_sha256}) or omit it from the request."
+        issues.append(ContractIssue("plan-digest-mismatch", "plan_sha256", message, correction))
 
     label = _required_string(request, "label", issues)
     if label and not LABEL_RE.fullmatch(label):
@@ -566,7 +607,7 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
     if issues:
         raise DelegateContractError(issues)
 
-    return {
+    contract = {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "slice_id": slice_id,
@@ -588,6 +629,9 @@ def validate_contract(policy: dict[str, Any], request: dict[str, Any], run_dir: 
         "expected_output": expected_output,
         "parent_label": parent_label,
     }
+    if plan_file is not None:
+        contract["plan_path"] = str(plan_file)
+    return contract
 
 
 def _skill_root() -> Path:
@@ -640,7 +684,16 @@ def compile_skill_bundle(skill_name: str) -> str:
     return "\n\n".join(rendered)
 
 
-def render_delegate_prompt(contract: dict[str, Any]) -> str:
+def _embedded_skills(skills: list[str]) -> str:
+    return "\n\n".join(compile_skill_bundle(name) for name in skills)
+
+
+def render_delegate_prompt(contract: dict[str, Any], *, embed_skills: bool = True) -> str:
+    """Render the request envelope; embed the skill bundle unless ``embed_skills`` is false.
+
+    A continuation resumes a session that already holds the bundle, so the launcher passes
+    ``embed_skills=False`` when the request's skills equal the parent's.
+    """
     skills = contract["required_skills"]
     skill_list = "\n".join(f"  - {name}" for name in skills) if skills else "  - none"
     files = "\n".join(f"  - {path}" for path in contract["files"]) if contract["files"] else "  - none"
@@ -665,7 +718,7 @@ def render_delegate_prompt(contract: dict[str, Any]) -> str:
             *contract["constraints"],
         ]
         constraint_text = "\n".join(f"  - {item}" for item in constraints)
-        embedded = "\n\n".join(compile_skill_bundle(name) for name in skills)
+        embedded = _embedded_skills(skills) if embed_skills else ""
         prompt = f"""{header}
 
 TASK: {contract['task']}
@@ -709,7 +762,7 @@ RETURN:
         *contract["constraints"],
     ]
     constraint_text = "\n".join(f"  - {item}" for item in constraints)
-    embedded = "\n\n".join(compile_skill_bundle(name) for name in skills)
+    embedded = _embedded_skills(skills) if embed_skills else ""
     prompt = f"""DELEGATE MODE: read-only - no edits, no state-changing commands, no orchestrator skill, no re-delegation, no commits, report blockers.
 
 TASK: {contract['task']}

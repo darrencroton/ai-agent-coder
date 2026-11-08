@@ -10,6 +10,9 @@ directions on purpose — an unclear approval flag blocks, while an unclear
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -480,6 +483,366 @@ class TestSurfaceGrants(PlanTestCase):
         # Plan entries must come first: grants only ever widen, never reorder
         # the frozen surface ahead of what a mid-run grant adds.
         self.assertEqual(plan_mod.effective_authorized_files(plan_slice, state), ["a.py", "b.py"])
+
+
+class TestLoadPolicy(PlanTestCase):
+    """`load_policy` reads untrusted operator input: every malformed shape is
+    a `PmError` naming the file, and a policy inside the repository protects
+    itself."""
+
+    def write_policy(self, content: object, path: Path | None = None) -> Path:
+        """Write `content` as JSON (or verbatim when it is a str) outside the repo by default."""
+        path = path or self.repo.parent / "policy.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = content if isinstance(content, str) else json.dumps(content)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_happy_path_returns_exactly_path_digest_and_entries(self) -> None:
+        path = self.write_policy({"schema": 1, "owner": "ignored", "protected_paths": ["instruments/", "data.csv"]})
+        policy = plan_mod.load_policy(path)
+        self.assertEqual(set(policy), {"path", "sha256", "protected_paths"})
+        self.assertEqual(policy["path"], str(path.resolve()))
+        self.assertTrue(Path(policy["path"]).is_absolute())
+        self.assertEqual(policy["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+        self.assertEqual(policy["protected_paths"], ["instruments/", "data.csv"])
+
+    def test_absent_protected_paths_is_empty_and_unknown_keys_ignored(self) -> None:
+        path = self.write_policy({"schema": "not even a number", "notes": [1, 2]})
+        self.assertEqual(plan_mod.load_policy(path)["protected_paths"], [])
+
+    def test_malformed_policy_raises_naming_the_file(self) -> None:
+        cases = {
+            "invalid JSON": "{not json",
+            "top-level list": [],
+            "protected_paths string": {"protected_paths": "instruments/"},
+            "protected_paths null": {"protected_paths": None},
+            "non-string item": {"protected_paths": ["ok/", 7]},
+            "empty-string item": {"protected_paths": [""]},
+            "absolute entry": {"protected_paths": ["/etc/passwd"]},
+            "dot-dot entry": {"protected_paths": ["../outside/"]},
+        }
+        for name, content in cases.items():
+            with self.subTest(case=name):
+                path = self.write_policy(content)
+                with self.assertRaises(PmError) as ctx:
+                    plan_mod.load_policy(path)
+                self.assertIn(str(path.resolve()), str(ctx.exception))
+
+    def test_unreadable_policy_raises_naming_the_file(self) -> None:
+        missing = self.repo.parent / "missing.json"
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(missing)
+        self.assertIn(str(missing.resolve()), str(ctx.exception))
+        self.assertIn("cannot be read", str(ctx.exception))
+
+    def test_entry_with_empty_literal_prefix_refused_naming_the_entry(self) -> None:
+        for entry in ("**/*.py", "*.lock"):
+            with self.subTest(entry=entry):
+                path = self.write_policy({"protected_paths": ["instruments/", entry]})
+                with self.assertRaises(PmError) as ctx:
+                    plan_mod.load_policy(path)
+                self.assertIn(repr(entry), str(ctx.exception))
+                self.assertIn(str(path.resolve()), str(ctx.exception))
+
+    def test_json_decoder_limits_raise_naming_the_file(self) -> None:
+        cases = {
+            # Longer than sys.int_max_str_digits: json.loads raises a bare ValueError.
+            "oversized integer": '{"protected_paths": [' + "1" * 5000 + "]}",
+            # Deep enough to raise RecursionError on 3.13 (recursion limit) and 3.14 (stack guard).
+            "deep nesting": "[" * 1_000_000 + "]" * 1_000_000,
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                path = self.write_policy(text)
+                with self.assertRaises(PmError) as ctx:
+                    plan_mod.load_policy(path)
+                self.assertIn(str(path.resolve()), str(ctx.exception))
+
+    def test_wildcard_subtree_entry_refused_naming_the_entry(self) -> None:
+        # A trailing-slash entry is a literal prefix to the matcher, so a
+        # wildcard inside one would match nothing: a silent fail-open.
+        for entry in ("src/**/", "a/*/"):
+            with self.subTest(entry=entry):
+                path = self.write_policy({"protected_paths": [entry]})
+                with self.assertRaises(PmError) as ctx:
+                    plan_mod.load_policy(path)
+                self.assertIn(repr(entry), str(ctx.exception))
+                self.assertIn(str(path.resolve()), str(ctx.exception))
+                self.assertIn("'src/**/*.py'", str(ctx.exception))
+
+    def test_entries_normalized_deduplicated_first_seen_order(self) -> None:
+        path = self.write_policy({"protected_paths": ["b/", "`a.py` (the instrument)", " b/ ", "a.py", "c/*.json"]})
+        self.assertEqual(plan_mod.load_policy(path)["protected_paths"], ["b/", "a.py", "c/*.json"])
+
+    def test_policy_inside_repo_appends_its_relative_path_once(self) -> None:
+        path = self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "config" / "policy.json")
+        # An unresolved repo spelling must still yield a repo-relative path.
+        policy = plan_mod.load_policy(path, repo=self.repo / "config" / "..")
+        self.assertEqual(policy["protected_paths"], ["instruments/", "config/policy.json"])
+
+    def test_policy_inside_repo_not_appended_when_an_entry_covers_it(self) -> None:
+        # A plain directory entry protects its subtree, so it covers the file too.
+        for entries in (["config/"], ["config/policy.json"], ["config/*.json"], ["config"]):
+            with self.subTest(entries=entries):
+                path = self.write_policy({"protected_paths": entries}, self.repo / "config" / "policy.json")
+                self.assertEqual(plan_mod.load_policy(path, repo=self.repo)["protected_paths"], entries)
+
+    def test_policy_outside_repo_or_without_repo_appends_nothing(self) -> None:
+        outside = self.write_policy({"protected_paths": ["instruments/"]})
+        self.assertEqual(plan_mod.load_policy(outside, repo=self.repo)["protected_paths"], ["instruments/"])
+        inside = self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "policy.json")
+        self.assertEqual(plan_mod.load_policy(inside)["protected_paths"], ["instruments/"])
+
+    def test_symlinked_policy_file_refused_naming_the_link(self) -> None:
+        # Protection would land on the link's target, while a later node could
+        # re-point the tracked link itself.
+        target = self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "real-policy.json")
+        link = self.repo / "policy.json"
+        link.symlink_to(target)
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(link, repo=self.repo)
+        self.assertIn(str(link), str(ctx.exception))
+        self.assertIn("symbolic link", str(ctx.exception))
+
+    def test_policy_reached_through_a_symlinked_directory_inside_repo_is_refused(self) -> None:
+        # Protection would land on `real/policy.json`, while a later node could
+        # re-point the tracked `link` directory itself.
+        self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "real" / "policy.json")
+        (self.repo / "link").symlink_to(self.repo / "real")
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(self.repo / "link" / "policy.json", repo=self.repo)
+        self.assertIn("through a symlink inside the repository", str(ctx.exception))
+
+    def test_inner_link_is_refused_when_the_repo_is_passed_resolved_and_spelled_through_a_link(self) -> None:
+        # The CLI resolves the repository, so the spelled path must be measured
+        # from the ancestor that resolves to it, not from the repo as given.
+        self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "real" / "policy.json")
+        (self.repo / "link").symlink_to(self.repo / "real")
+        repo_link = self.repo.parent / "repo-link"
+        repo_link.symlink_to(self.repo)
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(repo_link / "link" / "policy.json", repo=self.repo.resolve())
+        self.assertIn("through a symlink inside the repository", str(ctx.exception))
+        self.assertIn("'link/policy.json' resolves to 'real/policy.json'", str(ctx.exception))
+
+    def test_inner_link_to_a_directory_outside_the_repo_is_refused(self) -> None:
+        self.write_policy({"protected_paths": ["instruments/"]}, self.repo.parent / "elsewhere" / "policy.json")
+        (self.repo / "link").symlink_to(self.repo.parent / "elsewhere")
+        for repo in (self.repo, self.repo.resolve()):
+            with self.subTest(repo=repo), self.assertRaises(PmError) as ctx:
+                plan_mod.load_policy(self.repo / "link" / "policy.json", repo=repo)
+            self.assertIn("resolves to outside the repository", str(ctx.exception))
+
+    def test_policy_in_a_repo_under_a_symlinked_parent_still_loads(self) -> None:
+        self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "policy.json")
+        repo_link = self.repo.parent / "repo-link"
+        repo_link.symlink_to(self.repo)
+        policy = plan_mod.load_policy(repo_link / "policy.json", repo=repo_link)
+        self.assertEqual(policy["protected_paths"], ["instruments/", "policy.json"])
+        # The CLI's shape: the repo resolved, the path spelled through the link.
+        policy = plan_mod.load_policy(repo_link / "policy.json", repo=self.repo.resolve())
+        self.assertEqual(policy["protected_paths"], ["instruments/", "policy.json"])
+
+    def test_policy_inside_repo_whose_name_is_a_glob_is_refused(self) -> None:
+        # The self-protection entry would be read as a pattern: `policy[1].json`
+        # matches `policy1.json`, not itself, and so would protect nothing.
+        path = self.write_policy({"protected_paths": ["instruments/"]}, self.repo / "policy[1].json")
+        with self.assertRaises(PmError) as ctx:
+            plan_mod.load_policy(path, repo=self.repo)
+        self.assertIn("policy[1].json", str(ctx.exception))
+        self.assertIn("glob", str(ctx.exception))
+        # Outside the repository no self-protection entry is built, so the name is harmless.
+        outside = self.write_policy({"protected_paths": ["instruments/"]}, self.repo.parent / "policy[1].json")
+        self.assertEqual(plan_mod.load_policy(outside, repo=self.repo)["protected_paths"], ["instruments/"])
+
+
+class TestProtectedOverlap(unittest.TestCase):
+    """The plan-time overlap rule compares literal prefixes segment-wise."""
+
+    def test_literal_prefix_table(self) -> None:
+        cases = {
+            "a/b.py": "a/b.py",
+            "dir/": "dir",
+            "a/b/": "a/b",
+            # Trailing slash wins over the wildcard, as in git_ops.is_authorized_path.
+            "a/*/": "a/*",
+            "a/b/*.py": "a/b",
+            "src/**/x.py": "src",
+            "a/b?/c.py": "a",
+            "a/[xy]/c.py": "a",
+            "**/*.py": "",
+            "*.lock": "",
+        }
+        for entry, expected in cases.items():
+            with self.subTest(entry=entry):
+                self.assertEqual(plan_mod.literal_prefix(entry), expected)
+
+    def test_overlaps_reported(self) -> None:
+        cases = [
+            ("plain file inside a protected subtree", "a/b/c.py", ["a/b/"]),
+            ("subtree containing a protected file", "a/", ["a/b/c.py"]),
+            ("glob whose prefix lies inside a protected subtree", "a/b/*.py", ["a/"]),
+            ("empty-prefix glob against any protected entry", "**/*.py", ["x/y.json"]),
+            ("equal prefixes", "a/b", ["a/b"]),
+            # Deliberate over-refusal (D4): prefixes are compared, not glob intersections.
+            ("glob on the protected side", "c/x.py", ["c/*.json"]),
+        ]
+        for name, entry, protected in cases:
+            with self.subTest(case=name):
+                self.assertEqual(plan_mod.protected_overlap(entry, protected), protected[0])
+
+    def test_first_overlapping_protected_entry_returned(self) -> None:
+        self.assertEqual(plan_mod.protected_overlap("a/b/c.py", ["x/", "a/", "a/b/"]), "a/")
+
+    def test_no_overlap_for_sibling_name_or_disjoint_pair(self) -> None:
+        self.assertIsNone(plan_mod.protected_overlap("a/b", ["a/bc/"]))
+        self.assertIsNone(plan_mod.protected_overlap("src/x.py", ["docs/", "instruments/check.py"]))
+        self.assertIsNone(plan_mod.protected_overlap("src/x.py", []))
+
+
+class TestCheckPlanMissingFile(PlanTestCase):
+    def test_a_missing_plan_is_one_error_line_and_exit_2_not_a_traceback(self) -> None:
+        missing = self.repo.parent / "no-such-plan.md"
+
+        code, out, err = self.run_cli(["check-plan", "--plan", str(missing)])
+
+        self.assertEqual(code, 2, err)
+        self.assertEqual(out, f"ERROR: plan file not found: {missing.resolve()}\n")
+        self.assertNotIn("Traceback", err)
+
+
+class TestCheckPlanPolicy(PlanTestCase):
+    """`check-plan --policy` refuses a surface reaching a protected path and
+    still reports every other defect the plan carries."""
+
+    def write_policy(self, entries: list[str], path: Path | None = None) -> Path:
+        path = path or self.repo.parent / "policy.json"
+        path.write_text(json.dumps({"schema": 1, "protected_paths": entries}), encoding="utf-8")
+        return path
+
+    def git_init(self) -> None:
+        """Make `self.repo` a git repository: `--repo` is resolved by git."""
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True, capture_output=True)
+
+    def test_report_emits_overlap_error_beside_other_errors_and_warnings(self) -> None:
+        path = self.write_plan(
+            slices=[
+                {"title": "Touches instruments", "files": ["instruments/check.py", "package.json"]},
+                {"difficulty": "trivial"},
+            ]
+        )
+        report = plan_mod.plan_check_report(path, protected=["instruments/"])
+        self.assertIn(
+            "Slice 1 (Touches instruments): authorized entry 'instruments/check.py' reaches protected path "
+            "'instruments/'; give it a literal prefix disjoint from every protected path",
+            report["errors"],
+        )
+        self.assertTrue(any("Slice 2" in e and "'Difficulty:'" in e for e in report["errors"]))
+        self.assertTrue(any("dependency-shaped" in w for w in report["warnings"]))
+        self.assertEqual(report["protected_count"], 1)
+
+    def test_overlap_error_names_the_normalized_entry(self) -> None:
+        path = self.write_plan(slices=[{"files": ["`instruments/new.py` (new file)"]}])
+        report = plan_mod.plan_check_report(path, protected=["instruments/"])
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("authorized entry 'instruments/new.py' reaches", report["errors"][0])
+
+    def test_report_without_protected_is_unchanged(self) -> None:
+        path = self.write_plan(slices=[{"files": ["instruments/check.py", "package.json"]}, {"difficulty": "x"}])
+        baseline = plan_mod.plan_check_report(path)
+        self.assertEqual(baseline["protected_count"], 0)
+        for protected in (None, []):
+            with self.subTest(protected=protected):
+                report = plan_mod.plan_check_report(path, protected=protected)
+                self.assertEqual(report, baseline)
+
+    def test_cli_exits_2_on_overlap_and_prints_nothing_after_the_errors(self) -> None:
+        plan_path = self.write_plan(slices=[{"files": ["instruments/check.py"]}])
+        policy_path = self.write_policy(["instruments/"])
+        code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path), "--policy", str(policy_path)])
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: Slice 1 (Slice 1 title): authorized entry 'instruments/check.py' reaches", out)
+        # Warnings still print, as at init; no summary or protected-paths line follows the errors.
+        self.assertIn("WARNING: --policy without --repo", out)
+        self.assertNotIn("slice(s)", out)
+        self.assertNotIn("protected paths:", out)
+
+    def test_cli_exits_0_on_clean_plan_and_prints_protected_line(self) -> None:
+        plan_path = self.write_plan(slices=[{"files": ["src/a.py"]}])
+        policy_path = self.write_policy(["instruments/"])
+        code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path), "--policy", str(policy_path)])
+        self.assertEqual(code, 0)
+        self.assertNotIn("ERROR:", out)
+        self.assertIn(f"protected paths: 1 (from {policy_path.resolve()})", out)
+
+    def test_cli_counts_self_protected_policy_inside_repo(self) -> None:
+        self.git_init()
+        plan_path = self.write_plan(slices=[{"files": ["src/a.py"]}])
+        policy_path = self.write_policy(["instruments/"], self.repo / "policy.json")
+        argv = ["check-plan", "--plan", str(plan_path), "--repo", str(self.repo), "--policy", str(policy_path)]
+        code, out, _err = self.run_cli(argv)
+        self.assertEqual(code, 0)
+        self.assertIn(f"protected paths: 2 (from {policy_path.resolve()})", out)
+        self.assertNotIn("WARNING:", out)
+
+    def test_cli_resolves_a_subdirectory_repo_to_its_toplevel_as_init_does(self) -> None:
+        self.git_init()
+        (self.repo / "subdir").mkdir()
+        plan_path = self.write_plan(slices=[{"files": ["src/a.py"]}])
+        policy_path = self.write_policy(["instruments/"], self.repo / "policy.json")
+        argv = [
+            "check-plan",
+            "--plan",
+            str(plan_path),
+            "--repo",
+            str(self.repo / "subdir"),
+            "--policy",
+            str(policy_path),
+        ]
+        code, out, _err = self.run_cli(argv)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"protected paths: 2 (from {policy_path.resolve()})", out)
+
+    def test_cli_policy_without_repo_warns_that_self_protection_is_unchecked(self) -> None:
+        plan_path = self.write_plan(slices=[{"files": ["src/a.py"]}])
+        policy_path = self.write_policy(["instruments/"], self.repo / "policy.json")
+        code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path), "--policy", str(policy_path)])
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING: --policy without --repo: the policy file is not checked for self-protection\n", out)
+        self.assertIn(f"protected paths: 1 (from {policy_path.resolve()})", out)
+
+    def test_cli_malformed_policy_exits_2_naming_the_file(self) -> None:
+        plan_path = self.write_plan()
+        policy_path = self.repo.parent / "policy.json"
+        policy_path.write_text('{"protected_paths": "instruments/"}', encoding="utf-8")
+        code, out, err = self.run_cli(["check-plan", "--plan", str(plan_path), "--policy", str(policy_path)])
+        self.assertEqual(code, 2)
+        self.assertIn("pm: error:", err)
+        self.assertIn(str(policy_path.resolve()), err)
+        self.assertNotIn("slice(s); approval-gated", out)
+
+    def test_cli_oversized_integer_policy_exits_2_naming_the_file(self) -> None:
+        plan_path = self.write_plan()
+        policy_path = self.repo.parent / "policy.json"
+        policy_path.write_text('{"protected_paths": [' + "1" * 5000 + "]}", encoding="utf-8")
+        code, _out, err = self.run_cli(["check-plan", "--plan", str(plan_path), "--policy", str(policy_path)])
+        self.assertEqual(code, 2)
+        self.assertIn("pm: error:", err)
+        self.assertIn(str(policy_path.resolve()), err)
+        self.assertNotIn("Traceback", err)
+
+    def test_cli_without_policy_prints_no_protected_line(self) -> None:
+        plan_path = self.write_plan(slices=[{"files": ["instruments/check.py"]}])
+        code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path)])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "Slice 1: risk standard\n1 slice(s); approval-gated: none\n")
+
+    def test_cli_prints_elevated_risk_with_its_reason(self) -> None:
+        plan_path = self.write_plan(slices=[{"risky": "none. The slice adds one report"}])
+        code, out, _err = self.run_cli(["check-plan", "--plan", str(plan_path)])
+        self.assertEqual(code, 0)
+        self.assertIn("Slice 1: risk elevated (Risky surfaces touched: 'none. the slice adds one report')\n", out)
 
 
 class TestImportHygiene(unittest.TestCase):

@@ -230,6 +230,48 @@ class TestGrantsShapeValidation(PmTestCase):
         self.assertIn("without a path", str(ctx.exception))
 
 
+class TestProtectedPathsShapeValidation(PmTestCase):
+    """`_validate_shape` fails closed on a malformed `policy.protected_paths`:
+    the floor and `grant` read it to refuse writes, so bad data must refuse to
+    load rather than silently protect nothing. A policy without the key (a run
+    from before protected paths existed) stays valid."""
+
+    def _write_protected(self, run_dir: Path, value: object) -> None:
+        raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        raw["policy"]["protected_paths"] = value
+        (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    def test_non_list_and_null_protected_paths_rejected(self) -> None:
+        plan_path = self.write_plan()
+        _state, _token, run_dir = self.make_run(plan_path=plan_path)
+        for value in ("instruments/", None, {"instruments/": True}):
+            with self.subTest(value=value):
+                self._write_protected(run_dir, value)
+                with self.assertRaises(PmError) as ctx:
+                    state_mod.load_state(run_dir)
+                self.assertIn("non-list 'protected_paths'", str(ctx.exception))
+
+    def test_non_string_or_blank_entry_rejected(self) -> None:
+        plan_path = self.write_plan()
+        _state, _token, run_dir = self.make_run(plan_path=plan_path)
+        for item in (7, None, "", "   ", ["instruments/"]):
+            with self.subTest(item=item):
+                self._write_protected(run_dir, ["instruments/", item])
+                with self.assertRaises(PmError) as ctx:
+                    state_mod.load_state(run_dir)
+                self.assertIn("not a non-empty string", str(ctx.exception))
+
+    def test_absent_key_and_well_formed_list_load(self) -> None:
+        plan_path = self.write_plan()
+        _state, token, run_dir = self.make_run(plan_path=plan_path)
+        loaded = state_mod.load_state(run_dir, token)
+        self.assertNotIn("protected_paths", loaded["policy"])
+
+        self._write_protected(run_dir, ["instruments/", "policy.json"])
+        loaded = state_mod.load_state(run_dir)
+        self.assertEqual(loaded["policy"]["protected_paths"], ["instruments/", "policy.json"])
+
+
 class TestEventsAndReadback(PmTestCase):
     def test_append_event_does_not_rewrite_run_json(self) -> None:
         plan_path = self.write_plan()
@@ -564,6 +606,57 @@ class TestRunReportHeader(PlanTestCase):
         self.assertIn("- Reviewers (completed): opencode/minimax-m3, qwen/qwen3.6-27b-bf16, copilot", text)
         self.assertNotIn("run default", text)
 
+    def test_header_lists_every_developer_identity_the_run_launched(self) -> None:
+        """`Harness` is what `init` was given; a relaunch under another tool or model is a second identity."""
+        state = self._state_for_events()
+        events = [
+            {
+                "kind": "launch",
+                "slice": "Slice 1",
+                "data": {"developer": {"tool": "opencode", "model": "qwen", "effort": None}},
+            },
+            {
+                "kind": "relaunch",
+                "slice": "Slice 1",
+                "data": {"developer": {"tool": "codex", "model": "gpt-6", "effort": "high"}},
+            },
+            {"kind": "steer", "slice": "Slice 1", "data": {"developer": {"tool": "ignored", "model": "x"}}},
+            {
+                "kind": "launch",
+                "slice": "Slice 2",
+                "data": {"developer": {"tool": "opencode", "model": "qwen", "effort": None}},
+            },
+        ]
+
+        text = state_mod.render_run_report(state, events, Path(self.repo))
+
+        self.assertIn("- Developers (launched): opencode/qwen effort=unknown, codex/gpt-6 effort=high\n", text)
+        self.assertNotIn("- Developers", state_mod.render_run_report(state, [], Path(self.repo)))
+
+    def test_slice_table_labels_the_attempts_column_for_what_it_counts(self) -> None:
+        state = self._state_for_events()
+        state["slices"] = [{"id": "Slice 1", "title": "t", "status": "accepted", "attempts": 0, "decision": "ok"}]
+
+        text = state_mod.render_run_report(state, [], Path(self.repo))
+
+        self.assertIn("| id | title | risk | status | steers/relaunches | commit | decision |", text)
+        self.assertNotIn("| attempts |", text)
+
+    def _state_for_events(self) -> dict:
+        return {
+            "run_id": "r",
+            "repo": "/repo",
+            "branch": "b",
+            "status": "active",
+            "plan": {"path": "/plan.md", "sha256": "a" * 64},
+            "harness": {"name": "opencode", "model": "qwen"},
+            "reviewer": {},
+            "policy": {},
+            "slices": [],
+            "approvals": {},
+            "stop_reason": None,
+        }
+
     def test_header_reports_total_run_time_with_its_endpoints(self) -> None:
         """The report is the single source for run time so PM never hand-parses
         events.jsonl; the endpoints ship with it so the figure is checkable."""
@@ -609,6 +702,40 @@ class TestRunReportHeader(PlanTestCase):
         state a budget no command would apply."""
         text = self._header(policy={})
         self.assertIn("- Attempt budget: 10 per slice", text)
+
+    def test_header_names_a_recorded_sandbox_in_the_status_line_form_and_nothing_otherwise(self) -> None:
+        sandbox = {
+            "policy": "/ops/sandbox.json",
+            "policy_sha256": "b" * 64,
+            "socket": "pm-run-20260729T000000Z-abcdef",
+            "control_dir": "/repo/.git/pm-sandbox/pm-run-20260729T000000Z-abcdef",
+        }
+        text = self._header(sandbox=sandbox)
+        self.assertIn(
+            "- Plan: /plan.md (sha256 aaaaaaaaaaaa…)\n"
+            f"- Sandbox: /ops/sandbox.json (sha256 {'b' * 12}) socket pm-run-20260729T000000Z-abcdef\n",
+            text,
+        )
+        self.assertNotIn("sandbox", self._header().lower())
+
+
+class TestSandboxKeyRoundTrip(PmTestCase):
+    def test_a_recorded_sandbox_block_survives_a_verified_save_and_load(self) -> None:
+        """The optional `sandbox` key is MAC-covered like the rest of run state:
+        a verified load returns it unchanged, and editing it is tampering."""
+        plan_path = self.repo.parent / "plan.md"
+        self.write_plan(plan_path)
+        state, token, run_dir = self.make_run(plan_path=plan_path)
+        block = {"policy": "/p.json", "policy_sha256": "0" * 64, "socket": "pm-run-x", "control_dir": "/c"}
+        state["sandbox"] = block
+        state_mod.save_state(run_dir, state, token)
+        self.assertEqual(state_mod.load_state(run_dir, token)["sandbox"], block)
+
+        raw = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        raw["sandbox"]["socket"] = "pm-run-elsewhere"
+        (run_dir / "run.json").write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaises(IntegrityError):
+            state_mod.load_state(run_dir, token)
 
 
 class TestRunReportSurfaceGrants(PlanTestCase):

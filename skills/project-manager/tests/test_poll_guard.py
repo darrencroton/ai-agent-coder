@@ -370,6 +370,43 @@ class TestBashBranch(PollGuardTestCase):
         self.assertAllowed(self.bash_payload("sleep 30; echo done"))
 
 
+class TestCampaignDossier(PollGuardTestCase):
+    """A Campaign Manager works in the dossier, which holds `brief.md` and no
+    `.pm/`; its child's channel files live under `<node worktree>/.pm/campaign/`."""
+
+    _CHILD_RESULT = "/Users/me/worktrees/node-a/.pm/campaign/child-result.json"
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.cwd / ".pm").rmdir()
+        (self.cwd / "brief.md").write_text("# Brief\n", encoding="utf-8")
+
+    def test_a_hand_rolled_waiter_on_a_child_channel_is_denied_in_a_dossier(self) -> None:
+        self.assertDenied(
+            self.bash_payload(f"until [ -f {self._CHILD_RESULT} ]; do sleep 60; done; cat {self._CHILD_RESULT}")
+        )
+
+    def test_a_dossier_cwd_is_needed_for_the_deny(self) -> None:
+        (self.cwd / "brief.md").unlink()
+        self.assertAllowed(self.bash_payload(f"sleep 60; cat {self._CHILD_RESULT}"))
+
+    def test_a_plain_wait_child_is_allowed(self) -> None:
+        self.assertAllowed(
+            self.bash_payload(
+                "python3 ~/.claude/skills/project-manager/scripts/pm.py wait-child --worktree /w --wait 3600"
+            )
+        )
+
+    def test_wait_child_is_exempt_beside_review_and_observe_but_only_as_an_invocation(self) -> None:
+        self.assertAllowed(
+            self.bash_payload(f"pm.py wait-child --worktree /w --wait 60; sleep 5; cat {self._CHILD_RESULT}")
+        )
+        self.assertDenied(
+            self.bash_payload(f"sleep 60; cat {self._CHILD_RESULT} # pm.py wait-child"),
+            "a comment must not exempt a poll",
+        )
+
+
 class TestFailsOpen(PollGuardTestCase):
     """Anything unexpected allows. This is the property that lets the guard ship."""
 

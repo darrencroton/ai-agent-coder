@@ -5,9 +5,20 @@ a temp git repo), a valid-minimal-plan writer (parameterizable per slice), an
 in-process CLI runner, a run-creation helper built on `state.create_run`, and
 the fake-harness script builders the tmux-gated modules share.
 
-Importing this module also confines every tmux call this suite makes — the
-production ones through `pm_lib.sessions` and any the tests issue directly —
-to a private tmux server. See `TEST_TMUX_SOCKET`.
+Importing this module also:
+
+- confines every tmux call this suite makes — the production ones through
+  `pm_lib.sessions` and any the tests issue directly — to a private tmux
+  server (see `TEST_TMUX_SOCKET`), and holds that server up with a
+  `keepalive-<pid>` session for the life of the process (see
+  `_start_keepalive_session`);
+- puts a directory of stub `codex`, `claude`, `copilot`, `opencode` and
+  `qwen` executables first on `PATH`, so a test that composes a real
+  harness command reaches a stub that refuses, never the real coding CLI
+  (see `REAL_CLI_GUARD_DIR`).
+
+The server, the stubs and the private ledger directory are removed when the
+process exits.
 """
 
 from __future__ import annotations
@@ -24,9 +35,11 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterator
+from unittest import mock
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -65,6 +78,23 @@ os.environ["PM_TMUX_SOCKET"] = TEST_TMUX_SOCKET
 TEST_LEDGER_DIR = tempfile.mkdtemp(prefix="pm-tests-ledger-")
 os.environ["PM_LEDGER_DIR"] = TEST_LEDGER_DIR
 
+# --- real coding CLI guard ---------------------------------------------------
+#
+# A scratch test once launched the real codex, with its full-autonomy flags,
+# because `--harness codex` composed a command whose executable was on PATH.
+# Advice not to do that can be missed; a stub first on PATH cannot. Each stub
+# prints a marker and exits 97, so an accidental launch fails at once and
+# says why. A test that replaces PATH wholesale has already left the real
+# CLIs out.
+REAL_CLI_GUARD_DIR = tempfile.mkdtemp(prefix="pm-tests-cli-guard-")
+for _name in ("codex", "claude", "copilot", "opencode", "qwen"):
+    _stub = Path(REAL_CLI_GUARD_DIR) / _name
+    _stub.write_text(
+        f"#!/bin/sh\necho 'pm tests: refusing to launch the real {_name}' >&2\nexit 97\n", encoding="utf-8"
+    )
+    _stub.chmod(0o755)
+os.environ["PATH"] = REAL_CLI_GUARD_DIR + os.pathsep + os.environ.get("PATH", "")
+
 
 def tmux_argv(*args: str) -> list[str]:
     """`tmux` argv pinned to this process's private server.
@@ -72,8 +102,9 @@ def tmux_argv(*args: str) -> list[str]:
     Built here from the frozen `TEST_TMUX_SOCKET` rather than delegating to
     `sessions.tmux_argv`, which reads the mutable `PM_TMUX_SOCKET` at call
     time. A test that cleared or repointed that variable would otherwise send
-    these calls — including the teardown `kill-server` below — to the caller's
-    default tmux server. That is not a theoretical failure: an earlier
+    these calls to the caller's default tmux server (the teardown below goes
+    through `sessions.kill_server`, which takes the socket as an argument for
+    the same reason). That is not a theoretical failure: an earlier
     isolation attempt here did exactly that (via `TMUX_TMPDIR`, which tmux
     ignores when `$TMUX` is set) and destroyed a live operator's sessions.
     """
@@ -82,18 +113,136 @@ def tmux_argv(*args: str) -> list[str]:
 
 @atexit.register
 def _kill_test_tmux_server() -> None:
-    """Tear this process's private server down, and remove its private ledger
-    directory, when the process exits.
+    """Tear this process's private server down (keepalive session included),
+    and remove its private ledger and CLI-guard directories, when the process
+    exits.
 
-    Always `-L`-scoped to the frozen socket, never a bare `tmux kill-server`.
-    Best effort by construction: tmux may be absent (the tmux-gated tests
-    self-skip, but this still runs) or the server may already be gone.
+    Always `-L`-scoped to the frozen socket, never a bare `tmux kill-server`:
+    `sessions.kill_server` takes the socket as its argument and never reads
+    `PM_TMUX_SOCKET`, and it also removes the dead server's socket file,
+    which tmux itself never does. Best effort by construction: tmux may be
+    absent (the tmux-gated tests self-skip, but this still runs) or the
+    server may already be gone.
     """
     try:
-        subprocess.run(tmux_argv("kill-server"), check=False, capture_output=True)
-    except OSError:
+        sessions_mod.kill_server(TEST_TMUX_SOCKET)
+    except Exception:
         pass
     shutil.rmtree(TEST_LEDGER_DIR, ignore_errors=True)
+    shutil.rmtree(REAL_CLI_GUARD_DIR, ignore_errors=True)
+
+
+def _start_keepalive_session() -> None:
+    """Start a `keepalive-<pid>` session on this process's private server.
+
+    tmux exits a server when its last session ends, and under full-suite
+    load a fake harness that exits at once could be that last session: the
+    server vanished mid-module and later tests in it failed. One long-lived
+    session keeps it up until the `atexit` kill above. It polls this
+    process's pid rather than sleeping a fixed day: `atexit` does not run
+    when the process is killed or crashes, and the session then ends within
+    seconds of the process, taking the server with it once nothing else is
+    left there, rather than holding it for a day. The name is outside
+    `pm-*` and `campaign-*`, so no sweep or ownership rule a test exercises
+    can see it as PM's. Started without `PM_RUN_TOKEN`, since a new server's
+    global environment is copied from this process. Best effort: without
+    tmux the tmux-gated tests self-skip.
+    """
+    if shutil.which("tmux") is None:
+        return
+    with sessions_mod.scoped_environ("PM_RUN_TOKEN", None):
+        try:
+            subprocess.run(
+                tmux_argv(
+                    "new-session",
+                    "-d",
+                    "-s",
+                    f"keepalive-{os.getpid()}",
+                    f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 5; done",
+                ),
+                check=False,
+                capture_output=True,
+            )
+        except OSError:
+            pass
+
+
+_start_keepalive_session()
+
+
+# --- sandbox fixtures ---------------------------------------------------------
+#
+# Shared by the modules that exercise `pm_lib.sandbox`. Tests that start a real
+# sandboxed server need `srt`, `tmux` and macOS (CI runs Linux without `srt`),
+# and each uses a `<TEST_TMUX_SOCKET>-sb*` socket of its own, never the suite's
+# shared server: a sandboxed server's policy names exactly one socket.
+
+HAS_SRT = shutil.which("srt") is not None and shutil.which("tmux") is not None and sys.platform == "darwin"
+requires_srt = unittest.skipUnless(HAS_SRT, "srt, tmux and macOS are required to start a sandboxed tmux server")
+
+SANDBOX_TEST_SOCKET_PREFIX = f"{TEST_TMUX_SOCKET}-sb"
+_SANDBOX_TEST_SOCKETS: list[str] = []
+
+
+def register_sandbox_socket(socket: str) -> str:
+    """Record a `<TEST_TMUX_SOCKET>-sb*` socket for the `atexit` sweep below
+    and return it. Refuses any other name, so the sweep can only ever reach
+    this process's own servers."""
+    if not socket.startswith(SANDBOX_TEST_SOCKET_PREFIX):
+        raise ValueError(f"not a sandbox test socket of this process: {socket!r}")
+    if socket not in _SANDBOX_TEST_SOCKETS:
+        _SANDBOX_TEST_SOCKETS.append(socket)
+    return socket
+
+
+def register_run_socket(run_id: str) -> str:
+    """Record the `pm-run-<run_id>` socket of a sandboxed Mode B run a test of
+    this process just created for the `atexit` sweep below, and return it.
+    The run id's random nonce is what keeps the name this process's own."""
+    socket = f"pm-run-{run_id}"
+    if socket not in _SANDBOX_TEST_SOCKETS:
+        _SANDBOX_TEST_SOCKETS.append(socket)
+    return socket
+
+
+@atexit.register
+def _kill_sandbox_test_servers() -> None:
+    """Kill every registered sandbox test server still up when the process
+    exits: a test killed mid-run, or a cleanup that raised, would otherwise
+    leave one (and its `srt`) behind. Registered after
+    `_kill_test_tmux_server`, so it runs first. Best effort, like that hook."""
+    for socket in _SANDBOX_TEST_SOCKETS:
+        try:
+            sessions_mod.kill_server(socket)
+        except Exception:
+            pass
+
+
+def minimal_base_policy() -> dict:
+    """The smallest base policy `load_base_policy` and `srt` both accept:
+    no domains, no reads denied, no writes granted."""
+    return {
+        "network": {"allowedDomains": [], "deniedDomains": []},
+        "filesystem": {"denyRead": [], "allowWrite": [], "denyWrite": []},
+    }
+
+
+def write_base_policy(path: Path, policy: dict | None = None) -> Path:
+    """Write `policy` (default `minimal_base_policy()`) as JSON at `path`."""
+    path.write_text(json.dumps(minimal_base_policy() if policy is None else policy), encoding="utf-8")
+    return path
+
+
+def make_linked_worktree(repo: Path, path: Path, branch: str) -> Path:
+    """`git worktree add -b <branch> <path>` from `repo`; returns `path`.
+    The worktree's `.git` is a file, as for a campaign node's worktree."""
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", branch, str(path)],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    return path
 
 
 # --- CLI-driving helpers -----------------------------------------------------
@@ -222,10 +371,84 @@ def trigger_gated_result_script(trigger_path: Path, *, tail_sleep: float = 10.0)
     return f"{_READY}\ncat - >/dev/null &\n{trigger_wait(trigger_path)}\n{result_heredoc()}\nsleep {tail_sleep}"
 
 
+def question_then_result_script(trigger_path: Path, *, tail_sleep: float = 30.0) -> str:
+    """A Developer that asks PM one question, waits for the answer, then
+    finishes: once `trigger_path` exists it writes `$PM_QUESTION_PATH`, then
+    waits for `answer-1.md` in its artifact directory, commits a change to
+    `a.py` in its working directory (the repository) and writes result.json.
+
+    stdin is drained in the background, so the answer pointer `pm answer`
+    injects never accumulates unread; the terminal still echoes it into the
+    pane.
+    """
+    return (
+        f"{_READY}\n"
+        "cat - >/dev/null &\n"
+        f"{trigger_wait(trigger_path)}\n"
+        'printf "Which reading?\\nA: the first\\nB: the second\\nRecommendation: A\\n" > "$PM_QUESTION_PATH"\n'
+        'while [ ! -f "$PM_SLICE_ARTIFACT_DIR/answer-1.md" ]; do sleep 0.05; done\n'
+        'echo "answered change" >> a.py\n'
+        "git add a.py\n"
+        'git commit -q -m "slice work"\n'
+        f"{result_heredoc()}\n"
+        f"sleep {tail_sleep}"
+    )
+
+
 def trigger_gated_exit_script(trigger_path: Path) -> str:
     """Stays alive until `trigger_path` exists, then exits, so the session's
     death is timed by the test rather than by a launch-relative clock."""
     return f"{_READY}\ncat - >/dev/null &\n{trigger_wait(trigger_path)}"
+
+
+def sandbox_probe_child_script(*, out: Path, leak: Path, control_probe: Path, inside: Path) -> str:
+    """A fake child PM for a sandboxed launch: comes up ready, then records
+    to `out`, one `key=value` line each, the exit status of `touch` on
+    `leak`, `control_probe` and `inside`, whether `leak` exists afterwards,
+    its `$TMPDIR`, and whether `PM_RUN_TOKEN` is set; `done` last. Then it
+    drains stdin, so the launch pointer is read.
+
+    `out` must be writable inside the sandbox: under the worktree's `.pm/`,
+    say. Everything else this suite's fakes write to (`self.records`, beside
+    the repository) is outside every grant.
+    """
+    return "\n".join(
+        [
+            _READY,
+            f'touch "{leak}" 2>/dev/null; echo "leak_rc=$?" >> "{out}"',
+            f'if [ -e "{leak}" ]; then echo leak_exists=yes; else echo leak_exists=no; fi >> "{out}"',
+            f'touch "{control_probe}" 2>/dev/null; echo "control_rc=$?" >> "{out}"',
+            f'touch "{inside}" 2>/dev/null; echo "inside_rc=$?" >> "{out}"',
+            f'echo "tmpdir=$TMPDIR" >> "{out}"',
+            f'if [ -n "${{PM_RUN_TOKEN+x}}" ]; then echo token=set; else echo token=unset; fi >> "{out}"',
+            f'echo done >> "{out}"',
+            "exec cat -",
+        ]
+    )
+
+
+def sandbox_probe_developer_script(*, leak: Path, git_dir: Path, tail: str = "exec cat -") -> str:
+    """A fake Developer for a sandboxed Mode B run: comes up ready, then
+    records to `$PM_SLICE_ARTIFACT_DIR/sandbox-probe.txt`, one `key=value`
+    line each, the exit status of `touch` on `leak` (beside the repository)
+    and whether it exists afterwards, the exit status of `mkdir` on
+    `<git_dir>/pm/x` (the state root) and whether that exists, and its
+    `$TMPDIR`; `done` last. Then `tail` runs (by default it drains stdin, so
+    the launch pointer is read)."""
+    out = '"$PM_SLICE_ARTIFACT_DIR/sandbox-probe.txt"'
+    state_probe = git_dir / "pm" / "x"
+    return "\n".join(
+        [
+            _READY,
+            f'touch "{leak}" 2>/dev/null; echo "leak_rc=$?" >> {out}',
+            f'if [ -e "{leak}" ]; then echo leak_exists=yes; else echo leak_exists=no; fi >> {out}',
+            f'mkdir "{state_probe}" 2>/dev/null; echo "state_rc=$?" >> {out}',
+            f'if [ -e "{state_probe}" ]; then echo state_exists=yes; else echo state_exists=no; fi >> {out}',
+            f'echo "tmpdir=$TMPDIR" >> {out}',
+            f"echo done >> {out}",
+            tail,
+        ]
+    )
 
 
 def trigger_gated_churn_script(trigger_path: Path) -> str:
@@ -689,3 +912,92 @@ class TmuxRunTestCase(PmTestCase):
         if extra:
             argv += extra
         return self.run_cli_in_repo(argv)
+
+
+class SandboxedRunTestCase(TmuxRunTestCase):
+    """`TmuxRunTestCase` plus a sandboxed Mode B run (`init --sandbox`).
+
+    A test that only needs what `init` records runs without `srt`: when it
+    is absent (CI), `_init_sandboxed` stands in for its binary checks, its
+    version and the platform check, and nothing starts a sandboxed server.
+    Tests that do start one are `requires_srt`. Every run's socket is
+    registered for the `atexit` sweep, and each test's cleanup kills its
+    server and removes its temp dir when the test left them.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.base_policy = write_base_policy(self.repo.parent / "sandbox.json")
+
+    @contextmanager
+    def _srt_stand_in(self) -> Iterator[None]:
+        """Nothing with `srt` installed; otherwise its checks pass by stand-in."""
+        if HAS_SRT:
+            yield
+            return
+        from pm_lib import sandbox as sandbox_mod
+        from pm_lib import slice_ops
+
+        with (
+            mock.patch.object(sandbox_mod, "check_binaries"),
+            mock.patch.object(sandbox_mod, "srt_version", return_value="0.0.0-stand-in"),
+            mock.patch.object(slice_ops.platform, "system", return_value="Darwin"),
+        ):
+            yield
+
+    def _init_sandboxed(
+        self, plan_path: Path, harness_script: Path, *, extra: list[str] | None = None
+    ) -> tuple[str, str, str, Path]:
+        """`init --sandbox` on this test's base policy; asserts success and
+        returns (run id, token, socket, run dir)."""
+        with self._srt_stand_in():
+            code, out, err = self._init(
+                plan_path, harness_script, extra=["--sandbox", str(self.base_policy), *(extra or [])]
+            )
+        self.assertEqual(code, 0, err)
+        run_id, token = parse_init_output(out)
+        socket = register_run_socket(run_id)
+        self.addCleanup(self._clean_run_sandbox, socket)
+        self.init_out = out
+        return run_id, token, socket, state_mod.resolve_run_dir(self.repo, run_id)
+
+    def _clean_run_sandbox(self, socket: str) -> None:
+        try:
+            sessions_mod.kill_server(socket)
+        except Exception:
+            pass
+        shutil.rmtree(Path(tempfile.gettempdir()) / f"pm-sandbox-{socket}", ignore_errors=True)
+
+    @staticmethod
+    def on_socket(socket: str | None):
+        """`PM_TMUX_SOCKET` set to `socket` (unset for None) for a `with` block."""
+        environ = {key: value for key, value in os.environ.items() if key != "PM_TMUX_SOCKET"}
+        if socket is not None:
+            environ["PM_TMUX_SOCKET"] = socket
+        return mock.patch.dict(os.environ, environ, clear=True)
+
+    @contextmanager
+    def no_tmux(self) -> Iterator[list[list[str]]]:
+        """Fail any tmux call made inside the block (it is recorded, then
+        refused, so a regression cannot reach a real server); yields the
+        record of attempted calls."""
+        attempted: list[list[str]] = []
+        real_run, real_popen = subprocess.run, subprocess.Popen
+
+        def is_tmux(argv) -> bool:
+            return isinstance(argv, (list, tuple)) and bool(argv) and os.path.basename(str(argv[0])) == "tmux"
+
+        def run(argv, *args, **kwargs):
+            if is_tmux(argv):
+                attempted.append(list(argv))
+                raise AssertionError(f"unexpected tmux call: {argv}")
+            return real_run(argv, *args, **kwargs)
+
+        def popen(argv, *args, **kwargs):
+            if is_tmux(argv):
+                attempted.append(list(argv))
+                raise AssertionError(f"unexpected tmux call: {argv}")
+            return real_popen(argv, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "run", run), mock.patch.object(subprocess, "Popen", popen):
+            yield attempted

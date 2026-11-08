@@ -11,6 +11,7 @@ substitution.
 
 from __future__ import annotations
 
+import shlex
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -222,6 +223,83 @@ class TestQueryModelIdentityOpencode(unittest.TestCase):
             with self.assertRaises(PmError) as ctx:
                 profiles.resolve_opencode_variant("local/tiny", "high", explicit=True)
         self.assertIn("declares no effort variants", str(ctx.exception))
+
+
+class TestLaunchCommand(unittest.TestCase):
+    def test_override_is_returned_verbatim_without_an_inventory_query(self) -> None:
+        with mock.patch.object(profiles, "query_model_identity") as query:
+            result = profiles.launch_command("opencode", override="my-harness --flag", model="local/m", effort=None)
+        self.assertEqual(result, ("my-harness --flag", None))
+        query.assert_not_called()
+
+    def test_claude_command_carries_a_fresh_session_id(self) -> None:
+        first, display = profiles.launch_command("claude", override=None, model="opus", effort="high")
+        second, _ = profiles.launch_command("claude", override=None, model="opus", effort="high")
+        self.assertIsNone(display)
+        self.assertIn("--session-id", first)
+        self.assertNotEqual(first, second)
+
+    def test_opencode_with_a_model_returns_the_inventory_display_name(self) -> None:
+        identity = {"display_name": "Qwen 3.6 35B"}
+        with mock.patch.object(profiles, "query_model_identity", return_value=identity) as query:
+            command, display = profiles.launch_command("opencode", override=None, model="local/m", effort=None)
+        query.assert_called_once_with("opencode", "local/m")
+        self.assertEqual(command, profiles.compose_command("opencode", model="local/m"))
+        self.assertEqual(display, "Qwen 3.6 35B")
+
+    def test_other_harnesses_have_no_display_name_and_no_session_id(self) -> None:
+        with mock.patch.object(profiles, "query_model_identity") as query:
+            command, display = profiles.launch_command("codex", override=None, model="gpt-x", effort=None)
+            no_model = profiles.launch_command("opencode", override=None, model=None, effort=None)
+        query.assert_not_called()
+        self.assertEqual(command, profiles.compose_command("codex", model="gpt-x"))
+        self.assertIsNone(display)
+        self.assertEqual(no_model, (profiles.compose_command("opencode"), None))
+
+
+class TestSandboxedVariants(unittest.TestCase):
+    """Inside an `srt` sandbox a harness cannot start a sandbox of its own,
+    so the Codex and Claude profiles append their sandboxed arguments; every
+    other harness, and every unsandboxed command, is unchanged."""
+
+    CLAUDE_SANDBOX_OFF = ["--settings", '{"sandbox":{"enabled":false}}']
+
+    def test_codex_sandboxed_ends_with_no_daemon(self) -> None:
+        plain = profiles.compose_command("codex", model="o3", effort="high")
+        sandboxed = profiles.compose_command("codex", model="o3", effort="high", sandboxed=True)
+        self.assertTrue(sandboxed.endswith(" --no-daemon"), sandboxed)
+        self.assertEqual(sandboxed, plain + " --no-daemon")
+
+    def test_claude_sandboxed_carries_the_settings_pair(self) -> None:
+        session = "11111111-1111-1111-1111-111111111111"
+        plain = profiles.compose_command("claude", model="opus", session_id=session)
+        sandboxed = profiles.compose_command("claude", model="opus", session_id=session, sandboxed=True)
+        self.assertEqual(shlex.split(sandboxed), shlex.split(plain) + self.CLAUDE_SANDBOX_OFF)
+
+    def test_other_harnesses_and_unsandboxed_commands_are_unchanged(self) -> None:
+        for harness in profiles.SUPPORTED_HARNESSES:
+            with self.subTest(harness=harness):
+                self.assertEqual(
+                    profiles.compose_command(harness, sandboxed=False),
+                    TestComposeCommandBaseCommands.BASE_COMMANDS[harness],
+                )
+        for harness in ("copilot", "opencode", "qwen"):
+            with self.subTest(harness=harness, sandboxed=True):
+                self.assertEqual(profiles.compose_command(harness, sandboxed=True), profiles.compose_command(harness))
+
+    def test_launch_command_threads_the_flag(self) -> None:
+        codex, _ = profiles.launch_command("codex", override=None, model="gpt-x", effort=None, sandboxed=True)
+        self.assertEqual(codex, profiles.compose_command("codex", model="gpt-x", sandboxed=True))
+        claude, _ = profiles.launch_command("claude", override=None, model=None, effort=None, sandboxed=True)
+        self.assertEqual(shlex.split(claude)[-2:], self.CLAUDE_SANDBOX_OFF)
+        unsandboxed, _ = profiles.launch_command("codex", override=None, model="gpt-x", effort=None)
+        self.assertEqual(unsandboxed, profiles.compose_command("codex", model="gpt-x"))
+
+    def test_an_override_is_never_edited(self) -> None:
+        command, _ = profiles.launch_command(
+            "codex", override="my-harness --flag", model=None, effort=None, sandboxed=True
+        )
+        self.assertEqual(command, "my-harness --flag")
 
 
 class TestParseReviewerTools(unittest.TestCase):

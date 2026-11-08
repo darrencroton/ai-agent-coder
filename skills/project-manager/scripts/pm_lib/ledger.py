@@ -188,6 +188,8 @@ def _reviews(
                 "command_override": review.get("command_override"),
                 "model_tag": review.get("model_tag"),
                 "origin": origin,
+                # Absent `launched_at` (a review recorded before it existed) leaves the duration unknown.
+                "elapsed_s": _seconds_between(review.get("launched_at"), review.get("at")),
                 "rating": _rating(active, skill, review_id),
             }
         )

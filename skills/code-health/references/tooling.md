@@ -21,7 +21,7 @@ The v1 analyzer has a dependency-free portable floor and one optional collector:
 ## Dependency contract
 
 1. `detect` names installed, missing, unsupported, and failed coverage.
-2. Nothing here installs or repairs a tool. The analyzer names the command that would install its one optional collector and never runs it, so there is no code path that can change the machine — a stronger guarantee than a dry-run flag, and the reason the earlier `install` subcommand was removed.
+2. Nothing here installs or repairs a tool. The analyzer names the command that would install its one optional collector and never runs it, so there is no code path that can change the machine — a stronger guarantee than a dry-run flag.
 3. Tool name, version, arguments, configuration, parser failures, and covered languages appear in the evidence bundle.
 4. A missing or failed tool never produces a zero metric or clean verdict.
-5. The Lizard CSV parser is pinned to the single 11-column headerless shape Lizard emits. A format change raises, surfacing as a recorded collector error and unavailable coverage; speculative support for formats Lizard has never produced was removed rather than maintained untested.
+5. The Lizard CSV parser is pinned to the single 11-column headerless shape Lizard emits. A format change raises, surfacing as a recorded collector error and unavailable coverage.

@@ -28,7 +28,8 @@ the exact pass/fail wording in its `detail` strings:
 3. approval — an approval-flagged slice has a recorded human approval.
 4. result — result.json exists, parses, and names this slice.
 5. surface — changed files are a subset of the effective authorized surface
-   (frozen plan surface + PM grants).
+   (frozen plan surface + PM grants), and none matches a protected path
+   frozen into run state at `init`.
 6. commit-ancestry — a commit exists, descends from before_head, and is the
    recorded branch's tip.
 7. clean-worktree — nothing dirty outside `.pm/`.
@@ -43,10 +44,12 @@ from typing import Any
 
 from . import PmError
 from . import git_ops
+from . import pm_paths
 from .plan import PlanSlice
 from .plan import effective_authorized_files
 from .plan import plan_digest as compute_plan_digest
 from .plan import plan_slice_by_id
+from .plan import protected_paths
 from .plan import slice_grants
 
 
@@ -66,6 +69,24 @@ class FloorReport:
     @property
     def passed(self) -> bool:
         return all(fact.passed for fact in self.facts)
+
+    def failure_data(self) -> dict[str, Any] | None:
+        """What each failing fact found, for the `floor` event's `data`; None when the floor passed.
+
+        `{"failed": [{"fact", "detail", "evidence"}, ...]}` in fact order. The evidence is the fact's own (the
+        surface fact's offending and protected paths, the ancestry fact's heads, the worktree fact's status lines)
+        less the surface fact's full changed-file list, which can be large and is recoverable from the diff.
+        """
+        failed = [
+            {
+                "fact": fact.name,
+                "detail": fact.detail,
+                "evidence": {key: value for key, value in fact.evidence.items() if key != "changed_files"},
+            }
+            for fact in self.facts
+            if not fact.passed
+        ]
+        return {"failed": failed} if failed else None
 
 
 def _fact_plan_digest(state: dict[str, Any]) -> FloorFact:
@@ -155,14 +176,24 @@ def _fact_approval(state: dict[str, Any], plan_slice: PlanSlice | None, slice_id
     return FloorFact(3, "approval", recorded, detail, evidence)
 
 
-def _fact_result(artifact_dir: Path, slice_id: str) -> FloorFact:
+def _fact_result(repo: Path, artifact_dir: Path, slice_id: str) -> FloorFact:
+    # `result.json` is Developer-written under the sandbox-writable `.pm/`
+    # tree, so it is read through `pm_paths`: a planted symlink, hard link or
+    # non-regular file fails the fact with the refusal as its detail, and is
+    # never followed, never passed, and never raised through the floor.
     result_path = artifact_dir / "result.json"
     evidence: dict[str, Any] = {"path": str(result_path)}
-    if not result_path.is_file():
-        return FloorFact(4, "result", False, "result.json does not exist in the slice artifact directory", evidence)
     try:
-        data = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        text = pm_paths.read_pm_text(repo, result_path)
+    except FileNotFoundError:
+        return FloorFact(4, "result", False, "result.json does not exist in the slice artifact directory", evidence)
+    except PmError as exc:
+        return FloorFact(4, "result", False, f"result.json was refused: {exc}", evidence)
+    except (OSError, ValueError) as exc:
+        return FloorFact(4, "result", False, f"result.json could not be parsed: {exc}", evidence)
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
         return FloorFact(4, "result", False, f"result.json could not be parsed: {exc}", evidence)
     if not isinstance(data, dict):
         return FloorFact(4, "result", False, "result.json does not contain a JSON object", evidence)
@@ -180,7 +211,10 @@ def _fact_result(artifact_dir: Path, slice_id: str) -> FloorFact:
 def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | None) -> FloorFact:
     current_slice = state.get("current_slice") if isinstance(state.get("current_slice"), dict) else {}
     before_head = current_slice.get("before_head")
-    evidence: dict[str, Any] = {"before_head": before_head}
+    # Both protected-path keys are present on every return, including the
+    # early failures below, where no changed files were computed.
+    protected = protected_paths(state)
+    evidence: dict[str, Any] = {"before_head": before_head, "protected_files": [], "protected_surface": protected}
     if plan_slice is None:
         return FloorFact(
             5, "surface", False, "slice not found in the parsed plan; authorized surface is unknown", evidence
@@ -200,12 +234,20 @@ def _fact_surface(repo: Path, state: dict[str, Any], plan_slice: PlanSlice | Non
     evidence["unauthorized_files"] = unauthorized
     evidence["authorized_surface"] = list(plan_slice.authorized_files)
     evidence["granted_surface"] = [g["path"] for g in slice_grants(state, plan_slice.slice_id)]
-    passed = not unauthorized
-    detail = (
-        "all changed files are within the effective authorized surface"
-        if passed
-        else "changed files include entries outside the effective authorized surface"
-    )
+    # No authorized entry can legitimately cover a protected file: check-plan
+    # and init refuse an overlapping surface, and grant refuses a protected
+    # path. A hit is therefore a planning bypass or a bug, and fails closed.
+    protected_hits = sorted(path for path in changed if git_ops.is_protected_path(path, protected))
+    evidence["protected_files"] = protected_hits
+    passed = not unauthorized and not protected_hits
+    if passed:
+        detail = "all changed files are within the effective authorized surface"
+    elif not protected_hits:
+        detail = "changed files include entries outside the effective authorized surface"
+    elif not unauthorized:
+        detail = "changed files include protected paths"
+    else:
+        detail = "changed files include entries outside the effective authorized surface and protected paths"
     return FloorFact(5, "surface", passed, detail, evidence)
 
 
@@ -275,7 +317,7 @@ def evaluate_floor(
         _fact_plan_digest(state),
         _fact_identity_branch(repo, state),
         _fact_approval(state, plan_slice, slice_id),
-        _fact_result(artifact_dir, slice_id),
+        _fact_result(repo, artifact_dir, slice_id),
         _fact_surface(repo, state, plan_slice),
         _fact_commit_ancestry(repo, state),
         _fact_clean_worktree(repo),

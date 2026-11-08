@@ -1,6 +1,6 @@
 # Delegate Request Templates
 
-Delegate requests use schema v3. Copy `slice_id`, `plan_sha256`, tool, model, and effort from policy. Set `access` to one of policy's `required_access` values. Do not include `role`, an unauthorized `access` value, or any external-operation approval field.
+Delegate requests use schema v3. Copy `slice_id`, `plan_sha256`, tool, model, and effort from policy (omit `plan_sha256` when the policy sets `plan_path`; the launcher computes it). Set `access` to one of policy's `required_access` values. Do not include `role`, an unauthorized `access` value, or any external-operation approval field.
 
 Use the smallest file list that covers the question. Every file in `files` must already exist. Require `path:line` evidence for material claims and an explicit blocker when required coverage is unavailable.
 
@@ -27,6 +27,23 @@ Use the smallest file list that covers the question. Every file in `files` must 
   "expected_output": "Return SECTION: FINDINGS, SECTION: EVIDENCE, SECTION: RISKS, and SECTION: OPEN_QUESTIONS; use - none for empty sections."
 }
 ```
+
+## Plan review (`access: read-only`)
+
+Review a frozen plan before work starts. Use the investigation request with `required_skills: ["implementation-plan"]` on the first round, which is the plan format the reviewer judges against (a continuation with the same skills is not sent the bundle again). Put the plan in `files` when it lies inside the policy repository; otherwise inline the plan text in `context`, because every file must resolve beneath the policy repository. When the round has an exclusion list (findings already dispositioned, areas out of scope), carry it as a constraint:
+
+```json
+{
+  "constraints": [
+    "Review the plan only; do not review or propose code.",
+    "Do not re-raise these dispositioned items: <exclusion list, or none>.",
+    "Cite the plan section for every finding."
+  ],
+  "expected_output": "First line RESULT: clean or RESULT: revise. SECTION: FINDINGS lists items labelled FIX (the plan must change) or NOTE (optional), each naming the plan section it concerns and the change in one line. SECTION: DISPOSITIONS lists each earlier-round finding and whether it is resolved (continuations only). SECTION: OPEN_QUESTIONS. Use - none for an empty section."
+}
+```
+
+Continue the same session with a validated continuation for later rounds; the dispositions section then answers the previous round's findings.
 
 ## Drift audit (`access: read-only`)
 
@@ -63,7 +80,7 @@ Continue a terminal delegate only through another validated schema-v3 request in
 }
 ```
 
-The policy must authorize this request's tool, model, effort, and access exactly as for a first launch. For a read-write continuation, use the bounded implementation fields below, including non-empty `authorized_surface` and `non_goals`. The parent must be in the same run, terminal, use the same harness, own a captured session ID, and share the advancing label lineage. Missing or unverifiable identity blocks the launch; there is no “resume last” fallback. See [delegate-contract.md](delegate-contract.md#validated-continuation) for the authoritative validation and lineage rules.
+The policy must authorize this request's tool, model, effort, and access exactly as for a first launch. For a read-write continuation, use the bounded implementation fields below, including non-empty `authorized_surface` and `non_goals`. The parent must be in the same run, terminal, use the same harness, own a captured session ID, and share the advancing label lineage. Missing or unverifiable identity blocks the launch; there is no “resume last” fallback. Keep `required_skills` equal to the parent's and the resumed session is not sent the skill bundle again; change it and the bundle is embedded. See [delegate-contract.md](delegate-contract.md#validated-continuation) for the authoritative validation and lineage rules.
 
 ## Bounded implementation (`access: read-write`)
 

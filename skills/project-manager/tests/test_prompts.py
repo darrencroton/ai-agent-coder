@@ -9,7 +9,10 @@ loader tests build their own templates instead.
 
 from __future__ import annotations
 
+import functools
+import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -47,8 +50,6 @@ class TestLoadTemplate(unittest.TestCase):
         self.assertIn("{intended_change}", template)
 
     def test_no_fence_rejected(self, tmp_path: Path | None = None) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "no-fence.md"
             path.write_text("Just some prose, no fenced block here.\n", encoding="utf-8")
@@ -57,8 +58,6 @@ class TestLoadTemplate(unittest.TestCase):
             self.assertIn(str(path), str(ctx.exception))
 
     def test_multiple_fences_rejected(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "multi-fence.md"
             path.write_text(
@@ -74,8 +73,6 @@ class TestLoadTemplate(unittest.TestCase):
             prompts.load_template(Path("/does/not/exist/reference.md"))
 
     def test_named_heading_scopes_extraction_around_a_second_section(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "two-section.md"
             path.write_text(
@@ -106,8 +103,6 @@ class TestRenderSteerPointer(unittest.TestCase):
         """A custom reference file with a distinctive marker proves
         `render_steer_pointer` actually reads its wording from disk rather
         than duplicating an equivalent wrapper inline in prompts.py."""
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "custom-developer-prompt.md"
             path.write_text(
@@ -121,6 +116,32 @@ class TestRenderSteerPointer(unittest.TestCase):
             self.assertIn("/p/steer-attempt-1.md", rendered)
 
 
+class TestRenderAnswerPointer(unittest.TestCase):
+    def test_single_line_pointer_names_the_answer_path_and_states_frozen_contract(self) -> None:
+        rendered = prompts.render_answer_pointer(Path("/runs/x/slices/slice-001/answer-2.md"))
+        # One line, no newline: sessions.send_line refuses a newline, and the
+        # answer itself stays in the file.
+        self.assertNotIn("\n", rendered)
+        self.assertIn("/runs/x/slices/slice-001/answer-2.md", rendered)
+        self.assertNotIn("{answer_path}", rendered)
+        self.assertIn("frozen contract", rendered)
+        self.assertIn("never widens your authorized surface", rendered)
+
+    def test_wording_is_sourced_from_the_answer_pointer_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "custom-developer-prompt.md"
+            path.write_text(
+                "# Top\n\n```md\nmain: {slice_id}\n```\n\n"
+                "## Steer Message Template\n\n"
+                "```md\nsteer: {correction_path}\n```\n\n"
+                "## Answer Pointer\n\n"
+                "```md\nCUSTOM_ANSWER_MARKER_7c55 read {answer_path}\n```\n",
+                encoding="utf-8",
+            )
+            rendered = prompts.render_answer_pointer(Path("/p/answer-1.md"), reference_path=path)
+            self.assertEqual(rendered, "CUSTOM_ANSWER_MARKER_7c55 read /p/answer-1.md")
+
+
 class TestRenderLaunchPointer(unittest.TestCase):
     def test_single_line_pointer_names_the_contract_path(self) -> None:
         rendered = prompts.render_launch_pointer(Path("/runs/x/slices/slice-001/prompt.md"))
@@ -131,8 +152,6 @@ class TestRenderLaunchPointer(unittest.TestCase):
         self.assertNotIn("{prompt_path}", rendered)
 
     def test_wording_is_sourced_from_the_reference_file_not_hardcoded(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "custom-developer-prompt.md"
             path.write_text(
@@ -182,6 +201,35 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
         # No brace-wrapped identifier survives rendering.
         self.assertIsNone(re.search(r"\{[a-z_]+\}", rendered))
 
+    def test_question_path_is_named_in_the_workflow_hard_rule_and_stop_rules(self) -> None:
+        rendered = prompts.render_developer_prompt(
+            _make_plan_slice(3),
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/a"),
+            notes_path=Path("/repo/n.md"),
+            result_path=Path("/repo/a/result.json"),
+            question_path=Path("/elsewhere/q.md"),
+        )
+        self.assertIn("write one question to `/elsewhere/q.md` with the options and your recommendation", rendered)
+        self.assertIn("write only your code changes, `validation.md`, `/elsewhere/q.md`, and", rendered)
+        self.assertIn("is a question, not a stop: write it to `/elsewhere/q.md`", rendered)
+        self.assertIn(
+            'Stop (status "blocked") when: a second reading is also implementable and PM\'s answer to your '
+            "question did not settle it (an unanswered question is not a stop: wait for the pointer), or",
+            rendered,
+        )
+        self.assertNotIn("/repo/a/question.md", rendered)
+
+    def test_question_path_defaults_to_the_artifact_dir(self) -> None:
+        rendered = prompts.render_developer_prompt(
+            _make_plan_slice(3),
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/a"),
+            notes_path=Path("/repo/n.md"),
+            result_path=Path("/repo/a/result.json"),
+        )
+        self.assertEqual(rendered.count("`/repo/a/question.md`"), 3)
+
     def test_lint_base_is_the_slices_starting_commit(self) -> None:
         # The lint ref must be before_head, not HEAD: once the Developer has
         # committed, `--base HEAD` scopes nothing and lints nothing.
@@ -197,8 +245,6 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
         self.assertNotIn("check --base HEAD", rendered)
 
     def test_stray_unescaped_brace_raises_pm_error_naming_the_file(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "broken.md"
             path.write_text(
@@ -238,9 +284,168 @@ class TestRenderDeveloperPrompt(unittest.TestCase):
             without_grant,
         )
 
-    def test_missing_placeholder_field_raises_pm_error(self) -> None:
-        import tempfile
+    def _render_both(self, **kwargs) -> tuple[str, str]:
+        paths = dict(
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/.pm/runs/run-a/slices/slice-003"),
+            notes_path=Path("/repo/.pm/runs/run-a/notes.md"),
+            result_path=Path("/repo/.pm/runs/run-a/slices/slice-003/result.json"),
+        )
+        plain = prompts.render_developer_prompt(_make_plan_slice(3), **paths, **kwargs)
+        sandboxed = prompts.render_developer_prompt(_make_plan_slice(3), **paths, sandboxed=True, **kwargs)
+        return plain, sandboxed
 
+    def test_sandboxed_render_adds_only_the_sandbox_paragraph(self) -> None:
+        """The paragraph's wording lives in the template between marker
+        lines; an unsandboxed render drops the block whole and a sandboxed one
+        drops only the markers, so the two differ by exactly that paragraph."""
+        plain, sandboxed = self._render_both()
+        match = re.search(r"^\[sandboxed\]\n(.*?)\n\[/sandboxed\]$", prompts.load_template(), re.S | re.M)
+        self.assertIsNotNone(match, "the developer template must carry a [sandboxed] paragraph")
+        paragraph = match.group(1)
+        self.assertIn(paragraph, sandboxed)
+        self.assertNotIn(paragraph, plain)
+        self.assertEqual(sandboxed.replace(paragraph + "\n\n", "", 1), plain)
+        for rendered in (plain, sandboxed):
+            self.assertNotIn("[sandboxed]", rendered)
+            self.assertNotIn("[/sandboxed]", rendered)
+        self.assertNotIn("\n\n\n", plain)
+        # What the operator's boundary denies, named for the session.
+        for phrase in (
+            "Operation not permitted",
+            "$TMPDIR",
+            "the paths the operator granted",
+            "the few paths the sandbox needs in order to run",
+            "the hosts the operator listed, so a push to any other host fails",
+            "`.git/config` and `.git/hooks` are never writable",
+            "In a linked worktree (a campaign node)",
+            "`git stash`",
+            "`git tag`",
+            "`git worktree`",
+            "`git gc`",
+            "anything that updates a branch other than the one you work on",
+            "a boundary, not a bug to work around",
+        ):
+            self.assertIn(phrase, paragraph)
+
+    def test_unsandboxed_render_is_the_default(self) -> None:
+        plain, _ = self._render_both()
+        default = prompts.render_developer_prompt(
+            _make_plan_slice(3),
+            plan_path=Path("/repo/plan.md"),
+            artifact_dir=Path("/repo/.pm/runs/run-a/slices/slice-003"),
+            notes_path=Path("/repo/.pm/runs/run-a/notes.md"),
+            result_path=Path("/repo/.pm/runs/run-a/slices/slice-003/result.json"),
+        )
+        self.assertEqual(plain, default)
+
+    def test_sandboxed_render_of_a_template_without_the_paragraph_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "developer-prompt.md"
+            reference.write_text("# T\n\n```md\nSlice {slice_id}.\n```\n", encoding="utf-8")
+            plain = prompts.render_developer_prompt(
+                _make_plan_slice(3),
+                plan_path=Path("/p"),
+                artifact_dir=Path("/a"),
+                notes_path=Path("/n"),
+                result_path=Path("/r"),
+                reference_path=reference,
+            )
+            self.assertEqual(plain, "Slice Slice 3.")
+            with self.assertRaises(PmError) as ctx:
+                prompts.render_developer_prompt(
+                    _make_plan_slice(3),
+                    plan_path=Path("/p"),
+                    artifact_dir=Path("/a"),
+                    notes_path=Path("/n"),
+                    result_path=Path("/r"),
+                    reference_path=reference,
+                    sandboxed=True,
+                )
+        self.assertIn("[sandboxed]", str(ctx.exception))
+        self.assertIn(str(reference), str(ctx.exception))
+
+    def test_a_malformed_sandbox_block_raises_whether_sandboxed_or_not(self) -> None:
+        """A block the pattern cannot match would otherwise ship its markers
+        and paragraph to an unsandboxed seat, unannounced."""
+        malformed = {
+            "trailing space on the opening marker": "[sandboxed] \nBoundary.\n[/sandboxed]\n\nSlice {slice_id}.",
+            "block at the end of the fence": "Slice {slice_id}.\n\n[sandboxed]\nBoundary.\n[/sandboxed]",
+            "bullet-prefixed markers": "- [sandboxed]\n- Boundary.\n- [/sandboxed]\n\nSlice {slice_id}.",
+            "quote-prefixed markers": "> [sandboxed]\n> Boundary.\n> [/sandboxed]\n\nSlice {slice_id}.",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "developer-prompt.md"
+            for shape, body in malformed.items():
+                reference.write_text(f"# T\n\n```md\n{body}\n```\n", encoding="utf-8")
+                for sandboxed in (False, True):
+                    with self.subTest(shape=shape, sandboxed=sandboxed), self.assertRaises(PmError) as ctx:
+                        prompts.render_developer_prompt(
+                            _make_plan_slice(3),
+                            plan_path=Path("/p"),
+                            artifact_dir=Path("/a"),
+                            notes_path=Path("/n"),
+                            result_path=Path("/r"),
+                            reference_path=reference,
+                            sandboxed=sandboxed,
+                        )
+                    self.assertIn("malformed [sandboxed] block", str(ctx.exception))
+                    self.assertIn(str(reference), str(ctx.exception))
+
+    def test_two_blocks_with_a_malformed_first_closer_raise_even_when_unsandboxed(self) -> None:
+        """A closer the pattern does not recognise lets it run on to the second
+        block's closer; the prose between them must not be dropped silently.
+        A block whose markers are both malformed matches nothing, and must not
+        ship with its marker text either."""
+        bodies = {
+            "malformed first closer": (
+                "[sandboxed]\nFirst boundary.\n[/sandboxed ]\n\nProse that must survive {slice_id}.\n\n"
+                "[sandboxed]\nSecond boundary.\n[/sandboxed]\n\nSlice {slice_id}."
+            ),
+            "both markers malformed": "[sandboxed ]\nBoundary.\n[/sandboxed ]\n\nSlice {slice_id}.",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "developer-prompt.md"
+            for shape, body in bodies.items():
+                reference.write_text(f"# T\n\n```md\n{body}\n```\n", encoding="utf-8")
+                with self.subTest(shape=shape), self.assertRaises(PmError) as ctx:
+                    prompts.render_developer_prompt(
+                        _make_plan_slice(3),
+                        plan_path=Path("/p"),
+                        artifact_dir=Path("/a"),
+                        notes_path=Path("/n"),
+                        result_path=Path("/r"),
+                        reference_path=reference,
+                    )
+                self.assertIn("malformed [sandboxed] block", str(ctx.exception))
+                self.assertIn(str(reference), str(ctx.exception))
+
+    def test_an_empty_sandbox_block_counts_as_missing_when_sandboxed(self) -> None:
+        """An empty paragraph would announce no boundary at all; unsandboxed,
+        the block is removed as usual."""
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "developer-prompt.md"
+            for shape, body in {"empty": "", "whitespace only": "   \t"}.items():
+                reference.write_text(
+                    f"# T\n\n```md\n[sandboxed]\n{body}\n[/sandboxed]\n\nSlice {{slice_id}}.\n```\n", encoding="utf-8"
+                )
+                render = functools.partial(
+                    prompts.render_developer_prompt,
+                    _make_plan_slice(3),
+                    plan_path=Path("/p"),
+                    artifact_dir=Path("/a"),
+                    notes_path=Path("/n"),
+                    result_path=Path("/r"),
+                    reference_path=reference,
+                )
+                with self.subTest(shape=shape):
+                    self.assertEqual(render(), "Slice Slice 3.")
+                    with self.assertRaises(PmError) as ctx:
+                        render(sandboxed=True)
+                    self.assertIn("an empty or no [sandboxed] paragraph", str(ctx.exception))
+                    self.assertIn(str(reference), str(ctx.exception))
+
+    def test_missing_placeholder_field_raises_pm_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "unknown-field.md"
             path.write_text("```md\nSlice: {slice_id}\nUnknown: {not_a_real_field}\n```\n", encoding="utf-8")

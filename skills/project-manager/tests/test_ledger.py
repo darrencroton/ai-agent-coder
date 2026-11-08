@@ -418,6 +418,7 @@ class TestRunRowsReviews(unittest.TestCase):
                 "command_override": False,
                 "model_tag": "hot",
                 "origin": second,
+                "elapsed_s": None,
                 "rating": {"score": 2},
             },
         )
@@ -445,6 +446,16 @@ class TestRunRowsReviews(unittest.TestCase):
                 },
             ],
         )
+
+    def test_a_review_row_carries_its_run_time_only_when_launched_at_is_recorded(self) -> None:
+        log = _Log()
+        origin = log.launch("Slice 1", 0, OPUS)
+        timed = {**_review("review-1", origin), "launched_at": ledger_ts(10), "at": ledger_ts(95)}
+        legacy = {**_review("review-2", origin), "at": ledger_ts(95)}
+
+        (row,) = ledger.run_rows(_state(_entry(reviews=[timed, legacy])), log.events)
+
+        self.assertEqual([review["elapsed_s"] for review in row["reviews"]], [85, None])
 
     def test_an_order_only_partly_inside_the_window_is_dropped(self) -> None:
         log = _Log()

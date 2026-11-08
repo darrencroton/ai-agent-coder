@@ -637,6 +637,7 @@ def _new_reviewer_group() -> dict[str, Any]:
         "rated": 0,
         "unusable": 0,
         "scores": [],
+        "elapsed_s": [],
         "panels": 0,
         "wins": 0,
         "losses": 0,
@@ -671,6 +672,9 @@ def _reviewer_groups(
                     group["unusable"] += 1
                     continue
                 members[review.get("review_id")] = (skill, key)
+                elapsed = _int(review.get("elapsed_s"))
+                if elapsed is not None:
+                    group["elapsed_s"].append(elapsed)
                 if isinstance(rating, dict) and "score" in rating:
                     group["rated"] += 1
                     score = _int(rating.get("score"))
@@ -726,6 +730,7 @@ _REVIEWER_HEADERS = [
     "Commissions, n",
     "Usable (PM), share rated/(rated+unavailable+failed)",
     "Score (PM), mean 0–2",
+    "Review time, median s",
     "Panels (PM), n",
     "Pairwise wins (PM), share",
     "Close-call wins (PM), share",
@@ -740,6 +745,7 @@ def _reviewer_cells(key: tuple[Any, ...], group: dict[str, Any]) -> list[str]:
         str(group["commissions"]),
         _share_cell(group["rated"], group["rated"] + group["unusable"]),
         _mean_cell(group["scores"]),
+        _median_cell(group["elapsed_s"]),
         str(group["panels"]),
         _share_cell(group["wins"], group["wins"] + group["losses"]),
         _share_cell(group["close_wins"], group["close_wins"] + group["close_losses"]),

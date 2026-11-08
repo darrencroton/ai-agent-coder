@@ -13,14 +13,19 @@ Each contract lives in exactly one place; everything else points at it. Before e
 | Contract | Home |
 |---|---|
 | Why the repo exists, principles, personas, autonomy ladder | `docs/VISION.md` |
-| Human-facing skill index, quickstart, glossary | `README.md` (top level) |
-| Mode A launchers (checkpointed default and autonomous alternate usage) and the Mode B launcher | `skills/implementation-plan/SKILL.md` → "Next Chat Prompt Format" |
+| Human-facing skill index, the modes and how to choose one, glossary | `README.md` (top level) |
+| Mode A launcher (one launcher; its `Supervision:` line selects the checkpointed or autonomous usage) and the Mode B launcher | `skills/implementation-plan/SKILL.md` → "Next Chat Prompt Format" |
 | PM operating contract | `skills/project-manager/SKILL.md` → "Workflow" |
-| Handoff resume prompt | Derived from the checkpointed Mode A launcher per `skills/handoff/SKILL.md` — never restated |
+| Handoff resume prompt | Derived from the Mode A launcher per `skills/handoff/SKILL.md` — never restated |
 | Plan format and machine-consumed fields | `skills/implementation-plan/SKILL.md` |
 | PM charter, floor facts, and always-stop rules | `skills/project-manager/SKILL.md` → "Charter", "The floor", "Always stop" |
 | PM trust model and known limits | `skills/project-manager/README.md` → "Trust model, honestly" |
 | Run-state layout and authority model | `skills/project-manager/references/run-state.md` |
+| Protected-paths policy file contract | `skills/project-manager/references/run-state.md` |
+| Campaign-mode (Mode C) operating contract and the campaign launcher | `skills/project-manager/references/campaign-mode.md` |
+| Dossier layout and templates | `skills/project-manager/references/dossier-template.md` |
+| Sandbox contract (the boundary, what enforces what, limitations, base-policy refusals and warnings, derived policies, example policy, per-harness facts) | `skills/project-manager/references/sandbox.md` |
+| Guarded `.pm/` access rule | `skills/project-manager/scripts/pm_lib/pm_paths.py` module docstring |
 | Developer and Reviewer prompt contracts | `skills/project-manager/references/developer-prompt.md`, `…/reviewer-prompt.md` |
 | Harness profile table | `skills/project-manager/scripts/pm_lib/profiles.py` |
 | Delegate request contract and access-mode semantics | `skills/orchestrator/references/delegate-contract.md` |
@@ -34,14 +39,14 @@ Each skill's `SKILL.md` is the source of truth for its own triggers, workflow, a
 
 ## Tests
 
-- Project Manager: `python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'`. Tests needing `tmux` self-skip when it is absent; no test needs a real coding CLI (runtime tests inject fake harnesses). Module layout: `skills/project-manager/README.md` → "Maintainer map".
+- Project Manager: `python3 -m unittest discover -s skills/project-manager/tests -p 'test_*.py'`. Tests needing `tmux` self-skip when it is absent, and the sandbox tests that start a real server (`requires_srt`) self-skip without `srt` or off macOS, as on CI's Linux runner, so run them on a Mac with `srt` installed before changing the sandbox; no test needs a real coding CLI (runtime tests inject fake harnesses). Module layout: `skills/project-manager/README.md` → "Maintainer map".
 - The PM modules are independent and safe to run in parallel, which is roughly 2.5x faster than the serial discover above:
   `cd skills/project-manager/tests && for m in test_*.py; do python3 -m unittest "${m%.py}" & done; wait`
   Each test process pins its own tmux server (`PM_TMUX_SOCKET=pm-tests-<pid>`), so parallel runs cannot collide with each other — or with the tmux sessions you are working in. Never point the suite at the default tmux server, and never run a bare `tmux kill-server`: both reach the operator's own sessions.
 - Prefer trigger-gated fake harnesses over fixed delays. A launch takes several seconds (readiness settle plus two 1 s injection settles), so a delay timed from launch both races that and has to be padded until it is slow as well. `pm_test_helpers` provides the shared builders; put a fixture used by more than one module there rather than copying it.
 - Orchestrator: `python3 -m unittest discover -s skills/orchestrator/tests -p 'test_*.py'`.
 - Lint: `python3 -m unittest discover -s skills/lint/tests -p 'test_*.py'`.
-- Code Health: `python3 -m unittest discover -s skills/code-health/tests -p 'test_*.py'`.
+- Code Health: `python3 -m unittest discover -s skills/code-health/tests -p 'test_*.py'`. `project-manager`'s `code_metrics` imports `health.py` by path and depends on `SourceFile`, `language_for`, `category_for`, `line_counts` and `python_structure`, so run the project-manager suite after changing any of them.
 - CI runs all four suites, compile checks, the no-baggage greps, and doc-link reachability on every push and pull request using the minimum supported PM runtime, Python 3.13. Keep them green; never weaken a failing test to make it pass — a failing test is evidence of a real problem.
 - New behavior lands with a regression test pinned beside it. Keep tests boundary-focused rather than permutation-heavy.
 

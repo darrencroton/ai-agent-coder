@@ -18,7 +18,7 @@ The Developer must critically evaluate every delegate result — a read-only del
 
 Use [scripts/delegate_jobs.py](scripts/delegate_jobs.py) for every delegate launch. Read [references/delegate-contract.md](references/delegate-contract.md) before writing a request. The helper validates schema-v3 semantic requests, embeds required skills, composes the selected harness command, records normalized access evidence, manages process lifecycle, and extracts results.
 
-Delegate artifacts default to `.orchestrator/runs/`. Override that root with `ORCHESTRATOR_ARTIFACT_ROOT`. Existing `.ai-orchestrator/` evidence is historical and must not be read, migrated, or reinterpreted.
+Delegate artifacts default to `.orchestrator/runs/`. Override that root with `ORCHESTRATOR_ARTIFACT_ROOT`. A legacy `.ai-orchestrator/` directory is not delegate evidence and must not be read.
 
 ## Execution Checklist
 

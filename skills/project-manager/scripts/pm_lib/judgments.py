@@ -525,6 +525,11 @@ def read_events_or_raise(run_dir: Path) -> list[dict[str, Any]]:
         raise PmError(f"could not read PM event log {run_dir / 'events.jsonl'}: {exc}") from exc
 
 
+def latest_developer_origin(events: list[dict[str, Any]], slice_id: str) -> dict[str, Any] | None:
+    """The latest `launch`/`relaunch` origin of `slice_id` in `events`, for callers outside this module."""
+    return _scan_latest_developer_origin(events, slice_id)
+
+
 def _scan_latest_developer_origin(events: list[dict[str, Any]], slice_id: str) -> dict[str, Any] | None:
     for index in range(len(events) - 1, -1, -1):
         event = events[index]

@@ -173,6 +173,21 @@ def _validate_shape(state: dict[str, Any]) -> None:
     plan = state.get("plan")
     if not isinstance(plan, dict) or not plan.get("sha256"):
         raise PmError("run state is missing plan.sha256")
+    # Protected paths are an authorization field, so a malformed list fails
+    # closed here; `"protected_paths" in policy` (not `.get(...) is not None`)
+    # so a JSON `null` is refused too, as for `grants` below. A policy without
+    # the key (a run from before protected paths existed) enforces nothing.
+    policy = state.get("policy")
+    if isinstance(policy, dict) and "protected_paths" in policy:
+        protected = policy["protected_paths"]
+        if not isinstance(protected, list):
+            raise PmError("run state policy has a non-list 'protected_paths' field")
+        for item in protected:
+            if not isinstance(item, str) or not item.strip():
+                raise PmError(
+                    f"run state policy has a protected path that is not a non-empty string: {item!r}; "
+                    "protected paths restrict writes, so a malformed one fails closed"
+                )
     slices = state.get("slices")
     if not isinstance(slices, list):
         raise PmError("run state 'slices' field must be a list")
@@ -254,6 +269,9 @@ def create_run(
         "slices": slices,
         "approvals": {},
         "stop_reason": None,
+        # Optional, added by `init --sandbox` (Mode B) and absent otherwise:
+        # "sandbox": {"policy", "policy_sha256", "socket": "pm-run-<run id>",
+        # "control_dir": "<common git dir>/pm-sandbox/<socket>"}.
     }
     _validate_shape(state)
 
@@ -527,6 +545,25 @@ def run_elapsed(events: list[dict[str, Any]]) -> tuple[str, str, str] | None:
     )
 
 
+def _developers_line(events: list[dict[str, Any]]) -> str | None:
+    """The report's line naming every Developer identity the run launched, in first-use order.
+
+    The `Harness` line is what `init` was given; a relaunch under `--tool`/`--model` changes the identity, and
+    each `launch` and `relaunch` event records the one it used. None when no launch recorded an identity.
+    """
+    seen: list[str] = []
+    for event in events:
+        developer = (event.get("data") or {}).get("developer") if event.get("kind") in {"launch", "relaunch"} else None
+        if not isinstance(developer, dict):
+            continue
+        model = developer.get("model")
+        label = f"{developer.get('tool')}/{model}" if model else str(developer.get("tool"))
+        label += f" effort={developer.get('effort') if developer.get('effort') is not None else 'unknown'}"
+        if label not in seen:
+            seen.append(label)
+    return f"- Developers (launched): {', '.join(seen)}" if seen else None
+
+
 def _reviewer_line(state: dict[str, Any]) -> str:
     """The report's reviewer line, derived from the reviews state recorded.
 
@@ -585,9 +622,19 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     if state.get("run_tag") is not None:
         lines.append(f"- Run tag: {state['run_tag']}")
     lines.append(f"- Plan: {plan_info.get('path')} (sha256 {plan_sha}…)")
+    sandbox_info = state.get("sandbox")
+    if isinstance(sandbox_info, dict):
+        # The line `status` prints for a sandboxed run, capitalised like its neighbours.
+        lines.append(
+            f"- Sandbox: {sandbox_info.get('policy')} (sha256 {(sandbox_info.get('policy_sha256') or '')[:12]}) "
+            f"socket {sandbox_info.get('socket')}"
+        )
     lines.append(
         f"- Harness: {harness_info.get('name')} model={harness_info.get('model')} effort={harness_info.get('effort')}"
     )
+    developers = _developers_line(events)
+    if developers:
+        lines.append(developers)
     # Reviewer and budget are the run's other two comparability controls. The
     # budget mirrors the enforcement default so the report cannot state one the
     # toolkit would not apply.
@@ -608,7 +655,7 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
 
     lines.append("## Slices")
     lines.append("")
-    lines.append("| id | title | risk | status | attempts | commit | decision |")
+    lines.append("| id | title | risk | status | steers/relaunches | commit | decision |")
     lines.append("|---|---|---|---|---|---|---|")
     slices = state.get("slices") or []
     for entry in slices:

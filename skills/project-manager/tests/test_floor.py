@@ -13,6 +13,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -20,7 +21,9 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from pm_test_helpers import PmTestCase
 
+from pm_lib import PmError
 from pm_lib import floor as floor_mod
+from pm_lib import git_ops
 from pm_lib import plan as plan_mod
 from pm_lib import state as state_mod
 
@@ -283,6 +286,24 @@ class TestFactResult(FloorTestCase):
         report = floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
         self.assertFalse(_facts_by_name(report)["result"].passed)
 
+    def test_a_symlinked_result_fails_with_the_refusal_and_is_never_followed(self) -> None:
+        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
+        self._commit_authorized_change()
+        # A result.json planted as a link to a file outside `.pm/`, whose
+        # content would otherwise pass the fact.
+        outside = self.repo.parent / "outside-result.json"
+        outside.write_text(json.dumps({"slice": "Slice 1", "status": "complete"}), encoding="utf-8")
+        (self.artifact_dir / "result.json").symlink_to(outside)
+        state = self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        )
+
+        report = floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
+        fact = _facts_by_name(report)["result"]
+        self.assertFalse(fact.passed)
+        self.assertIn("sandbox-writable .pm/", fact.detail)
+        self.assertIn("result.json", fact.detail)
+
 
 class TestFactSurface(FloorTestCase):
     def test_unauthorized_committed_change_fails_surface(self) -> None:
@@ -359,6 +380,193 @@ class TestFactSurfaceGrants(FloorTestCase):
         self.assertEqual(evidence["granted_surface"], ["b.py"])
 
 
+_FACT_NAMES = ["plan-digest", "identity-branch", "approval", "result", "surface", "commit-ancestry", "clean-worktree"]
+
+
+class TestProtectedPathsReader(unittest.TestCase):
+    """`plan.protected_paths`, which fact 5 and `grant` read, is tolerant: a run
+    from before protected paths existed, or a policy that is not a dict, protects
+    nothing."""
+
+    def test_returns_the_recorded_list_or_empty(self) -> None:
+        self.assertEqual(plan_mod.protected_paths({"policy": {"protected_paths": ["a/", "b.py"]}}), ["a/", "b.py"])
+        for state in ({}, {"policy": None}, {"policy": ["a/"]}, {"policy": {"max_attempts": 3}}):
+            with self.subTest(state=state):
+                self.assertEqual(plan_mod.protected_paths(state), [])
+
+
+class TestFactSurfaceProtectedPaths(FloorTestCase):
+    """Fact 5 also fails on any changed file matching a protected path frozen
+    into run state at `init`, even one inside the effective authorized
+    surface: check-plan, init and grant all refuse such an overlap, so a hit
+    is a planning bypass or a bug and must fail closed. `make_run(policy=…)`
+    writes the overlap straight into state to stand in for that bypass."""
+
+    def _protected_run(self, *, files: list[str], protected: list[str]):
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": files}])
+        policy = {"max_attempts": 3, "protected_paths": protected, "protected_paths_source": None}
+        state, token, run_dir = self.make_run(plan_path=plan_path, policy=policy)
+        return state, token, run_dir, plan_mod.parse_plan(plan_path)
+
+    def _commit(self, relative: str, text: str = "changed\n") -> None:
+        path = self.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        self._git("add", relative)
+        self._git("commit", "-q", "-m", f"change {relative}")
+
+    def _evaluate(self, state: dict, token: str, run_dir: Path, slices, before_head: str) -> floor_mod.FloorReport:
+        self._write_result()
+        state = self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        )
+        return floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
+
+    def test_protected_file_inside_the_plan_surface_fails_only_fact_5(self) -> None:
+        state, token, run_dir, slices = self._protected_run(files=["src/"], protected=["src/vendor/frozen.py"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit("src/vendor/frozen.py")
+
+        report = self._evaluate(state, token, run_dir, slices, before_head)
+        facts = _facts_by_name(report)
+        surface = facts["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.detail, "changed files include protected paths")
+        self.assertEqual(surface.evidence["unauthorized_files"], [])
+        self.assertEqual(surface.evidence["protected_files"], ["src/vendor/frozen.py"])
+        self.assertEqual(surface.evidence["protected_surface"], ["src/vendor/frozen.py"])
+        self.assertEqual([fact.name for fact in report.facts], _FACT_NAMES)
+        self.assertEqual([name for name, fact in facts.items() if not fact.passed], ["surface"])
+
+    def test_change_under_a_plain_directory_entry_fails_fact_5_naming_the_file(self) -> None:
+        # "src/vendor" has no trailing slash: an equality match would let this pass.
+        state, token, run_dir, slices = self._protected_run(files=["src/"], protected=["src/vendor"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit("src/vendor/deep/frozen.py")
+
+        surface = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.evidence["protected_files"], ["src/vendor/deep/frozen.py"])
+        self.assertEqual(surface.detail, "changed files include protected paths")
+
+    def test_committed_rename_of_a_protected_file_into_the_surface_fails_naming_the_source(self) -> None:
+        state, token, run_dir, slices = self._protected_run(files=["src/"], protected=["instruments/"])
+        self._commit("instruments/check.py", "print('known good')\n" * 20)
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "src").mkdir()
+        self._git("mv", "instruments/check.py", "src/check.py")
+        self._git("commit", "-q", "-m", "move the instrument into the surface")
+
+        surface = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.evidence["changed_files"], ["instruments/check.py", "src/check.py"])
+        self.assertEqual(surface.evidence["protected_files"], ["instruments/check.py"])
+        # The source is outside src/ as well, so both conditions hold.
+        self.assertEqual(surface.evidence["unauthorized_files"], ["instruments/check.py"])
+        self.assertEqual(
+            surface.detail,
+            "changed files include entries outside the effective authorized surface and protected paths",
+        )
+
+    def test_clean_run_with_a_policy_passes_with_no_protected_files(self) -> None:
+        state, token, run_dir, slices = self._protected_run(files=["a.py"], protected=["instruments/"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit_authorized_change()
+
+        report = self._evaluate(state, token, run_dir, slices, before_head)
+        surface = _facts_by_name(report)["surface"]
+        self.assertTrue(report.passed)
+        self.assertEqual(surface.detail, "all changed files are within the effective authorized surface")
+        self.assertEqual(surface.evidence["protected_files"], [])
+        self.assertEqual(surface.evidence["protected_surface"], ["instruments/"])
+        self.assertEqual([fact.name for fact in report.facts], _FACT_NAMES)
+
+    def test_unauthorized_only_keeps_todays_wording_and_evidence_keys(self) -> None:
+        state, token, run_dir, slices = self._protected_run(files=["a.py"], protected=["instruments/"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit("c.py")
+
+        surface = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.detail, "changed files include entries outside the effective authorized surface")
+        self.assertEqual(surface.evidence["unauthorized_files"], ["c.py"])
+        self.assertEqual(surface.evidence["protected_files"], [])
+
+    def test_unauthorized_and_protected_changes_use_the_combined_wording(self) -> None:
+        state, token, run_dir, slices = self._protected_run(files=["src/"], protected=["src/frozen.py"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit("src/frozen.py")
+        self._commit("c.py")
+
+        surface = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.evidence["unauthorized_files"], ["c.py"])
+        self.assertEqual(surface.evidence["protected_files"], ["src/frozen.py"])
+        self.assertEqual(
+            surface.detail,
+            "changed files include entries outside the effective authorized surface and protected paths",
+        )
+
+    def test_policy_without_protected_paths_enforces_nothing_and_still_reports_the_keys(self) -> None:
+        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
+        self.assertNotIn("protected_paths", state["policy"])
+        self._commit_authorized_change()
+
+        report = self._evaluate(state, token, run_dir, slices, before_head)
+        surface = _facts_by_name(report)["surface"]
+        self.assertTrue(report.passed)
+        self.assertEqual(surface.evidence["protected_files"], [])
+        self.assertEqual(surface.evidence["protected_surface"], [])
+
+    def test_slice_missing_from_the_plan_still_reports_both_protected_keys(self) -> None:
+        state, token, run_dir, _slices = self._protected_run(files=["a.py"], protected=["instruments/"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit_authorized_change()
+
+        surface = _facts_by_name(self._evaluate(state, token, run_dir, [], before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.detail, "slice not found in the parsed plan; authorized surface is unknown")
+        self.assertEqual(surface.evidence["protected_files"], [])
+        self.assertEqual(surface.evidence["protected_surface"], ["instruments/"])
+
+    def test_uncomputable_changed_files_still_report_both_protected_keys(self) -> None:
+        state, token, run_dir, slices = self._protected_run(files=["a.py"], protected=["instruments/"])
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit_authorized_change()
+
+        with mock.patch.object(git_ops, "changed_files_between", side_effect=PmError("git diff failed")):
+            surface = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        self.assertFalse(surface.passed)
+        self.assertEqual(surface.detail, "changed files could not be computed: git diff failed")
+        self.assertEqual(surface.evidence["protected_files"], [])
+        self.assertEqual(surface.evidence["protected_surface"], ["instruments/"])
+
+    def test_editing_or_deleting_the_policy_file_after_init_changes_nothing(self) -> None:
+        """Fact 5 reads only the entries frozen into run state; the policy
+        file they came from is never consulted again."""
+        policy_path = self.repo.parent / "policy.json"
+        policy_path.write_text(json.dumps({"protected_paths": ["src/frozen.py"]}), encoding="utf-8")
+        loaded = plan_mod.load_policy(policy_path, repo=self.repo)
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["src/"]}])
+        policy = {
+            "max_attempts": 3,
+            "protected_paths": loaded["protected_paths"],
+            "protected_paths_source": {"path": loaded["path"], "sha256": loaded["sha256"]},
+        }
+        state, token, run_dir = self.make_run(plan_path=plan_path, policy=policy)
+        slices = plan_mod.parse_plan(plan_path)
+        before_head = self._git("rev-parse", "HEAD").stdout.strip()
+        self._commit("src/frozen.py")
+
+        policy_path.write_text(json.dumps({"protected_paths": []}), encoding="utf-8")
+        edited = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        policy_path.unlink()
+        deleted = _facts_by_name(self._evaluate(state, token, run_dir, slices, before_head))["surface"]
+        for surface in (edited, deleted):
+            self.assertFalse(surface.passed)
+            self.assertEqual(surface.evidence["protected_files"], ["src/frozen.py"])
+
+
 class TestFactCommitAncestry(FloorTestCase):
     def test_no_commit_when_required_fails(self) -> None:
         _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
@@ -428,6 +636,38 @@ class TestFactCleanWorktree(FloorTestCase):
 
         report = floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
         self.assertTrue(_facts_by_name(report)["clean-worktree"].passed)
+
+
+class TestFailureData(FloorTestCase):
+    """`FloorReport.failure_data` is what the `floor` event records: only failing facts, each with its evidence."""
+
+    def _report(self, *, commit: bool, stray: bool) -> floor_mod.FloorReport:
+        _plan_path, state, token, run_dir, before_head, slices = self._happy_path()
+        if commit:
+            self._commit_authorized_change()
+        self._write_result()
+        if stray:
+            (self.repo / "stray.txt").write_text("oops\n", encoding="utf-8")
+        state = self.set_current_slice(
+            state, token, run_dir, slice_id="Slice 1", before_head=before_head, artifact_dir=self.artifact_dir
+        )
+        self.before_head = before_head
+        return floor_mod.evaluate_floor(self.repo, state, slices, "Slice 1", artifact_dir=self.artifact_dir)
+
+    def test_a_passing_floor_has_no_failure_data(self) -> None:
+        self.assertIsNone(self._report(commit=True, stray=False).failure_data())
+
+    def test_failing_facts_carry_their_heads_and_status_lines_and_serialise(self) -> None:
+        data = self._report(commit=False, stray=True).failure_data()
+
+        # The stray file is also outside the authorized surface, so the surface fact fails with it named.
+        self.assertEqual([item["fact"] for item in data["failed"]], ["surface", "commit-ancestry", "clean-worktree"])
+        surface, ancestry, worktree = data["failed"]
+        self.assertEqual(surface["evidence"]["unauthorized_files"], ["stray.txt"])
+        self.assertEqual(ancestry["evidence"]["before_head"], self.before_head)
+        self.assertEqual(ancestry["evidence"]["head"], self.before_head)
+        self.assertEqual(worktree["evidence"]["dirty_lines"], ["?? stray.txt"])
+        json.dumps(data)
 
 
 class TestFloorNeverMutates(FloorTestCase):

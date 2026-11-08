@@ -12,7 +12,7 @@ Three subcommands:
             tools. Never invoked implicitly: `check` and `detect` never install.
 
 Design invariants (see SKILL.md):
-  * `check` mutates nothing outside a temporary git worktree it removes.
+  * `check` mutates nothing outside a temporary directory under $TMPDIR it removes.
   * A missing tool is reported as `unavailable` coverage, never a silent pass.
   * Absolute mode (`--all`) is for standalone use; differential mode is for
     workflow gates, where pre-existing findings are out of scope.
@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -388,6 +389,60 @@ def _ruff_config(cwd: str) -> list[str]:
     return ["--config", shipped] if os.path.exists(shipped) else []
 
 
+def _black_owned(cwd: str) -> bool:
+    """True when the project configures black: a `[tool.black]` table in
+    `pyproject.toml`, or a `black` invocation at command position on a recipe
+    line of a top-level `Makefile` (`black --check .`, `$(VENV)/bin/black "src dir"`,
+    `python -m black src`, after `&&`, `;` or `|` too). Recipe lines are read
+    with shell quoting, so the word inside an echo's text is not one. A wrapper
+    (`poetry run black`) is not recognised, which only leaves `ruff format` on."""
+    try:
+        with open(os.path.join(cwd, "pyproject.toml"), encoding="utf-8") as fh:
+            if re.search(r"^\s*\[tool\.black[\].]", fh.read(), re.MULTILINE):
+                return True
+    except (OSError, UnicodeDecodeError):
+        pass
+    try:
+        with open(os.path.join(cwd, "Makefile"), encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return any(_recipe_invokes_black(line) for line in lines if line.startswith("\t"))
+
+
+def _recipe_invokes_black(line: str) -> bool:
+    # Only `&|;` split tokens, so `$(VENV)/bin/black` stays one word.
+    lexer = shlex.shlex(line.lstrip("\t @-+"), posix=True, punctuation_chars="&|;")
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:  # an unbalanced quote: not a recipe this heuristic can read
+        return False
+    previous = None
+    python_command = False  # the previous-but-one token was a python at command position
+    for token in tokens:
+        at_command = previous is None or previous in {"&&", "||", ";", "|"}
+        if (at_command or (previous == "-m" and python_command)) and (token == "black" or token.endswith("/black")):
+            return True
+        if at_command and _is_python(token):
+            python_command = True
+        elif token != "-m":
+            python_command = False
+        previous = token
+    return False
+
+
+def _is_python(token: str) -> bool:
+    return re.fullmatch(r"(?:.*/)?python[0-9.]*", token) is not None
+
+
+def _unless_black_owned(cwd: str) -> str | None:
+    """Two formatters would disagree, so the project's own choice wins."""
+    if _black_owned(cwd):
+        return "formatter is black-owned (project configures black); ruff format --check skipped"
+    return None
+
+
 def _markdownlint_config(cwd: str) -> list[str]:
     """Use the project's own markdownlint config when it has one; otherwise the
     skill's shipped defect-focused default (SKILL.md invariant 4)."""
@@ -449,7 +504,7 @@ TOOLS: list[Tool] = [
     Tool(
         name="ruff-format", language="python", extensions=PY, binary="ruff",
         build=lambda b, f: [b, "format", "--check", "--force-exclude", "--"] + f,
-        parse=_parse_ruff_format,
+        parse=_parse_ruff_format, precondition=_unless_black_owned,
         # ruff format --check exit codes: 0 = nothing to reformat, 1 = some
         # file(s) would be reformatted, 2 = error. Exit 1 is accepted only
         # when findings were actually parsed -- see run_tool's `rc not in
@@ -548,6 +603,21 @@ def git(args: Sequence[str], cwd: str) -> str:
     return out
 
 
+def git_bytes(args: Sequence[str], cwd: str, input_bytes: bytes | None = None, timeout: int = 300) -> bytes:
+    """Run git and return stdout undecoded, for object content that is not text."""
+    try:
+        p = subprocess.run(["git", *args], cwd=cwd, input=input_bytes, capture_output=True,
+                           timeout=timeout, check=False)
+    except FileNotFoundError as e:
+        raise RuntimeError("executable not found: git") from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"timed out after {timeout}s: git {' '.join(args)}") from e
+    if p.returncode != 0:
+        detail = p.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+    return p.stdout
+
+
 def repo_root(cwd: str) -> str:
     return git(["rev-parse", "--show-toplevel"], cwd).strip()
 
@@ -589,7 +659,7 @@ def rename_map(root: str, base: str | None) -> dict[str, str]:
     """new path -> old path for files renamed since `base`.
 
     Without this, renaming a file carries its untouched pre-existing findings
-    into the "new" bucket: the base worktree has nothing at the new path, so
+    into the "new" bucket: the base tree has nothing at the new path, so
     every finding in it looks introduced.
     """
     if not base:
@@ -607,9 +677,10 @@ def rename_map(root: str, base: str | None) -> dict[str, str]:
     return mapping
 
 
-def whitespace_check(root: str, base: str | None) -> list[Finding]:
+def whitespace_check(root: str, base: str | None, scope: Iterable[str]) -> list[Finding]:
     """`git diff --check`: whitespace errors and conflict markers introduced by
-    this change. Inherently differential, so it needs no base comparison run.
+    this change, reported only for the repo-relative paths in `scope` (the files
+    being linted). Inherently differential, so it needs no base comparison run.
 
     Three sources, because no single git invocation covers them all and the
     prescribed pre-commit call passes `--base HEAD`:
@@ -620,6 +691,7 @@ def whitespace_check(root: str, base: str | None) -> list[Finding]:
          `--no-index` against /dev/null.
     """
     pat = re.compile(r"^(?P<path>.+?):(?P<line>\d+):\s*(?P<msg>.+)$", re.MULTILINE)
+    scoped = set(scope)
 
     def collect(args: list[str]) -> list[Finding]:
         _rc, out, _err = run(["git", *args], root)
@@ -627,6 +699,7 @@ def whitespace_check(root: str, base: str | None) -> list[Finding]:
             Finding("git-diff-check", "whitespace", m.group("path").strip(),
                     int(m.group("line")), m.group("msg").strip())
             for m in pat.finditer(out)
+            if m.group("path").strip() in scoped
         ]
 
     findings: list[Finding] = []
@@ -649,7 +722,7 @@ def whitespace_check(root: str, base: str | None) -> list[Finding]:
 
     for rel in git(["ls-files", "--others", "--exclude-standard"], root).splitlines():
         rel = rel.strip()
-        if not rel or not os.path.isfile(os.path.join(root, rel)):
+        if rel not in scoped or not os.path.isfile(os.path.join(root, rel)):
             continue
         findings += collect(["diff", "--check", "--no-index", "/dev/null", rel])
 
@@ -773,20 +846,73 @@ def diff_findings(head: list[Finding], base: list[Finding]) -> list[Finding]:
     return new
 
 
+# Blobs fetched per `cat-file --batch` exchange, bounding peak memory on large trees.
+BASE_BATCH = 256
+
+
+def _read_blobs(data: bytes, count: int) -> list[bytes]:
+    """Split `cat-file --batch` output (`<oid> blob <size>\\n<bytes>\\n` per object)."""
+    blobs, offset = [], 0
+    for _ in range(count):
+        newline = data.find(b"\n", offset)
+        header = data[offset:newline].decode("ascii", errors="replace").split() if newline != -1 else []
+        if len(header) != 3 or header[1] != "blob" or not header[2].isdigit():
+            raise RuntimeError("git cat-file returned an invalid blob header")
+        start, size = newline + 1, int(header[2])
+        if start + size > len(data):
+            raise RuntimeError("git cat-file returned a truncated blob")
+        blobs.append(data[start:start + size])
+        offset = start + size + 1
+    return blobs
+
+
 @contextmanager
-def base_worktree(root: str, base: str):
-    """Yield a detached worktree at `base`, removed on exit."""
-    path = tempfile.mkdtemp(prefix="lint-base-")
-    git(["worktree", "add", "--detach", "--quiet", path, base], root)
+def base_tree(root: str, base: str):
+    """Yield `(directory, paths)`: the regular files of `base` written byte for
+    byte under $TMPDIR (removed on exit) and their repo-relative paths.
+
+    Built from `ls-tree` and `cat-file --batch`, so it needs no write access to
+    the git dir (`git worktree add` does) and honours no `export-ignore`
+    attribute (`git archive` does). The whole tree is written, not only the
+    linted files, so base-side tools find the base's own project config;
+    symlinks are recreated as links. Submodules are not materialised.
+    """
+    commit = git(["rev-parse", "--verify", f"{base}^{{commit}}"], root).strip()
+    tmp = tempfile.mkdtemp(prefix="lint-base-")
     try:
-        yield path
+        entries: list[tuple[str, str, bool]] = []
+        for entry in git_bytes(["ls-tree", "-r", "-z", commit], root).split(b"\0"):
+            if not entry:
+                continue
+            meta, raw_path = entry.split(b"\t", 1)
+            mode, kind, oid = meta.decode("ascii").split()
+            if kind == "blob":
+                entries.append((oid, os.fsdecode(raw_path), mode == "120000"))
+        # Regular files first, links last: a link written early could redirect a
+        # later file's parent directory outside the temp tree.
+        ordered = sorted(entries, key=lambda e: e[2])
+        real_tmp = os.path.realpath(tmp)
+        for i in range(0, len(ordered), BASE_BATCH):
+            chunk = ordered[i:i + BASE_BATCH]
+            data = git_bytes(["cat-file", "--batch"], root,
+                             input_bytes="".join(f"{oid}\n" for oid, _, _ in chunk).encode())
+            for (_oid, path, is_link), content in zip(chunk, _read_blobs(data, len(chunk)), strict=True):
+                target = os.path.normpath(os.path.join(tmp, path))
+                parent = os.path.dirname(target)
+                if not target.startswith(tmp + os.sep) or not os.path.realpath(parent).startswith(real_tmp + os.sep) \
+                        and os.path.realpath(parent) != real_tmp:
+                    raise RuntimeError(f"unsafe path in git tree: {path}")
+                os.makedirs(parent, exist_ok=True)
+                if is_link:
+                    # A symlink's blob is its target; recreated as a link so a linked
+                    # config file (`ruff.toml -> cfg/ruff.toml`) resolves as at head.
+                    os.symlink(os.fsdecode(content), target)
+                else:
+                    with open(target, "wb") as fh:
+                        fh.write(content)
+        yield tmp, {path for _oid, path, _ in entries}
     finally:
-        for args in (["worktree", "remove", "--force", path], ["worktree", "prune"]):
-            try:
-                run(["git", *args], root)
-            except RuntimeError:
-                pass
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --- Reporting ---------------------------------------------------------------
@@ -882,6 +1008,9 @@ def cmd_detect(args) -> int:
             "name": t.name, "language": t.language, "binary": t.binary,
             "installed": have(t.binary), "files": len(subset),
             "default": t.default, "note": t.note,
+            # Only the formatter choice is reported here; other preconditions
+            # stay a `check`-time skip.
+            "skipped_reason": _unless_black_owned(root) if t.name == "ruff-format" else None,
         })
     missing = sorted({t.binary for t in tools if not have(t.binary)})
     payload = {
@@ -900,6 +1029,8 @@ def cmd_detect(args) -> int:
                   "pass paths or --base <ref> to inspect coverage)")
         for r in rows:
             state = "installed" if r["installed"] else "MISSING"
+            if r["skipped_reason"]:
+                state = f"skipped: {r['skipped_reason']}"
             tier = "" if r["default"] else " (opt-in)"
             print(f"  {r['name']:<16} {r['language']:<9} {r['files']:>4} file(s)  {state}{tier}")
         if missing:
@@ -1020,17 +1151,17 @@ def cmd_check(args) -> int:
     tools = select_tools(files, args.enable, args.skip)
     head_results = lint_tree(tools, files, root, args.timeout)
     head_findings = [f for r in head_results for f in r.findings]
-    head_findings += whitespace_check(root, args.base if differential else None)
+    head_findings += whitespace_check(root, args.base if differential else None, files)
 
     base_errors: list[str] = []
     if differential:
         renames = rename_map(root, args.base)
-        with base_worktree(root, args.base) as wt:
+        with base_tree(root, args.base) as (wt, at_base):
             present = []
             base_to_head: dict[str, str] = {}
             for f in files:
                 old = renames.get(f, f)
-                if os.path.isfile(os.path.join(wt, old)):
+                if old in at_base:
                     present.append(old)
                     base_to_head[old] = f
             base_results = lint_tree(tools, present, wt, args.timeout) if present else []

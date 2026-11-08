@@ -22,6 +22,7 @@ Pins, each one a bug found during implementation or an invariant from SKILL.md:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -387,23 +388,63 @@ class TestWhitespaceCheck(unittest.TestCase):
             base = repo.commit("base")
             repo.write("a.txt", "clean\ntrailing   \n")
             repo.commit("head")
-            got = lint.whitespace_check(lint.repo_root(repo.dir), base)
+            got = lint.whitespace_check(lint.repo_root(repo.dir), base, ["a.txt"])
             self.assertTrue(any(f.tool == "git-diff-check" for f in got))
 
-
-class TestBaseWorktree(unittest.TestCase):
-    def test_worktree_is_created_at_base_and_removed(self):
+    def test_reports_only_scoped_paths(self):
+        """Committed, worktree and untracked findings are all filtered to the
+        files being linted, so `check --all <path>` says nothing about others."""
         with TempRepo() as repo:
-            repo.write("a.py", "old = 1\n")
+            repo.write("a.txt", "clean\n")
+            repo.write("b.txt", "clean\n")
+            base = repo.commit("base")
+            repo.write("a.txt", "clean\nbad   \n")
+            repo.write("b.txt", "clean\nbad   \n")
+            repo.write("untracked.txt", "bad   \n")
+            root = lint.repo_root(repo.dir)
+            got = lint.whitespace_check(root, base, ["a.txt"])
+            self.assertEqual({f.path for f in got}, {"a.txt"})
+            got = lint.whitespace_check(root, base, ["untracked.txt"])
+            self.assertEqual({f.path for f in got}, {"untracked.txt"})
+
+    def test_check_all_with_a_path_ignores_other_untracked_files(self):
+        with TempRepo() as repo, FakeTool():
+            repo.write("a.fk", "x\n")
+            repo.commit("base")
+            repo.write("other.txt", "bad   \n")
+            args = CheckArgs(repo.dir, all=True)
+            args.paths = [os.path.join(repo.dir, "a.fk")]
+            rc, out = run_check(args)
+            self.assertEqual(json.loads(out)["new_findings"], [], out)
+            self.assertEqual(rc, lint.EXIT_PASS)
+
+
+class TestBaseTree(unittest.TestCase):
+    def test_tree_is_written_byte_for_byte_and_removed(self):
+        with TempRepo() as repo:
+            blob = b"old = 1\r\n\x00\xff"
+            with open(os.path.join(repo.dir, "a.py"), "wb") as fh:
+                fh.write(blob)
+            repo.write("pkg/ruff.toml", "[lint]\n")
             base = repo.commit("base")
             repo.write("a.py", "new = 2\n")
             repo.commit("head")
             root = lint.repo_root(repo.dir)
-            with lint.base_worktree(root, base) as wt:
-                with open(os.path.join(wt, "a.py")) as fh:
-                    self.assertIn("old", fh.read())
-                held = wt
+            with lint.base_tree(root, base) as (tree, paths):
+                with open(os.path.join(tree, "a.py"), "rb") as fh:
+                    self.assertEqual(fh.read(), blob)
+                self.assertEqual(paths, {"a.py", "pkg/ruff.toml"})
+                self.assertTrue(tree.startswith(tempfile.gettempdir()))
+                held = tree
             self.assertFalse(os.path.exists(held))
+
+    def test_bad_ref_is_an_error(self):
+        with TempRepo() as repo:
+            repo.write("a.py", "x = 1\n")
+            repo.commit("base")
+            with self.assertRaises(RuntimeError):
+                with lint.base_tree(lint.repo_root(repo.dir), "no-such-ref"):
+                    pass
 
 
 class TestInstallSafety(unittest.TestCase):
@@ -667,7 +708,7 @@ class TestWhitespaceCoversWorktreeAndUntracked(unittest.TestCase):
             repo.write("a.txt", "clean\n")
             repo.commit("base")
             repo.write("a.txt", "clean\ntrailing   \n")
-            got = lint.whitespace_check(lint.repo_root(repo.dir), "HEAD")
+            got = lint.whitespace_check(lint.repo_root(repo.dir), "HEAD", ["a.txt"])
             self.assertTrue(any(f.path.endswith("a.txt") for f in got), got)
 
     def test_untracked_file_whitespace_is_found(self):
@@ -675,7 +716,7 @@ class TestWhitespaceCoversWorktreeAndUntracked(unittest.TestCase):
             repo.write("a.txt", "clean\n")
             repo.commit("base")
             repo.write("new.txt", "bad   \n")
-            got = lint.whitespace_check(lint.repo_root(repo.dir), "HEAD")
+            got = lint.whitespace_check(lint.repo_root(repo.dir), "HEAD", ["new.txt"])
             self.assertTrue(any("new.txt" in f.path for f in got), got)
 
     def test_committed_range_whitespace_still_found(self):
@@ -684,7 +725,7 @@ class TestWhitespaceCoversWorktreeAndUntracked(unittest.TestCase):
             base = repo.commit("base")
             repo.write("a.txt", "clean\nbad   \n")
             repo.commit("head")
-            got = lint.whitespace_check(lint.repo_root(repo.dir), base)
+            got = lint.whitespace_check(lint.repo_root(repo.dir), base, ["a.txt"])
             self.assertTrue(any(f.path.endswith("a.txt") for f in got), got)
 
 
@@ -711,6 +752,120 @@ class TestRenameDoesNotFabricateFindings(unittest.TestCase):
             payload = json.loads(out)
             self.assertEqual(payload["new_findings"], [], payload)
             self.assertEqual(rc, lint.EXIT_PASS)
+
+
+class TestBaseSideWithoutWorktree(unittest.TestCase):
+    """Differential mode must work where `git worktree add` cannot (a sandbox
+    that leaves the git dir read-only), so no `worktree` subcommand may run."""
+
+    def test_added_modified_and_renamed_files_without_a_worktree_subcommand(self):
+        import unittest.mock
+        real_run = subprocess.run
+        calls = []
+
+        def spy(argv, *a, **kw):
+            calls.append(list(argv))
+            return real_run(argv, *a, **kw)
+
+        with TempRepo() as repo, FakeTool(exit_code=1, per_file_msg="pre-existing"):
+            repo.write("mod.fk", "x\n")
+            repo.write("old.fk", "x\n")
+            base = repo.commit("base")
+            repo.write("mod.fk", "y\n")
+            sh(["git", "mv", "old.fk", "new.fk"], repo.dir)
+            repo.write("add.fk", "z\n")
+            repo.commit("head")
+            with unittest.mock.patch.object(lint.subprocess, "run", spy):
+                rc, out = run_check(CheckArgs(repo.dir, base=base))
+            payload = json.loads(out)
+            self.assertEqual([f["path"] for f in payload["new_findings"]], ["add.fk"], out)
+            self.assertEqual(rc, lint.EXIT_FINDINGS)
+            self.assertTrue(calls)
+            self.assertFalse([c for c in calls if "worktree" in c], calls)
+
+    def test_a_symlink_at_the_base_is_recreated_as_a_link(self):
+        """A linked config file (`ruff.toml -> cfg/ruff.toml`) must resolve at the base as at head."""
+        with TempRepo() as repo:
+            repo.write("real.fk", "x\n")
+            os.symlink("real.fk", os.path.join(repo.dir, "link.fk"))
+            base = repo.commit("base")
+            with lint.base_tree(repo.dir, base) as (tree, paths):
+                self.assertIn("link.fk", paths)
+                self.assertEqual(os.readlink(os.path.join(tree, "link.fk")), "real.fk")
+                with open(os.path.join(tree, "link.fk")) as fh:
+                    self.assertEqual(fh.read(), "x\n")
+
+    def test_export_ignored_file_is_still_linted_at_base(self):
+        """`git archive` would drop it, making its pre-existing findings look new."""
+        with TempRepo() as repo, FakeTool(exit_code=1, per_file_msg="pre-existing"):
+            repo.write(".gitattributes", "ignored.fk export-ignore\n")
+            repo.write("ignored.fk", "x\n")
+            base = repo.commit("base")
+            repo.write("ignored.fk", "y\n")
+            repo.commit("head")
+            rc, out = run_check(CheckArgs(repo.dir, base=base))
+            self.assertEqual(json.loads(out)["new_findings"], [], out)
+            self.assertEqual(rc, lint.EXIT_PASS)
+
+
+class TestBlackOwnsFormatting(unittest.TestCase):
+    def test_pyproject_tool_black_table_skips_ruff_format(self):
+        with TempRepo() as repo:
+            repo.write("pyproject.toml", "[tool.black]\nline-length = 100\n")
+            self.assertIn("black-owned", lint._unless_black_owned(repo.dir))
+
+    def test_makefile_black_invocation_skips_ruff_format(self):
+        with TempRepo() as repo:
+            repo.write("Makefile", "fmt:\n\tpython -m black src\n")
+            self.assertIn("black-owned", lint._unless_black_owned(repo.dir))
+
+    def test_the_word_black_in_an_echo_is_not_an_invocation(self):
+        with TempRepo() as repo:
+            repo.write(
+                "Makefile",
+                "help:\n\techo \"Optional formatter: black\"\n\techo \"Use black --check .\"\n"
+                "\techo \"Run: cd src && black --check .\"\n\techo python -m black src\n# install black; black --check .\n",
+            )
+            self.assertIsNone(lint._unless_black_owned(repo.dir))
+
+    def test_black_at_command_position_with_a_quoted_argument_counts(self):
+        with TempRepo() as repo:
+            repo.write("Makefile", "fmt:\n\t@$(VENV)/bin/black \"src dir\" && echo done\n")
+            self.assertIn("black-owned", lint._unless_black_owned(repo.dir))
+
+    def test_black_after_a_quoted_cd_counts(self):
+        with TempRepo() as repo:
+            repo.write("Makefile", "fmt:\n\tcd \"src dir\" && black --check .\n")
+            self.assertIn("black-owned", lint._unless_black_owned(repo.dir))
+
+    def test_unrelated_config_leaves_ruff_format_alone(self):
+        with TempRepo() as repo:
+            repo.write("pyproject.toml", "[project]\nname = \"x\"\n\n[tool.ruff]\n")
+            repo.write("Makefile", "# black is not used here\nfmt:\n\truff format .\n")
+            self.assertIsNone(lint._unless_black_owned(repo.dir))
+
+    def test_skip_is_reported_as_skipped_not_checked(self):
+        import dataclasses
+        tool = dataclasses.replace(lint.TOOLS_BY_NAME["ruff-format"], binary="sh")
+        with TempRepo() as repo:
+            repo.write("pyproject.toml", "[tool.black]\n")
+            res = lint.run_tool(tool, ["a.py"], repo.dir, 30)
+            self.assertFalse(res.ran)
+            self.assertIn("black-owned", res.skipped_reason)
+
+    def test_detect_says_the_formatter_is_black_owned(self):
+        import contextlib
+        import io
+        with TempRepo() as repo:
+            repo.write("pyproject.toml", "[tool.black]\n")
+            repo.write("a.py", "x = 1\n")
+            args = argparse.Namespace(repo=repo.dir, paths=[os.path.join(repo.dir, "a.py")], all=False,
+                                      base=None, enable=[], skip=[], json=False, timeout=30)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                lint.cmd_detect(args)
+            line = next(ln for ln in buf.getvalue().splitlines() if ln.strip().startswith("ruff-format"))
+            self.assertIn("black-owned", line)
 
 
 class TestCoverageGateCommandLevel(unittest.TestCase):
@@ -774,7 +929,7 @@ class TestConfigPrecedence(unittest.TestCase):
     def test_markdownlint_argv_suppresses_config_globs(self):
         """markdownlint-cli2 appends a project config's "globs" to the CLI
         file list rather than replacing it, so without --no-globs a config
-        globbing the whole tree would lint files the base worktree lacks."""
+        globbing the whole tree would lint files the base tree lacks."""
         tool = lint.TOOLS_BY_NAME["markdownlint"]
         argv = tool.build("markdownlint-cli2", ["a.md"])
         self.assertIn("--no-globs", argv)

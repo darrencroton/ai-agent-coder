@@ -17,35 +17,62 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import signal
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from . import PmError
 from . import git_ops
+from . import pm_paths
 from . import plan as plan_mod
 from . import profiles
 from . import prompts
+from . import sandbox
+from . import sessions
 from . import slice_ops
 from . import state as state_mod
 
 _STDERR_TAIL_CHARS = 4000
+# `validation.md` is Developer-written and reaches the reviewer through argv,
+# so it is bounded; the full file stays readable at its own path.
+_VALIDATION_RECORD_MAX_CHARS = 20000
+# Languages whose changes make the code-review skill's language-priorities
+# resource relevant; the resource is dropped from the embedded bundle otherwise.
+_PRIORITIES_REFERENCE = "scientific-and-language-priorities.md"
+_PRIORITIES_SUFFIXES = frozenset(
+    {".py", ".pyi", ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx"}
+    | {".f", ".for", ".f77", ".f90", ".f95", ".f03", ".f08"}
+)
 
 
 # --- one-shot reviewer command composition (this module's own table) ---------
 
 
 def compose_reviewer_command(
-    tool: str, prompt: str, *, model: str | None = None, effort: str | None = None, repo: Path
+    tool: str,
+    prompt: str,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+    repo: Path,
+    sandboxed: bool = False,
 ) -> list[str]:
     """Compose a one-shot reviewer invocation for `tool`. Unsupported tool
     names, and a non-default `effort` for qwen (whose tested one-shot command
     has no effort/reasoning flag), fail closed with `PmError` rather than
     silently dropping the request. opencode takes effort as `--variant`; note
     this is the one-shot `opencode run` only, so it does NOT apply to the
-    Developer seat's interactive TUI (see profiles.py)."""
+    Developer seat's interactive TUI (see profiles.py).
+
+    `sandboxed` is true when the reviewer will run inside an `srt` sandbox,
+    where no harness can start a sandbox of its own (nesting fails with exit
+    71): Codex then runs at `danger-full-access`, Qwen without `--sandbox`,
+    and Claude with its sandbox setting off. The OS boundary replaces the
+    harness's; Copilot and OpenCode commands are the same either way."""
     repo_str = str(repo)
 
     if tool == "codex":
@@ -59,11 +86,14 @@ def compose_reviewer_command(
         # The sandbox is set through its config key to match the orchestrator's
         # codex profile, which must use the config form because `codex exec resume`
         # rejects `--sandbox`. Full rationale and the verifying evidence:
-        # skills/orchestrator/references/codex.md.
+        # skills/orchestrator/references/codex.md. Inside `srt` the read-only
+        # sandbox cannot start and fails every tool call, so the OS sandbox
+        # around the reviewer is the boundary instead.
+        sandbox_mode = "danger-full-access" if sandboxed else "read-only"
         command.extend(
             [
                 "-c",
-                'sandbox_mode="read-only"',
+                f'sandbox_mode="{sandbox_mode}"',
                 "-c",
                 'approval_policy="never"',
                 "--skip-git-repo-check",
@@ -80,6 +110,10 @@ def compose_reviewer_command(
         if effort:
             command.extend(["--effort", effort])
         command.extend(["--permission-mode", "plan", "--output-format", "text", "--add-dir", repo_str])
+        # Claude Code's own sandbox cannot start inside `srt`; switch it off
+        # for this launch rather than let it fall back silently.
+        if sandboxed:
+            command.extend(["--settings", '{"sandbox":{"enabled":false}}'])
         return command
 
     if tool == "copilot":
@@ -113,7 +147,10 @@ def compose_reviewer_command(
         # --yolo for the same reason the Developer seat carries it: without it
         # qwen gates every tool call on a confirmation a one-shot run cannot
         # answer, and the reviewer hangs until --timeout.
-        command.extend(["--yolo", "--sandbox", "--output-format", "text"])
+        command.append("--yolo")
+        if not sandboxed:
+            command.append("--sandbox")
+        command.extend(["--output-format", "text"])
         return command
 
     raise PmError(
@@ -122,11 +159,19 @@ def compose_reviewer_command(
 
 
 def _build_reviewer_command(
-    tool: str, prompt: str, *, model: str | None, effort: str | None, repo: Path, reviewer_command_override: str | None
+    tool: str,
+    prompt: str,
+    *,
+    model: str | None,
+    effort: str | None,
+    repo: Path,
+    reviewer_command_override: str | None,
+    sandboxed: bool = False,
 ) -> list[str]:
+    # An override is run verbatim: `sandboxed` shapes only a composed command.
     if reviewer_command_override:
         return shlex.split(reviewer_command_override) + [prompt]
-    return compose_reviewer_command(tool, prompt, model=model, effort=effort, repo=repo)
+    return compose_reviewer_command(tool, prompt, model=model, effort=effort, repo=repo, sandboxed=sandboxed)
 
 
 def _resolve_tool(state: dict[str, Any], tool_arg: str | None, *, has_override: bool) -> str:
@@ -190,6 +235,29 @@ def _commission_origin(run_dir: Path, slice_id: str) -> dict[str, Any]:
         if event.get("slice") == slice_id and event.get("kind") in {"launch", "relaunch", "steer"}:
             return {"index": index, "kind": event["kind"], "slice": slice_id}
     raise PmError(f"cannot commission {slice_id}: no launch, relaunch, or steer event records its current attempt")
+
+
+def _reference_filter(changed_files: list[str]) -> Callable[[Path], bool]:
+    """Predicate for `prompts.compile_skill_bundle`: every linked skill file is
+    kept except the language-priorities one, which is kept only when the pinned
+    diff touches C, C++, Fortran or Python."""
+    relevant = any(Path(name).suffix.lower() in _PRIORITIES_SUFFIXES for name in changed_files)
+    return lambda path: relevant or path.name != _PRIORITIES_REFERENCE
+
+
+def _read_validation_record(repo: Path, artifact_dir: Path) -> str | None:
+    """The Developer's `validation.md` for this slice, or None when absent.
+
+    Read through the `.pm/` guard (`pm_paths`): the directory is Developer-writable,
+    so a planted link there is refused (PmError), never followed."""
+    path = artifact_dir / "validation.md"
+    try:
+        text = pm_paths.read_pm_text(repo, path, errors="replace").strip()
+    except FileNotFoundError:
+        return None
+    if len(text) > _VALIDATION_RECORD_MAX_CHARS:
+        text = f"{text[:_VALIDATION_RECORD_MAX_CHARS]}\n[truncated; the full file is at {path}]"
+    return text or None
 
 
 def _tail(path: Path, max_chars: int = _STDERR_TAIL_CHARS) -> str:
@@ -315,8 +383,23 @@ def run_review(
     rendered prompt is persisted beside the report: a channel that can narrow
     what a reviewer reports must leave the human an audit trail of what it
     was told.
+
+    A reviewer runs inside a sandbox when this PM already does
+    (`SANDBOX_RUNTIME=1`) or the run records one: its command and prompt are
+    then the sandboxed variants, which leave the boundary to the OS. A run
+    that records a sandbox always has its reviewer wrapped in `srt` with the
+    control directory's reviewer policy at `Popen` time, after everything
+    recorded about the commission is built, even when this PM itself runs
+    inside a sandbox: a nested `srt` fails closed (exit 71) rather than the
+    inherited sandbox standing in for the run's. That wrap fails closed: a
+    control directory outside the one place a host-written one can be, a
+    missing reviewer policy, a record naming no temp dir (the refusal names
+    which), or no `srt` on PATH raises PmError before any commission
+    artifact is written rather than running the reviewer unwrapped.
     """
     state = slice_ops.load_writable_state(run_dir, token)
+    # Like every other command of a sandboxed run: never against another server.
+    sandbox.require_run_socket(state)
     current = state.get("current_slice")
     if not current or current.get("id") != slice_id:
         raise PmError(
@@ -342,6 +425,30 @@ def run_review(
             "quiesce the Developer session and commit or restore before commissioning: " + "; ".join(dirty)
         )
 
+    # A run that records a sandbox runs its reviewer under `srt` with the
+    # host-written reviewer policy: read-only on the repository and with no
+    # route to the Developer server. Its prerequisites are checked here,
+    # before any commission artifact exists, so a refusal leaves none behind
+    # to raise the next commission's sequence; the wrap is applied at launch.
+    reviewer_wrap: tuple[Path, str] | None = None
+    if sandbox.records_sandbox(state):
+        _block, _socket, control = sandbox.run_sandbox(state, repo)
+        policy_path = control / sandbox.REVIEWER_POLICY_NAME
+        tmpdir = sandbox.read_record(control).get("tmpdir")
+        missing = []
+        if not policy_path.is_file():
+            missing.append(f"its reviewer policy {policy_path} is missing")
+        if not isinstance(tmpdir, str) or not tmpdir:
+            missing.append(f"its record {control / sandbox.RECORD_NAME} names no temp dir")
+        if missing:
+            raise PmError(
+                f"this run records a sandbox, but {' and '.join(missing)}; "
+                "refusing to run the reviewer outside the sandbox"
+            )
+        if shutil.which("srt") is None:
+            raise PmError(sandbox.SRT_MISSING)
+        reviewer_wrap = (policy_path, tmpdir)
+
     run_id = state["run_id"]
     plan_slices = plan_mod.parse_plan(Path(state["plan"]["path"]))
     plan_slice = plan_mod.plan_slice_by_id(plan_slices, slice_id)
@@ -364,7 +471,12 @@ def run_review(
     # Per-commission, so a later commission cannot replace the pinned diff a
     # running reviewer has not opened yet.
     diff_path = original_slice_dir / f"review-{seq}-{skill}-{resolved_tool}.patch"
-    git_ops.write_git_diff(repo, before_head, reviewed_head, diff_path)
+    # The pinned diff lives under the run dir (`.git/pm/...`, host-only), not
+    # `.pm/`, so a plain write is correct; the error sidecar sits beside it.
+    diff_text, diff_error = git_ops.git_diff_text(repo, before_head, reviewed_head)
+    diff_path.write_text(diff_text, encoding="utf-8")
+    if diff_error is not None:
+        (diff_path.parent / "git-diff-error.txt").write_text(diff_error, encoding="utf-8")
     if before_head and before_head != reviewed_head:
         changed_files = sorted(
             path for path in git_ops.git(repo, "diff", "--name-only", before_head, reviewed_head).splitlines() if path
@@ -395,6 +507,10 @@ def run_review(
         )
     )
     origin_event = _commission_origin(run_dir, slice_id)
+    # The reviewer runs inside a sandbox either way: inherited, when this PM
+    # already runs under `srt` (a campaign child), or wrapped at launch below,
+    # when the run records a sandbox of its own (Mode B).
+    sandboxed = sandbox.inside_sandbox() or sandbox.records_sandbox(state)
     prompt_text = prompts.render_reviewer_prompt(
         # Never handed to a drift audit itself: a second audit of the same
         # commit must stay independent of the first one's verdict.
@@ -414,6 +530,10 @@ def run_review(
         authorized_surface=sections.get("Authorized Surface", "").rstrip(),
         explicit_non_goals=sections.get("Explicit Non-Goals", "").rstrip(),
         risk_flags=sections.get("Risk Flags", "").rstrip(),
+        validation_plan=sections.get("Validation Plan", "").rstrip(),
+        validation_record=_read_validation_record(repo, slice_ops.slice_artifact_dir(repo, run_id, slice_id)),
+        include_reference=_reference_filter(changed_files),
+        sandboxed=sandboxed,
     )
 
     # Checked here, not in compose_reviewer_command, which stays pure and
@@ -438,6 +558,7 @@ def run_review(
         effort=resolved_effort,
         repo=repo,
         reviewer_command_override=reviewer_command,
+        sandboxed=sandboxed,
     )
 
     report_relative = f"{slice_ops.slice_relative_dir(slice_id)}/review-{seq}-{skill}-{resolved_tool}.md"
@@ -454,14 +575,24 @@ def run_review(
 
     # The reviewer process must not inherit the PM run capability token from
     # the controller's exported environment: the token is the controller's
-    # alone, and SKILL.md forbids it in any Reviewer session.
-    reviewer_env = {key: value for key, value in os.environ.items() if key != "PM_RUN_TOKEN"}
+    # alone, and SKILL.md forbids it in any Reviewer session. Nor does it
+    # inherit the supervising session's own variables (`SEAT_ENV_DROPPED`).
+    reviewer_env = sessions.seat_environ()
+
+    # The wrap checked above is applied here, at launch, so nothing recorded
+    # about the commission sees it. `srt` starts in this new session as its
+    # group leader and the reviewer shares that group, so the timeout's
+    # killpg below still reaches every process.
+    popen_command = command
+    if reviewer_wrap is not None:
+        policy_path, tmpdir = reviewer_wrap
+        popen_command = sandbox.wrap_command(policy_path, command, tmpdir=tmpdir)
 
     with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:
         process = subprocess.Popen(
             # stdin=DEVNULL: `codex exec` blocks on inherited stdin ("Reading
             # additional input from stdin...") and the hang looks like a slow model.
-            command,
+            popen_command,
             cwd=str(repo),
             stdout=stdout_handle,
             stderr=stderr_handle,
@@ -473,6 +604,7 @@ def run_review(
         # leader, so its pgid equals its pid at creation time — no
         # getpgid() race against a fast-exiting process.
         pgid = process.pid
+        launched_at = state_mod.utc_now_iso()
         # Persist before waiting so `stop` can reap every parallel reviewer.
         with state_mod.locked_update(run_dir, token) as live_state:
             live_current = live_state.get("current_slice")
@@ -484,6 +616,22 @@ def run_review(
         print(
             f"reviewer launched: pgid={pgid} report={report_original} stderr={stderr_path}",
             flush=True,
+        )
+        # Durable counterpart of the line above: lets a later reader tell how
+        # long a reviewer ran, and that one was started even if it never finishes.
+        state_mod.append_event(
+            run_dir,
+            "review-launched",
+            slice_id=slice_id,
+            note=f"{skill} via {resolved_tool}",
+            data={
+                "skill": skill,
+                "tool": resolved_tool,
+                "model": resolved_model,
+                "effort": recorded_effort,
+                "sequence": seq,
+                "pgid": pgid,
+            },
         )
         timed_out = False
         try:
@@ -525,7 +673,8 @@ def run_review(
         # `reviewer_pids` before killing the group; that is PM's choice, not
         # the reviewer's failure. Decided before the filter below removes
         # the pgid, and only for failed exits: a reviewer that exited 0 is
-        # recorded as a review whatever `reviewer_pids` holds.
+        # recorded as a review (or, with an empty report, failed on that
+        # ground below) whatever `reviewer_pids` holds.
         if failed:
             reaped = current is None or pgid not in (current.get("reviewer_pids") or [])
         if current is not None and current.get("reviewer_pids"):
@@ -534,13 +683,20 @@ def run_review(
     if reaped:
         raise PmError(f"reviewer was reaped by a PM decision (process group {pgid}); not recorded as a failure")
 
-    if failed:
-        reason = "timeout" if timed_out else f"exit {returncode}"
-        note = (
-            f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed"
-            if timed_out
-            else f"{skill} via {resolved_tool} exited {returncode}"
-        )
+    # A reviewer that exits 0 having written nothing (one died mid-investigation
+    # in the shakedown) is a failed review, not a blank one that would satisfy
+    # the freshness check; it is read like a non-zero exit, via its stderr.
+    empty = not failed and not report_original.read_text(encoding="utf-8", errors="replace").strip()
+    if failed or empty:
+        if timed_out:
+            reason = "timeout"
+            note = f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed"
+        elif failed:
+            reason = f"exit {returncode}"
+            note = f"{skill} via {resolved_tool} exited {returncode}"
+        else:
+            reason = "empty report"
+            note = f"{skill} via {resolved_tool} exited 0 with an empty report"
         state_mod.append_event(
             run_dir,
             "review-failed",
@@ -569,6 +725,12 @@ def run_review(
         stderr_tail = _tail(stderr_path)
         raise PmError(f"reviewer command failed (exit {returncode}): {stderr_tail}")
 
+    if empty:
+        raise PmError(
+            f"reviewer exited 0 but wrote an empty report; its stderr is at {stderr_path}: "
+            "read it, then re-commission the review"
+        )
+
     report_original = slice_ops.mirror_artifact(repo, run_dir, run_id, report_relative)
     sha256 = slice_ops.sha256_file(report_original)
 
@@ -590,6 +752,7 @@ def run_review(
                     "before_head": before_head,
                     "artifact": str(report_original),
                     "sha256": sha256,
+                    "launched_at": launched_at,
                     "at": state_mod.utc_now_iso(),
                     # How many surface grants this reviewer's prompt showed.
                     # `is_review_fresh` stales the review as soon as the slice

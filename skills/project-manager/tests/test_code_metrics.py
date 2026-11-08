@@ -89,6 +89,24 @@ class TestLinesAndComplexity(CodeMetricsTestCase):
             },
         )
 
+    def test_test_named_files_count_as_test_code_and_a_near_miss_stays_production(self) -> None:
+        before = self._git("rev-parse", "HEAD").stdout.strip()
+        head = self.commit(
+            {
+                "tool/selftest.py": "a = 1\n",
+                "tool/selftest_probe.py": "b = 2\n",
+                "tool/mod_test.py": "c = 3\n",
+                "tool/test_mod.py": "d = 4\n",
+                "tests/helper.py": "e = 5\n",
+                "tool/contest.py": "f = 6\n",
+            }
+        )
+
+        lines = code_metrics.code_block(self.repo, before, head)["lines"]
+
+        self.assertEqual(lines["test"]["code"], 5)
+        self.assertEqual(lines["production"]["code"], 1)
+
     def test_deleted_file_is_negative_and_unchanged_count_is_zero(self) -> None:
         before = self.commit(
             {

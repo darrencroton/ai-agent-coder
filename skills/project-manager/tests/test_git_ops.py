@@ -7,7 +7,9 @@ temporary repository with actual commits rather than string fixtures.
 
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +68,24 @@ class TestSurfaceMatching(unittest.TestCase):
         self.assertEqual(git_ops.normalize_authorized_entry("README.md."), "README.md")
 
 
+class TestProtectedMatching(unittest.TestCase):
+    def test_plain_directory_entry_covers_its_subtree_and_itself_but_not_a_sibling_prefix(self) -> None:
+        protected = ["instruments"]
+        self.assertTrue(git_ops.is_protected_path("instruments/check.py", protected))
+        self.assertTrue(git_ops.is_protected_path("instruments", protected))
+        self.assertFalse(git_ops.is_protected_path("instrumentsx/a", protected))
+        # The authorized-surface matcher must never widen the same way.
+        self.assertFalse(git_ops.is_authorized_path("instruments/check.py", protected))
+
+    def test_slash_glob_and_exact_entries_behave_as_the_authorized_matcher(self) -> None:
+        self.assertTrue(git_ops.is_protected_path("src/deep/a.py", ["src/"]))
+        self.assertFalse(git_ops.is_protected_path("srcx/a.py", ["src/"]))
+        self.assertTrue(git_ops.is_protected_path("src/a.py", ["src/*.py"]))
+        self.assertFalse(git_ops.is_protected_path("src/deep/a.py", ["src/*.py"]))
+        self.assertTrue(git_ops.is_protected_path("policy.json", ["`policy.json` (the policy)"]))
+        self.assertFalse(git_ops.is_protected_path("policy.json.bak", ["policy.json"]))
+
+
 class TestStatusParsing(unittest.TestCase):
     def test_leading_space_status_code_preserved(self) -> None:
         # An unstaged modify: code is " M" (leading space is meaningful, not stripped).
@@ -118,6 +138,43 @@ class TestGitFacts(PmTestCase):
         self.assertIn("committed.py", changed)
         self.assertIn("dirty.py", changed)
 
+    def test_changed_files_between_reports_both_sides_of_a_committed_rename(self) -> None:
+        """Without `--no-renames`, git reports only a rename's destination, so
+        a file moved out of a protected or unauthorized path would be invisible
+        to fact 5. Covers both the diff branch and the unborn-before `show`
+        branch."""
+        (self.repo / "protected").mkdir()
+        (self.repo / "protected" / "check.py").write_text("print('instrument')\n" * 20, encoding="utf-8")
+        self._git("add", "protected/check.py")
+        self._git("commit", "-q", "-m", "add protected/check.py")
+        before_head = git_ops.git_head(self.repo)
+        (self.repo / "src").mkdir()
+        self._git("mv", "protected/check.py", "src/check.py")
+        self._git("commit", "-q", "-m", "move check.py")
+        after_head = git_ops.git_head(self.repo)
+        after_status = git_ops.git_status_text(self.repo)
+
+        between = git_ops.changed_files_between(self.repo, before_head, after_head, after_status)
+        self.assertEqual(between, {"protected/check.py", "src/check.py"})
+        shown = git_ops.changed_files_between(self.repo, None, after_head, after_status)
+        self.assertEqual(shown, {"protected/check.py", "src/check.py"})
+
+    def test_dirty_rename_reports_both_sides(self) -> None:
+        """The dirty-tree counterpart of the committed-rename test: plain
+        `git status` collapses an uncommitted `git mv` to its destination."""
+        (self.repo / "protected").mkdir()
+        (self.repo / "protected" / "check.py").write_text("print('instrument')\n" * 20, encoding="utf-8")
+        self._git("add", "protected/check.py")
+        self._git("commit", "-q", "-m", "add protected/check.py")
+        head = git_ops.git_head(self.repo)
+        (self.repo / "src").mkdir()
+        self._git("mv", "protected/check.py", "src/check.py")
+        status = git_ops.git_status_text(self.repo)
+
+        expected = {"protected/check.py", "src/check.py"}
+        self.assertEqual(git_ops.status_changed_files(status), expected)
+        self.assertEqual(git_ops.changed_files_between(self.repo, head, head, status), expected)
+
     def test_commit_is_descendant_true(self) -> None:
         before_head = git_ops.git_head(self.repo)
         (self.repo / "next.py").write_text("z = 3\n", encoding="utf-8")
@@ -163,15 +220,13 @@ class TestGitFacts(PmTestCase):
             linked_dir = git_ops.worktree_git_dir(linked_path)
             self.assertNotEqual(main_dir, linked_dir)
 
-    def test_write_git_diff_produces_a_patch_for_working_tree_change(self) -> None:
+    def test_git_diff_text_produces_a_patch_for_working_tree_change(self) -> None:
         (self.repo / "README.md").write_text("hello, changed\n", encoding="utf-8")
-        destination = self.repo / "diff.patch"
-        git_ops.write_git_diff(self.repo, None, None, destination)
-        content = destination.read_text(encoding="utf-8")
+        content, error = git_ops.git_diff_text(self.repo, None, None)
         self.assertIn("README.md", content)
-        self.assertFalse((destination.parent / "git-diff-error.txt").exists())
+        self.assertIsNone(error)
 
-    def test_write_git_diff_covers_first_commit_on_unborn_branch_run(self) -> None:
+    def test_git_diff_text_covers_first_commit_on_unborn_branch_run(self) -> None:
         # A run initialized before the first commit has before_head=None; the
         # committed slice must still appear in the evidence patch, mirroring
         # changed_files_between's `git show` handling of the same case.
@@ -179,19 +234,41 @@ class TestGitFacts(PmTestCase):
         self._git("add", "new-file.txt")
         self._git("commit", "-q", "-m", "first slice commit")
         after_head = git_ops.git_head(self.repo)
-        destination = self.repo / "diff.patch"
-        git_ops.write_git_diff(self.repo, None, after_head, destination)
-        content = destination.read_text(encoding="utf-8")
+        content, error = git_ops.git_diff_text(self.repo, None, after_head)
         self.assertIn("new-file.txt", content)
-        self.assertFalse((destination.parent / "git-diff-error.txt").exists())
+        self.assertIsNone(error)
 
-    def test_write_git_diff_writes_error_sidecar_on_bad_ref(self) -> None:
-        destination = self.repo / "diff.patch"
-        git_ops.write_git_diff(self.repo, "0" * 40, "1" * 40, destination)
-        self.assertEqual(destination.read_text(encoding="utf-8"), "")
-        sidecar = destination.parent / "git-diff-error.txt"
-        self.assertTrue(sidecar.exists())
-        self.assertTrue(sidecar.read_text(encoding="utf-8").strip())
+    def test_gitlink_in_index_is_refused_by_status_and_worktree_diff(self) -> None:
+        # A gitlink makes the host's `git status` and ref-less `git diff` execute
+        # the submodule's configuration, so both refuse before running anything.
+        # `--cacheinfo` plants the entry without a populated submodule.
+        head = git_ops.git_head(self.repo)
+        self._git("update-index", "--add", "--cacheinfo", f"160000,{head},sub")
+        self.assertEqual(git_ops.gitlinks(self.repo), ["sub"])
+        with self.assertRaisesRegex(PmError, "submodules are not supported.*sub"):
+            git_ops.git_status_text(self.repo)
+        with self.assertRaisesRegex(PmError, "submodules are not supported.*sub"):
+            git_ops.git_diff_text(self.repo, None, None)
+
+    def test_a_gitlink_whose_name_is_not_utf8_is_listed_not_a_decode_error(self) -> None:
+        # The listing is read as bytes: a non-UTF-8 path reaches the refusal
+        # (surrogate-escaped) instead of raising UnicodeDecodeError.
+        name = b"sub\xff".decode("utf-8", "surrogateescape")
+        head = git_ops.git_head(self.repo)
+        argv = ["git", "-C", str(self.repo), "update-index", "--add", "--cacheinfo", f"160000,{head},{name}"]
+        # os.fsencode restores the raw byte from its surrogate escape.
+        planted = subprocess.run([os.fsencode(arg) for arg in argv], capture_output=True, check=False)
+        if planted.returncode != 0:
+            self.skipTest(f"git refused a non-UTF-8 index path here: {planted.stderr!r}")
+        self.assertEqual(git_ops.gitlinks(self.repo), [name])
+        with self.assertRaisesRegex(PmError, "submodules are not supported"):
+            git_ops.git_status_text(self.repo)
+
+    def test_git_diff_text_returns_empty_diff_and_error_text_on_bad_ref(self) -> None:
+        content, error = git_ops.git_diff_text(self.repo, "0" * 40, "1" * 40)
+        self.assertEqual(content, "")
+        self.assertIsNotNone(error)
+        self.assertTrue(error.strip())
 
     def test_resolve_repo_and_resolve_plan(self) -> None:
         resolved = git_ops.resolve_repo(self.repo)
