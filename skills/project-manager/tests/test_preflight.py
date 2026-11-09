@@ -54,7 +54,9 @@ class PreflightTestCase(PmTestCase):
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.dossier)], check=True)
         self._commit_dossier()
 
-    def write_brief(self, *, policy_sha: str | None = None, setup_sha: str | None = None, extra: str = "") -> None:
+    def write_brief(
+        self, *, policy_sha: str | None = None, setup_sha: str | None = None, extra: str = "", output_line: bool = True
+    ) -> None:
         policy_sha = policy_sha or _sha(POLICY)
         setup_sha = setup_sha or _sha(self.setup)
         (self.dossier / "brief.md").write_text(
@@ -63,7 +65,8 @@ class PreflightTestCase(PmTestCase):
             "## Allowed paths\n"
             f"- Node worktree parent: `{self.parent}`.\n"
             f"- Protected-paths policy file: `campaign-policy.json`, SHA-256 `{policy_sha}`.\n"
-            f"## Worktree setup\n- `setup.sh` in this dossier, SHA-256 `{setup_sha}`.\n"
+            + ("- Git-ignored output directories: none\n" if output_line else "")
+            + f"## Worktree setup\n- `setup.sh` in this dossier, SHA-256 `{setup_sha}`.\n"
             f"## Budgets\n- max_parallel: 1{extra}\n",
             encoding="utf-8",
         )
@@ -211,6 +214,60 @@ class TestPreflight(PreflightTestCase):
         self.assertIn("integration head descends from the base", failed)
         self.assertIn("brief has a Worktree setup section", failed)
         self.assertTrue(any(f.startswith("integration checkout") for f in failed), failed)
+
+    def test_product_exclusions_are_counted_a_path_absent_at_the_head_is_a_note_and_a_bad_one_fails(self) -> None:
+        code, out, err = self.preflight()
+        self.assertIn("ok    exclusions: none\n", out)
+        self.write_brief(
+            extra="\n## Exclusions\n- product: `campaign-policy.json`\n- product: docs/dev/\n- ~/Obsidian\n"
+        )
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ok    exclusions: 2 product path(s)\n", out)
+        notes = [line for line in out.splitlines() if line.startswith("note  exclusions:")]
+        # One glob note per path, and the absent-path note for docs/dev.
+        self.assertEqual(len(notes), 3, out)
+        self.assertIn("denies /**/campaign-policy.json", notes[0])
+        self.assertIn("product path docs/dev is not in the integration head's tree", notes[2])
+        self.assertIn("ok    output directories: none\n", out)
+        for extra in ("", "\n## Elsewhere\n- Git-ignored output directories: output/\n"):
+            with self.subTest(extra=extra):
+                self.write_brief(output_line=False, extra=extra)
+                self._commit_dossier()
+                code, out, err = self.preflight()
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("brief names its git-ignored output directories", self.failures(out))
+        self.write_brief(extra="\n## Exclusions\n- product: /abs/docs/dev\n")
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 1, out + err)
+        # The trial cannot apply exclusions it cannot read, so it is skipped too.
+        self.assertEqual(self.failures(out), ["setup.sh trial", "brief's Exclusions product: lines name product paths"])
+        self.assertIn("'- product: /abs/docs/dev' is absolute", out)
+
+    def test_the_trial_applies_the_exclusions_and_fails_a_setup_that_recreates_one(self) -> None:
+        (self.repo / "secret").mkdir()
+        (self.repo / "secret" / "x.txt").write_text("owner notes\n", encoding="utf-8")
+        self._git("add", "secret")
+        self._git("commit", "-q", "-m", "owner's notes")
+        self._git("branch", "-f", "integration/t", "HEAD")
+        exclusions = "\n## Exclusions\n- product: secret\n"
+        self.write_brief(extra=exclusions)
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 0, out + err)
+        # An identical copy: `mkdir` succeeds only if the sparse checkout removed
+        # `secret/`, and `git status` stays clean, so only the path check fails it.
+        self.setup = "mkdir secret\nprintf 'owner notes\\n' > secret/x.txt\n"
+        (self.dossier / "setup.sh").write_text(self.setup, encoding="utf-8")
+        self.write_brief(extra=exclusions)
+        self._commit_dossier()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(self.failures(out), ["setup.sh runs in a fresh worktree and leaves it clean"])
+        self.assertIn("the brief excludes secret, but the worktree holds it after setup", out)
+        self.assertEqual(self._git("worktree", "list", "--porcelain").stdout.count("worktree "), 1)
 
     def test_the_command_takes_no_run_or_token(self) -> None:
         import argparse

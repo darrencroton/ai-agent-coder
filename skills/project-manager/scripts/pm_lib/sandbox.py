@@ -14,9 +14,11 @@ was started with. This module is the toolkit's one seam onto that mechanism:
   the first two carrying the denies that keep a pane from redirecting the
   host's next git command (the repository's config and hooks, and the
   pointer files `commondir`, `gitdir` and `config.worktree`, denied in every
-  checkout because git honours them in a plain one too), plus the refusal of
-  a write grant reaching `srt`'s own installation or the launchers the host
-  runs it through (`check_binaries`);
+  checkout because git honours them in a plain one too), a grant on the
+  worktree's own Claude Code transcript directory and, in the server's
+  policy, an any-depth deny of each of a campaign brief's product
+  exclusions, plus the refusal of a write grant reaching `srt`'s own installation or the
+  launchers the host runs it through (`check_binaries`);
 - the host-only control directory and its record (`control_dir`,
   `write_record`, `read_record`), and the per-run temp directory
   (`make_tmpdir`, `remove_tmpdir`);
@@ -24,8 +26,9 @@ was started with. This module is the toolkit's one seam onto that mechanism:
   (`start_server`, `verify_server`, `stop_server`), and a one-shot command
   wrapped the same way (`wrap_command`); the one teardown both modes share
   (`tear_down`), whose structured `TeardownOutcome` they decide from;
-- a campaign brief's sandbox pin, which `launch-child` and
-  `campaign-preflight` both read (`find_brief`, `brief_sandbox_pin`);
+- a campaign brief's sandbox pin and product exclusions, which
+  `launch-child` and `campaign-preflight` both read (`find_brief`,
+  `brief_sandbox_pin`, `brief_product_exclusions`);
 - a Mode B run's server: the socket every command of a sandboxed run must
   be pointed at (`require_run_socket`), the three policies its control
   directory holds (`derive_run_policies`), the server `start-slice` ensures,
@@ -41,8 +44,9 @@ symbolic links followed. A pattern entry (a string holding `*`, `?`, `[` or
 that whole directory, which fails toward refusing. An entry written as
 `{"path": ..., "literal": true}` is never a pattern, so every filesystem entry
 the toolkit derives itself is written that way: a worktree under `work[1]`
-must not also grant `work1`. Base-policy entries stay as the operator wrote
-them.
+must not also grant `work1`. The one exception is a product exclusion's
+`denyRead` entry, a deliberate glob (see `derive_policy`). Base-policy
+entries stay as the operator wrote them.
 
 The base-policy refusals are listed once, in `load_pinned_policy`'s
 docstring; `check_binaries` adds the refusal of a write grant reaching `srt`
@@ -135,6 +139,19 @@ _SANDBOX_SECTION = re.compile(r"^##\s+Sandbox\s*$(.*?)(?=^##\s|\Z)", re.M | re.S
 _PIN_SHA256 = re.compile(r"SHA-256 `([0-9a-f]{64})`")
 # `none` as the whole section, give or take one list marker, whitespace and case.
 _NONE_ONLY = re.compile(r"\s*(?:(?:[-*+]|\d+[.)])\s+)?none\s*", re.I)
+# A brief's `## Exclusions` section and one `product:` item in it, which
+# `launch-child` enforces (`brief_product_exclusions`).
+_EXCLUSIONS_SECTION = re.compile(r"^##\s+Exclusions\s*$(.*?)(?=^##\s|\Z)", re.M | re.S | re.I)
+_PRODUCT_ITEM = re.compile(r"^\s*[-*+]\s+product:(.*)$", re.I)
+# Characters that would make an exclusion a pattern, to `git sparse-checkout`
+# or to `srt`, rather than the one path the owner named.
+_EXCLUSION_PATTERN_CHARS = re.compile(r"[*?\[\]\\]")
+# A brief's `## Allowed paths` section and its `Git-ignored output
+# directories:` item, which `stop-child --archive` copies out of a node
+# worktree (`brief_output_directories`); the label opens the item, as
+# `preflight._pin_line` matches labels.
+_ALLOWED_PATHS_SECTION = re.compile(r"^##\s+Allowed paths\s*$(.*?)(?=^##\s|\Z)", re.M | re.S | re.I)
+_OUTPUT_DIRECTORIES_ITEM = re.compile(r"^\s*[-*+]\s+Git-ignored output directories:(.*)$", re.I)
 
 # `srt` processes this process started, by pid. The server outlives
 # `start_server`, so its `Popen` is kept here rather than dropped while still
@@ -544,6 +561,31 @@ def _repository_reads(worktree: Path, common: Path, extra_read: Iterable[Path | 
     return [_literal(worktree), _literal(common), _literal(toolkit_root()), *(_literal(path) for path in extra_read)]
 
 
+def _claude_transcript_dir(worktree: Path) -> Path:
+    """Where Claude Code keeps the transcripts of a session started in
+    `worktree`: `~/.claude/projects/<mangled>`, `<mangled>` being the
+    worktree's real absolute path with every character outside
+    `[A-Za-z0-9]` replaced by `-`. That is Claude Code's observed
+    convention, not a documented interface, so it is kept in this one place."""
+    return Path.home() / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(_real(worktree)))
+
+
+def _grant_transcripts(filesystem: dict[str, Any], worktree: Path) -> None:
+    """Grant reads and writes on `worktree`'s Claude Code transcript
+    directory (`_claude_transcript_dir`), as literal entries.
+
+    A base policy denies `~/.claude/projects` so that no seat reads other
+    sessions' transcripts; this re-allows the one directory a seat working
+    here writes its own into. It must be literal: a glob grant reaches the
+    directory it matches but not the files a seat then writes inside it
+    (`srt` 0.0.81, sandbox.md *The base policy*). It is per worktree, inert
+    when no seat runs Claude Code, and unconditional, because the launch
+    knows only the supervising seat's harness, not every seat's."""
+    transcripts = _literal(_claude_transcript_dir(worktree))
+    filesystem["allowRead"].append(transcripts)
+    filesystem["allowWrite"].append(copy.deepcopy(transcripts))
+
+
 def derive_policy(
     base: dict[str, Any],
     *,
@@ -554,6 +596,7 @@ def derive_policy(
     control_root: Path,
     pm_inside: bool,
     extra_read: Iterable[Path | str] = (),
+    exclusions: Iterable[str] = (),
 ) -> dict[str, Any]:
     """The server's effective policy: `base` plus the toolkit's grants and
     denies for `worktree` on `branch`. `base` is not mutated.
@@ -565,9 +608,20 @@ def derive_policy(
     (`pm_inside`, Mode C), the ledger directory. `denyWrite`, which `srt`
     ranks above every grant, gains `_repository_denies` and, when the PM runs
     outside (Mode B), the state root `<git dir>/pm`. Reads gain the
-    worktree, the common dir, the toolkit checkout and `extra_read`; the
-    socket becomes reachable and `allowPty` is set. Every filesystem entry
-    added here is a literal entry (see the module docstring).
+    worktree, the common dir, the toolkit checkout and `extra_read`; reads
+    and writes gain the worktree's Claude Code transcript directory
+    (`_grant_transcripts`); the socket becomes reachable and `allowPty` is
+    set. Every filesystem entry added so far is a literal entry (see the
+    module docstring).
+
+    `denyRead` gains `/**/<path>` for each of `exclusions`, a campaign
+    brief's product paths (`brief_product_exclusions`), deliberately a glob:
+    `launch-child` removes the path from the node worktree by a sparse
+    checkout, and the glob, which `srt` applies to the subtree beneath every
+    match and ranks above the worktree's read grant, also covers a copy at
+    any depth: a clone a seat makes under the worktree, the temp dir or a
+    reference workspace. The cost is that a full checkout of the product
+    anywhere inside fails, and that a same-named path elsewhere is denied too.
 
     PmError when a base write grant reaches into the repository (see
     `_refuse_repository_grants`).
@@ -598,6 +652,8 @@ def derive_policy(
     if not pm_inside:
         filesystem["denyWrite"].append(_literal(git_dir / "pm"))
     filesystem["allowRead"] += _repository_reads(worktree, common, extra_read)
+    _grant_transcripts(filesystem, worktree)
+    filesystem["denyRead"] += [f"/**/{path}" for path in exclusions]
     policy["network"].setdefault("allowUnixSockets", []).append(socket_grant)
     policy["allowPty"] = True
     return policy
@@ -612,7 +668,8 @@ def derive_reviewer_policy(
     extra_read: Iterable[Path | str] = (),
 ) -> dict[str, Any]:
     """A Mode B reviewer's policy: `base` plus the effective policy's reads
-    and repository denies and a write grant on `tmpdir` only, so the
+    and repository denies, and write grants on `tmpdir` and the worktree's
+    Claude Code transcript directory only (`_grant_transcripts`), so the
     reviewer cannot write the repository; no tmux socket is added, so it
     cannot reach the Developer's server. Same base refusal as
     `derive_policy`; `base` is not mutated."""
@@ -625,6 +682,7 @@ def derive_reviewer_policy(
     filesystem["allowWrite"].append(_literal(_real(tmpdir)))
     filesystem["denyWrite"] += _repository_denies(worktree, git_dir, common, _real(control_root))
     filesystem["allowRead"] += _repository_reads(worktree, common, extra_read)
+    _grant_transcripts(filesystem, worktree)
     policy["allowPty"] = True
     return policy
 
@@ -1875,7 +1933,7 @@ def scavenge_run(state: dict[str, Any], *, repo: Path, run_dir: Path) -> list[st
     return notes
 
 
-# --- A campaign brief's pin ----------------------------------------------------
+# --- A campaign brief's pin and exclusions ---------------------------------------
 
 
 def _git_toplevel(directory: Path) -> Path | None:
@@ -1958,3 +2016,105 @@ def brief_sandbox_pin(text: str) -> str | None:
         f" name {DOSSIER_POLICY_NAME}, and read as no pin, it holds more than `none` alone; write a pinned"
         f" {DOSSIER_POLICY_NAME}, or `- none` as the whole section"
     )
+
+
+def brief_product_exclusions(text: str) -> list[str]:
+    """The product paths a brief's `## Exclusions` section names, in order
+    and without repeats: each list item opening `product:` (any case) names
+    one path relative to the product repository's root, read with its
+    whitespace, surrounding backticks and trailing `/` removed. `[]` when
+    there is no such section or no such item; every other item is free text
+    for the seats.
+
+    `launch-child` removes each path from the node worktree by a sparse
+    checkout and the derived policy denies it at any depth, so a path that
+    would name something other than the one the owner wrote is refused with
+    PmError naming its line: an empty path, an absolute one, an empty, `.`
+    or `..` component (git would match no path, or one outside the
+    product), or a pattern character (`*`, `?`, `[`, `]`, a backslash) or
+    control character, which either reader would take as a pattern.
+    """
+    match = _EXCLUSIONS_SECTION.search(text)
+    if match is None:
+        return []
+    paths: list[str] = []
+    for line in match.group(1).splitlines():
+        item = _PRODUCT_ITEM.match(line)
+        if item is None:
+            continue
+        path, fault = _product_path(item.group(1))
+        if fault is not None:
+            raise PmError(
+                f"the brief's ## Exclusions line {line.strip()!r} {fault}; a `product:` line names one path relative"
+                " to the product repository's root, such as `- product: docs/dev`"
+            )
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def brief_output_directories(text: str) -> list[str] | None:
+    """The product directories a brief's `## Allowed paths` section names as
+    git-ignored output, in order and without repeats: the value of its
+    `- Git-ignored output directories:` item (label in any case), `none` or
+    a comma-separated list of paths relative to the product repository's
+    root, each read as `brief_product_exclusions` reads a `product:` path.
+    `[]` when its value is `none`; None when there is no such section or
+    item, which `campaign-preflight` reports and the archive reads as none.
+
+    `stop-child --archive` copies each of these directories out of the node
+    worktree before the worktree is removed, and accepts a nested repository
+    only beneath one of them, so a path that would name something other
+    than the directory the owner wrote is refused with PmError naming its
+    line, on the rules `brief_product_exclusions` gives.
+    """
+    match = _ALLOWED_PATHS_SECTION.search(text)
+    if match is None:
+        return None
+    for line in match.group(1).splitlines():
+        item = _OUTPUT_DIRECTORIES_ITEM.match(line)
+        if item is None:
+            continue
+        value = item.group(1).strip().strip("`").strip()
+        if value.lower() == "none":
+            return []
+        paths: list[str] = []
+        for raw in item.group(1).split(","):
+            path, fault = _product_path(raw)
+            if fault is not None:
+                raise PmError(
+                    f"the brief's ## Allowed paths line {line.strip()!r}: {raw.strip()!r} {fault}; the line names"
+                    " `none` or product directories relative to the product repository's root, separated by commas,"
+                    " such as `- Git-ignored output directories: output/, results`"
+                )
+            if path not in paths:
+                paths.append(path)
+        return paths
+    return None
+
+
+def _product_path(raw: str) -> tuple[str, str | None]:
+    """(`raw` read as one product path, why it is refused or None): its
+    whitespace, surrounding backticks and trailing `/` removed, refused when
+    empty, absolute, with an empty, `.` or `..` component (git would match
+    no path, or one outside the product), or holding a pattern character
+    (`*`, `?`, `[`, `]`, a backslash) or control character, which git or
+    `srt` would take as a pattern, or whitespace, parentheses or a
+    backtick, which mean prose beside the path."""
+    path = raw.strip().strip("`").strip()
+    if path.startswith("/"):
+        return path, "is absolute"
+    path = path.rstrip("/")
+    if not path:
+        return path, "names no path"
+    # Prose beside a path ("output/ (plots)", "`plots/` (git-ignored)") would
+    # read as a path that exists nowhere, which an archive would then report
+    # as absent and remove the worktree over: a path holds no whitespace,
+    # parentheses or backticks.
+    if any(ch.isspace() for ch in path) or any(ch in path for ch in "()`"):
+        return path, "holds whitespace, parentheses or a backtick (a path, not prose, with nothing beside it)"
+    if any(part in ("", ".", "..") for part in path.split("/")):
+        return path, "has an empty, `.` or `..` component"
+    if _EXCLUSION_PATTERN_CHARS.search(path) or _BAD_PATH_CHARS.search(path):
+        return path, "holds a pattern or control character"
+    return path, None

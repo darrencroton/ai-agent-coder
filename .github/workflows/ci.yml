@@ -122,7 +122,11 @@ jobs:
           check "deterministic-batch|model-supervised|repair round|circuit breaker|operational_round|session_generation|reserved_skill_sets|PM_AUDIT_VERDICT|audit_provenance|developer-self-audit|prior-slice-context|residual_findings|continuation_notes|assumed-complete|\.ai-pm|schema_version[\"']?[[:space:]]*:[[:space:]]*[\"']?5|pm-reconciliation|stop-with-evidence|run-next|allow-unattended-default|assume-complete" "${HIST[@]}"
           check "reviewer-evidence|unauthorized-files|changed-files-mismatch|result-malformed|residual-ledger-mismatch|commit-missing|dirty-worktree|developer-repairable|context-budget|transient-service-unavailable|idle-no-progress|ledger-retention|integrity-head|slice-id-mismatch|reviewer-unavailable|prior-context-integrity" "${HIST[@]}"
           check "\.ai-pm|pm-slice-contract|PM_REVIEWER_" "${HIST[@]}"
-          check "ORCHESTRATOR_ARTIFACT_ROOT" "${HIST[@]}" ':!skills/orchestrator'
+          # ... except in the PM's review-plan command, which launches
+          # delegate_jobs.py as a subprocess and places its run through that
+          # documented override (the second cross-skill exception, see
+          # pm_lib/__init__.py), its test, and the README row that says so.
+          check "ORCHESTRATOR_ARTIFACT_ROOT" "${HIST[@]}" ':!skills/orchestrator' ':!skills/project-manager/scripts/pm_lib/plan_review.py' ':!skills/project-manager/tests/test_plan_review.py' ':!skills/project-manager/README.md'
           echo "all no-baggage greps clean"
 
       - name: Doc-link reachability (root README and CONTRIBUTING)

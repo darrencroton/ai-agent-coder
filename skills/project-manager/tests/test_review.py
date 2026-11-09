@@ -313,6 +313,37 @@ class TestComposeReviewerCommandSandboxed(unittest.TestCase):
                 self.assertEqual(sandboxed, default)
 
 
+class TestClassifyFailure(unittest.TestCase):
+    """One phrase per class, then the process outcome when no phrase matches."""
+
+    def classify(self, stderr: str, *, timed_out: bool = False, returncode: int | None = 1, empty: bool = False):
+        return review_mod.classify_failure(stderr, timed_out=timed_out, returncode=returncode, empty=empty)
+
+    def test_each_class_is_read_from_one_of_its_phrases(self) -> None:
+        cases = {
+            "limit": "Error: You've hit your usage limit. Try again in 3 hours.",
+            "auth": "Please log in again: your OAuth token has expired",
+            "capacity": "API Error: 529 Overloaded",
+        }
+        for expected, stderr in cases.items():
+            with self.subTest(expected=expected):
+                self.assertEqual(self.classify(stderr), expected)
+
+    def test_a_status_code_matches_only_as_a_whole_number(self) -> None:
+        self.assertEqual(self.classify("HTTP 429 Too Many Requests"), "limit")
+        self.assertEqual(self.classify("wrote 14290 bytes"), "exit 1")
+
+    def test_without_a_phrase_the_outcome_decides(self) -> None:
+        self.assertEqual(self.classify("", timed_out=True, returncode=-9), "timeout")
+        self.assertEqual(self.classify("gave up", returncode=0, empty=True), "empty")
+        self.assertEqual(self.classify("boom", returncode=3), "exit 3")
+
+    def test_a_phrase_wins_over_the_outcome(self) -> None:
+        """A reviewer stuck retrying a rate limit until it times out failed on
+        the limit, which no wait clears."""
+        self.assertEqual(self.classify("429: rate limit exceeded, retrying", timed_out=True), "limit")
+
+
 class TestRenderReviewerPrompt(unittest.TestCase):
     def _render(self, **overrides) -> str:
         fields = dict(
@@ -553,6 +584,14 @@ class TestRenderReviewerPrompt(unittest.TestCase):
 
 
 class ReviewCommandTestCase(PmTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # A failure a wait may clear is re-commissioned after this many
+        # seconds; no test here waits a real minute for it.
+        patcher = mock.patch.object(review_mod, "RETRY_WAIT_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _plan_path(self) -> Path:
         # Kept outside self.repo for the same reason as the slice-ops tests:
         # an untracked plan.md inside the worktree trips the clean-worktree
@@ -1093,9 +1132,10 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
 
         reloaded = state_mod.load_state(run_dir, token)
         self.assertEqual(reloaded["slices"][0].get("reviews") or [], [])
+        # An empty report is a failure a wait may clear: one same-seat retry.
         failed = [e for e in state_mod.read_events(run_dir) if e["kind"] == "review-failed"]
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["data"]["reason"], "empty report")
+        self.assertEqual([event["data"]["reason"] for event in failed], ["empty", "empty"])
+        self.assertNotIn("exit_code", failed[0]["data"])
 
     def test_a_failed_commissions_prompt_survives_its_retry(self) -> None:
         """The whole point of persisting the prompt is auditing what a reviewer
@@ -1133,22 +1173,24 @@ class TestReviewEndToEnd(ReviewCommandTestCase):
 
         # A multi-line ruling also proves newline collapsing: the block sits
         # above the frozen contract, so an embedded newline could otherwise
-        # imitate a later prompt section.
+        # imitate a later prompt section. The failing call makes two
+        # commissions (an unclassified exit earns one same-seat retry), and
+        # the retry's prompt must not overwrite the first one either.
         self.assertEqual(commission(failing, "first ruling\nsmuggled second line"), 2)
         self.assertEqual(commission(passing, "second ruling"), 0)
 
         slice_dir = run_dir / "slices" / "slice-001"
         mirror_dir = slice_ops.run_artifact_dir(self.repo, state["run_id"]) / "slices" / "slice-001"
-        first = "review-1-code-review-faketool-prompt.md"
-        second = "review-2-code-review-faketool-prompt.md"
+        first, retry, second = (f"review-{n}-code-review-faketool-prompt.md" for n in (1, 2, 3))
         for directory in (slice_dir, mirror_dir):
-            self.assertTrue((directory / first).is_file(), f"missing {first} in {directory}")
-            self.assertTrue((directory / second).is_file(), f"missing {second} in {directory}")
+            for name in (first, retry, second):
+                self.assertTrue((directory / name).is_file(), f"missing {name} in {directory}")
 
         first_text = (slice_dir / first).read_text(encoding="utf-8")
         second_text = (slice_dir / second).read_text(encoding="utf-8")
         self.assertIn("- first ruling smuggled second line", first_text)
         self.assertNotIn("first ruling\nsmuggled", first_text)
+        self.assertIn("- first ruling smuggled second line", (slice_dir / retry).read_text(encoding="utf-8"))
         self.assertIn("- second ruling", second_text)
         self.assertNotIn("first ruling", second_text)
 
@@ -1469,11 +1511,12 @@ class TestReviewerPidsClearedOnFailure(ReviewCommandTestCase):
         # The failure path must not leave a stale pgid behind for a later
         # `stop` to SIGKILL after PID reuse.
         self.assertEqual(reloaded["current_slice"]["reviewer_pids"], [])
-        # A non-zero exit that no PM decision caused is a recorded failure.
+        # A non-zero exit that no PM decision caused is a recorded failure,
+        # one per commission: nothing in "boom" classes it, so it is retried
+        # once on the same seat and keeps its exit code beside the reason.
         events = state_mod.read_events(run_dir)
         failed = [e for e in events if e["kind"] == "review-failed"]
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["data"]["reason"], "exit 1")
+        self.assertEqual([(e["data"]["reason"], e["data"]["exit_code"]) for e in failed], [("exit 1", 1)] * 2)
 
 
 class TestReviewDirtyWorktreeRefusal(ReviewCommandTestCase):
@@ -1565,8 +1608,11 @@ class TestReviewTimeout(ReviewCommandTestCase):
 
         events = state_mod.read_events(run_dir)
         self.assertEqual([e for e in events if e["kind"] == "review"], [])
+        # A timeout is a failure a wait may clear: one same-seat retry, which
+        # times out too.
         failed = [e for e in events if e["kind"] == "review-failed"]
-        self.assertEqual(len(failed), 1)
+        self.assertEqual(len(failed), 2)
+        self.assertEqual(failed[0]["data"], failed[1]["data"])
         launch_index = next(i for i, e in enumerate(events) if e["kind"] == "launch")
         self.assertEqual(
             failed[0]["data"],
@@ -1793,6 +1839,167 @@ class TestReviewDefaultTimeout(ReviewCommandTestCase):
         # the way are filtered out by construction), and its wait received
         # the default backstop rather than an unbounded None.
         self.assertEqual(reviewer_wait_timeouts, [cli._REVIEW_DEFAULT_TIMEOUT_SECONDS])
+
+
+class TestReviewReCommission(ReviewCommandTestCase):
+    """The bounded re-commission policy end to end. The primary seat is a
+    `--reviewer-command` script that always fails with the given stderr line;
+    the fallback is composed, so it reaches a fake `claude` put first on
+    PATH, ahead of the guard stub, that writes a report."""
+
+    _FALLBACK = "claude claude-opus-5-5 high"
+
+    def setUp(self) -> None:
+        super().setUp()
+        bin_dir = self.repo.parent / "bin"
+        bin_dir.mkdir()
+        _write_fake_reviewer(bin_dir / "claude", 'echo "FALLBACK REVIEW REPORT"')
+        path = mock.patch.dict(os.environ, {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"})
+        path.start()
+        self.addCleanup(path.stop)
+
+    def _review(self, stderr_line: str, *, fallback: str | None = None):
+        """Run one `review`; returns (code, out, err, events, recorded reviews).
+        The run's token and directory are kept on the test for a mid-review hook."""
+        token, before_head, run_dir = self._init_and_advance()
+        self.token, self.run_dir = token, run_dir
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+        primary = _write_fake_reviewer(self.repo.parent / "primary.sh", f'echo "{stderr_line}" 1>&2\nexit 1')
+        argv = ["review", "--slice", "Slice 1", "--skill", "code-review", "--tool", "faketool"]
+        argv += ["--reviewer-command", str(primary), "--token", token]
+        if fallback is not None:
+            argv += ["--fallback", fallback]
+        code, out, err = self.run_cli_in_repo(argv)
+        reviews = state_mod.load_state(run_dir, token)["slices"][0].get("reviews") or []
+        return code, out, err, state_mod.read_events(run_dir), reviews
+
+    @staticmethod
+    def _kinds(events: list[dict], kind: str) -> list[dict]:
+        return [event for event in events if event["kind"] == kind]
+
+    def test_a_capacity_failure_retries_the_same_seat_then_falls_back(self) -> None:
+        code, out, err, events, reviews = self._review("API Error: 503 Service Unavailable", fallback=self._FALLBACK)
+        self.assertEqual(code, 0, err)
+
+        launched = self._kinds(events, "review-launched")
+        self.assertEqual([event["data"]["tool"] for event in launched], ["faketool", "faketool", "claude"])
+        self.assertEqual([event["data"]["sequence"] for event in launched], [1, 2, 3])
+        failed = self._kinds(events, "review-failed")
+        self.assertEqual(
+            [(event["data"]["reason"], event["data"]["exit_code"]) for event in failed], [("capacity", 1)] * 2
+        )
+        self.assertIn(
+            "reviewer failed: review-1 on faketool (--reviewer-command): capacity; retrying the same seat", out
+        )
+        self.assertIn(
+            "reviewer failed: review-2 on faketool (--reviewer-command): capacity; "
+            "falling back to claude claude-opus-5-5 high",
+            out,
+        )
+
+        (review,) = reviews
+        self.assertEqual(review["review_id"], "review-3")
+        self.assertEqual(
+            {key: review[key] for key in ("tool", "model", "effort", "command_override")},
+            {"tool": "claude", "model": "claude-opus-5-5", "effort": "high", "command_override": False},
+        )
+        self.assertIn("FALLBACK REVIEW REPORT", Path(review["artifact"]).read_text(encoding="utf-8"))
+        self.assertEqual(len(self._kinds(events, "review")), 1)
+
+    def test_a_usage_limit_goes_straight_to_the_fallback(self) -> None:
+        code, out, err, events, reviews = self._review(
+            "Error: You've hit your usage limit. Try again in 3 hours.", fallback=self._FALLBACK
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            [event["data"]["tool"] for event in self._kinds(events, "review-launched")], ["faketool", "claude"]
+        )
+        self.assertEqual([event["data"]["reason"] for event in self._kinds(events, "review-failed")], ["limit"])
+        self.assertNotIn("retrying", out)
+        self.assertEqual([review["review_id"] for review in reviews], ["review-2"])
+
+    def test_without_a_fallback_a_usage_limit_fails_at_once(self) -> None:
+        code, out, err, events, reviews = self._review("Error: You've hit your usage limit.")
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self._kinds(events, "review-launched")), 1)
+        self.assertIn("reviewer failed: review-1 on faketool (--reviewer-command): limit\n", out)
+        self.assertIn("every reviewer commission failed (1):", err)
+        self.assertIn("- review-1 on faketool (--reviewer-command): limit (stderr: ", err)
+        self.assertEqual(reviews, [])
+
+    def test_without_a_fallback_a_capacity_failure_retries_once_and_lists_both(self) -> None:
+        code, _out, err, events, reviews = self._review("upstream connection reset by peer")
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self._kinds(events, "review-launched")), 2)
+        self.assertEqual([event["data"]["reason"] for event in self._kinds(events, "review-failed")], ["capacity"] * 2)
+        self.assertIn("every reviewer commission failed (2):", err)
+        for review_id in ("review-1", "review-2"):
+            self.assertIn(f"- {review_id} on faketool (--reviewer-command): capacity (stderr: ", err)
+        # The per-cause advice survives: an exit still shows its stderr tail.
+        self.assertIn("reviewer command failed (exit 1): upstream connection reset by peer", err)
+        self.assertEqual(reviews, [])
+
+    def test_no_retry_once_the_run_has_stopped_during_the_wait(self) -> None:
+        """A retry starts after a wait in which `stop` can land; a reviewer
+        launched after it would review a run that is no longer live."""
+
+        def stop_during_wait(_seconds: float) -> None:
+            with state_mod.locked_update(self.run_dir, self.token) as live:
+                live["status"] = "stopped"
+
+        # Only review's own `time` is replaced: `Popen.wait` sleeps through the
+        # real module, and must not stop the run mid-commission.
+        with mock.patch.object(review_mod, "time", mock.Mock(sleep=stop_during_wait)):
+            code, _out, err, events, _reviews = self._review("API Error: 529 Overloaded", fallback=self._FALLBACK)
+        self.assertEqual(code, 2)
+        self.assertIn("no longer the current in-flight slice of a live run", err)
+        self.assertEqual(len(self._kinds(events, "review-launched")), 1)
+
+    def test_no_retry_once_head_has_moved_during_the_wait(self) -> None:
+        """The pinned range is re-checked before a re-commission: a Developer
+        commit during the wait would otherwise be reviewed under the old head."""
+
+        def commit_during_wait(_seconds: float) -> None:
+            self._advance_head("moved.py")
+
+        with mock.patch.object(review_mod, "time", mock.Mock(sleep=commit_during_wait)):
+            code, _out, err, events, _reviews = self._review("API Error: 529 Overloaded", fallback=self._FALLBACK)
+        self.assertEqual(code, 2)
+        self.assertIn("HEAD has moved past the reviewed head", err)
+        self.assertEqual(len(self._kinds(events, "review-launched")), 1)
+
+    def test_an_unsupported_fallback_variant_refuses_before_any_commission(self) -> None:
+        """The opencode variant check covers the fallback seat too, and runs
+        before the primary is launched, not after it fails."""
+        token, before_head, run_dir = self._init_and_advance()
+        state = state_mod.load_state(run_dir, token)
+        self.set_current_slice(state, token, run_dir, slice_id="Slice 1", before_head=before_head, reviewer_pids=[])
+        self._advance_head()
+        with mock.patch.object(profiles, "query_model_identity", return_value={"variants": ("max",)}):
+            with self.assertRaises(PmError) as ctx:
+                review_mod.run_review(
+                    self.repo,
+                    run_dir,
+                    token,
+                    slice_id="Slice 1",
+                    skill="code-review",
+                    tool="faketool",
+                    reviewer_command="/bin/false",
+                    fallback=("opencode", "prov/m", "high"),
+                )
+        self.assertIn("does not offer variant", str(ctx.exception))
+        self.assertEqual(self._kinds(state_mod.read_events(run_dir), "review-launched"), [])
+
+    def test_a_malformed_fallback_is_a_usage_error_naming_the_form(self) -> None:
+        for value in ("claude", "claude a b c", 'claude "unclosed'):
+            with self.subTest(value=value):
+                code, _out, err = self.run_cli(
+                    ["review", "--slice", "Slice 1", "--skill", "code-review", "--fallback", value]
+                )
+                self.assertEqual(code, 2)
+                self.assertIn('must be "<tool> <model> [<effort>]"', err)
 
 
 class TestReviewLaunchVisibilityOrdering(ReviewCommandTestCase):
@@ -2048,10 +2255,12 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
         self._recorded_socket = socket
         return control
 
-    def _review(self, token: str, *, sandbox_runtime: bool, extra: list[str] | None = None):
-        """Commission one review; returns (code, out, err, reviewer argv as
-        launched or None). `review` resolves the repository from the cwd, so
-        the composed `-C` path is the real one (`/private/var/...` on macOS)."""
+    def _review(self, token: str, *, sandbox_runtime: bool, extra: list[str] | None = None, launches: int = 1):
+        """Commission one review; returns (code, out, err, first reviewer argv
+        as launched or None). At most `launches` reviewers may start: more
+        than one only when a failure is re-commissioned. `review` resolves the
+        repository from the cwd, so the composed `-C` path is the real one
+        (`/private/var/...` on macOS)."""
         argv = [
             "review",
             "--slice",
@@ -2068,7 +2277,7 @@ class SandboxedReviewTestCase(ReviewCommandTestCase):
         ):
             code, out, err = self.run_cli_in_repo(argv)
         launched = [call.args[0] for call in popen.call_args_list if call.kwargs.get("start_new_session")]
-        self.assertLessEqual(len(launched), 1, launched)
+        self.assertLessEqual(len(launched), launches, launched)
         return code, out, err, (launched[0] if launched else None)
 
     def _only_review(self, token: str, run_dir: Path) -> tuple[dict, str, str]:
@@ -2324,10 +2533,12 @@ class TestReviewWrappedInRealSrt(SandboxedReviewTestCase):
             f"sleep {marker + 1}",
         )
         self.addCleanup(subprocess.run, ["pkill", "-f", f"^sleep {marker + 1}$"], check=False)
+        # A timeout earns one same-seat retry, which times out the same way.
         code, out, err, launched = self._review(
             token,
             sandbox_runtime=False,
             extra=["--tool", "faketool", "--reviewer-command", str(fake), "--timeout", "5"],
+            launches=2,
         )
         self.assertEqual(code, 2)
         self.assertIn("timed out", err.lower())

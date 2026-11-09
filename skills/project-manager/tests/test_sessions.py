@@ -58,6 +58,19 @@ class TestScanDialogMarkersPositiveFixtures(unittest.TestCase):
         self.assertTrue(result["present"])
         self.assertIn("trust_prompt", result["kinds"])
 
+    def test_claude_code_safety_check_dialog(self) -> None:
+        """Pinned to the observed screen of Claude Code 2.1.319, whose default
+        is the exit: an unrecognized one ends the session on the launch
+        pointer's Enter, leaving no transcript and no pane to read."""
+        screen = (
+            "Quick safety check: Is this a project you created or one you trust? (Like your\n"
+            "own code, a well-known open source project, or work from your team).\n"
+            "❯ No, exit\n  Yes, I trust this folder\nEnter to confirm · Esc to cancel"
+        )
+        result = sessions.scan_dialog_markers(screen)
+        self.assertTrue(result["present"])
+        self.assertIn("trust_prompt", result["kinds"])
+
     def test_approval_prompt(self) -> None:
         result = sessions.scan_dialog_markers("Do you want to proceed?")
         self.assertTrue(result["present"])
@@ -85,6 +98,18 @@ class TestScanDialogMarkersPositiveFixtures(unittest.TestCase):
         result = sessions.scan_dialog_markers("Grant permission to read this file?")
         self.assertTrue(result["present"])
         self.assertIn("permission_prompt", result["kinds"])
+
+    def test_unquoted_marker_still_matches_bare_and_behind_box_drawing(self) -> None:
+        """The quote exemption is only for a quote directly against the literal;
+        a dialog is rendered bare or inside a TUI frame."""
+        for text, kind in (
+            ("Showing detailed transcript", "transcript_view"),
+            ("│ Do you trust the files in this folder?", "trust_prompt"),
+        ):
+            with self.subTest(text=text):
+                result = sessions.scan_dialog_markers(text)
+                self.assertTrue(result["present"])
+                self.assertIn(kind, result["kinds"])
 
 
 class TestScanDialogMarkersNegativeFixtures(unittest.TestCase):
@@ -127,6 +152,22 @@ class TestScanDialogMarkersNegativeFixtures(unittest.TestCase):
         result = sessions.scan_dialog_markers("PM_TMPDIR=/tmp/tmpq8mfa2z1/fake.sh")
         self.assertFalse(result["present"])
         self.assertEqual(result["kinds"], [])
+
+    def test_quoted_marker_is_a_command_echo_not_a_dialog(self) -> None:
+        """A child PM acknowledged a marker with `observe --seen-marker "…"`;
+        that command line, in the child's own pane, ended `wait-child` on its
+        own echo. Quoted marker text (the command, the toolkit's `dialog
+        marker:` line, prose) is never a dialog a harness renders."""
+        for text in (
+            'python3 pm.py observe --seen-marker "Showing detailed transcript"',
+            "dialog marker: transcript_view (matched 'Showing detailed transcript')",
+            "ran `Showing detailed transcript` earlier",
+            "“Showing detailed transcript”",
+        ):
+            with self.subTest(text=text):
+                result = sessions.scan_dialog_markers(text)
+                self.assertFalse(result["present"])
+                self.assertEqual(result["kinds"], [])
 
     def test_permission_denied_outcome_is_not_a_prompt(self) -> None:
         """An operation that already failed is not a prompt waiting on a human.

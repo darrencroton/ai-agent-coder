@@ -111,6 +111,30 @@ class TestScopeAndCoverage(InRepo):
             with health.archive_revision(Path(repo.path), base) as snapshot:
                 self.assertTrue(Path(snapshot, "tests/heavy.py").is_file())
 
+    def test_base_snapshot_skips_what_the_sparse_checkout_skips(self):
+        """A campaign's exclusion is a sparse checkout; its content must not reach $TMPDIR."""
+        with Repo() as repo:
+            repo.write("secret/notes.py", "private = 1\n")
+            repo.write("src/impl.py", "x = 1\n")
+            base = repo.commit()
+            sh(["git", "sparse-checkout", "set", "--no-cone", "--", "/*", "!/secret"], repo.path)
+            self.assertFalse(Path(repo.path, "secret").exists())
+            with health.archive_revision(Path(repo.path), base) as snapshot:
+                self.assertFalse(Path(snapshot, "secret").exists())
+                self.assertTrue(Path(snapshot, "src/impl.py").is_file())
+
+    def test_base_snapshot_skips_an_excluded_path_present_only_at_the_base(self):
+        with Repo() as repo:
+            repo.write("secret/notes.py", "private = 1\n")
+            repo.write("src/impl.py", "x = 1\n")
+            base = repo.commit()
+            sh(["git", "rm", "-q", "secret/notes.py"], repo.path)
+            repo.commit()
+            sh(["git", "sparse-checkout", "set", "--no-cone", "--", "/*", "!/secret"], repo.path)
+            with health.archive_revision(Path(repo.path), base) as snapshot:
+                self.assertFalse(Path(snapshot, "secret").exists())
+                self.assertTrue(Path(snapshot, "src/impl.py").is_file())
+
     def test_symlink_is_not_followed_and_is_disclosed(self):
         with Repo() as repo:
             repo.write("real/impl.py", "x = 1\n")

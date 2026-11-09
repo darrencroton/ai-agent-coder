@@ -302,6 +302,15 @@ def campaign_preflight(
                 "the committed file differs from the brief's SHA-256; a changed policy is a question to the owner",
             )
 
+    # The brief's product exclusions, read once: the setup trial applies them
+    # as a launch does, and their own check is reported further down.
+    exclusions: list[str] = []
+    exclusions_error: str | None = None
+    try:
+        exclusions = sandbox.brief_product_exclusions(brief)
+    except PmError as exc:
+        exclusions_error = str(exc)
+
     # The owner's worktree setup script, if the brief names one.
     setup_section = _section(brief, "Worktree setup")
     if setup_section is None:
@@ -333,8 +342,14 @@ def campaign_preflight(
                     "setup.sh trial",
                     "skipped: the brief or the owner's files failed their checks above, and an unverified script is never run",
                 )
+            elif exclusions_error is not None:
+                fail(
+                    "setup.sh trial",
+                    "skipped: the brief's Exclusions cannot be read (see below), so the trial could not apply them "
+                    "as a launch would",
+                )
             else:
-                checks.append(_trial_setup(repo, head, setup_path))
+                checks.append(_trial_setup(repo, head, setup_path, exclusions))
     elif "none" not in setup_section.lower():
         fail("Worktree setup names setup.sh or none", "the section is present but names neither")
     else:
@@ -400,6 +415,42 @@ def campaign_preflight(
                             "sandboxing is supported on this host",
                             "sandboxing is implemented for macOS only; launch-child refuses a sandboxed launch here",
                         )
+
+    # The product paths launch-child removes from every node worktree. One
+    # absent from the head is probably a typo, but an excluded path may
+    # legitimately not exist yet, so it is a note for a human.
+    if exclusions_error is not None:
+        fail(
+            "brief's Exclusions product: lines name product paths",
+            f"{exclusions_error}; launch-child refuses this brief",
+        )
+    else:
+        ok(f"exclusions: {len(exclusions)} product path(s)" if exclusions else "exclusions: none")
+        for path in exclusions:
+            # The sandbox deny is a glob at any depth, so a short or common
+            # name hides every same-named path inside the sandbox too.
+            note(f"exclusions: a sandboxed child denies /**/{path}, every path of that name at any depth")
+            if head and git_ops.git_result(repo, "cat-file", "-e", f"{head}:{path}")[0] != 0:
+                note(
+                    f"exclusions: product path {path} is not in the integration head's tree; a typo, or a path"
+                    " that does not exist yet"
+                )
+    # The output directories stop-child --archive copies before it removes a
+    # worktree: a line that does not parse would otherwise be found at the
+    # first archive, after a node has run.
+    try:
+        output_dirs = sandbox.brief_output_directories(brief)
+    except PmError as exc:
+        fail("brief's Git-ignored output directories line names product directories", str(exc))
+    else:
+        if output_dirs is None:
+            fail(
+                "brief names its git-ignored output directories",
+                "add `- Git-ignored output directories: <directories>` or `none` under Allowed paths; without it the"
+                " archive copies nothing before a node worktree is removed",
+            )
+        else:
+            ok(f"output directories: {', '.join(output_dirs)}" if output_dirs else "output directories: none")
 
     # Every other file the brief pins by SHA-256, in the dossier or at the head.
     for name, pinned in _generic_pins(brief, _dedicated_pins(brief)):
@@ -470,20 +521,26 @@ def campaign_preflight(
     return checks
 
 
-def _trial_setup(repo: Path, head: str, setup_path: Path) -> Check:
+def _trial_setup(repo: Path, head: str, setup_path: Path, exclusions: list[str]) -> Check:
     """Run the setup script in a throwaway detached worktree of the integration
-    head with the code `launch-child --setup` uses, then remove the worktree.
-    The log is read before removal, so a failure carries its tail."""
+    head with the code `launch-child --setup` uses, then remove the worktree:
+    the brief's product `exclusions` are removed by the same sparse checkout
+    first, and an excluded path the script recreates fails the trial as it
+    would the launch. The log is read before removal, so a failure carries
+    its tail."""
     name = "setup.sh runs in a fresh worktree and leaves it clean"
     temp = Path(tempfile.mkdtemp(prefix="pm-preflight-"))
     trial = temp / "worktree"
     log = temp / "setup.log"
+    left_behind = "(trial worktree removed)"
     try:
         code, _, err = git_ops.git_result(repo, "worktree", "add", "--detach", "-q", str(trial), head)
         if code != 0:
             return Check(name, False, f"could not add a trial worktree: {err.strip()}")
         try:
-            campaign.run_setup_script(setup_path, trial, log=log, left_behind="(trial worktree removed)")
+            campaign.apply_exclusions(trial, exclusions, left_behind=left_behind)
+            campaign.run_setup_script(setup_path, trial, log=log, left_behind=left_behind)
+            campaign.refuse_excluded_paths(trial, exclusions, left_behind=left_behind)
             result = Check(name, True)
         except PmError as exc:
             tail = " | ".join(campaign.log_tail(log, 10)) or "(no output)"

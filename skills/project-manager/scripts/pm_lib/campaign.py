@@ -24,6 +24,10 @@ The manifest is child-writable, so the server it names is not trusted to be
 the child's: `launch-child` marks the server at launch and `stop-child` kills
 only a server carrying this worktree's mark (see `stop_child`).
 
+`stop-child --archive` also captures the stopped child into the dossier and
+a results root (`archive`) and then removes the node worktree, keeping its
+branch, so nothing the child left is lost with it.
+
 With `--sandbox`, the child's server runs under `srt` (see `sandbox`), so the
 child PM and everything it starts are confined to the policy derived for its
 worktree. The host-only control directory `<common git dir>/pm-sandbox/<socket>/`
@@ -54,6 +58,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import PmError
+from . import TypedNotSubmitted
+from . import archive as archive_mod
 from . import git_ops
 from . import pm_paths
 from . import profiles
@@ -90,7 +96,10 @@ _SOCKET_NAME_MAX = 64
 # `pm-*` Developer sessions the child launches. Anything else is a bystander.
 _OWNED_SESSION_RE = re.compile(r"^(campaign|pm)-")
 # Matches `cm-answer-<n>.md`; `answer-child --redeliver` re-sends the highest `<n>`.
+# Anchored at both ends, so a `cm-answer-<n>-followup-<k>.md` is not an answer.
 _ANSWER_FILE_RE = re.compile(r"^cm-answer-(\d+)\.md$")
+# Matches `cm-answer-<n>-followup-<k>.md`; `answer-child --follow-up` numbers its next from these.
+_FOLLOWUP_FILE_RE = re.compile(r"^cm-answer-(\d+)-followup-(\d+)\.md$")
 # The server-environment mark `launch-child` sets on a child's server: the
 # worktree it was launched for. `stop-child` kills no server without it.
 _OWNER_ENV_VAR = "PM_CHILD_WORKTREE"
@@ -294,6 +303,8 @@ class _ChildLaunch:
     # The launcher's directory and the dossier HEAD, when it lies in a repository.
     node_dir: Path | None = None
     dossier_commit: str | None = None
+    # The brief's `product:` exclusions (`sandbox.brief_product_exclusions`).
+    exclusions: list[str] = field(default_factory=list)
 
 
 # A worktree setup script that has not finished in this long is hung, and a
@@ -330,21 +341,25 @@ def launch_child(
     `git worktree add -b <branch> <worktree> <base commit>`, `/HANDOFF.md` in
     the git exclude file the worktree reads (verified with `git
     check-ignore`), the self-ignoring `.pm/.gitignore`, `.pm/campaign/` and
-    a byte copy of the prompt file as `launcher.md`; then `setup`, when
-    given, runs as `sh <setup>` inside the new worktree with its output kept
-    in `.pm/campaign/setup.log`, so a product's git-ignored scaffolding (data
-    links, a virtualenv link) is in place before any session starts there,
-    and a non-zero exit or a hang fails the launch; then the session starts
-    as `start_slice` starts a Developer's, its server is marked as this
-    child's (`PM_CHILD_WORKTREE`), the manifest is written, readiness is
-    awaited, and the one-line child launch pointer is injected.
+    a byte copy of the prompt file as `launcher.md`; then, when the
+    launcher's dossier brief names `product:` exclusions, a sparse checkout
+    that removes them from the worktree (`apply_exclusions`); then `setup`,
+    when given, runs as `sh <setup>` inside the new worktree with its output
+    kept in `.pm/campaign/setup.log`, so a product's git-ignored scaffolding
+    (data links, a virtualenv link) is in place before any session starts
+    there, and a non-zero exit or a hang fails the launch, as does an
+    excluded path the script recreated (`refuse_excluded_paths`); then the
+    session starts as `start_slice` starts a Developer's, its server is
+    marked as this child's (`PM_CHILD_WORKTREE`), the manifest is written,
+    readiness is awaited, and the one-line child launch pointer is injected.
 
     With `sandbox`, an `srt` base policy, the server is sandboxed: after
     `setup` and before the session, the control directory and the per-run
     temp directory are created, the effective policy (`pm_inside`, the
     launcher's directory readable) and the attach policy are derived and
     written there, the server is started under `srt` and verified by its
-    probes, and its record is written; the session is then created through
+    probes (the effective policy also denies each product exclusion at any
+    depth), and its record is written; the session is then created through
     that server, the manifest gains a `sandbox` block, and `watch` runs the
     attach under the attach policy. When the launcher's dossier brief pins a
     policy (`## Sandbox`), `sandbox` is required and must match the pin.
@@ -381,7 +396,10 @@ def launch_child(
         sandbox=sandbox,
     )
     launcher = _create_node_worktree(launch)
+    left_behind = _left_behind(launch.branch, launch.worktree)
+    apply_exclusions(launch.worktree, launch.exclusions, left_behind=left_behind)
     _run_worktree_setup(launch)
+    refuse_excluded_paths(launch.worktree, launch.exclusions, left_behind=left_behind)
     _start_child_session(launch, launcher)
     # `-t` is the point: a bare `attach` lands on the most recent session,
     # usually a Developer rather than the child PM. A sandboxed server is
@@ -422,8 +440,8 @@ def _check_launch_preconditions(
     sandbox: Path | None = None,
 ) -> _ChildLaunch:
     """Every refusal `launch_child` makes before anything is created: the
-    inputs first (the dossier brief's sandbox pin and the base policy among
-    them), then the environment (tmux, the harness executable, the socket's
+    inputs first (the dossier brief's sandbox pin and product exclusions and
+    the base policy among them), then the environment (tmux, the harness executable, the socket's
     server, for a sandboxed launch `srt` and the platform, the socket's
     sandbox control directory for every launch, and for a sandboxed launch
     its temp directory)."""
@@ -463,12 +481,16 @@ def _check_launch_preconditions(
             raise PmError(f"setup script is blank: {setup}")
         setup = setup.resolve()
     # The launcher's dossier brief: when it pins a sandbox policy, the launch
-    # must be sandboxed under exactly that file, so a CM cannot forget it.
+    # must be sandboxed under exactly that file, so a CM cannot forget it;
+    # its `product:` exclusions are removed from the worktree below.
     brief = sandbox_mod.find_brief(prompt_file)
     pin: str | None = None
+    exclusions: list[str] = []
     if brief is not None:
         try:
-            pin = sandbox_mod.brief_sandbox_pin(brief.read_text(encoding="utf-8"))
+            brief_text = brief.read_text(encoding="utf-8")
+            pin = sandbox_mod.brief_sandbox_pin(brief_text)
+            exclusions = sandbox_mod.brief_product_exclusions(brief_text)
         except (OSError, UnicodeDecodeError) as exc:
             raise PmError(f"the launcher's dossier brief could not be read: {brief} ({exc})") from exc
         except PmError as exc:
@@ -583,6 +605,7 @@ def _check_launch_preconditions(
         launcher_dir=prompt_file.expanduser().resolve().parent,
         node_dir=node_dir,
         dossier_commit=dossier_commit,
+        exclusions=exclusions,
     )
 
 
@@ -651,6 +674,50 @@ def _create_node_worktree(launch: _ChildLaunch) -> Path:
     except (OSError, PmError) as exc:
         raise PmError(f"child setup failed ({exc}); {_left_behind(branch, worktree)}") from exc
     return launcher
+
+
+def apply_exclusions(worktree: Path, exclusions: Sequence[str], *, left_behind: str) -> None:
+    """Remove a brief's product `exclusions` from `worktree`, when there are
+    any, by a non-cone sparse checkout (`/*` and one `!/<path>` per
+    exclusion), then require the worktree clean, as setup is; a failure
+    raises `PmError` ending in `left_behind`. `campaign-preflight`'s setup
+    trial runs the same code, so what it checks is what a launch will do.
+
+    A path the checkout skips is absent from disk, never shown as deleted by
+    `git status` or `git diff` (the index marks it skip-worktree), and left
+    out of what `lint` and `code-health` copy to the temp dir; an OS read
+    denial alone does none of that. In a linked worktree git records the
+    sparse state in the worktree's `config.worktree` and sets
+    `extensions.worktreeConfig` in the product repository's shared config,
+    which outlasts the campaign."""
+    if not exclusions:
+        return
+    patterns = ["/*", *(f"!/{path}" for path in exclusions)]
+    try:
+        git_ops.git(worktree, "sparse-checkout", "set", "--no-cone", "--", *patterns)
+        dirty = git_ops.meaningful_status_lines(git_ops.git_status_text(worktree))
+    except PmError as exc:
+        raise PmError(f"the sparse checkout of the brief's exclusions failed ({exc}); {left_behind}") from exc
+    if dirty:
+        raise PmError(
+            f"the sparse checkout of the brief's exclusions left the worktree dirty outside .pm/ ({'; '.join(dirty)}); "
+            f"{left_behind}"
+        )
+
+
+def refuse_excluded_paths(worktree: Path, exclusions: Sequence[str], *, left_behind: str) -> None:
+    """`PmError` ending in `left_behind` when an excluded path exists in
+    `worktree` after setup: the sparse checkout removed it, so the owner's
+    setup script made it again, which is a conflict in the brief for the
+    owner to resolve. A recreated file identical to the committed one leaves
+    `git status` clean (git then clears its skip-worktree bit), so the path
+    itself is checked."""
+    present = [path for path in exclusions if os.path.lexists(worktree / path)]
+    if present:
+        raise PmError(
+            f"the brief excludes {', '.join(present)}, but the worktree holds it after setup (the setup script "
+            f"recreated what the sparse checkout removed); a question to the owner; {left_behind}"
+        )
 
 
 def _run_worktree_setup(launch: _ChildLaunch) -> None:
@@ -904,6 +971,7 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
                 control_root=control_root,
                 pm_inside=True,
                 extra_read=[launch.launcher_dir] if launch.launcher_dir is not None else [],
+                exclusions=launch.exclusions,
             )
             sandbox_mod.check_binaries(policy)
             attach = sandbox_mod.derive_attach_policy(launch.base_policy, socket=socket, control_root=control_root)
@@ -971,6 +1039,7 @@ def _start_child_session(launch: _ChildLaunch, launcher: Path) -> None:
             manifest["launched_at"] = state_mod.utc_now_iso()
             manifest["dossier_commit"] = launch.dossier_commit
             manifest["node_dir"] = str(launch.node_dir) if launch.node_dir is not None else None
+            manifest["exclusions"] = list(launch.exclusions)
             if control is not None:
                 manifest["sandbox"] = {
                     "policy": str(launch.sandbox),
@@ -1146,21 +1215,39 @@ class AnswerChildOutcome:
     delivered: bool = True
 
 
-def answer_child(worktree: Path, *, text: str | None = None, redeliver: bool = False) -> AnswerChildOutcome:
-    """Deliver the CM's answer to the child's open `cm-question.md`, or re-send the last one.
+def answer_child(
+    worktree: Path,
+    *,
+    text: str | None = None,
+    redeliver: bool = False,
+    follow_up: str | None = None,
+) -> AnswerChildOutcome:
+    """Deliver the CM's answer to the child's open `cm-question.md`, re-send the last one, or follow it up.
 
     With `text`: refused, before any file is touched, with no live session, no
     open question, a completion file already present, or blank text. Delivery
     is `slice_ops.deliver_answer` with the `cm-` prefix — the helper behind
     `pm answer`, with its numbering and its failure handling.
 
-    With `redeliver` (and no `text`): re-sends the pointer for the
+    With `redeliver` (and no other mode): re-sends the pointer for the
     highest-numbered `cm-answer-<n>.md` through `sessions.send_line` and writes
     nothing. Refused with no live session, an open `cm-question.md` (a newer
     question the answer does not address), a completion file, or no answer file.
+
+    With `follow_up` (and no other mode): a further message to a question
+    already answered, for a child that acted on a partial answer. One answer
+    per question is the contract, so the message is a new file,
+    `cm-answer-<n>-followup-<k>.md`, never a second `cm-answer-<n>.md`; it
+    leaves `--redeliver` and the answer numbering alone. Refused, before any
+    file is touched, with no live session, an open `cm-question.md` (answer it
+    with `text`), a completion file, blank text, or no answer to follow up.
+    A follow-up that did not land is sent again as another `follow_up`, not
+    with `redeliver`, which re-sends the answer and not the follow-ups.
     """
-    if redeliver == (text is not None):
-        raise PmError("answer-child takes exactly one of --text (answer the open question) and --redeliver")
+    if [text is not None, redeliver, follow_up is not None].count(True) != 1:
+        raise PmError(
+            "answer-child takes exactly one of --text (answer the open question), --redeliver and --follow-up"
+        )
     worktree = worktree.expanduser().resolve()
     manifest = load_manifest(worktree)
     session = manifest["session"]
@@ -1172,6 +1259,8 @@ def answer_child(worktree: Path, *, text: str | None = None, redeliver: bool = F
             raise PmError(f"no live child session {session} on tmux server {manifest['socket']}")
         if redeliver:
             return _redeliver_answer(worktree, directory, session)
+        if follow_up is not None:
+            return _follow_up_answer(worktree, directory, session, follow_up)
         assert text is not None
         if not pm_paths.pm_file_present(worktree, question_path):
             raise PmError(f"no open child question: {question_path} does not exist")
@@ -1221,6 +1310,52 @@ def _redeliver_answer(worktree: Path, directory: Path, session: str) -> AnswerCh
     )
 
 
+def _follow_up_answer(worktree: Path, directory: Path, session: str, text: str) -> AnswerChildOutcome:
+    """Write and send a follow-up to the highest-numbered answer; `answer_child` has checked the session."""
+    question_path = directory / "cm-question.md"
+    if pm_paths.pm_file_present(worktree, question_path):
+        raise PmError(
+            f"{question_path} is open: a new question is waiting, answer it with --text rather than a follow-up"
+        )
+    _refuse_if_child_finished(worktree, directory / "child-result.json")
+    if not text.strip():
+        raise PmError("--follow-up text must be non-empty (there is nothing to deliver)")
+    names = [path.name for path in directory.glob("cm-answer-*.md")]
+    answers = [int(match.group(1)) for match in map(_ANSWER_FILE_RE.match, names) if match]
+    if not answers:
+        raise PmError(f"no answer to follow up: {directory} holds no cm-answer-<n>.md")
+    number = max(answers)
+    if not pm_paths.pm_file_present(worktree, directory / f"cm-answer-{number}.md"):
+        raise PmError(f"no answer to follow up: {directory / f'cm-answer-{number}.md'} is not a regular file")
+    followups = [
+        int(match.group(2)) for match in map(_FOLLOWUP_FILE_RE.match, names) if match and int(match.group(1)) == number
+    ]
+    follow_up_path = directory / f"cm-answer-{number}-followup-{max(followups, default=0) + 1}.md"
+    try:
+        pm_paths.write_pm_text(worktree, follow_up_path, text, exclusive=True)
+    except FileExistsError as exc:
+        raise PmError(
+            f"{follow_up_path} already exists; the follow-up numbering is off — read the files by hand"
+        ) from exc
+    try:
+        delivery = sessions.send_line(session, prompts.render_answer_pointer(follow_up_path))
+    except TypedNotSubmitted:
+        # The pointer is typed in the child's input line: removing the file it
+        # names would leave it dangling (the rule `deliver_answer` follows).
+        raise
+    except PmError:
+        # Nothing was typed, so the file points nowhere the child will look;
+        # removing it keeps the next follow-up's number free.
+        follow_up_path.unlink(missing_ok=True)
+        raise
+    return AnswerChildOutcome(
+        answer_path=follow_up_path,
+        question_archived_path=directory / f"cm-question-{number}.md",
+        answer_number=number,
+        delivered=bool(delivery.confirmed),
+    )
+
+
 # --- stop-child -----------------------------------------------------------------
 
 
@@ -1247,6 +1382,24 @@ class StopChildOutcome:
     # and why it did not run or failed, when it did not complete.
     sandbox_teardown: sandbox_mod.TeardownOutcome | None = None
     sandbox_error: str | None = None
+    # With `--archive`: the archive's lines (`archive.ArchiveOutcome.lines`,
+    # the steps that completed, also when it stopped part-way), why it did not
+    # complete, and the worktree removal that follows a complete archive and
+    # teardown. `branch` is the node branch, which the removal keeps.
+    archive_requested: bool = False
+    archive_lines: list[str] = field(default_factory=list)
+    archive_error: str | None = None
+    branch: str | None = None
+    worktree_removed: Path | None = None
+    worktree_error: str | None = None
+
+    @property
+    def archive_completed(self) -> bool:
+        """True without `--archive`; with it, only when the archive completed
+        and the worktree was removed (and pruned)."""
+        if not self.archive_requested:
+            return True
+        return self.archive_error is None and self.worktree_error is None and self.worktree_removed is not None
 
     @property
     def sandbox_notes(self) -> list[str]:
@@ -1266,12 +1419,24 @@ class StopChildOutcome:
         return teardown is None or not teardown.left
 
 
-def stop_child(worktree: Path) -> StopChildOutcome:
+def stop_child(worktree: Path, archive: Path | None = None) -> StopChildOutcome:
     """Capture the child's full pane, report its recorded reviewers, kill its
     private tmux server and tear down its sandbox, if it has one; a sandbox
     left up makes `stop-child` exit non-zero. Safe to re-run: with the
     session already gone, an existing `pane.txt` is kept rather than
-    overwritten.
+    overwritten, and nothing here needs the server to have been running.
+
+    With `archive`, a results root, the stopped child is archived
+    (`archive.archive_child`) once its server is confirmed gone and before
+    the sandbox teardown, which would remove the sandbox temp dir the
+    archive copies (the record's temp dir, else `sandbox.run_tmpdir` of the
+    socket, when it exists). An archive that does not complete is recorded
+    on the outcome, the teardown is then skipped so that temp dir survives
+    for a re-run, and the worktree is kept. After a complete archive and a
+    complete teardown, the worktree is removed with `git worktree remove
+    --force` from the product repository (the archive's removal rule is
+    what permits `--force`), then `git worktree prune` drops any stale
+    entry a product gate left; the node branch is kept.
 
     The manifest sits in the child's own worktree, so the server it names is
     checked rather than trusted, before anything is captured or killed.
@@ -1409,10 +1574,28 @@ def stop_child(worktree: Path) -> StopChildOutcome:
         kill_error = str(exc)
         remaining = []
     server_gone = kill_error is None and not remaining
+    archive_lines: list[str] = []
+    archive_error: str | None = None
+    if archive is not None:
+        if not server_gone:
+            archive_error = "the server was not confirmed gone, so nothing was archived; re-run stop-child"
+        else:
+            try:
+                archived = archive_mod.archive_child(worktree, manifest, archive, _archive_tmpdir(socket, record))
+                archive_lines = archived.lines
+            except archive_mod.ArchiveIncomplete as exc:
+                archive_lines, archive_error = exc.outcome.lines, str(exc)
+            except (PmError, OSError) as exc:
+                archive_error = str(exc)
     teardown: sandbox_mod.TeardownOutcome | None = None
     sandbox_error: str | None = None
     if sandboxed and control is not None:
-        if not server_gone:
+        if archive_error is not None:
+            sandbox_error = (
+                "skipped: the archive did not complete, so the sandbox temp dir and "
+                f"{control} were kept for a re-run of stop-child --archive"
+            )
+        elif not server_gone:
             sandbox_error = (
                 f"the server was not confirmed gone, so its sandbox temp dir and {control} were left in place; "
                 "re-run stop-child"
@@ -1427,6 +1610,13 @@ def stop_child(worktree: Path) -> StopChildOutcome:
                 teardown = sandbox_mod.tear_down(socket=socket, control=control, record=record)
             except (PmError, OSError) as exc:
                 sandbox_error = str(exc)
+    worktree_removed: Path | None = None
+    worktree_error: str | None = None
+    if archive is not None and archive_error is None:
+        if sandbox_error is not None or (teardown is not None and teardown.left):
+            worktree_error = "the sandbox was not torn down, so the worktree was kept; re-run stop-child --archive"
+        else:
+            worktree_removed, worktree_error = _remove_worktree(worktree)
     return StopChildOutcome(
         session=session,
         socket=socket,
@@ -1441,4 +1631,44 @@ def stop_child(worktree: Path) -> StopChildOutcome:
         kill_error=kill_error,
         sandbox_teardown=teardown,
         sandbox_error=sandbox_error,
+        archive_requested=archive is not None,
+        archive_lines=archive_lines,
+        archive_error=archive_error,
+        branch=manifest["branch"],
+        worktree_removed=worktree_removed,
+        worktree_error=worktree_error,
     )
+
+
+def _archive_tmpdir(socket: str, record: dict[str, Any] | None) -> Path | None:
+    """The sandbox temp dir to archive: the host-written record's, else the
+    one `launch-child` would have made for `socket` (`sandbox.run_tmpdir`)
+    when it exists; None when neither names one (an unsandboxed child)."""
+    if record is not None and isinstance(record.get("tmpdir"), str) and record["tmpdir"]:
+        return Path(record["tmpdir"])
+    try:
+        tmpdir = sandbox_mod.run_tmpdir(socket)
+    except (PmError, OSError):
+        return None
+    return tmpdir if os.path.lexists(tmpdir) else None
+
+
+def _remove_worktree(worktree: Path) -> tuple[Path | None, str | None]:
+    """`git worktree remove --force <worktree>`, then `git worktree prune`,
+    both run in the product repository's main worktree (the first entry
+    `git worktree list` gives), never in the worktree being removed; the
+    branch is kept. (removed worktree or None, why not or None); a prune
+    that fails after the removal is reported, with the worktree named as
+    removed."""
+    code, listing, err = git_ops.git_result(worktree, "worktree", "list", "--porcelain")
+    first = listing.splitlines()[0] if code == 0 and listing else ""
+    if not first.startswith("worktree "):
+        return None, f"the product repository could not be found from {worktree}: {err.strip() or 'no worktree list'}"
+    repo = Path(first.removeprefix("worktree "))
+    code, _out, err = git_ops.git_result(repo, "worktree", "remove", "--force", str(worktree))
+    if code != 0:
+        return None, f"git worktree remove --force {worktree} failed: {err.strip() or 'no output'}"
+    code, _out, err = git_ops.git_result(repo, "worktree", "prune")
+    if code != 0:
+        return worktree, f"git worktree prune in {repo} failed: {err.strip() or 'no output'}"
+    return worktree, None

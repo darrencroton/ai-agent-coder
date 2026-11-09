@@ -62,6 +62,38 @@ MANIFEST_LOCK_NAME = ".manifest.lock"
 SECTION_RE = re.compile(r"^\s*(?:#+\s*)?SECTION:\s*([A-Za-z0-9_ -]+)\s*$", re.MULTILINE)
 CONTINUATION_SUFFIX_RE = re.compile(r"-r(\d+)$")
 
+# Phrases a harness prints when it stops for a usage limit or a login failure
+# rather than doing the work, matched case-insensitively. A deliberate copy of
+# the limit and auth tables in skills/project-manager/scripts/pm_lib/review.py:
+# that package may not import from this skill, nor this skill from it, so the
+# two stay textually identical by hand and by a test (test_delegate_contract).
+_LIMIT_PATTERNS = (
+    r"usage[ _-]?limit",
+    r"rate[ _-]?limit",
+    r"insufficient_quota",
+    r"quota exceeded",
+    r"too many requests",
+    r"\b429\b",
+)
+_AUTH_PATTERNS = (
+    r"unauthori[sz]ed",
+    r"\b401\b",
+    r"authentication (?:failed|error|required)",
+    r"not logged in",
+    r"please log ?in",
+    r"oauth token",
+    r"token (?:has )?expired",
+    r"invalid api key",
+)
+_HARNESS_FAILURE_PATTERNS = (
+    ("limit", re.compile("|".join(_LIMIT_PATTERNS), re.IGNORECASE)),
+    ("auth", re.compile("|".join(_AUTH_PATTERNS), re.IGNORECASE)),
+)
+# A harness's limit or login notice is a line or two. Longer output is the
+# delegate's own work, which may well discuss rate limits or logins (a review
+# of authentication code does), so it is never read as a harness failure.
+_HARNESS_NOTICE_MAX_CHARS = 1000
+
 
 class DelegateJobsError(RuntimeError):
     """Raised for expected operational errors."""
@@ -383,11 +415,23 @@ def delegate_status(entry: dict[str, Any]) -> dict[str, Any]:
     else:
         state = status_state or "finished"
     contract_met = None
+    failure_class = None
     if state == "completed":
-        contract_met = output_contract_met(primary_output_text(entry), entry)
+        output = primary_output_text(entry)
+        contract_met = output_contract_met(output, entry)
         if contract_met is False:
             # A clean exit doesn't mean the declared output contract was met.
             state = "incomplete"
+        elif contract_met is None:
+            # With no SECTION: contract to check, a clean exit is still not a
+            # success when it reported nothing, or only a harness's own notice
+            # that it stopped for a usage limit or a login.
+            if not output.strip():
+                state = "incomplete"
+            else:
+                failure_class = harness_failure_class(output)
+                if failure_class is not None:
+                    state = "failed"
     return {
         "label": entry["label"],
         "pid": pid,
@@ -407,7 +451,25 @@ def delegate_status(entry: dict[str, Any]) -> dict[str, Any]:
         "session_id": entry.get("session_id"),
         "session_path": entry.get("session_path"),
         "contract_met": contract_met,
+        "failure_class": failure_class,
     }
+
+
+def harness_failure_class(text: str) -> str | None:
+    """`limit` or `auth` when `text` reads as a harness's own notice that it
+    stopped for a usage limit or a login, else None.
+
+    A heuristic over harness text, not a fact the harness reports: none
+    gives a machine-readable cause, and some exit 0 after printing one. Only
+    a short output is read this way (`_HARNESS_NOTICE_MAX_CHARS`).
+    """
+    stripped = text.strip()
+    if len(stripped) > _HARNESS_NOTICE_MAX_CHARS:
+        return None
+    for name, pattern in _HARNESS_FAILURE_PATTERNS:
+        if pattern.search(stripped):
+            return name
+    return None
 
 
 def find_section_blocks(text: str) -> list[tuple[str, int, int]]:
@@ -1135,7 +1197,8 @@ def command_wait(args: argparse.Namespace) -> int:
             # returncode=None too (see delegate_status) - catch that via the
             # "failed" state so wait doesn't exit 0 for a dead-on-arrival job.
             # "incomplete" is a clean exit (returncode=0) whose output never
-            # satisfied its declared SECTION: contract - also not a success.
+            # satisfied its declared SECTION: contract, or that declared none
+            # and reported nothing - also not a success.
             failed = [
                 status
                 for status in statuses

@@ -11,15 +11,22 @@ PM reads the report and records the decision itself, in
 diff and changed-files list are generated from `before_head..HEAD` at the
 moment `review` runs, so a still-running or restarted Developer session
 cannot race the reviewer.
+
+A `review` call may make up to three commissions: a failed one is classed
+from its stderr (`classify_failure`) and re-commissioned under a fixed,
+bounded policy (`run_review`), so a usage limit or a capacity blip costs
+the PM seat nothing but the wait.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -268,6 +275,90 @@ def _tail(path: Path, max_chars: int = _STDERR_TAIL_CHARS) -> str:
     return text[-max_chars:]
 
 
+# --- failure classes ------------------------------------------------------
+#
+# Why a commission failed decides whether trying again can help: a wait may
+# clear a capacity failure, a timeout, an empty report or an exit nothing
+# recognised, but never a spent usage limit or an expired login, which only
+# another seat gets past. `FAILURE_CLASSES` is also the leaderboard's display
+# order; any other `review-failed` reason (`exit <N>`) is unclassified there.
+
+FAILURE_CLASSES = ("limit", "auth", "capacity", "timeout", "empty")
+# The classes no wait clears: they skip the same-seat retry.
+_NO_WAIT_CLASSES = frozenset({"limit", "auth"})
+# Seconds before a seat is tried again after a failure a wait may clear. A
+# module constant rather than an option, so tests can set it to 0.
+RETRY_WAIT_SECONDS = 60
+
+# Phrases the harnesses print when they fail for a reason outside the review,
+# matched case-insensitively over the last `_CLASSIFY_TAIL_CHARS` of stderr
+# only: a harness's failure notice is a line or two at the end, while codex
+# streams its whole working transcript to stderr, and a review of code that
+# touches logins or status codes must not be read as a login failure. The
+# phrases are the harnesses' own notice wordings, not bare words. The limit
+# and auth tables have a textually identical copy in
+# skills/orchestrator/scripts/delegate_jobs.py: pm_lib may not import from
+# the orchestrator, nor it from pm_lib, so the two are kept in step by hand
+# and by a test there.
+_CLASSIFY_TAIL_CHARS = 1000
+_LIMIT_PATTERNS = (
+    r"usage[ _-]?limit",
+    r"rate[ _-]?limit",
+    r"insufficient_quota",
+    r"quota exceeded",
+    r"too many requests",
+    r"\b429\b",
+)
+_AUTH_PATTERNS = (
+    r"unauthori[sz]ed",
+    r"\b401\b",
+    r"authentication (?:failed|error|required)",
+    r"not logged in",
+    r"please log ?in",
+    r"oauth token",
+    r"token (?:has )?expired",
+    r"invalid api key",
+)
+_CAPACITY_PATTERNS = (
+    r"overloaded",
+    r"at capacity",
+    r"\b503\b",
+    r"\b529\b",
+    r"service unavailable",
+    r"temporarily unavailable",
+    r"try again later",
+    r"connection reset",
+)
+_FAILURE_PATTERNS = tuple(
+    (name, re.compile("|".join(patterns), re.IGNORECASE))
+    for name, patterns in (("limit", _LIMIT_PATTERNS), ("auth", _AUTH_PATTERNS), ("capacity", _CAPACITY_PATTERNS))
+)
+
+
+def classify_failure(stderr_text: str, *, timed_out: bool, returncode: int | None, empty: bool) -> str:
+    """The class of one failed commission: one of `FAILURE_CLASSES`, or
+    `exit <N>` when nothing recognised it.
+
+    A heuristic over harness text, not a fact the harness reports: no
+    harness gives a machine-readable failure cause, so the stderr tail is
+    searched for a usage limit, then a login failure, then a capacity
+    failure, and only then does the process outcome decide. Text comes first
+    because a reviewer that hits a limit can also run on until it times out
+    or exit 0 having written nothing, and the limit is what a wait cannot
+    clear. A wrong class costs at most one retry: a same-seat retry that
+    could not help, or one that was skipped.
+    """
+    tail = stderr_text[-_CLASSIFY_TAIL_CHARS:]
+    for name, pattern in _FAILURE_PATTERNS:
+        if pattern.search(tail):
+            return name
+    if timed_out:
+        return "timeout"
+    if empty:
+        return "empty"
+    return f"exit {returncode}"
+
+
 def _next_commission_seq(slice_dir: Path, recorded_reviews: int) -> int:
     """Next collision-free artifact sequence for a commissioned review.
 
@@ -348,6 +439,430 @@ class ReviewOutcome:
     command_override: bool = False
 
 
+@dataclass(frozen=True)
+class _Seat:
+    """One reviewer configuration, resolved and checked before any commission.
+
+    `effort` is what goes on the command line and `recorded_effort` what the
+    records carry (see `_resolve_seat`). `override` is `--reviewer-command`,
+    which only the primary seat ever runs: a fallback is a named harness, so
+    it is always composed from its own profile and recorded as such.
+    """
+
+    tool: str
+    model: str | None
+    effort: str | None
+    recorded_effort: str | None
+    override: str | None = None
+
+    def label(self) -> str:
+        words = " ".join(part for part in (self.tool, self.model, self.effort) if part)
+        return f"{words} (--reviewer-command)" if self.override else words
+
+
+def _resolve_seat(
+    repo: Path, tool: str, model: str | None, effort: str | None, *, explicit_effort: bool, override: str | None
+) -> _Seat:
+    """Resolve one seat and run its refusals before anything is written, so a
+    fallback that could never run refuses up front, not after the primary
+    has failed."""
+    # Checked here, not in compose_reviewer_command, which stays pure and
+    # I/O-free. opencode is the only tool whose effort flag needs verifying
+    # against the model; the others take effort verbatim or refuse it.
+    if tool == "opencode" and effort and not override:
+        effort = profiles.resolve_opencode_variant(model, effort, explicit=explicit_effort)
+    if not override:
+        # Composed with a stand-in prompt only for its refusals: a tool with
+        # no profile, or an effort qwen cannot take.
+        compose_reviewer_command(tool, "", model=model, effort=effort, repo=repo)
+    # `effort` (possibly None) is what goes on the command line. What gets
+    # RECORDED is a distinct value on the COMPOSED path only: an omitted
+    # effort there is a known, repeatable fact -- ran at the harness/model's
+    # own default -- never an unattributed null. Under `--reviewer-command`
+    # there is no harness profile in play, so pm_lib cannot know what an
+    # omitted effort means to the wrapper; that stays an honest null rather
+    # than an invented "default".
+    recorded_effort = effort if override else (effort or "default")
+    return _Seat(tool=tool, model=model, effort=effort, recorded_effort=recorded_effort, override=override)
+
+
+@dataclass(frozen=True)
+class _Pinned:
+    """What every commission of one `review` call shares, checked or derived
+    once before the first: the pinned range and its diff, and everything the
+    prompt is rendered from. Each commission still claims its own sequence
+    and writes its own diff copy, prompt, report and stderr."""
+
+    repo: Path
+    run_dir: Path
+    token: str
+    run_id: str
+    slice_id: str
+    skill: str
+    model_tag: str | None
+    timeout: float | None
+    pm_adjudications: str | None
+    before_head: str | None
+    reviewed_head: str
+    slice_dir: Path
+    recorded_reviews: int
+    diff_text: str
+    diff_error: str | None
+    changed_files: list[str]
+    plan_slice: plan_mod.PlanSlice
+    commissioned_grants: list[dict[str, Any]]
+    drift_record: tuple[dict[str, Any], str] | None
+    origin_event: dict[str, Any]
+    sandboxed: bool
+    reviewer_wrap: tuple[Path, str] | None
+
+
+@dataclass(frozen=True)
+class FailedCommission:
+    """One commission that produced no usable report.
+
+    `failure_class` is `classify_failure`'s answer and the `review-failed`
+    event's `reason`; `message` is the advice for its cause, carried into the
+    error `run_review` raises when no commission succeeds.
+    """
+
+    review_id: str
+    seat: _Seat
+    failure_class: str
+    stderr_path: Path
+    message: str
+
+
+def _commission(pinned: _Pinned, seat: _Seat) -> ReviewOutcome | FailedCommission:
+    """Run one commission on `seat`: claim its sequence, launch and wait on the
+    reviewer, and record either the review or a `review-failed` event.
+
+    A reviewer failure is returned, never raised, so `run_review` can decide
+    what follows it. PmError is raised only for what is not one: a reviewer
+    reaped by a PM decision, or a commission that could not be set up.
+    """
+    repo, run_dir, token, run_id = pinned.repo, pinned.run_dir, pinned.token, pinned.run_id
+    slice_id, skill, timeout = pinned.slice_id, pinned.skill, pinned.timeout
+    # Failed commissions also reserve their artifact sequence: they record no
+    # review, so numbering from `len(reviews)` alone would overwrite them.
+    seq, stderr_path = _claim_commission_seq(pinned.slice_dir, pinned.recorded_reviews, skill, seat.tool)
+
+    # Per-commission, so a later commission cannot replace the pinned diff a
+    # running reviewer has not opened yet. The pinned diff lives under the run
+    # dir (`.git/pm/...`, host-only), not `.pm/`, so a plain write is correct;
+    # the error sidecar sits beside it.
+    diff_path = pinned.slice_dir / f"review-{seq}-{skill}-{seat.tool}.patch"
+    diff_path.write_text(pinned.diff_text, encoding="utf-8")
+    if pinned.diff_error is not None:
+        (diff_path.parent / "git-diff-error.txt").write_text(pinned.diff_error, encoding="utf-8")
+
+    sections = pinned.plan_slice.sections
+    drift_record = pinned.drift_record
+    prompt_text = prompts.render_reviewer_prompt(
+        # Never handed to a drift audit itself: a second audit of the same
+        # commit must stay independent of the first one's verdict.
+        drift_audit_report=drift_record[1] if drift_record else None,
+        pm_adjudications=pinned.pm_adjudications,
+        pm_surface_grants=pinned.commissioned_grants,
+        skill_name=skill,
+        repo=str(repo),
+        slice_id=slice_id,
+        slice_title=pinned.plan_slice.title,
+        before_head=pinned.before_head,
+        reviewed_head=pinned.reviewed_head,
+        diff_path=str(diff_path),
+        changed_files=pinned.changed_files,
+        intended_change=sections.get("Intended Change", "").rstrip(),
+        acceptance_criteria=sections.get("Acceptance Criteria", "").rstrip(),
+        authorized_surface=sections.get("Authorized Surface", "").rstrip(),
+        explicit_non_goals=sections.get("Explicit Non-Goals", "").rstrip(),
+        risk_flags=sections.get("Risk Flags", "").rstrip(),
+        validation_plan=sections.get("Validation Plan", "").rstrip(),
+        validation_record=_read_validation_record(repo, slice_ops.slice_artifact_dir(repo, run_id, slice_id)),
+        include_reference=_reference_filter(pinned.changed_files),
+        sandboxed=pinned.sandboxed,
+    )
+
+    command = _build_reviewer_command(
+        seat.tool,
+        prompt_text,
+        model=seat.model,
+        effort=seat.effort,
+        repo=repo,
+        reviewer_command_override=seat.override,
+        sandboxed=pinned.sandboxed,
+    )
+
+    report_relative = f"{slice_ops.slice_relative_dir(slice_id)}/review-{seq}-{skill}-{seat.tool}.md"
+    report_original = run_dir / report_relative
+    report_original.parent.mkdir(parents=True, exist_ok=True)
+
+    # The rendered prompt is the only record of what this reviewer was told,
+    # including any PM adjudications that narrowed where it spent attention.
+    # Written BEFORE the reviewer runs so a timeout, crash, or non-zero exit
+    # still leaves the commission auditable rather than only its silence.
+    # Derived from the report's own path so the two can never diverge.
+    prompt_relative = report_relative[: -len(".md")] + "-prompt.md"
+    slice_ops.write_controller_artifact(repo, run_dir, run_id, prompt_relative, prompt_text)
+
+    # The reviewer process must not inherit the PM run capability token from
+    # the controller's exported environment: the token is the controller's
+    # alone, and SKILL.md forbids it in any Reviewer session. Nor does it
+    # inherit the supervising session's own variables (`SEAT_ENV_DROPPED`).
+    reviewer_env = sessions.seat_environ()
+
+    # The wrap checked in `run_review` is applied here, at launch, so nothing
+    # recorded about the commission sees it. `srt` starts in this new session
+    # as its group leader and the reviewer shares that group, so the
+    # timeout's killpg below still reaches every process.
+    popen_command = command
+    if pinned.reviewer_wrap is not None:
+        policy_path, tmpdir = pinned.reviewer_wrap
+        popen_command = sandbox.wrap_command(policy_path, command, tmpdir=tmpdir)
+
+    with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:
+        process = subprocess.Popen(
+            # stdin=DEVNULL: `codex exec` blocks on inherited stdin ("Reading
+            # additional input from stdin...") and the hang looks like a slow model.
+            popen_command,
+            cwd=str(repo),
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=reviewer_env,
+        )
+        # start_new_session=True makes the child its own process-group
+        # leader, so its pgid equals its pid at creation time — no
+        # getpgid() race against a fast-exiting process.
+        pgid = process.pid
+        launched_at = state_mod.utc_now_iso()
+        # Persist before waiting so `stop` can reap every parallel reviewer.
+        with state_mod.locked_update(run_dir, token) as live_state:
+            live_current = live_state.get("current_slice")
+            if live_current is not None:
+                live_current["reviewer_pids"] = [*(live_current.get("reviewer_pids") or []), pgid]
+        # Printed before the (possibly long) wait begins — a slow-but-alive
+        # local reviewer and a hung one are otherwise indistinguishable from
+        # the PM seat.
+        print(
+            f"reviewer launched: pgid={pgid} report={report_original} stderr={stderr_path}",
+            flush=True,
+        )
+        # Durable counterpart of the line above: lets a later reader tell how
+        # long a reviewer ran, and that one was started even if it never finishes.
+        state_mod.append_event(
+            run_dir,
+            "review-launched",
+            slice_id=slice_id,
+            note=f"{skill} via {seat.tool}",
+            data={
+                "skill": skill,
+                "tool": seat.tool,
+                "model": seat.model,
+                "effort": seat.recorded_effort,
+                "sequence": seq,
+                "pgid": pgid,
+            },
+        )
+        timed_out = False
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)  # grace for a clean exit; return value unused
+            except subprocess.TimeoutExpired:
+                pass
+            # Unconditional: a descendant that ignores SIGTERM would survive
+            # if SIGKILL only ran when the leader-wait above also timed out
+            # (the leader can exit on SIGTERM while a child lingers).
+            # ProcessLookupError means the group is already empty — success.
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            returncode = process.wait()
+
+    # Reload and clear the recorded pgid FIRST, on every exit path: the
+    # process has exited, so a failed review must not leave a stale
+    # process-group id behind for a later `stop` to SIGKILL after PID reuse.
+    # (Re-reading also avoids relying on the in-memory state staying
+    # accurate across the potentially long subprocess wait above.)
+    # Persisted BEFORE any fallible post-processing (mirror/hash below): if
+    # either raises, the cleared pgid must already be on disk so a later
+    # `stop` cannot SIGKILL a reused pgid recorded as still-live.
+    failed = timed_out or returncode != 0
+    reaped = False
+    with state_mod.locked_update(run_dir, token) as state:
+        current = state.get("current_slice")
+        # A failed reviewer whose pgid is no longer recorded was reaped by a
+        # PM decision (`stop`, `finalize --accept`/`--stop`), which clears
+        # `reviewer_pids` before killing the group; that is PM's choice, not
+        # the reviewer's failure. Decided before the filter below removes
+        # the pgid, and only for failed exits: a reviewer that exited 0 is
+        # recorded as a review (or, with an empty report, failed on that
+        # ground below) whatever `reviewer_pids` holds.
+        if failed:
+            reaped = current is None or pgid not in (current.get("reviewer_pids") or [])
+        if current is not None and current.get("reviewer_pids"):
+            current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
+
+    if reaped:
+        raise PmError(f"reviewer was reaped by a PM decision (process group {pgid}); not recorded as a failure")
+
+    # A reviewer that exits 0 having written nothing (one died mid-investigation
+    # in the shakedown) is a failed review, not a blank one that would satisfy
+    # the freshness check; it is read like a non-zero exit, via its stderr.
+    empty = not failed and not report_original.read_text(encoding="utf-8", errors="replace").strip()
+    if failed or empty:
+        stderr_tail = _tail(stderr_path)
+        failure_class = classify_failure(stderr_tail, timed_out=timed_out, returncode=returncode, empty=empty)
+        data: dict[str, Any] = {
+            "skill": skill,
+            "tool": seat.tool,
+            "model": seat.model,
+            "effort": seat.recorded_effort,
+            "command_override": bool(seat.override),
+            "model_tag": pinned.model_tag,
+            "origin_event_index": pinned.origin_event["index"],
+            "reason": failure_class,
+        }
+        if timed_out:
+            note = f"{skill} via {seat.tool} timed out after {timeout:g}s; reviewer process group killed"
+            message = (
+                f"timed out after {timeout:g}s and was killed (process group {pgid}); "
+                "this is not proof of a hang — a slow cold local model may just need a longer --timeout, "
+                "so re-commission with a larger --timeout to retry"
+            )
+        elif failed:
+            note = f"{skill} via {seat.tool} exited {returncode}"
+            # The class replaced the old `exit <N>` reason; the code itself is kept.
+            data["exit_code"] = returncode
+            message = f"reviewer command failed (exit {returncode}): {stderr_tail}"
+        else:
+            note = f"{skill} via {seat.tool} exited 0 with an empty report"
+            message = "exited 0 but wrote an empty report: read its stderr, then re-commission the review"
+        state_mod.append_event(run_dir, "review-failed", slice_id=slice_id, note=note, data=data)
+        return FailedCommission(
+            review_id=f"review-{seq}",
+            seat=seat,
+            failure_class=failure_class,
+            stderr_path=stderr_path,
+            message=message,
+        )
+
+    report_original = slice_ops.mirror_artifact(repo, run_dir, run_id, report_relative)
+    sha256 = slice_ops.sha256_file(report_original)
+
+    # Locked: preserve reviews completed concurrently.
+    with state_mod.locked_update(run_dir, token) as state:
+        entry = slice_ops.slice_entry(state, slice_id)
+        if entry is not None:
+            entry["reviews"] = [
+                *(entry.get("reviews") or []),
+                {
+                    "skill": skill,
+                    "tool": seat.tool,
+                    "model": seat.model,
+                    "effort": seat.recorded_effort,
+                    "command_override": bool(seat.override),
+                    "model_tag": pinned.model_tag,
+                    "review_id": f"review-{seq}",
+                    "head": pinned.reviewed_head,
+                    "before_head": pinned.before_head,
+                    "artifact": str(report_original),
+                    "sha256": sha256,
+                    "launched_at": launched_at,
+                    "at": state_mod.utc_now_iso(),
+                    # How many surface grants this reviewer's prompt showed.
+                    # `is_review_fresh` stales the review as soon as the slice
+                    # carries a different number, so a grant landing mid-review
+                    # cannot be papered over by a later completion stamp.
+                    "grants_seen": len(pinned.commissioned_grants),
+                    "origin_event": pinned.origin_event,
+                    "review_context": {
+                        "pm_adjudications": pinned.pm_adjudications,
+                        "drift_review": (
+                            {
+                                "review_id": drift_record[0].get("review_id"),
+                                "artifact": drift_record[0].get("artifact"),
+                                "sha256": drift_record[0].get("sha256"),
+                            }
+                            if drift_record
+                            else None
+                        ),
+                    },
+                },
+            ]
+    state_mod.append_event(
+        run_dir, "review", slice_id=slice_id, note=f"{skill} via {seat.tool}", evidence=str(report_original)
+    )
+
+    return ReviewOutcome(
+        slice_id=slice_id,
+        skill=skill,
+        tool=seat.tool,
+        model=seat.model,
+        effort=seat.recorded_effort,
+        model_tag=pinned.model_tag,
+        command_override=bool(seat.override),
+        review_id=f"review-{seq}",
+        head=pinned.reviewed_head,
+        before_head=pinned.before_head,
+        diff_path=diff_path,
+        changed_files=pinned.changed_files,
+        artifact_path=report_original,
+        sha256=sha256,
+    )
+
+
+def _failures_text(failures: list[FailedCommission]) -> str:
+    return "\n".join(
+        f"- {failure.review_id} on {failure.seat.label()}: {failure.failure_class} "
+        f"(stderr: {failure.stderr_path}); {failure.message}"
+        for failure in failures
+    )
+
+
+def _require_still_current(
+    run_dir: Path, token: str, slice_id: str, failures: list[FailedCommission], *, repo: Path, reviewed_head: str
+) -> None:
+    """Refuse a re-commission once the run has moved on without it.
+
+    A retry starts up to `RETRY_WAIT_SECONDS` after the failure it follows,
+    long enough for a `finalize` or `stop` to land in between; a reviewer
+    launched after either would review a slice no longer in flight.
+    """
+    state = slice_ops.load_writable_state(run_dir, token)
+    current = state.get("current_slice") or {}
+    if state.get("status") == "stopped" or current.get("id") != slice_id:
+        raise PmError(
+            f"{slice_id} is no longer the current in-flight slice of a live run; "
+            "not re-commissioning its review. Commissions so far:\n" + _failures_text(failures)
+        )
+    # The pinned range and the tree the reviewer reads must still be the ones
+    # the first commission checked: a retry starts up to a timeout and a wait
+    # later, long enough for a Developer to commit or dirty the tree.
+    if git_ops.git_head(repo) != reviewed_head:
+        raise PmError(
+            f"HEAD has moved past the reviewed head {reviewed_head}; not re-commissioning a review of a range "
+            "that is no longer the live one. Commissions so far:\n" + _failures_text(failures)
+        )
+    dirty = git_ops.meaningful_status_lines(git_ops.git_status_text(repo))
+    if dirty:
+        raise PmError(
+            "worktree is dirty outside .pm/ — a re-commission must run against the pinned committed tree: "
+            + "; ".join(dirty)
+            + "\nCommissions so far:\n"
+            + _failures_text(failures)
+        )
+
+
 def run_review(
     repo: Path,
     run_dir: Path,
@@ -362,20 +877,38 @@ def run_review(
     reviewer_command: str | None = None,
     timeout: float | None = None,
     pm_adjudications: str | None = None,
+    fallback: tuple[str, str | None, str | None] | None = None,
 ) -> ReviewOutcome:
-    """Commission one independent review against the slice's pinned range.
+    """Commission one independent review against the slice's pinned range,
+    re-commissioning a bounded number of times when the reviewer fails.
 
     Reviews pin to the LIVE range: `slice_id` must be the run's current
     in-flight slice, and HEAD must have advanced past `before_head` — an
     already-current or unreviewable range refuses outright (PmError) rather
-    than silently reviewing nothing.
+    than silently reviewing nothing. Those checks, the tree, the sandbox
+    prerequisites, the plan and both seats are checked once, before the
+    first commission.
 
-    `timeout` bounds the wait on the reviewer subprocess; on expiry the
-    process group is killed and the call fails closed (PmError). This
-    function itself requires it to be passed (None means an unbounded wait);
-    the CLI never omits it, applying a one-hour default so an unattended run
-    always regains control from a stuck reviewer. A legitimately slow cold
-    local model is handled with a larger explicit `--timeout`.
+    A failed commission (timeout, non-zero exit, empty report) is classed by
+    `classify_failure` and recorded as a `review-failed` event; what follows
+    it is fixed, never chosen per call. A failure a wait may clear
+    (`capacity`, `timeout`, `empty`, or an unclassified `exit <N>`) earns one
+    more commission on the same seat after `RETRY_WAIT_SECONDS`; a `limit` or
+    `auth` failure, which no wait clears, skips that retry. Whatever is still
+    failing then gets one commission on `fallback` (tool, model, effort),
+    when one was given. So a call makes at most three commissions, each with
+    its own sequence, `review-launched` event and record, and one line is
+    printed per failure naming its class and the next step. A re-commission
+    is refused once the slice is no longer in flight or the run has stopped.
+    When every commission fails, one PmError lists each with its class,
+    stderr path and the advice for its cause.
+
+    `timeout` bounds the wait on each reviewer subprocess; on expiry the
+    process group is killed and that commission fails. This function itself
+    requires it to be passed (None means an unbounded wait); the CLI never
+    omits it, applying a one-hour default so an unattended run always
+    regains control from a stuck reviewer. A legitimately slow cold local
+    model is handled with a larger explicit `--timeout`.
 
     `pm_adjudications` is PM-authored free text naming rulings already settled
     in this run, so a reviewer stops re-raising them. It is the only
@@ -383,6 +916,9 @@ def run_review(
     rendered prompt is persisted beside the report: a channel that can narrow
     what a reviewer reports must leave the human an audit trail of what it
     was told.
+
+    `reviewer_command` replaces the primary seat's command only; a fallback
+    is a named harness and is always composed from its own profile.
 
     A reviewer runs inside a sandbox when this PM already does
     (`SANDBOX_RUNTIME=1`) or the run records one: its command and prompt are
@@ -458,25 +994,29 @@ def run_review(
     original_slice_dir = slice_ops.slice_state_dir(run_dir, slice_id)
     original_slice_dir.mkdir(parents=True, exist_ok=True)
 
-    has_override = bool(reviewer_command)
-    resolved_tool = _resolve_tool(state, tool, has_override=has_override)
+    resolved_tool = _resolve_tool(state, tool, has_override=bool(reviewer_command))
+    reviewer_block = state.get("reviewer") or {}
+    primary = _resolve_seat(
+        repo,
+        resolved_tool,
+        model or reviewer_block.get("model"),
+        effort or reviewer_block.get("effort"),
+        explicit_effort=bool(effort),
+        override=reviewer_command,
+    )
+    fallback_seat = None
+    if fallback is not None:
+        fallback_tool, fallback_model, fallback_effort = fallback
+        # Named on the command line, so its effort is an explicit request.
+        fallback_seat = _resolve_seat(
+            repo, fallback_tool, fallback_model, fallback_effort, explicit_effort=True, override=None
+        )
 
     entry = slice_ops.slice_entry(state, slice_id)
     if entry is None:
         raise PmError(f"{slice_id} is not present in the run's slice entries")
-    # Failed commissions also reserve their artifact sequence: they record no
-    # review, so numbering from `len(reviews)` alone would overwrite them.
-    seq, stderr_path = _claim_commission_seq(original_slice_dir, len(entry.get("reviews") or []), skill, resolved_tool)
 
-    # Per-commission, so a later commission cannot replace the pinned diff a
-    # running reviewer has not opened yet.
-    diff_path = original_slice_dir / f"review-{seq}-{skill}-{resolved_tool}.patch"
-    # The pinned diff lives under the run dir (`.git/pm/...`, host-only), not
-    # `.pm/`, so a plain write is correct; the error sidecar sits beside it.
     diff_text, diff_error = git_ops.git_diff_text(repo, before_head, reviewed_head)
-    diff_path.write_text(diff_text, encoding="utf-8")
-    if diff_error is not None:
-        (diff_path.parent / "git-diff-error.txt").write_text(diff_error, encoding="utf-8")
     if before_head and before_head != reviewed_head:
         changed_files = sorted(
             path for path in git_ops.git(repo, "diff", "--name-only", before_head, reviewed_head).splitlines() if path
@@ -486,11 +1026,6 @@ def run_review(
             path for path in git_ops.git(repo, "show", "--name-only", "--format=", reviewed_head).splitlines() if path
         )
 
-    sections = plan_slice.sections
-    reviewer_block = state.get("reviewer") or {}
-    resolved_model = model or reviewer_block.get("model")
-    resolved_effort = effort or reviewer_block.get("effort")
-
     # Read once, so the grants rendered into the prompt and the count recorded
     # with the finished review are provably the same set. That count is what
     # `slice_ops.is_review_fresh` compares against the slice's current grants:
@@ -499,298 +1034,62 @@ def run_review(
     # happened to finish.
     commissioned_grants = plan_mod.slice_grants(state, slice_id)
 
-    drift_record = (
-        None
-        if skill == "drift-audit"
-        else _fresh_drift_audit_report(
-            repo, run_dir, run_id, slice_ops.slice_entry(state, slice_id), reviewed_head, len(commissioned_grants)
-        )
-    )
-    origin_event = _commission_origin(run_dir, slice_id)
-    # The reviewer runs inside a sandbox either way: inherited, when this PM
-    # already runs under `srt` (a campaign child), or wrapped at launch below,
-    # when the run records a sandbox of its own (Mode B).
-    sandboxed = sandbox.inside_sandbox() or sandbox.records_sandbox(state)
-    prompt_text = prompts.render_reviewer_prompt(
-        # Never handed to a drift audit itself: a second audit of the same
-        # commit must stay independent of the first one's verdict.
-        drift_audit_report=drift_record[1] if drift_record else None,
-        pm_adjudications=pm_adjudications,
-        pm_surface_grants=commissioned_grants,
-        skill_name=skill,
-        repo=str(repo),
-        slice_id=slice_id,
-        slice_title=plan_slice.title,
-        before_head=before_head,
-        reviewed_head=reviewed_head,
-        diff_path=str(diff_path),
-        changed_files=changed_files,
-        intended_change=sections.get("Intended Change", "").rstrip(),
-        acceptance_criteria=sections.get("Acceptance Criteria", "").rstrip(),
-        authorized_surface=sections.get("Authorized Surface", "").rstrip(),
-        explicit_non_goals=sections.get("Explicit Non-Goals", "").rstrip(),
-        risk_flags=sections.get("Risk Flags", "").rstrip(),
-        validation_plan=sections.get("Validation Plan", "").rstrip(),
-        validation_record=_read_validation_record(repo, slice_ops.slice_artifact_dir(repo, run_id, slice_id)),
-        include_reference=_reference_filter(changed_files),
-        sandboxed=sandboxed,
-    )
-
-    # Checked here, not in compose_reviewer_command, which stays pure and
-    # I/O-free. opencode is the only tool whose effort flag needs verifying
-    # against the model; the others take effort verbatim or refuse it.
-    if resolved_tool == "opencode" and resolved_effort and not reviewer_command:
-        resolved_effort = profiles.resolve_opencode_variant(resolved_model, resolved_effort, explicit=bool(effort))
-
-    # `resolved_effort` (possibly None) is what goes on the command line.
-    # What gets RECORDED is a distinct value on the COMPOSED path only: an
-    # omitted effort there is a known, repeatable fact -- ran at the
-    # harness/model's own default -- never an unattributed null. Under
-    # `--reviewer-command` there is no harness profile in play, so pm_lib
-    # cannot know what an omitted effort means to the wrapper; that stays
-    # an honest null rather than an invented "default".
-    recorded_effort = resolved_effort if reviewer_command else (resolved_effort or "default")
-
-    command = _build_reviewer_command(
-        resolved_tool,
-        prompt_text,
-        model=resolved_model,
-        effort=resolved_effort,
+    pinned = _Pinned(
         repo=repo,
-        reviewer_command_override=reviewer_command,
-        sandboxed=sandboxed,
-    )
-
-    report_relative = f"{slice_ops.slice_relative_dir(slice_id)}/review-{seq}-{skill}-{resolved_tool}.md"
-    report_original = run_dir / report_relative
-    report_original.parent.mkdir(parents=True, exist_ok=True)
-
-    # The rendered prompt is the only record of what this reviewer was told,
-    # including any PM adjudications that narrowed where it spent attention.
-    # Written BEFORE the reviewer runs so a timeout, crash, or non-zero exit
-    # still leaves the commission auditable rather than only its silence.
-    # Derived from the report's own path so the two can never diverge.
-    prompt_relative = report_relative[: -len(".md")] + "-prompt.md"
-    slice_ops.write_controller_artifact(repo, run_dir, run_id, prompt_relative, prompt_text)
-
-    # The reviewer process must not inherit the PM run capability token from
-    # the controller's exported environment: the token is the controller's
-    # alone, and SKILL.md forbids it in any Reviewer session. Nor does it
-    # inherit the supervising session's own variables (`SEAT_ENV_DROPPED`).
-    reviewer_env = sessions.seat_environ()
-
-    # The wrap checked above is applied here, at launch, so nothing recorded
-    # about the commission sees it. `srt` starts in this new session as its
-    # group leader and the reviewer shares that group, so the timeout's
-    # killpg below still reaches every process.
-    popen_command = command
-    if reviewer_wrap is not None:
-        policy_path, tmpdir = reviewer_wrap
-        popen_command = sandbox.wrap_command(policy_path, command, tmpdir=tmpdir)
-
-    with open(report_original, "wb") as stdout_handle, open(stderr_path, "wb") as stderr_handle:
-        process = subprocess.Popen(
-            # stdin=DEVNULL: `codex exec` blocks on inherited stdin ("Reading
-            # additional input from stdin...") and the hang looks like a slow model.
-            popen_command,
-            cwd=str(repo),
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            env=reviewer_env,
-        )
-        # start_new_session=True makes the child its own process-group
-        # leader, so its pgid equals its pid at creation time — no
-        # getpgid() race against a fast-exiting process.
-        pgid = process.pid
-        launched_at = state_mod.utc_now_iso()
-        # Persist before waiting so `stop` can reap every parallel reviewer.
-        with state_mod.locked_update(run_dir, token) as live_state:
-            live_current = live_state.get("current_slice")
-            if live_current is not None:
-                live_current["reviewer_pids"] = [*(live_current.get("reviewer_pids") or []), pgid]
-        # Printed before the (possibly long) wait begins — a slow-but-alive
-        # local reviewer and a hung one are otherwise indistinguishable from
-        # the PM seat.
-        print(
-            f"reviewer launched: pgid={pgid} report={report_original} stderr={stderr_path}",
-            flush=True,
-        )
-        # Durable counterpart of the line above: lets a later reader tell how
-        # long a reviewer ran, and that one was started even if it never finishes.
-        state_mod.append_event(
-            run_dir,
-            "review-launched",
-            slice_id=slice_id,
-            note=f"{skill} via {resolved_tool}",
-            data={
-                "skill": skill,
-                "tool": resolved_tool,
-                "model": resolved_model,
-                "effort": recorded_effort,
-                "sequence": seq,
-                "pgid": pgid,
-            },
-        )
-        timed_out = False
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=5)  # grace for a clean exit; return value unused
-            except subprocess.TimeoutExpired:
-                pass
-            # Unconditional: a descendant that ignores SIGTERM would survive
-            # if SIGKILL only ran when the leader-wait above also timed out
-            # (the leader can exit on SIGTERM while a child lingers).
-            # ProcessLookupError means the group is already empty — success.
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            returncode = process.wait()
-
-    # Reload and clear the recorded pgid FIRST, on every exit path: the
-    # process has exited, so a failed review must not leave a stale
-    # process-group id behind for a later `stop` to SIGKILL after PID reuse.
-    # (Re-reading also avoids relying on the in-memory state staying
-    # accurate across the potentially long subprocess wait above.)
-    # Persisted BEFORE any fallible post-processing (mirror/hash below): if
-    # either raises, the cleared pgid must already be on disk so a later
-    # `stop` cannot SIGKILL a reused pgid recorded as still-live.
-    failed = timed_out or returncode != 0
-    reaped = False
-    with state_mod.locked_update(run_dir, token) as state:
-        current = state.get("current_slice")
-        # A failed reviewer whose pgid is no longer recorded was reaped by a
-        # PM decision (`stop`, `finalize --accept`/`--stop`), which clears
-        # `reviewer_pids` before killing the group; that is PM's choice, not
-        # the reviewer's failure. Decided before the filter below removes
-        # the pgid, and only for failed exits: a reviewer that exited 0 is
-        # recorded as a review (or, with an empty report, failed on that
-        # ground below) whatever `reviewer_pids` holds.
-        if failed:
-            reaped = current is None or pgid not in (current.get("reviewer_pids") or [])
-        if current is not None and current.get("reviewer_pids"):
-            current["reviewer_pids"] = [pid for pid in current["reviewer_pids"] if pid != pgid]
-
-    if reaped:
-        raise PmError(f"reviewer was reaped by a PM decision (process group {pgid}); not recorded as a failure")
-
-    # A reviewer that exits 0 having written nothing (one died mid-investigation
-    # in the shakedown) is a failed review, not a blank one that would satisfy
-    # the freshness check; it is read like a non-zero exit, via its stderr.
-    empty = not failed and not report_original.read_text(encoding="utf-8", errors="replace").strip()
-    if failed or empty:
-        if timed_out:
-            reason = "timeout"
-            note = f"{skill} via {resolved_tool} timed out after {timeout:g}s; reviewer process group killed"
-        elif failed:
-            reason = f"exit {returncode}"
-            note = f"{skill} via {resolved_tool} exited {returncode}"
-        else:
-            reason = "empty report"
-            note = f"{skill} via {resolved_tool} exited 0 with an empty report"
-        state_mod.append_event(
-            run_dir,
-            "review-failed",
-            slice_id=slice_id,
-            note=note,
-            data={
-                "skill": skill,
-                "tool": resolved_tool,
-                "model": resolved_model,
-                "effort": recorded_effort,
-                "command_override": bool(reviewer_command),
-                "model_tag": model_tag,
-                "origin_event_index": origin_event["index"],
-                "reason": reason,
-            },
-        )
-
-    if timed_out:
-        raise PmError(
-            f"reviewer timed out after {timeout:g}s and was killed (process group {pgid}); "
-            "this is not proof of a hang — a slow cold local model may just need a longer --timeout. "
-            f"Its stderr is at {stderr_path}; re-commission with a larger --timeout to retry"
-        )
-
-    if returncode != 0:
-        stderr_tail = _tail(stderr_path)
-        raise PmError(f"reviewer command failed (exit {returncode}): {stderr_tail}")
-
-    if empty:
-        raise PmError(
-            f"reviewer exited 0 but wrote an empty report; its stderr is at {stderr_path}: "
-            "read it, then re-commission the review"
-        )
-
-    report_original = slice_ops.mirror_artifact(repo, run_dir, run_id, report_relative)
-    sha256 = slice_ops.sha256_file(report_original)
-
-    # Locked: preserve reviews completed concurrently.
-    with state_mod.locked_update(run_dir, token) as state:
-        entry = slice_ops.slice_entry(state, slice_id)
-        if entry is not None:
-            entry["reviews"] = [
-                *(entry.get("reviews") or []),
-                {
-                    "skill": skill,
-                    "tool": resolved_tool,
-                    "model": resolved_model,
-                    "effort": recorded_effort,
-                    "command_override": bool(reviewer_command),
-                    "model_tag": model_tag,
-                    "review_id": f"review-{seq}",
-                    "head": reviewed_head,
-                    "before_head": before_head,
-                    "artifact": str(report_original),
-                    "sha256": sha256,
-                    "launched_at": launched_at,
-                    "at": state_mod.utc_now_iso(),
-                    # How many surface grants this reviewer's prompt showed.
-                    # `is_review_fresh` stales the review as soon as the slice
-                    # carries a different number, so a grant landing mid-review
-                    # cannot be papered over by a later completion stamp.
-                    "grants_seen": len(commissioned_grants),
-                    "origin_event": origin_event,
-                    "review_context": {
-                        "pm_adjudications": pm_adjudications,
-                        "drift_review": (
-                            {
-                                "review_id": drift_record[0].get("review_id"),
-                                "artifact": drift_record[0].get("artifact"),
-                                "sha256": drift_record[0].get("sha256"),
-                            }
-                            if drift_record
-                            else None
-                        ),
-                    },
-                },
-            ]
-    state_mod.append_event(
-        run_dir, "review", slice_id=slice_id, note=f"{skill} via {resolved_tool}", evidence=str(report_original)
-    )
-
-    return ReviewOutcome(
+        run_dir=run_dir,
+        token=token,
+        run_id=run_id,
         slice_id=slice_id,
         skill=skill,
-        tool=resolved_tool,
-        model=resolved_model,
-        effort=recorded_effort,
         model_tag=model_tag,
-        command_override=bool(reviewer_command),
-        review_id=f"review-{seq}",
-        head=reviewed_head,
+        timeout=timeout,
+        pm_adjudications=pm_adjudications,
         before_head=before_head,
-        diff_path=diff_path,
+        reviewed_head=reviewed_head,
+        slice_dir=original_slice_dir,
+        recorded_reviews=len(entry.get("reviews") or []),
+        diff_text=diff_text,
+        diff_error=diff_error,
         changed_files=changed_files,
-        artifact_path=report_original,
-        sha256=sha256,
+        plan_slice=plan_slice,
+        commissioned_grants=commissioned_grants,
+        drift_record=(
+            None
+            if skill == "drift-audit"
+            else _fresh_drift_audit_report(repo, run_dir, run_id, entry, reviewed_head, len(commissioned_grants))
+        ),
+        origin_event=_commission_origin(run_dir, slice_id),
+        # The reviewer runs inside a sandbox either way: inherited, when this
+        # PM already runs under `srt` (a campaign child), or wrapped at
+        # launch, when the run records a sandbox of its own (Mode B).
+        sandboxed=sandbox.inside_sandbox() or sandbox.records_sandbox(state),
+        reviewer_wrap=reviewer_wrap,
     )
+
+    failures: list[FailedCommission] = []
+    seat, retried, on_fallback = primary, False, False
+    while True:
+        result = _commission(pinned, seat)
+        if isinstance(result, ReviewOutcome):
+            return result
+        failures.append(result)
+        if not retried and not on_fallback and result.failure_class not in _NO_WAIT_CLASSES:
+            next_seat, step = seat, f"retrying the same seat after {RETRY_WAIT_SECONDS:g} s"
+        elif fallback_seat is not None and not on_fallback:
+            next_seat, step = fallback_seat, f"falling back to {fallback_seat.label()}"
+        else:
+            next_seat, step = None, None
+        print(
+            f"reviewer failed: {result.review_id} on {seat.label()}: {result.failure_class}"
+            + (f"; {step}" if step else ""),
+            flush=True,
+        )
+        if next_seat is None:
+            raise PmError(f"every reviewer commission failed ({len(failures)}):\n" + _failures_text(failures))
+        if next_seat is seat:
+            retried = True
+            time.sleep(RETRY_WAIT_SECONDS)
+        else:
+            on_fallback = True
+        _require_still_current(run_dir, token, slice_id, failures, repo=repo, reviewed_head=reviewed_head)
+        seat = next_seat

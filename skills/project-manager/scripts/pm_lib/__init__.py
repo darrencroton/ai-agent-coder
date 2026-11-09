@@ -4,12 +4,17 @@ Pure-stdlib package. Nothing in ``pm_lib`` or its submodules may import from
 outside the standard library or from ``pm_lib`` itself. In particular, no
 module here may import from ``skills/orchestrator/``.
 
-The one deliberate exception is cross-skill, not a package import:
-``code_metrics`` loads the sibling ``code-health`` skill's ``health.py`` at
-runtime with ``importlib``, from a path relative to this file. It is path-based
-because ``skills/`` is not an importable package and ``pm_lib`` must keep
-importing nothing outside the standard library; a missing or unloadable
-``health.py`` degrades to an ``{"error": ...}`` code block, never a failure.
+There are two deliberate exceptions, both cross-skill and neither a package
+import. First, ``code_metrics`` loads the sibling ``code-health`` skill's
+``health.py`` at runtime with ``importlib``, from a path relative to this file.
+It is path-based because ``skills/`` is not an importable package and
+``pm_lib`` must keep importing nothing outside the standard library; a missing
+or unloadable ``health.py`` degrades to an ``{"error": ...}`` code block, never
+a failure. Second, ``plan_review`` runs the ``orchestrator`` skill's
+``delegate_jobs.py``, found by the same kind of relative path, as a
+subprocess and never an import, so nothing of the orchestrator enters this
+process; the orchestrator's own contract validates the request it is given,
+and any step that fails is an error, never a degraded result.
 """
 
 from __future__ import annotations

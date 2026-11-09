@@ -339,6 +339,10 @@ class DerivationTestCase(PmTestCase):
         arguments.update(overrides)
         return sandbox.derive_policy(minimal_base_policy() if base is None else base, **arguments)
 
+    def transcripts(self, worktree: Path | None = None) -> dict:
+        """The literal grant on `worktree`'s Claude Code transcript directory."""
+        return _literal(sandbox._claude_transcript_dir(worktree or self.worktree))
+
     def pointer_denies(self, git_dir: Path) -> list[dict]:
         return [
             _literal(git_dir / "commondir"),
@@ -386,6 +390,7 @@ class TestDerivePolicy(DerivationTestCase):
                 _literal(self.common / "packed-refs.lock"),
                 _literal(_socket_grant(self.socket)),
                 _literal(self.tmpdir),
+                self.transcripts(),
             ],
         )
         self.assertEqual(
@@ -400,7 +405,7 @@ class TestDerivePolicy(DerivationTestCase):
         self.assertIn(_literal(self.git_dir / "pm"), outside["filesystem"]["denyWrite"])
         self.assertNotIn(ledger_grant, outside["filesystem"]["allowWrite"])
         self.assertNotIn(_literal(self.git_dir / "pm"), inside["filesystem"]["denyWrite"])
-        self.assertEqual(inside["filesystem"]["allowWrite"][-1], ledger_grant)
+        self.assertEqual(inside["filesystem"]["allowWrite"][-2:], [ledger_grant, self.transcripts()])
         for policy in (outside, inside):
             for deny in self.escape_denies():
                 self.assertIn(deny, policy["filesystem"]["denyWrite"])
@@ -413,7 +418,13 @@ class TestDerivePolicy(DerivationTestCase):
         repo = _real(self.repo)
         self.assertEqual(
             policy["filesystem"]["allowWrite"],
-            [_literal(repo), _literal(repo / ".git"), _literal(_socket_grant(self.socket)), _literal(self.tmpdir)],
+            [
+                _literal(repo),
+                _literal(repo / ".git"),
+                _literal(_socket_grant(self.socket)),
+                _literal(self.tmpdir),
+                self.transcripts(repo),
+            ],
         )
         self.assertEqual(
             policy["filesystem"]["denyWrite"],
@@ -442,6 +453,7 @@ class TestDerivePolicy(DerivationTestCase):
                 _literal(self.common),
                 _literal(sandbox.toolkit_root()),
                 _literal(extra),
+                self.transcripts(),
             ],
         )
         self.assertEqual(policy["network"]["allowUnixSockets"], [_socket_grant(self.socket)])
@@ -450,6 +462,26 @@ class TestDerivePolicy(DerivationTestCase):
             self.assertEqual(policy["network"][key], [])
         self.assertEqual(policy["filesystem"]["denyRead"], [])
         self.assertIsInstance(policy["filesystem"]["denyWrite"], list)
+
+    def test_exclusions_are_denied_at_any_depth_by_glob_and_the_transcript_dir_is_granted_literally(self) -> None:
+        base = minimal_base_policy()
+        base["filesystem"]["denyRead"] = ["~/.ssh"]
+        policy = self.derive(base, pm_inside=True, exclusions=["docs/dev", "secret.env"])
+        # Plain strings, so srt reads them as globs: a copy at any depth is denied.
+        self.assertEqual(policy["filesystem"]["denyRead"], ["~/.ssh", "/**/docs/dev", "/**/secret.env"])
+        for key in ("allowRead", "allowWrite"):
+            self.assertEqual(policy["filesystem"][key].count(self.transcripts()), 1, key)
+        self.assertEqual(self.derive()["filesystem"]["denyRead"], [])
+
+    def test_the_transcript_dir_follows_claude_codes_mangling_of_the_worktree_path(self) -> None:
+        worktree = Path("/Users/dcroton/Local/git-repos/campaign-worktrees/sage26/sage26-c03-supply")
+        self.assertEqual(
+            sandbox._claude_transcript_dir(worktree),
+            Path.home()
+            / ".claude"
+            / "projects"
+            / "-Users-dcroton-Local-git-repos-campaign-worktrees-sage26-sage26-c03-supply",
+        )
 
     def test_the_socket_is_granted_under_its_real_directory(self) -> None:
         # srt resolves only paths that exist and the socket does not yet,
@@ -566,19 +598,90 @@ class TestDerivePolicy(DerivationTestCase):
                     self.assertIn(fragment, str(ctx.exception))
 
 
+class TestBriefProductExclusions(unittest.TestCase):
+    """`sandbox.brief_product_exclusions`, which launch-child and preflight share."""
+
+    def test_product_items_are_read_as_paths_and_every_other_item_is_free_text(self) -> None:
+        brief = (
+            "# Brief\n\n## Exclusions\n"
+            "- product: `docs/dev/`\n"
+            "- Product:  secret.env \n"
+            "- ~/Obsidian, which no seat may read\n"
+            "- product: docs/dev\n"
+            "- CM only: none\n"
+            "\n## Budgets\n- product: not/an/exclusion\n"
+        )
+        self.assertEqual(sandbox.brief_product_exclusions(brief), ["docs/dev", "secret.env"])
+        self.assertEqual(sandbox.brief_product_exclusions("# Brief\n\n## Budgets\n- max_parallel: 1\n"), [])
+
+    def test_a_path_that_is_not_one_relative_path_is_refused_naming_its_line(self) -> None:
+        for item in ("- product: /Users/me/repo/docs/dev", "- product: docs/../secrets", "- product: docs/*"):
+            with self.subTest(item=item), self.assertRaises(PmError) as caught:
+                sandbox.brief_product_exclusions(f"## Exclusions\n{item}\n")
+            self.assertIn(repr(item), str(caught.exception))
+
+
+class TestBriefOutputDirectories(unittest.TestCase):
+    """`sandbox.brief_output_directories`, which `stop-child --archive` copies out of a node worktree."""
+
+    def test_the_item_under_allowed_paths_is_read_as_a_list_of_paths(self) -> None:
+        brief = (
+            "# Brief\n\n## Allowed paths\n- src/\n"
+            "- git-ignored OUTPUT directories: `output/`, results/runs/ , `output`\n"
+            "\n## Budgets\n- Git-ignored output directories: elsewhere\n"
+        )
+        self.assertEqual(sandbox.brief_output_directories(brief), ["output", "results/runs"])
+
+    def test_none_gives_no_directories_and_a_missing_item_or_section_gives_none(self) -> None:
+        for brief in (
+            "## Allowed paths\n- Git-ignored output directories: none\n",
+            "## Allowed paths\n- Git-ignored output directories: `None`\n",
+        ):
+            with self.subTest(brief=brief):
+                self.assertEqual(sandbox.brief_output_directories(brief), [])
+        for brief in (
+            "## Allowed paths\n- src/\n",
+            "## Budgets\n- Git-ignored output directories: output\n",
+        ):
+            with self.subTest(brief=brief):
+                self.assertIsNone(sandbox.brief_output_directories(brief))
+
+    def test_a_path_that_is_not_one_relative_path_is_refused_naming_its_line(self) -> None:
+        for value in (
+            "output, ../shared",
+            "/abs/output",
+            "output, , results",
+            "out*",
+            "output/ (plots)",
+            "`plots/` (git-ignored)",
+        ):
+            line = f"- Git-ignored output directories: {value}"
+            with self.subTest(value=value), self.assertRaises(PmError) as caught:
+                sandbox.brief_output_directories(f"## Allowed paths\n{line}\n")
+            self.assertIn(repr(line), str(caught.exception))
+
+
 class TestDeriveReviewerAndAttachPolicies(DerivationTestCase):
-    def test_the_reviewer_writes_only_its_temp_dir_and_reaches_no_tmux_socket(self) -> None:
+    def test_the_reviewer_writes_only_its_temp_and_transcript_dirs_and_reaches_no_tmux_socket(self) -> None:
         base = minimal_base_policy()
         base["filesystem"]["allowWrite"] = ["~/.codex/sessions"]
         extra = self.repo.parent / "plan-dir"
         policy = sandbox.derive_reviewer_policy(
             base, worktree=self.worktree, tmpdir=self.tmpdir, control_root=self.control_root, extra_read=[extra]
         )
-        self.assertEqual(policy["filesystem"]["allowWrite"], ["~/.codex/sessions", _literal(self.tmpdir)])
+        self.assertEqual(
+            policy["filesystem"]["allowWrite"], ["~/.codex/sessions", _literal(self.tmpdir), self.transcripts()]
+        )
         self.assertEqual(policy["filesystem"]["denyWrite"], [*self.always_denies(), *self.escape_denies()])
         self.assertEqual(
             policy["filesystem"]["allowRead"],
-            [_literal(self.worktree), _literal(self.common), _literal(sandbox.toolkit_root()), _literal(extra)],
+            [
+                _literal(self.worktree),
+                _literal(self.common),
+                _literal(sandbox.toolkit_root()),
+                _literal(extra),
+                self.transcripts(),
+            ],
         )
         self.assertIs(policy["allowPty"], True)
         self.assertNotIn("allowUnixSockets", policy["network"])

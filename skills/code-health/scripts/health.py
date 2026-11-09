@@ -165,9 +165,34 @@ def unmerged_paths(root: Path) -> list[str]:
     return sorted({row.split("\t", 1)[1] for row in rows if "\t" in row})
 
 
+def skip_worktree_paths(root: Path) -> set[str]:
+    """Return paths the index marks skip-worktree: those a sparse checkout omits."""
+    # The lint skill has its own copy; the two skills are deliberately self-contained.
+    rows = git_bytes(root, "ls-files", "-t", "-z").split(b"\0")
+    return {row[2:].decode("utf-8", errors="surrogateescape") for row in rows if row.startswith(b"S ")}
+
+
+def sparse_excluded_prefixes(root: Path) -> list[str]:
+    """Return the paths a non-cone sparse checkout excludes (`!/<path>` patterns), or [] when not sparse.
+
+    The index marks only paths present at HEAD, so a path excluded by pattern but present only at the
+    base revision is caught by these."""
+    result = subprocess.run(["git", "-C", str(root), "sparse-checkout", "list"], capture_output=True, text=True,
+                            check=False)
+    if result.returncode != 0:
+        return []
+    return [line[2:].rstrip("/") for line in result.stdout.splitlines() if line.startswith("!/") and len(line) > 2]
+
+
 def archive_revision(root: Path, ref: str) -> tempfile.TemporaryDirectory[str]:
-    """Materialise base blobs without ``git archive`` attribute exclusions."""
+    """Materialise base blobs without ``git archive`` attribute exclusions.
+
+    A path the checkout skips is not materialised: a campaign enforces a
+    brief's exclusion by a sparse checkout, and the skipped content must not
+    reach $TMPDIR, where the sandbox's read denial does not reach.
+    """
     revision = git(root, "rev-parse", "--verify", f"{ref}^{{commit}}").strip()
+    skipped, prefixes = skip_worktree_paths(root), sparse_excluded_prefixes(root)
     tmp = tempfile.TemporaryDirectory(prefix="code-health-base-")
     try:
         entries: list[tuple[str, Path]] = []
@@ -177,7 +202,8 @@ def archive_revision(root: Path, ref: str) -> tempfile.TemporaryDirectory[str]:
             metadata, raw_path = entry.split(b"\t", 1)
             mode, kind, object_id = metadata.decode("ascii").split()
             path = raw_path.decode("utf-8", errors="surrogateescape")
-            if kind != "blob" or mode == "120000" or not language_for(path):
+            excluded = path in skipped or any(path == p or path.startswith(p + "/") for p in prefixes)
+            if kind != "blob" or mode == "120000" or not language_for(path) or excluded:
                 continue
             target = Path(tmp.name, path)
             if target.parent == target or not target.is_relative_to(tmp.name):

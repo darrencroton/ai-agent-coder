@@ -866,6 +866,32 @@ def _read_blobs(data: bytes, count: int) -> list[bytes]:
     return blobs
 
 
+def skip_worktree_paths(root: str) -> set[str]:
+    """Repo-relative paths the index marks skip-worktree (`S` in `ls-files -t`),
+    which is how a sparse checkout marks a path it leaves off disk."""
+    paths = set()
+    for entry in git_bytes(["ls-files", "-t", "-z"], root).split(b"\0"):
+        tag, _, raw_path = entry.partition(b" ")
+        if tag == b"S" and raw_path:
+            paths.add(os.fsdecode(raw_path))
+    return paths
+
+
+def sparse_excluded_prefixes(root: str) -> list[str]:
+    """The paths a non-cone sparse checkout excludes (`!/<path>` lines of
+    `git sparse-checkout list`), without the markers; empty when the checkout
+    is not sparse. The index only marks paths that exist at HEAD, so a path
+    excluded by pattern but present only at the base is caught by these."""
+    code, out, _err = run(["git", "sparse-checkout", "list"], root)
+    if code != 0:
+        return []
+    return [line[2:].rstrip("/") for line in out.splitlines() if line.startswith("!/") and len(line) > 2]
+
+
+def _is_skipped(path: str, skipped: set[str], prefixes: list[str]) -> bool:
+    return path in skipped or any(path == p or path.startswith(p + "/") for p in prefixes)
+
+
 @contextmanager
 def base_tree(root: str, base: str):
     """Yield `(directory, paths)`: the regular files of `base` written byte for
@@ -875,9 +901,16 @@ def base_tree(root: str, base: str):
     the git dir (`git worktree add` does) and honours no `export-ignore`
     attribute (`git archive` does). The whole tree is written, not only the
     linted files, so base-side tools find the base's own project config;
-    symlinks are recreated as links. Submodules are not materialised.
+    symlinks are recreated as links. Submodules are not materialised, and
+    neither is a path the checkout skips (`skip_worktree_paths`) or a sparse
+    pattern excludes (`sparse_excluded_prefixes`, which also covers a path
+    present only at the base): a campaign
+    enforces a brief's exclusion by a sparse checkout of the node worktree, and
+    a skipped path must never be written to $TMPDIR, where the sandbox's read
+    denial of it does not reach.
     """
     commit = git(["rev-parse", "--verify", f"{base}^{{commit}}"], root).strip()
+    skipped, prefixes = skip_worktree_paths(root), sparse_excluded_prefixes(root)
     tmp = tempfile.mkdtemp(prefix="lint-base-")
     try:
         entries: list[tuple[str, str, bool]] = []
@@ -886,8 +919,9 @@ def base_tree(root: str, base: str):
                 continue
             meta, raw_path = entry.split(b"\t", 1)
             mode, kind, oid = meta.decode("ascii").split()
-            if kind == "blob":
-                entries.append((oid, os.fsdecode(raw_path), mode == "120000"))
+            path = os.fsdecode(raw_path)
+            if kind == "blob" and not _is_skipped(path, skipped, prefixes):
+                entries.append((oid, path, mode == "120000"))
         # Regular files first, links last: a link written early could redirect a
         # later file's parent directory outside the temp tree.
         ordered = sorted(entries, key=lambda e: e[2])

@@ -82,7 +82,7 @@ def _rev(
     }
 
 
-def _failed(key: tuple, skill: str = "code-review") -> dict:
+def _failed(key: tuple, skill: str = "code-review", reason: str = "timeout") -> dict:
     tool, model, effort, override = key
     return {
         "review_id": None,
@@ -93,7 +93,7 @@ def _failed(key: tuple, skill: str = "code-review") -> dict:
         "effort": effort,
         "command_override": override,
         "origin": 0,
-        "reason": "timeout",
+        "reason": reason,
     }
 
 
@@ -360,6 +360,7 @@ class TestLeaderboardColumns(unittest.TestCase):
             ["1", "3", "1.50 (n=2)", "2"],
         )
         self.assertEqual(claude["Usable (PM), share rated/(rated+unavailable+failed)"], "2/2 (100%)")
+        self.assertEqual(claude["Failed by class, n"], "0")
         self.assertEqual(claude["Pairwise wins (PM), share"], "2/3 (67%)")
         self.assertEqual(claude["Close-call wins (PM), share"], "1/2 (50%)")
         self.assertEqual(codex["Score (PM), mean 0–2"], "1.67 (n=3)")
@@ -373,6 +374,7 @@ class TestLeaderboardColumns(unittest.TestCase):
         )
         self.assertEqual(qwen["Commissions, n"], "2")
         self.assertEqual(qwen["Usable (PM), share rated/(rated+unavailable+failed)"], "1/2 (50%)")
+        self.assertEqual(qwen["Failed by class, n"], "timeout 1")
         self.assertEqual(qwen["Pairwise wins (PM), share"], "0/2 (0%)")
         self.assertEqual(qwen["Close-call wins (PM), share"], "n/a")
 
@@ -496,6 +498,20 @@ class TestLeaderboardWindowSelection(unittest.TestCase):
             ranked[0]["Usable (PM), share rated/(rated+unavailable+failed)"],
             "1/3 (33%)",
         )
+
+    def test_failed_commissions_are_counted_by_class_in_a_fixed_order(self) -> None:
+        """Classes print in the review module's order, whatever order they
+        failed in; a zero class is left out; any reason outside the classes
+        (an unrecognised exit, or an older run's `empty report`) is
+        unclassified."""
+        drift = ("codex", "gpt-6.1-sol", "high", False)
+        reasons = ("capacity", "exit 3", "limit", "empty report", "limit", "capacity", "limit")
+        reviews = [_failed(drift, "drift-audit", reason) for reason in reasons]
+        text = _render(("host/run-1.json", _file("run-1", [_row([_sub(OPUS)], reviews=reviews)])))
+        (ranked,) = _tables(_section(text, "### drift-audit"))
+
+        self.assertEqual(ranked[0]["Failed by class, n"], "limit 3 · capacity 2 · unclassified 2")
+        self.assertEqual(ranked[0]["Usable (PM), share rated/(rated+unavailable+failed)"], "0/7 (0%)")
 
 
 class TestLeaderboardRanking(unittest.TestCase):

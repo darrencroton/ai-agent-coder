@@ -51,6 +51,14 @@ TRUST_PROMPT_MARKERS: tuple[str, ...] = (
     # Qwen's phrasing, and its dialog defaults to "Trust folder" — an
     # unrecognized one would be confirmed by the launch injection's Enter.
     "Do you trust this folder",
+    # Claude Code 2.1.319's phrasing ("Quick safety check: Is this a project
+    # you created or one you trust?", options "No, exit" and "Yes, I trust
+    # this folder"). Its default is the exit, so an unrecognized one ended
+    # the session on the launch pointer's Enter, with no transcript and no
+    # pane left to read; found by the first sandboxed Claude child launched
+    # under that version.
+    "Is this a project you created or one you trust",
+    "Yes, I trust this folder",
 )
 
 _LITERAL_MARKERS: dict[str, tuple[str, ...]] = {
@@ -97,17 +105,31 @@ def _literal_marker_re(marker: str) -> re.Pattern[str]:
     path like `/tmp/tmpq8mfa2z1/` scanned as a credential prompt, and a false
     marker refuses every send and ends `observe --wait` early. Everything else keeps substring matching so a real prompt
     a pane renders flush against other characters ("xxxEnter API key", the
-    mid-token wrap case) still matches; the accepted cost is that negated or
-    quoted prose can match too ("no approval required", "disallow access"),
-    which fails toward stopping and is the safer direction here.
+    mid-token wrap case) still matches; the accepted cost is that negated
+    prose can match too ("no approval required", "disallow access"), which
+    fails toward stopping and is the safer direction here.
 
     The test is a pure word token, not the absence of spaces: "two-factor" is
     a hyphenated phrase, and bounding it would lose "xxxTwo-factor".
+
+    An occurrence directly preceded by a quote character (`"`, `'`, a
+    backtick, or a curly opening quote) never matches. On a pane, quoted
+    marker text is not a dialog a harness renders: it is a command echo
+    (`observe --seen-marker "Showing detailed transcript"`, visible in the
+    child's own pane), the toolkit's `dialog marker: ... (matched '...')` line
+    printed there, or prose quoting a marker. A child PM acknowledging a
+    marker by running that command ended `wait-child` on the echo of the
+    command itself. The scan lowercases and whitespace-normalises first, so
+    in every such echo the quote sits directly against the literal. The
+    rule is a heuristic about how the harnesses render: every dialog seen so
+    far is bare or behind box-drawing characters, which still match, and a
+    harness that rendered a quote directly before a marker would be missed.
     """
     body = re.escape(marker.lower())
+    unquoted = "(?<![\"'`‘“])"
     if not marker.isalnum():
-        return re.compile(body)
-    return re.compile(rf"\b{body}\b")
+        return re.compile(unquoted + body)
+    return re.compile(rf"{unquoted}\b{body}\b")
 
 
 def scan_dialog_markers(text: str) -> dict[str, Any]:

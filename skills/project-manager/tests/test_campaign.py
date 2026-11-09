@@ -231,8 +231,8 @@ class TestCampaignParsers(unittest.TestCase):
             "--sandbox",
         },
         "wait-child": {"--worktree", "--wait", "--seen-marker"},
-        "answer-child": {"--worktree", "--text", "--redeliver"},
-        "stop-child": {"--worktree", "--reason"},
+        "answer-child": {"--worktree", "--text", "--redeliver", "--follow-up"},
+        "stop-child": {"--worktree", "--reason", "--archive"},
     }
 
     def test_each_campaign_command_takes_exactly_its_flags_and_never_run_or_token(self) -> None:
@@ -816,7 +816,8 @@ class TestChildLifecycle(CampaignTestCase):
         self.assertTrue((worktree / ".pm" / ".gitignore").is_file())
         self.assertEqual(launcher.read_bytes(), self.prompt_file.read_bytes())
         manifest = json.loads((directory / "child.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(manifest), {*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir"})
+        self.assertEqual(set(manifest), {*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir", "exclusions"})
+        self.assertEqual(manifest["exclusions"], [], "no brief, so nothing is excluded")
         # The launcher sits in no git repository: nothing is refused and both are null.
         self.assertIsNone(manifest["dossier_commit"])
         self.assertIsNone(manifest["node_dir"])
@@ -1203,7 +1204,7 @@ class TestUnsandboxedLaunchUnchanged(CampaignTestCase):
         self.assertEqual(code, 0, out + err)
         worktree = self.worktree.resolve()
         manifest = json.loads(campaign.manifest_path(worktree).read_text(encoding="utf-8"))
-        self.assertEqual(list(manifest), [*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir"])
+        self.assertEqual(list(manifest), [*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir", "exclusions"])
         session = manifest["session"]
         self.assertIn(f"\nwatch: tmux -L {CHILD_SOCKET} attach -t {session}\n", out)
         self.assertNotIn("sandbox", out)
@@ -1290,6 +1291,135 @@ class TestLaunchChildNodeDirectory(SandboxLaunchTestCase):
         self.assertEqual(campaign.load_manifest(worktree)["session"], manifest["session"])
         code, out, err = self.run_cli(["stop-child", "--worktree", str(worktree), "--reason", "done"])
         self.assertEqual(code, 0, out + err)
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real child session")
+class TestLaunchChildProductExclusions(SandboxLaunchTestCase):
+    """A brief's `product:` exclusion is removed from the node worktree by a
+    sparse checkout, and a launch whose setup brings it back is refused."""
+
+    SECRET = "owner notes\n"
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "secret").mkdir()
+        (self.repo / "secret" / "x.txt").write_text(self.SECRET, encoding="utf-8")
+        self._git("add", "secret")
+        self._git("commit", "-q", "-m", "owner's private notes")
+        (self.dossier / "brief.md").write_text(
+            "# Brief: t\n\n## Worktree setup\n- none\n\n## Exclusions\n- product: `secret/`\n- ~/Obsidian\n",
+            encoding="utf-8",
+        )
+        self.commit_dossier()
+
+    def argv(self) -> list[str]:
+        argv = self.launch_argv(self.harness)
+        argv[argv.index("--base") + 1] = "HEAD"
+        return argv
+
+    def test_the_excluded_path_is_absent_the_worktree_clean_and_the_manifest_records_it(self) -> None:
+        code, out, err = self.run_cli(self.argv())
+        self.assertEqual(code, 0, out + err)
+        worktree = self.worktree.resolve()
+        self.assertFalse(os.path.lexists(worktree / "secret"))
+        self.assertTrue((worktree / "README.md").is_file(), "everything else is checked out")
+        self.assertEqual(git_ops.git(worktree, "status", "--porcelain"), "")
+        self.assertEqual(git_ops.git(worktree, "diff", "HEAD", "--name-only"), "")
+        self.assertEqual(campaign.load_manifest(worktree)["exclusions"], ["secret"])
+        code, out, err = self.run_cli(["stop-child", "--worktree", str(worktree), "--reason", "done"])
+        self.assertEqual(code, 0, out + err)
+
+    def test_a_setup_script_that_recreates_the_path_is_refused_naming_it_and_the_leftovers(self) -> None:
+        # An identical copy leaves `git status` clean, so only the path check sees it.
+        script = self.repo.parent / "setup-recreate.sh"
+        script.write_text(f"mkdir secret\nprintf '{self.SECRET.strip()}\\n' > secret/x.txt\n", encoding="utf-8")
+        with mock.patch.object(campaign.sessions, "start_session") as start:
+            code, out, err = self.run_cli([*self.argv(), "--setup", str(script)])
+        self.assertEqual(code, 2, out + err)
+        start.assert_not_called()
+        self.assertIn("the brief excludes secret, but the worktree holds it after setup", err)
+        self.assertIn(f"branch node-1 and worktree {self.worktree.resolve()} are left behind", err)
+        self.assertFalse(campaign.manifest_path(self.worktree).exists(), "no session, so no manifest")
+
+
+@unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real child session")
+class TestStopChildArchive(SandboxLaunchTestCase):
+    """`stop-child --archive` after a fake child that writes git-ignored
+    output and its completion file: the archive, then the worktree removal
+    with the branch kept, or, when the copy fails, nothing removed."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / ".gitignore").write_text("output/\n", encoding="utf-8")
+        self._git("add", ".gitignore")
+        self._git("commit", "-q", "-m", "ignore output")
+        (self.dossier / "brief.md").write_text(
+            "# Brief: t\n\n## Allowed paths\n- README.md\n- Git-ignored output directories: `output/`\n",
+            encoding="utf-8",
+        )
+        self.commit_dossier()
+        body = "\n".join(
+            [
+                "echo FAKE_HARNESS_READY",
+                "mkdir -p output && printf 'measured\\n' > output/data.txt",
+                f"echo '{_RESULT_JSON}' > \"$PM_CHILD_RESULT_PATH\"",
+                "exec cat -",
+            ]
+        )
+        self.harness = write_fake_harness(self.repo.parent / "fake-child.sh", body)
+        self.results = self.repo.parent / "results"
+
+    def launch_completed_child(self) -> Path:
+        argv = self.launch_argv(self.harness)
+        argv[argv.index("--base") + 1] = "HEAD"
+        code, out, err = self.run_cli(argv)
+        self.assertEqual(code, 0, out + err)
+        worktree = self.worktree.resolve()
+        result = campaign.campaign_dir(worktree) / "child-result.json"
+        self.assertTrue(self._wait_for(result.is_file), "the fake child never wrote its completion file")
+        return worktree
+
+    def stop(self, worktree: Path) -> tuple[int, str, str]:
+        return self.run_cli(
+            ["stop-child", "--worktree", str(worktree), "--reason", "done", "--archive", str(self.results)]
+        )
+
+    def test_a_complete_archive_removes_the_worktree_and_keeps_the_branch(self) -> None:
+        worktree = self.launch_completed_child()
+        code, out, err = self.stop(worktree)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+        self.assertIn(f"worktree removed: {worktree} (branch node-1 kept)", out)
+        self.assertNotIn("archive: not completed", out)
+        validation = self.dossier.resolve() / "validation" / "n1"
+        self.assertIn(f"archive: wrote {validation / 'diff.patch'}", out)
+        self.assertTrue((validation / "campaign" / "child-result.json").is_file())
+        self.assertTrue((validation / "campaign" / "pane.txt").is_file(), "the pane is captured before the archive")
+        self.assertEqual((self.results / "n1" / "output" / "data.txt").read_text(encoding="utf-8"), "measured\n")
+        self.assertFalse(os.path.lexists(worktree))
+        self.assertNotIn(str(worktree), self.worktrees())
+        self.assertIn("refs/heads/node-1 ", self.branches())
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root writes through a 0500 directory")
+    def test_an_unwritable_results_root_exits_2_naming_the_copy_and_removes_nothing(self) -> None:
+        worktree = self.launch_completed_child()
+        self.results.mkdir()
+        self.results.chmod(0o500)
+        self.addCleanup(self.results.chmod, 0o700)
+        code, out, err = self.stop(worktree)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn(f"killed tmux server {CHILD_SOCKET}", out)
+        self.assertIn(f"archive: not completed (could not copy {worktree / 'output'} to", out)
+        self.assertNotIn("worktree removed", out)
+        self.assertTrue((worktree / "output" / "data.txt").is_file())
+        self.assertIn(f"worktree {worktree}\n", self.worktrees())
+
+        # The child is dead now; a re-run once the root is writable still archives, then removes.
+        self.results.chmod(0o700)
+        code, out, err = self.stop(worktree)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"worktree removed: {worktree} (branch node-1 kept)", out)
+        self.assertTrue((self.results / "n1" / "output" / "data.txt").is_file())
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required to drive a real child session")
@@ -1430,6 +1560,63 @@ class TestAnswerChildDelivery(CampaignTestCase):
             campaign.answer_child(self.worktree, text="A", redeliver=True)
         with self.assertRaises(PmError):
             campaign.answer_child(self.worktree)
+
+    def followup_pointer(self, number: int, k: int) -> str:
+        return prompts.render_answer_pointer(self.directory / f"cm-answer-{number}-followup-{k}.md")
+
+    def test_follow_up_writes_a_numbered_file_and_sends_its_pointer(self) -> None:
+        (self.directory / "cm-question.md").write_text("which?\n", encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--text", "A"])
+        self.assertEqual(code, 0, out + err)
+        for k in (1, 2):
+            code, out, err = self.run_cli([*self.argv, "--follow-up", f"and also B{k}"])
+            self.assertEqual(code, 0, out + err)
+            path = self.directory / f"cm-answer-1-followup-{k}.md"
+            self.assertEqual(path.read_text(encoding="utf-8"), f"and also B{k}")
+            self.assertIn(f"follow-up: {path} (to answer 1)", out)
+            self.assertIn("delivery: ", out)
+            pointer = self.followup_pointer(1, k)
+            self.assertTrue(self._wait_for(lambda seen=pointer: seen in self.inputs()), self.inputs())
+        # The answer is untouched and `--redeliver` still resolves to it, not to a follow-up.
+        self.assertEqual((self.directory / "cm-answer-1.md").read_text(encoding="utf-8"), "A")
+        code, out, err = self.run_cli([*self.argv, "--redeliver"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"redelivered: {self.directory / 'cm-answer-1.md'}", out)
+        self.assert_socket_untouched()
+
+    def test_follow_up_refusals_touch_nothing(self) -> None:
+        # No answer yet.
+        code, out, err = self.run_cli([*self.argv, "--follow-up", "x"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("no answer to follow up", err)
+        (self.directory / "cm-answer-1.md").write_text("A", encoding="utf-8")
+        # An open question wants --text, not a follow-up.
+        (self.directory / "cm-question.md").write_text("and then?\n", encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--follow-up", "x"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("answer it with --text", err)
+        (self.directory / "cm-question.md").unlink()
+        # A finished child cannot be reached.
+        (self.directory / "child-result.json").write_text(_RESULT_JSON, encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--follow-up", "x"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("completion file", err)
+        (self.directory / "child-result.json").unlink()
+        # Blank text.
+        code, out, err = self.run_cli([*self.argv, "--follow-up", "  "])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("must be non-empty", err)
+        self.assertEqual(self.files(), ["cm-answer-1.md"])
+        time.sleep(1.0)
+        self.assertNotIn(self.followup_pointer(1, 1), self.inputs())
+
+    def test_follow_up_is_exclusive_with_text_and_redeliver(self) -> None:
+        for extra in (["--text", "A", "--follow-up", "x"], ["--redeliver", "--follow-up", "x"]):
+            with self.subTest(extra=extra):
+                code, _out, err = self.run_cli([*self.argv, *extra])
+                self.assertEqual(code, 2, err)
+        with self.assertRaises(PmError):
+            campaign.answer_child(self.worktree, text="A", follow_up="x")
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required to host the marked server")
@@ -1930,8 +2117,9 @@ class TestSandboxedChild(SandboxLaunchTestCase):
         self.assertFalse(self.control.exists())
 
     def test_a_sandboxed_launch_confines_the_child_and_stop_child_tears_it_down(self) -> None:
-        # The brief pins the policy, so the launch also shows a matching pin is accepted.
-        self.write_brief(self.pin(self.policy))
+        # The brief pins the policy, so the launch also shows a matching pin is
+        # accepted, and excludes a product path, which the policy must deny.
+        self.write_brief(self.pin(self.policy) + "\n\n## Exclusions\n- product: secret")
         pm_dir = self.worktree_real / ".pm"
         probes = pm_dir / "probes.txt"
         leak = self.worktree_real.parent / "leak"
@@ -1958,10 +2146,14 @@ class TestSandboxedChild(SandboxLaunchTestCase):
         self.assertIn(
             {"path": str(self.prompt_file.resolve().parent), "literal": True}, policy["filesystem"]["allowRead"]
         )
+        self.assertEqual(policy["filesystem"]["denyRead"], ["/**/secret"])
         record = sandbox.read_record(self.control)
         self.assertEqual(record["worktree"], str(worktree))
         manifest = json.loads(campaign.manifest_path(worktree).read_text(encoding="utf-8"))
-        self.assertEqual(list(manifest), [*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir", "sandbox"])
+        self.assertEqual(
+            list(manifest), [*campaign._MANIFEST_FIELDS, "dossier_commit", "node_dir", "exclusions", "sandbox"]
+        )
+        self.assertEqual(manifest["exclusions"], ["secret"])
         block = manifest["sandbox"]
         self.assertEqual(set(block), {"policy", "policy_sha256", "socket", "control_dir"})
         for key, value in block.items():

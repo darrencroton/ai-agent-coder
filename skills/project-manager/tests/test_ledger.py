@@ -322,6 +322,23 @@ class TestRunRowsDeveloperFigures(unittest.TestCase):
 
 
 class TestRunRowsReviews(unittest.TestCase):
+    def test_a_failed_rows_reason_is_the_recorded_one_whether_classified_or_not(self) -> None:
+        """The ledger projects the reason as recorded; reading `exit <N>` as
+        unclassified is the leaderboard's rendering, not a rewrite here."""
+        log = _Log()
+        origin = log.launch("Slice 1", 0, OPUS)
+        for second, reason in enumerate(("limit", "exit 7"), start=1):
+            log.add(
+                "review-failed",
+                "Slice 1",
+                second,
+                {"skill": "code-review", "tool": "codex", "origin_event_index": origin, "reason": reason},
+            )
+
+        (row,) = ledger.run_rows(_state(_entry()), log.events)
+
+        self.assertEqual([review["reason"] for review in row["reviews"]], ["limit", "exit 7"])
+
     def test_reviews_failures_and_comparisons_are_projected_per_window(self) -> None:
         tagged = {**OPUS, "model_tag": "temp-0.2"}
         log = _Log()

@@ -14,15 +14,18 @@ import argparse
 import math
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
 from . import IntegrityError, PmError
 from . import campaign
+from . import dossier as dossier_mod
 from . import git_ops
 from . import judgments
 from . import leaderboard, ledger
 from . import plan as plan_mod
+from . import plan_review
 from . import pm_paths
 from . import preflight
 from . import review as review_mod
@@ -54,6 +57,20 @@ def _positive_seconds(value: str) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(f"must be a finite number > 0, got {value!r}")
     return parsed
+
+
+def _seat_value(value: str) -> tuple[str, str, str | None]:
+    """argparse `type=` for `review --fallback` and `review-plan --seat`: one
+    quoted value naming a tool, a model and optionally an effort. One value
+    rather than three flags, so a seat is named the way a launcher line
+    writes it."""
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        tokens = []
+    if len(tokens) not in (2, 3):
+        raise argparse.ArgumentTypeError(f'must be "<tool> <model> [<effort>]", got {value!r}')
+    return tokens[0], tokens[1], tokens[2] if len(tokens) == 3 else None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -229,6 +246,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review.add_argument("--reviewer-command", help="override the whole reviewer command (tests/unsupported tools)")
     review.add_argument(
+        "--fallback",
+        type=_seat_value,
+        metavar='"TOOL MODEL [EFFORT]"',
+        help="the seat the review is re-commissioned on, once, when the primary reviewer fails on a usage "
+        "limit or login, or fails again after its one same-seat retry; one quoted value, "
+        'e.g. --fallback "claude claude-opus-5-5 high"',
+    )
+    review.add_argument(
         "--timeout",
         type=_positive_seconds,
         default=_REVIEW_DEFAULT_TIMEOUT_SECONDS,
@@ -267,8 +292,9 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument("--run")
     stop.add_argument("--token")
 
-    # The four campaign commands take a node worktree path and never a run or
-    # a token, so the post-command ledger hook never fires for them.
+    # The four campaign child commands take a node worktree path, and
+    # `review-plan` after them a node directory, never a run or a token, so the
+    # post-command ledger hook never fires for them.
     launch_child = subparsers.add_parser(
         "launch-child",
         help="Create a node branch and worktree and launch a child PM there in tmux on a private socket",
@@ -337,6 +363,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-send the pointer for the latest cm-answer-<n>.md when the child did not react to it; writes "
         "nothing; refused when a newer question or the completion file exists, or there is no answer",
     )
+    answer_child_mode.add_argument(
+        "--follow-up",
+        metavar="TEXT",
+        help="a further message to a question already answered (the child acted on a partial answer), delivered "
+        "verbatim through cm-answer-<n>-followup-<k>.md with the same one-line pointer; refused when a new question "
+        "is open (use --text), the completion file exists, the text is blank or there is no answer; one that did "
+        "not land is sent again with another --follow-up",
+    )
 
     stop_child = subparsers.add_parser(
         "stop-child",
@@ -345,6 +379,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stop_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree")
     stop_child.add_argument("--reason", required=True)
+    stop_child.add_argument(
+        "--archive",
+        metavar="PATH",
+        help="the results root (created if absent): once the server is gone, archive the child into its dossier's "
+        "validation/<node>/, copy the brief's git-ignored output directories and the sandbox temp dir to "
+        "PATH/<node>/, then remove the worktree, keeping the branch; exits 2 unless all of it completed",
+    )
+
+    review_plan = subparsers.add_parser(
+        "review-plan",
+        help="Run the next plan-review round of a campaign node through the orchestrator, recorded in "
+        "<node>/reviews/round-<N>/; prints the reviewer's RESULT: line and decides nothing",
+    )
+    review_plan.add_argument(
+        "--node", required=True, metavar="PATH", help="the node directory in the dossier, <dossier>/nodes/<node>"
+    )
+    review_plan.add_argument("--repo", required=True, metavar="PATH", help="the product repository")
+    review_plan.add_argument(
+        "--seat",
+        required=True,
+        type=_seat_value,
+        metavar='"TOOL MODEL [EFFORT]"',
+        help='the reviewer seat as one quoted value, e.g. --seat "codex gpt-6.1-sol high"',
+    )
+    review_plan.add_argument(
+        "--results",
+        metavar="PATH",
+        help="the orchestrator run root (default <node>/reviews/round-<N>/orchestrator/, which the dossier "
+        "git-ignores)",
+    )
+    review_plan.add_argument(
+        "--timeout",
+        type=_positive_seconds,
+        default=plan_review.DEFAULT_TIMEOUT_SECONDS,
+        help=f"cancel the reviewer and fail after N seconds (default {plan_review.DEFAULT_TIMEOUT_SECONDS:g}); "
+        "a hang backstop, not a cadence",
+    )
 
     preflight_parser = subparsers.add_parser(
         "campaign-preflight",
@@ -366,6 +437,38 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="a seat's harness to look for on PATH; repeatable",
     )
+
+    # Like the campaign commands, `dossier` takes a path and never a run or a
+    # token, so the post-command ledger hook never fires for it.
+    dossier_parser = subparsers.add_parser(
+        "dossier",
+        help="Number and stamp a campaign dossier's decisions and evidence, and keep a node row's head SHA current",
+    )
+    dossier_commands = dossier_parser.add_subparsers(dest="dossier_command", required=True)
+    add_decision = dossier_commands.add_parser(
+        "add-decision", help="Append a D<n> entry to decisions.md (the next number, an At stamp); a repeat is a no-op"
+    )
+    add_decision.add_argument("--dossier", required=True, metavar="PATH", help="the dossier repository")
+    add_decision.add_argument("--title", required=True)
+    add_decision.add_argument("--actor", required=True, choices=list(dossier_mod.ACTORS))
+    add_decision.add_argument("--decision", required=True)
+    add_decision.add_argument("--grounds", required=True)
+    add_decision.add_argument("--permission", required=True, help="the permission the decision uses")
+    add_evidence = dossier_commands.add_parser(
+        "add-evidence", help="Append an E<n> entry to evidence.md (the next number, an At stamp); a repeat is a no-op"
+    )
+    add_evidence.add_argument("--dossier", required=True, metavar="PATH", help="the dossier repository")
+    add_evidence.add_argument("--title", required=True)
+    add_evidence.add_argument("--finding", required=True)
+    add_evidence.add_argument("--source", required=True, help="file:line")
+    add_evidence.add_argument("--sha", required=True, help="the SHA the source was read at")
+    add_evidence.add_argument("--uncertainty", required=True)
+    set_head = dossier_commands.add_parser(
+        "set-head", help="Set the Head SHA cell of one node's row in work.md's Nodes table"
+    )
+    set_head.add_argument("--dossier", required=True, metavar="PATH", help="the dossier repository")
+    set_head.add_argument("--node", required=True, help="the row's Id")
+    set_head.add_argument("--head", required=True, help="the node branch head, a full 40-hex SHA")
 
     # Reads only the ledger directory: no run, no token, so the post-command
     # ledger hook never fires for it.
@@ -1019,6 +1122,7 @@ def _run_review(args: argparse.Namespace) -> int:
         model_tag=model_tag,
         reviewer_command=args.reviewer_command,
         timeout=args.timeout,
+        fallback=args.fallback,
         # Rendered one-per-line so the reviewer reads a list, not a run-on
         # sentence; None when unused, which the template shows as `none`.
         # Newlines inside an item are collapsed: the block sits above the frozen
@@ -1323,9 +1427,13 @@ def _run_wait_child(args: argparse.Namespace) -> int:
 
 
 def _run_answer_child(args: argparse.Namespace) -> int:
-    outcome = campaign.answer_child(Path(args.worktree), text=args.text, redeliver=args.redeliver)
+    outcome = campaign.answer_child(
+        Path(args.worktree), text=args.text, redeliver=args.redeliver, follow_up=args.follow_up
+    )
     if args.redeliver:
         print(f"redelivered: {outcome.answer_path}")
+    elif args.follow_up is not None:
+        print(f"follow-up: {outcome.answer_path} (to answer {outcome.answer_number})")
     else:
         print(f"answered: {outcome.answer_path}")
         print(f"question archived: {outcome.question_archived_path}")
@@ -1334,7 +1442,7 @@ def _run_answer_child(args: argparse.Namespace) -> int:
 
 
 def _run_stop_child(args: argparse.Namespace) -> int:
-    outcome = campaign.stop_child(Path(args.worktree))
+    outcome = campaign.stop_child(Path(args.worktree), archive=Path(args.archive) if args.archive else None)
     if outcome.runs_error is not None:
         print(f"child runs: state root unavailable ({outcome.runs_error}); recorded reviewer process groups unknown")
     if outcome.reviewer_pgids:
@@ -1361,9 +1469,19 @@ def _run_stop_child(args: argparse.Namespace) -> int:
         print(line)
     if outcome.sandbox_error is not None:
         print(f"sandbox: not torn down ({outcome.sandbox_error})")
+    for line in outcome.archive_lines:
+        print(f"archive: {line}")
+    if outcome.archive_error is not None:
+        print(f"archive: not completed ({outcome.archive_error})")
+    if outcome.worktree_error is not None:
+        removal = "not removed" if outcome.worktree_removed is None else "removed, but not pruned"
+        print(f"worktree: {removal} ({outcome.worktree_error})")
+    if outcome.worktree_removed is not None:
+        print(f"worktree removed: {outcome.worktree_removed} (branch {outcome.branch} kept)")
     print(f"reason: {args.reason}")
-    # Sessions still listed after the kill, or a sandbox left up: the child is not stopped.
-    return 0 if outcome.server_gone and outcome.sandbox_stopped else 2
+    # Sessions still listed after the kill, a sandbox left up, or (with
+    # --archive) an archive or worktree removal that did not complete.
+    return 0 if outcome.server_gone and outcome.sandbox_stopped and outcome.archive_completed else 2
 
 
 # --- notes ----------------------------------------------------------------
@@ -1443,6 +1561,51 @@ def _run_ledger(args: argparse.Namespace) -> int:
     return {"render": _run_ledger_render, "tag": _run_ledger_tag}[args.ledger_command](args)
 
 
+def _run_dossier(args: argparse.Namespace) -> int:
+    dossier = Path(args.dossier).expanduser()
+    if args.dossier_command == "add-decision":
+        number, new = dossier_mod.add_decision(
+            dossier,
+            title=args.title,
+            actor=args.actor,
+            decision=args.decision,
+            grounds=args.grounds,
+            permission=args.permission,
+        )
+        print(f"D{number}: {'recorded' if new else 'already recorded'}")
+    elif args.dossier_command == "add-evidence":
+        number, new = dossier_mod.add_evidence(
+            dossier,
+            title=args.title,
+            finding=args.finding,
+            source=args.source,
+            sha=args.sha,
+            uncertainty=args.uncertainty,
+        )
+        print(f"E{number}: {'recorded' if new else 'already recorded'}")
+    else:
+        if dossier_mod.set_head(dossier, node=args.node, head=args.head):
+            print(f"head SHA set for {args.node}")
+        else:
+            print(f"head SHA already {args.head} for {args.node}")
+    return 0
+
+
+def _run_review_plan(args: argparse.Namespace) -> int:
+    outcome = plan_review.review_plan(
+        node=Path(args.node),
+        repo=Path(args.repo),
+        seat=args.seat,
+        results=Path(args.results) if args.results else None,
+        timeout=args.timeout,
+    )
+    print(f"round: {outcome.round_dir}")
+    print(f"label: {outcome.label}")
+    print(outcome.result_line)
+    print(f"report: {outcome.report}")
+    return 0
+
+
 _HANDLERS = {
     "check-plan": _run_check_plan,
     "init": _run_init,
@@ -1464,7 +1627,9 @@ _HANDLERS = {
     "wait-child": _run_wait_child,
     "answer-child": _run_answer_child,
     "stop-child": _run_stop_child,
+    "review-plan": _run_review_plan,
     "campaign-preflight": _run_campaign_preflight,
+    "dossier": _run_dossier,
 }
 
 

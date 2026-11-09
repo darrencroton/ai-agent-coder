@@ -39,11 +39,11 @@ Review a frozen plan before work starts. Use the investigation request with `req
     "Do not re-raise these dispositioned items: <exclusion list, or none>.",
     "Cite the plan section for every finding."
   ],
-  "expected_output": "First line RESULT: clean or RESULT: revise. SECTION: FINDINGS lists items labelled FIX (the plan must change) or NOTE (optional), each naming the plan section it concerns and the change in one line. SECTION: DISPOSITIONS lists each earlier-round finding and whether it is resolved (continuations only). SECTION: OPEN_QUESTIONS. Use - none for an empty section."
+  "expected_output": "First line RESULT: clean or RESULT: revise. SECTION: FINDINGS lists items labelled FIX (the plan must change) or NOTE (optional), each naming the plan section it concerns and the change in one line. SECTION: DISPOSITIONS lists each earlier-round finding and whether it is resolved (rounds after the first). SECTION: OPEN_QUESTIONS. Use - none for an empty section."
 }
 ```
 
-Continue the same session with a validated continuation for later rounds; the dispositions section then answers the previous round's findings.
+A later round may be a validated continuation of the same session or a fresh request that carries the prior round's report and the dispositions in `context`; the dispositions section then answers the previous round's findings.
 
 ## Drift audit (`access: read-only`)
 

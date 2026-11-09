@@ -15,6 +15,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
   nodes/<node>/plan.md          the committed node plan
   nodes/<node>/policy.json      the committed per-child protected-paths policy file
   nodes/<node>/launcher.md      the filled Mode B launcher the child is launched from
+  nodes/<node>/reviews/round-<N>/  one review-plan round: delegate-policy.json, request.json, report.md, status.json, and the CM's dispositions.md (its orchestrator/ run directory git-ignored)
   validation/<node>/            one directory per node: its archived run and, for an evidence node, its receipt
   retrospective.md              the campaign's retrospective, written at acceptance
 ```
@@ -44,7 +45,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 - Instrument paths: <product paths that become protected once their controls pass; none>
 - Node worktree parent: `<absolute directory the owner has trusted in each harness>`
 - Protected-paths policy file: `<path in the product repository>`, SHA-256 `<digest of the file, from shasum -a 256>` (see [campaign-mode.md](campaign-mode.md) *Launching and watching a child*)
-- Git-ignored output directories: <product directories, or none>
+- Git-ignored output directories: <product directories, comma-separated, or none; stop-child --archive copies each to the results root before the node worktree is removed>
 
 ## Reserved decision classes
 - <class>: <what the class covers>
@@ -62,9 +63,12 @@ The layout of a campaign dossier and a template for each of its files. This is a
 - max_parallel: 1
 
 ## Exclusions
-- <path no seat may read>
+- product: <path in the product repository no seat may read; launch-child removes it from every node worktree by sparse checkout and the sandbox denies it at any depth>
+- <any other path no seat may read>
 - CM only: <paths the Campaign Manager alone may read, or none; every other seat is excluded from them>
 ```
+
+For a documentation target in the Targets table, each measured statement names its record (the receipt or evidence entry) as it is written, so the acceptance claims read is a lookup.
 
 ## `work.md`
 
@@ -79,15 +83,21 @@ The layout of a campaign dossier and a template for each of its files. This is a
 - Watching: <for each node in flight, the `watch:` line launch-child printed, or none>
 
 ## Nodes
-| Id | Kind | Objective | Target | Dependencies | Surface | Resources | Status | Branch | Base SHA | Head SHA | Policy | Report |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| N1 | change \| evidence \| task | <one line> | T1 | <node ids, or none> | <authorized entries> | <exclusive resources, or none> | <status> | campaign/<id>/N1 | <SHA> | <SHA> | nodes/N1/policy.json | <child run-report.md, or campaign-reports/N1.md> |
+| Id | Kind | Objective | Target | Dependencies | Surface | Resources | Status | Base SHA | Head SHA |
+|---|---|---|---|---|---|---|---|---|---|
+| N1 | change \| evidence \| task | <one line> | T1 | <node ids, or none> | <authorized entries> | <exclusive resources, or none> | <status> | <SHA> | <SHA> |
+
+## Side records
+- <what the owner asked for>: <where it is written, or not written>
 ```
+
+One line per record the owner asks for during the campaign, added when the ask is made: the brief is the owner's and digest-frozen, so a mid-campaign ask cannot go there, and a record with no node, receipt or table row would otherwise fall through.
 
 ## `evidence.md`
 
 ```md
 ## E<n>: <short title>
+- At: <UTC time, written by pm.py dossier>
 - Finding: <what was found>
 - Source: <file:line>
 - SHA read at: <SHA>
@@ -98,6 +108,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 
 ```md
 ## D<n>: <short title>
+- At: <UTC time, written by pm.py dossier>
 - Actor: <CM | owner>
 - Decision: <what was decided>
 - Grounds: <the evidence it rests on>
@@ -108,6 +119,7 @@ An approval of rules quotes them. An approval never summarises the rule it appro
 
 ```md
 ## D<n>: <approval of nodes/<node>/plan.md>
+- At: <UTC time, written by pm.py dossier>
 - Actor: owner
 - Decision: approved nodes/<node>/plan.md at SHA-256 `<digest of the plan>`, whose rules read: "<the rule, in the plan's own words>"
 - Grounds: <the evidence it rests on>
@@ -117,7 +129,7 @@ An approval of rules quotes them. An approval never summarises the rule it appro
 ## `validation/`
 
 ```text
-validation/<node>/
+validation/<node>/              stop-child --archive writes everything here but artifacts/ and receipt.md, which are the CM's
   HANDOFF.md                    the child PM's handoff
   campaign/                     the worktree's .pm/campaign/ (launcher copy, manifest, questions and answers, pane captures, child-result.json)
   runs/<run-id>/                the worktree's .pm/runs/<run-id>/

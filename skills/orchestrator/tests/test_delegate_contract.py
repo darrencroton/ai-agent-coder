@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import io
 import json
@@ -1505,6 +1506,68 @@ class DelegateContractTests(unittest.TestCase):
             status = delegate_jobs.delegate_status(entry)
         self.assertEqual(status["state"], "completed")
         self.assertIsNone(status["contract_met"])
+        self.assertIsNone(status["failure_class"])
+
+    def test_delegate_status_without_a_section_contract_is_incomplete_when_nothing_was_reported(self):
+        entry = self._contract_entry(
+            "04-opencode-review",
+            expected_output="RESULT: pass or RESULT: blocked.",
+            out_text=" \n",
+            err_text="\n",
+        )
+        with mock.patch.object(delegate_jobs, "process_running", return_value=False):
+            status = delegate_jobs.delegate_status(entry)
+        self.assertEqual(status["state"], "incomplete")
+        self.assertIsNone(status["contract_met"])
+        self.assertIsNone(status["failure_class"])
+
+    def test_delegate_status_without_a_section_contract_fails_a_harness_limit_or_login_notice(self):
+        cases = (
+            ("limit", "You've hit your usage limit. Upgrade to Pro or try again in 3 hours.\n", ""),
+            # The notice reaches stderr only: the primary output falls back to it.
+            ("auth", "", "Error: not logged in. Run `opencode auth login` first.\n"),
+        )
+        for index, (expected, out_text, err_text) in enumerate(cases):
+            with self.subTest(expected=expected):
+                entry = self._contract_entry(
+                    f"0{5 + index}-opencode-review",
+                    expected_output="RESULT: pass or RESULT: blocked.",
+                    out_text=out_text,
+                    err_text=err_text,
+                )
+                with mock.patch.object(delegate_jobs, "process_running", return_value=False):
+                    status = delegate_jobs.delegate_status(entry)
+                self.assertEqual(status["state"], "failed")
+                self.assertEqual(status["failure_class"], expected)
+
+    def test_delegate_status_never_reads_a_long_report_about_logins_as_a_harness_failure(self):
+        report = "RESULT: pass\n" + "The login handler rejects an expired OAuth token with a 401. " * 30
+        entry = self._contract_entry(
+            "07-opencode-review", expected_output="RESULT: pass or RESULT: blocked.", out_text=report
+        )
+        with mock.patch.object(delegate_jobs, "process_running", return_value=False):
+            status = delegate_jobs.delegate_status(entry)
+        self.assertEqual(status["state"], "completed")
+        self.assertIsNone(status["failure_class"])
+
+    def test_harness_phrase_tables_match_the_pm_review_copy_textually(self):
+        """The limit and auth tables are a declared copy of pm_lib/review.py's
+        (neither skill may import the other); this keeps the copy honest."""
+
+        def tables(path: Path) -> dict[str, str]:
+            source = path.read_text(encoding="utf-8")
+            found = {}
+            for node in ast.parse(source).body:
+                if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    name = getattr(node.targets[0], "id", None)
+                    if name in {"_LIMIT_PATTERNS", "_AUTH_PATTERNS"}:
+                        found[name] = ast.get_source_segment(source, node)
+            return found
+
+        skills = SCRIPT_DIR.parents[1]
+        review = tables(skills / "project-manager" / "scripts" / "pm_lib" / "review.py")
+        self.assertEqual(set(review), {"_LIMIT_PATTERNS", "_AUTH_PATTERNS"})
+        self.assertEqual(tables(SCRIPT_DIR / "delegate_jobs.py"), review)
 
     def test_delegate_status_survives_unreadable_and_malformed_request_artifacts(self):
         cases = (

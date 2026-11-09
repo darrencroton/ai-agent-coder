@@ -17,11 +17,20 @@
 # each outcome is the measured command's own exit status, which the report
 # states.
 #
+# Provided here, so a runner adds none of them itself:
+#   sparse_clone DEST PATTERN...  clone this repository at the measured head to $OUT/DEST, limited to the patterns (the brief's exclusions read '/*' '!/docs/dev').
+#     Inside a sandbox the clone needs filesystem.allowGitConfig in the base policy, since srt denies .git/config writes beneath the worktree.
+#   require FILE [EXPECTED]  stop unless $OUT/FILE is a non-empty file (with its trailing newline stripped equal to EXPECTED, if given), e.g. require build.status 0.
+#   declared files  measure declares its log and status file, expect FILE... declares the outputs a stage must write; before the manifest each must exist and
+#     each but a measure log must be non-empty (a silent command's log is legitimately empty). declared.txt is a runner-written file and is in the manifest.
+#   heredoc exception  the clean-tree checks ignore untracked sh-thd-* files, the transient heredoc files a sandboxed shell leaves in the worktree.
+#
 # Exit status: 0 when every file was captured (whatever the measured statuses
 # are); 2 when the runner itself could not run or capture (a pin mismatch, an
 # existing output path, a log or status file it cannot write, a HEAD other
 # than the measured head, a worktree not clean at start or after, a HEAD that
-# moved during the run), in which case the measurement is unusable and the
+# moved during the run, a failed clone, an unmet require, a declared file that
+# is missing or empty), in which case the measurement is unusable and the
 # node stops. It refuses to run twice, because a correction that would
 # re-measure is a new node.
 set -u
@@ -43,14 +52,64 @@ now() {
 ctx() { printf '%s\n' "$1" >> "$OUT/context.txt" || die "cannot write $OUT/context.txt"; }
 # put FILE TEXT: write one status or note file under $OUT.
 put() { printf '%s\n' "$2" > "$OUT/$1" || die "cannot write $OUT/$1"; }
+# expect FILE...: declare files a stage must write; each must be a non-empty
+# file under $OUT before the manifest is written. measure declares its own
+# log through declare_log, since a silent command's log is legitimately
+# empty; declared.txt records which rule each name is under.
+expect() {
+  for f in "$@"; do
+    printf 'file %s\n' "$f" >> "$OUT/declared.txt" || die "cannot write $OUT/declared.txt"
+  done
+}
+declare_log() { printf 'log %s\n' "$1" >> "$OUT/declared.txt" || die "cannot write $OUT/declared.txt"; }
+# require FILE [EXPECTED]: stop unless $OUT/FILE is a non-empty regular file
+# and, when EXPECTED is given, its content less the trailing newline is
+# EXPECTED. For a stage whose precondition is an earlier stage's result, as
+# `require build.status 0`, where recording a skip with put would not stop a
+# next stage that cannot run at all.
+# shellcheck disable=SC2329 # called by the steps the Campaign Manager adds below
+require() {
+  if [ ! -f "$OUT/$1" ] || [ ! -s "$OUT/$1" ]; then
+    die "required $OUT/$1 is missing or empty"
+  fi
+  [ "$#" -lt 2 ] && return 0
+  got=$(cat "$OUT/$1") || die "cannot read $OUT/$1"
+  [ "$got" = "$2" ] || die "required $OUT/$1 holds '$got', not '$2'"
+}
+# sparse_clone DEST PATTERN...: clone this worktree's repository at
+# $EXPECTED_HEAD to $OUT/DEST, for a measurement that needs a pristine
+# checkout of the measured commit; with patterns, only those are checked out.
+# shellcheck disable=SC2329 # called by the steps the Campaign Manager adds below
+sparse_clone() {
+  dest=$1
+  shift
+  git clone -q --no-checkout -- "$PWD" "$OUT/$dest" || die "cannot clone into $OUT/$dest"
+  if [ "$#" -gt 0 ]; then
+    git -C "$OUT/$dest" sparse-checkout set --no-cone -- "$@" || die "cannot set the sparse patterns in $OUT/$dest"
+  fi
+  git -C "$OUT/$dest" checkout -q "$EXPECTED_HEAD" || die "cannot check out $EXPECTED_HEAD in $OUT/$dest"
+  clone_head=$(git -C "$OUT/$dest" rev-parse HEAD) || die "git rev-parse failed in $OUT/$dest"
+  [ "$clone_head" = "$EXPECTED_HEAD" ] || die "the clone's HEAD is $clone_head, not $EXPECTED_HEAD"
+}
+# tree_status: set `status` to the worktree's porcelain status, less the
+# transient sh-thd-* heredoc files a sandboxed shell leaves while a heredoc
+# runs. grep exits 1 when it filters every line, which is not a failure; a
+# git status failure is.
+tree_status() {
+  raw=$(git status --porcelain) || die "git status failed"
+  status=$(printf '%s\n' "$raw" | grep -Ev '^\?\? (.*/)?sh-thd-[^/]*$') || [ "$?" -eq 1 ] || die "cannot filter the git status"
+}
 # measure LOG STATUS CMD...: run CMD with its output in $OUT/LOG and its exit
 # status in $OUT/STATUS, with a start and finish timestamp in context.txt. A
 # log that cannot be created stops the runner before CMD runs, so a capture
-# failure is never recorded as a measurement.
+# failure is never recorded as a measurement. Both files are declared, so a
+# missing one stops the runner before the manifest.
 measure() {
   log=$1
   status_file=$2
   shift 2
+  declare_log "$log"
+  expect "$status_file"
   : > "$OUT/$log" || die "cannot create $OUT/$log"
   now
   ctx "${log%.log}_started_utc=$t"
@@ -80,6 +139,7 @@ mkdir -p "$(dirname "$OUT")" || die "cannot create $(dirname "$OUT")"
 # The exclusive mkdir reserves the one run: a concurrent second invocation
 # fails here, before any measured command.
 mkdir "$OUT" || die "cannot reserve $OUT; a second measurement is a new node"
+: > "$OUT/declared.txt" || die "cannot create $OUT/declared.txt"
 
 # Variables that change what make, git or Python do are recorded, then
 # removed, so no measurement can be suppressed or redirected by an inherited
@@ -92,7 +152,7 @@ for v in MAKEFLAGS MFLAGS GNUMAKEFLAGS MAKEFILES GIT_DIR GIT_WORK_TREE GIT_INDEX
   ctx "inherited_$v=${isset:+${val:-<empty>}}"
   unset "$v"
 done
-status=$(git status --porcelain) || die "git status failed"
+tree_status
 head=$(git rev-parse HEAD) || die "git rev-parse failed"
 nonempty "git rev-parse" "$head"
 # The measurement is valid only at the measured head, from a clean worktree.
@@ -111,8 +171,9 @@ ctx "started_utc=$t"
 
 # --- measurements ---
 # Replace the two example steps. Each is `measure NAME.log NAME.status CMD...`;
-# a step that depends on an earlier one reads its status from $OUT and records
-# the skip with `put`, never leaving the pair of files out.
+# a step that depends on an earlier one reads its status from $OUT and either
+# records the skip with `put`, never leaving the pair of files out, or, when
+# it cannot run at all, stops with `require`.
 echo "run.sh: example 1, the measured commit"
 measure commit.log commit.status git log -1 --format=%H
 echo "run.sh: example 2, a build or test command"
@@ -124,15 +185,26 @@ ctx "finished_utc=$t"
 head_after=$(git rev-parse HEAD) || die "git rev-parse failed"
 nonempty "git rev-parse" "$head_after"
 ctx "head_after=$head_after"
-status=$(git status --porcelain) || die "git status failed"
+tree_status
 ctx "worktree_clean_after=$([ -z "$status" ] && echo yes || echo no)"
 # A HEAD that moved or a worktree left dirty invalidates every measurement:
 # the runner stops before writing the manifest.
 [ "$head_after" = "$head" ] || die "HEAD moved during the run: $head -> $head_after"
 [ -z "$status" ] || die "the worktree is not clean after the run: $status"
+# Every declared file must exist, and every expected file must be non-empty:
+# a status file always holds the exit status and an expected output must
+# hold the output, while a measure log is empty when the command printed
+# nothing (cmp or diff -q on identical outputs), which is a measurement,
+# not a capture failure.
+while read -r kind f; do
+  [ -f "$OUT/$f" ] || die "stage wrote nothing: $OUT/$f is missing"
+  [ "$kind" = log ] || [ -s "$OUT/$f" ] || die "stage wrote nothing: $OUT/$f is empty"
+done < "$OUT/declared.txt"
 
-# The manifest lists every file in $OUT but itself, and appears atomically.
-files=$(cd "$OUT" && find . -type f ! -path ./manifest.sha256 ! -path ./manifest.tmp | sed 's|^\./||' | sort) || die "cannot list $OUT"
+# The manifest lists every file in $OUT but itself and a clone's git
+# metadata (a sparse_clone's .git is machinery, not capture), and appears
+# atomically.
+files=$(cd "$OUT" && find . -type f ! -path ./manifest.sha256 ! -path ./manifest.tmp ! -path '*/.git/*' | sed 's|^\./||' | sort) || die "cannot list $OUT"
 nonempty find "$files"
 # shellcheck disable=SC2086 # files is a list of runner-written plain names, split on purpose
 (cd "$OUT" && shasum -a 256 $files > manifest.tmp) || die "cannot write the manifest"

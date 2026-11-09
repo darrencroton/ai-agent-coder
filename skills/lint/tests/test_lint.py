@@ -446,6 +446,36 @@ class TestBaseTree(unittest.TestCase):
                 with lint.base_tree(lint.repo_root(repo.dir), "no-such-ref"):
                     pass
 
+    def test_a_path_the_sparse_checkout_skips_is_never_written(self):
+        """A campaign's exclusion is a sparse checkout; its content must not reach $TMPDIR."""
+        with TempRepo() as repo:
+            repo.write("secret/notes.py", "private = 1\n")
+            repo.write("ruff.toml", "[lint]\n")
+            repo.write("a.py", "x = 1\n")
+            base = repo.commit("base")
+            sh(["git", "sparse-checkout", "set", "--no-cone", "--", "/*", "!/secret"], repo.dir)
+            self.assertFalse(os.path.exists(os.path.join(repo.dir, "secret")))
+            with lint.base_tree(lint.repo_root(repo.dir), base) as (tree, paths):
+                self.assertFalse(os.path.exists(os.path.join(tree, "secret")))
+                self.assertEqual(paths, {"a.py", "ruff.toml"})
+                with open(os.path.join(tree, "ruff.toml")) as fh:
+                    self.assertEqual(fh.read(), "[lint]\n")
+
+
+class TestSparseBaseOnlyPath(unittest.TestCase):
+    def test_an_excluded_path_present_only_at_the_base_is_never_written(self):
+        """The index marks only paths at HEAD; the sparse pattern covers one deleted since the base."""
+        with TempRepo() as repo:
+            repo.write("secret/notes.py", "private = 1\n")
+            repo.write("a.py", "x = 1\n")
+            base = repo.commit("base")
+            sh(["git", "rm", "-q", "secret/notes.py"], repo.dir)
+            repo.commit("head")
+            sh(["git", "sparse-checkout", "set", "--no-cone", "--", "/*", "!/secret"], repo.dir)
+            with lint.base_tree(lint.repo_root(repo.dir), base) as (tree, paths):
+                self.assertFalse(os.path.exists(os.path.join(tree, "secret")))
+                self.assertEqual(paths, {"a.py"})
+
 
 class TestInstallSafety(unittest.TestCase):
     def test_install_is_dry_run_without_yes(self):

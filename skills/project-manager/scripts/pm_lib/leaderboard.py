@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import PmError
+from . import review as review_mod
 from . import state as state_mod
 
 # Groups with fewer windows (Developers) or commissions (Reviewers) than this
@@ -643,7 +644,22 @@ def _new_reviewer_group() -> dict[str, Any]:
         "losses": 0,
         "close_wins": 0,
         "close_losses": 0,
+        "failed_by_class": {},
     }
+
+
+def _failure_class(reason: Any) -> str:
+    """A `review-failed` reason as the leaderboard counts it: one of the
+    review module's classes, else `unclassified` (an `exit <N>` nothing
+    recognised, or a reason recorded before the classes existed)."""
+    return reason if reason in review_mod.FAILURE_CLASSES else "unclassified"
+
+
+def _failed_by_class_cell(counts: dict[str, int]) -> str:
+    """`limit 14 · capacity 11 · unclassified 2` in the classes' fixed order,
+    zero classes left out, and `0` when nothing failed."""
+    parts = [f"{name} {counts[name]}" for name in (*review_mod.FAILURE_CLASSES, "unclassified") if counts.get(name)]
+    return " · ".join(parts) or "0"
 
 
 def _reviewer_groups(
@@ -670,6 +686,8 @@ def _reviewer_groups(
                 rating = review.get("rating")
                 if review.get("failed"):
                     group["unusable"] += 1
+                    failure_class = _failure_class(review.get("reason"))
+                    group["failed_by_class"][failure_class] = group["failed_by_class"].get(failure_class, 0) + 1
                     continue
                 members[review.get("review_id")] = (skill, key)
                 elapsed = _int(review.get("elapsed_s"))
@@ -729,6 +747,7 @@ _REVIEWER_HEADERS = [
     "Reviewer (tool / model / effort / override / tag)",
     "Commissions, n",
     "Usable (PM), share rated/(rated+unavailable+failed)",
+    "Failed by class, n",
     "Score (PM), mean 0–2",
     "Review time, median s",
     "Panels (PM), n",
@@ -744,6 +763,7 @@ def _reviewer_cells(key: tuple[Any, ...], group: dict[str, Any]) -> list[str]:
         _identity_label(tool, model, effort, override_label, model_tag=model_tag),
         str(group["commissions"]),
         _share_cell(group["rated"], group["rated"] + group["unusable"]),
+        _failed_by_class_cell(group["failed_by_class"]),
         _mean_cell(group["scores"]),
         _median_cell(group["elapsed_s"]),
         str(group["panels"]),

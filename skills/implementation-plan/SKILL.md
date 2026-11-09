@@ -214,6 +214,7 @@ Repo: <path>
 Developer: <harness> <full model id> <effort>   (model and effort may be "per plan": each slice's Recommended Developer line)
 Drift auditor: <harness> <full model id> <effort>
 Code reviewers: <harness> <full model id> <effort>; <harness> <full model id> <effort>
+Fallback reviewer (optional): <harness> <full model id> <effort>   (the seat review --fallback re-commissions on when a reviewer fails)
 Run tag (optional): <tag>
 Sandbox policy (optional, macOS): <absolute path to an srt base policy, per project-manager's references/sandbox.md; omit the line for a campaign child, whose server the Campaign Manager sandboxes>
 Use the project-manager skill. You are the PM: the accountable supervisor of this run. You never write slice code.
