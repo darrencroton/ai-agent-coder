@@ -227,7 +227,7 @@ Human present (the default):
 - If HANDOFF.md names an unfinished run of this plan, read it fully and resume that run (I will supply the token). Otherwise prepare, then confirm with me once:
   - Read the whole plan, run check-plan with repo context, and check that the repo still matches what the plan assumes. Init freezes the plan, so raise any drift or warning now.
   - Require a clean worktree with the plan committed. Propose the plan's feature branch, or a new branch name to create.
-  - Confirm: plan read, check-plan result, seats, branch, first slice, any approval-flagged slices (each stops the run until I approve it), and my standing authorisation for Developers to commit each slice.
+  - Confirm: plan read, check-plan result, seats, branch, first slice, any approval-flagged slices (each stops the run until I approve it), my standing authorisation for Developers to commit each slice, and, when the Developer's harness asks for directory trust per worktree, my permission to add the repo's trust entry yourself (project-manager's references/sandbox.md *Troubleshooting*).
 - After my go-ahead, run init. Give me the run id and token, then begin.
 
 Campaign child (a Campaign Manager launched this run; the contract this serves is project-manager's references/campaign-mode.md):

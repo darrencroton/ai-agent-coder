@@ -82,7 +82,7 @@ The attempt budget defaults to 10 per slice — the initial launch plus ten stee
 
 Exit codes: 0 success; 1 = a `finalize` refusal — a floor fact failed, or `--accept` was refused for another recorded reason (e.g. a missing or stale mandatory review on an elevated slice); 2 = error/refusal, or the judgment gate (integrity failures are prefixed `INTEGRITY:` and are terminal — start a new run).
 
-If a harness displays a directory-trust or permission prompt, the PM stops and leaves that approval to the human. The human may configure trust through the harness's own supported mechanism, then rerun `start-slice`; the PM must not acknowledge the dialog with `tmux send-keys` or change user-global harness configuration itself. Autonomy flags do not clear a folder-trust dialog — Copilot still asks on a folder it has not been told to remember — so that one stays a human decision.
+If a harness displays a directory-trust or permission prompt, the PM stops and leaves that approval to the human. The human may configure trust through the harness's own supported mechanism, then rerun `start-slice`; the PM must not acknowledge the dialog with `tmux send-keys` or change user-global harness configuration itself, with one exception: a directory-trust entry the human has permitted it in advance to add for a path it knows it will need, which both launchers ask for as a first duty (the entry's shape is in [references/sandbox.md](references/sandbox.md) *Troubleshooting*). Autonomy flags do not clear a folder-trust dialog — Copilot still asks on a folder it has not been told to remember — so that one stays a human decision.
 
 ## Optional: the poll guard (Claude Code PM seat)
 
