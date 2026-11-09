@@ -236,7 +236,7 @@ Campaign child (a Campaign Manager launched this run; the contract this serves i
 - The Campaign Manager's launcher carries the owner's standing authorisation for each Developer to commit each slice on `<branch>`; never merge: the Campaign Manager merges.
 - A decision the Campaign Manager can give in a line (a reading the plan leaves genuinely open, a tolerance) goes to `.pm/campaign/cm-question.md` with the options and your recommendation; then wait for the one-line pointer to the answer.
 - For an evidence node, the "full test suite" in the per-slice steps below is reading the files the node's pinned script wrote, never running it again, and a measured `fail` or `error` faithfully reported is acceptable slice work.
-- A human gate, a floor failure you cannot steer within budget, an integrity stop, a dialog or an exhausted budget ends the run.
+- A directory-trust dialog a Developer's harness shows is a question to the Campaign Manager through `cm-question.md`, which holds the owner's permission to add the trust entry; you never add or acknowledge one yourself. A human gate, a floor failure you cannot steer within budget, an integrity stop, any other dialog or an exhausted budget ends the run.
 - When the run is decided, run `status --report`, confirm the ledger was written, write `.pm/campaign/child-result.json` as `{"status": "complete" | "stopped" | "needs-human", "run_id": "<run id, or null when init never succeeded>", "summary": "<one paragraph>"}`, make the Finish report your last message, and stay idle.
 
 Per slice, in plan order:
