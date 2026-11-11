@@ -233,7 +233,7 @@ cat > ../developer-judgment.json <<'JUDGE'
  "defects": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
  "reason": "Trial slice: hello.txt matches the contract and the floor passed 7/7."}
 JUDGE
-python3 $PM judge-developer --file ../developer-judgment.json   # origin_event_index: the launch event status names
+python3 $PM judge-developer --file ../developer-judgment.json   # origin_event_index: the launch event status names; criteria_met: a count (this plan has one criterion)
 python3 $PM finalize --accept "Trial slice: diff creates hello.txt exactly per contract; validation output shows the expected content; floor 7/7; pane tail clear, no dialog or usage message."
 python3 $PM status --report                # then read .pm/runs/<id>/run-report.md
 ```

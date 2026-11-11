@@ -371,7 +371,10 @@ def init_run(
         sandbox_policy = sandbox_policy.expanduser()
         # The policy every later server start re-checks is the one hashed: one read.
         sandbox_base, sandbox_warnings, policy_sha256 = sandbox.load_pinned_policy(sandbox_policy)
-        sandbox_policy = sandbox_policy.resolve()
+        # Absolute, so a later command run from the repository finds it, but
+        # recorded as given rather than resolved: the SHA-256 pin, re-checked
+        # at every server start, is what holds a retargeted link to account.
+        sandbox_policy = sandbox_policy.absolute()
         # `check_binaries` refuses first when srt is absent.
         sandbox.check_binaries(sandbox_base)
         srt_version = sandbox.srt_version()
@@ -838,47 +841,75 @@ class StartSliceOutcome:
     sandbox_notes: list[str] | None = None
 
 
-def _rotate_prior_attempt(repo: Path, artifact_dir: Path, superseded_attempt: int) -> list[str]:
+def _latest_submission(run_dir: Path, slice_id: str) -> int:
+    """The number of `slice_id`'s latest submission, -1 when it has none.
+
+    Submissions are numbered from 0 by the slice's `launch`, `relaunch` and
+    `steer` events, across every launch window. The attempt budget is not a
+    substitute: a fresh launch of a slice `finalize --stop` ended restarts it
+    at 0, so artifact names taken from it collide with the earlier window's.
+    """
+    from . import judgments
+
+    return judgments.developer_origin_count(judgments.read_events_or_raise(run_dir), slice_id) - 1
+
+
+def _rotate_prior_attempt(repo: Path, artifact_dir: Path, superseded_attempt: int) -> list[Path]:
+    # `superseded_attempt` is the outgoing submission's number
+    # (`_latest_submission`), so `attempt-<n>/` never names two submissions.
+    #
     # `validation.md` rotates with the rest: it is Developer-authored evidence
     # PM assesses the attempt against, so a steer or relaunch that left the
     # prior attempt's copy in place would present stale evidence as this
     # attempt's own.
     #
-    # Returns the names actually moved (empty if there was nothing to rotate)
-    # so a caller that later fails to deliver can restore exactly those names
-    # with `_restore_rotated_attempt` — see finalize_steer.
+    # Returns the archived paths (empty if there was nothing to rotate) so a
+    # caller that later fails to deliver can restore exactly those files with
+    # `_restore_rotated_attempt` — see finalize_steer.
     #
     # An open `question.md` rotates too: it belongs to the attempt that asked
     # it, and left in place it would read as the new attempt's question.
     # Answered questions (`question-<n>.md`) and their `answer-<n>.md` files
     # stay at the top level, numbered across the whole slice.
     #
-    # The destination is created through `pm_paths.ensure_pm_dir`, so a symlink planted
-    # at `attempt-<n>` (or above it) is refused rather than moving the files
-    # into whatever it points at. The renames themselves move names, never
-    # content, and `rename` does not follow a leaf link.
+    # Submission `n` can be archived twice: a launch or steer that rotated but
+    # was never recorded (a typed-but-unsubmitted steer, a launch that failed)
+    # leaves the number unconsumed, and `observe`, `finalize` and `stop` then
+    # rewrite pane captures for the same submission. `rename` replaces an
+    # existing name silently and an archived file is evidence, so a second set
+    # goes to the first `attempt-<n>.<k>/` (k = 1, 2, ...) holding none of the
+    # names, and nothing is overwritten or refused.
+    #
+    # Each candidate is created through `pm_paths.ensure_pm_dir` before it is
+    # inspected, so a symlink planted at `attempt-<n>` (or above it) is refused
+    # before anything moves rather than moving the files into whatever it points
+    # at; `lexists` then counts a link planted at a name inside it as taken. The
+    # renames themselves move names, never content, and `rename` does not
+    # follow a leaf link.
     names = ("result.json", "pane.txt", "pane-live.txt", "validation.md", "question.md")
     present = [name for name in names if (artifact_dir / name).exists()]
     if not present:
         return []
     destination = artifact_dir / f"attempt-{superseded_attempt}"
-    pm_paths.ensure_pm_dir(repo, destination)
+    copy = 0
+    while True:
+        pm_paths.ensure_pm_dir(repo, destination)
+        if not any(os.path.lexists(destination / name) for name in present):
+            break
+        copy += 1
+        destination = artifact_dir / f"attempt-{superseded_attempt}.{copy}"
     for name in present:
         (artifact_dir / name).rename(destination / name)
-    return present
+    return [destination / name for name in present]
 
 
-def _restore_rotated_attempt(artifact_dir: Path, superseded_attempt: int, names: list[str]) -> None:
+def _restore_rotated_attempt(artifact_dir: Path, archived: list[Path]) -> None:
     # Mirror image of `_rotate_prior_attempt`, for a caller that rotated
-    # speculatively and then proved delivery never happened: moves `names`
-    # back from attempt-<n>/ to the top level. A no-op if rotation itself
-    # was a no-op (names == []).
-    if not names:
-        return
-    source = artifact_dir / f"attempt-{superseded_attempt}"
-    for name in names:
-        source_path = source / name
-        destination = artifact_dir / name
+    # speculatively and then proved delivery never happened: moves the
+    # `archived` files back to the top level. A no-op if rotation itself was
+    # a no-op (archived == []).
+    for source_path in archived:
+        destination = artifact_dir / source_path.name
         try:
             # Hardlink-then-unlink instead of rename: os.link is atomic
             # against an existing destination (unlike exists()-then-rename),
@@ -1044,13 +1075,23 @@ def start_slice(
     artifact_dir = slice_artifact_dir(repo, run_id, plan_slice.slice_id)
     pm_paths.ensure_pm_dir(repo, artifact_dir)
 
-    if relaunch:
-        _rotate_prior_attempt(repo, artifact_dir, attempts - 1)
+    outgoing = max(_latest_submission(run_dir, plan_slice.slice_id), 0)
 
     reaped: list[str] = []
     for name in sessions.sessions_for_run(run_id):
         sessions.force_stop(name)
         reaped.append(name)
+
+    # Every launch archives what the latest submission left at the top level,
+    # not only a relaunch: a fresh launch of a slice `finalize --stop` ended
+    # finds that stopped submission's files there, and its result.json would
+    # end `observe --wait` at once and satisfy floor fact 4. After the reap,
+    # so a live outgoing session cannot write its result.json between the
+    # archive and its kill; `kill-session` does not wait for the pane's
+    # process to exit, so a file written on its way out can still land after
+    # this. Files present before any recorded submission belong to none and
+    # are archived as attempt-0's.
+    _rotate_prior_attempt(repo, artifact_dir, outgoing)
 
     if relaunch:
         before_head = current.get("before_head") if current else None
@@ -1833,22 +1874,6 @@ def _attempts_summary(run_dir: Path, slice_id: str, attempts: int) -> str:
     return "\n".join(lines)
 
 
-def _criteria_note(run_dir: Path, entry: dict[str, Any], slice_id: str) -> str | None:
-    """`criteria met: N of M (...)` when the current submission's Developer judgment met fewer than the slice's M.
-
-    None when the judgment met them all, is `unavailable` (it records no count) or the slice has no recorded total.
-    """
-    from . import judgments
-
-    origin = judgments.latest_developer_origin(judgments.read_events_or_raise(run_dir), slice_id)
-    judgment = judgments.active_developer_judgment(entry, origin["index"]) if origin else None
-    met = judgment.get("criteria_met") if judgment else None
-    total = entry.get("criteria_total")
-    if type(met) is not int or type(total) is not int or met >= total:
-        return None
-    return f"criteria met: {met} of {total} (accepted with {total - met} unmet; see the assessment)"
-
-
 def _render_assessment(
     entry: dict[str, Any],
     report: FloorReport,
@@ -1936,6 +1961,8 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     leaves the slice accepted and the run complete, and raises PmError saying
     so; the next `start-slice` retries it.
     """
+    from . import judgments
+
     stripped_reasoning = reasoning.strip()
     if len(stripped_reasoning) < _ACCEPT_REASONING_MIN_CHARS:
         raise PmError(
@@ -2013,7 +2040,7 @@ def finalize_accept(repo: Path, run_dir: Path, token: str, *, reasoning: str, ri
     reviews_text = _reviews_consulted_text(reviews, head, effective_risk, grant_count)
     attempts_summary = _attempts_summary(run_dir, slice_id, current.get("attempts", entry.get("attempts", 0)))
     grants_text = _grants_text(plan_mod.slice_grants(state, slice_id))
-    criteria_note = _criteria_note(run_dir, entry, slice_id)
+    criteria_note = judgments.criteria_note(entry, judgments.read_events_or_raise(run_dir))
     assessment_text = _render_assessment(
         entry,
         report,
@@ -2170,25 +2197,30 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     # line later), so restoring would risk the same race this ordering
     # exists to avoid.
     artifact_dir = Path(current["artifact_dir"])
-    rotated = _rotate_prior_attempt(repo, artifact_dir, attempts - 1)
+    outgoing = _latest_submission(run_dir, slice_id)
+    rotated = _rotate_prior_attempt(repo, artifact_dir, outgoing)
 
     # File plus one-line pointer, the split `start_slice` uses for prompt.md:
     # no harness TUI is trusted with long multi-line input (sessions.send_prompt).
     #
-    # Exclusive create, so a retry reusing an attempt number `save_state`
-    # failed to persist can never rewrite a correction already pointed at.
+    # Named for the submission this steer opens (`_latest_submission`), not
+    # the attempt budget, which restarts in a new launch window.
+    #
+    # Exclusive create, so a retry reusing a number whose steer was never
+    # recorded (`save_state` or the event append failed after the send) can
+    # never rewrite a correction already pointed at.
     # Unlinked when the send raises, which normally means nothing was typed;
     # a failed submit leaves it typed-but-unsubmitted, and a cleanup that
     # fails leaves the file. So a collision means delivery is *uncertain*,
     # not proven — hence a stop for a human rather than either default.
-    correction_path = artifact_dir / f"steer-attempt-{attempts}.md"
+    correction_path = artifact_dir / f"steer-attempt-{outgoing + 1}.md"
     try:
         try:
             pm_paths.write_pm_text(repo, correction_path, correction, exclusive=True)
         except FileExistsError as exc:
             raise PmError(
-                f"{correction_path} already exists: a correction for attempt {attempts} was written but "
-                "its attempt was never persisted, so whether the Developer received it is unknown. Read "
+                f"{correction_path} already exists: a correction was written under this number but its "
+                "steer was never recorded, so whether the Developer received it is unknown. Read "
                 "that file and the pane, then decide as a human — accept, stop, or relaunch; this will "
                 "not overwrite it"
             ) from exc
@@ -2209,7 +2241,7 @@ def finalize_steer(repo: Path, run_dir: Path, token: str, *, correction: str, ri
     except TypedNotSubmitted:
         raise
     except PmError:
-        _restore_rotated_attempt(artifact_dir, attempts - 1, rotated)
+        _restore_rotated_attempt(artifact_dir, rotated)
         raise
 
     state_mod.save_state(run_dir, state, token)

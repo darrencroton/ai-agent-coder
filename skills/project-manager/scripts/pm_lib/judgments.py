@@ -525,9 +525,30 @@ def read_events_or_raise(run_dir: Path) -> list[dict[str, Any]]:
         raise PmError(f"could not read PM event log {run_dir / 'events.jsonl'}: {exc}") from exc
 
 
-def latest_developer_origin(events: list[dict[str, Any]], slice_id: str) -> dict[str, Any] | None:
-    """The latest `launch`/`relaunch` origin of `slice_id` in `events`, for callers outside this module."""
-    return _scan_latest_developer_origin(events, slice_id)
+def developer_origin_count(events: list[dict[str, Any]], slice_id: str) -> int:
+    """How many `launch`/`relaunch`/`steer` origins `slice_id` has in `events`: its submissions in every window."""
+    return sum(
+        1 for event in events if event.get("slice") == slice_id and event.get("kind") in {"launch", "relaunch", "steer"}
+    )
+
+
+def latest_developer_judgment(entry: dict[str, Any], events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The active Developer judgment of the latest submission of `entry`'s slice in `events`, or None."""
+    origin = _scan_latest_developer_origin(events, str(entry.get("id")))
+    return active_developer_judgment(entry, origin["index"]) if origin else None
+
+
+def criteria_note(entry: dict[str, Any], events: list[dict[str, Any]]) -> str | None:
+    """`criteria met: N of M (...)` when the latest submission's Developer judgment met fewer than the slice's M.
+
+    None when the judgment met them all, is `unavailable` (it records no count) or the slice has no recorded total.
+    """
+    judgment = latest_developer_judgment(entry, events)
+    met = judgment.get("criteria_met") if judgment else None
+    total = entry.get("criteria_total")
+    if type(met) is not int or type(total) is not int or met >= total:
+        return None
+    return f"criteria met: {met} of {total} (accepted with {total - met} unmet; see the assessment)"
 
 
 def _scan_latest_developer_origin(events: list[dict[str, Any]], slice_id: str) -> dict[str, Any] | None:

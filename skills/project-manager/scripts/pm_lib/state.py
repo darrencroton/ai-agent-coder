@@ -692,9 +692,13 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
         lines.append(f"### {entry.get('id')}: {entry.get('title')}")
         lines.append("")
         try:
-            lines.append(Path(assessment_path).read_text(encoding="utf-8").rstrip())
+            assessment_text = Path(assessment_path).read_text(encoding="utf-8").rstrip()
         except OSError as exc:
             lines.append(f"(assessment could not be read: {exc})")
+        else:
+            if entry.get("status") == "accepted":
+                assessment_text = _with_active_criteria(assessment_text, entry, events)
+            lines.append(assessment_text)
     if not any_assessment:
         lines.append("")
         lines.append("(no slice has been accepted or stopped yet)")
@@ -726,6 +730,42 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     lines.append(f"- Events recorded: {len(events)}")
     lines.append("")
 
+    return "\n".join(lines)
+
+
+def _with_active_criteria(text: str, entry: dict[str, Any], events: list[dict[str, Any]]) -> str:
+    """An accepted slice's assessment `text`, its criteria line agreeing with the active Developer judgment.
+
+    `finalize --accept` writes `Criteria met: N of M (...)` under `Commit:`,
+    or no line when every criterion was met, from the judgment active then. A
+    `judge-developer` correction made after the accept supersedes that
+    judgment, and the report, which lists both judgments, must not then print
+    the superseded count as the slice's. The file stays the accept-time
+    record; when its count (none recorded: all met) is not the active
+    judgment's, the report shows the active count and names that judgment. A
+    judgment that records no count (`unavailable`) leaves the text as written.
+    """
+    from . import judgments
+
+    judgment = judgments.latest_developer_judgment(entry, events)
+    met = judgment.get("criteria_met") if judgment else None
+    total = entry.get("criteria_total")
+    lines = text.split("\n")
+    commit = next((index for index, line in enumerate(lines) if line.startswith("Commit: ")), None)
+    if judgment is None or type(met) is not int or type(total) is not int or commit is None:
+        return text
+    recorded = commit + 1 < len(lines) and lines[commit + 1].startswith("Criteria met: ")
+    if recorded:
+        agrees = lines[commit + 1].startswith(f"Criteria met: {met} of {total} ")
+    else:
+        agrees = met >= total
+    if agrees:
+        return text
+    active = f"Criteria met: {met} of {total} (active Developer judgment {judgment.get('judgment_id')})"
+    if recorded:
+        lines[commit + 1] = active
+    else:
+        lines.insert(commit + 1, active)
     return "\n".join(lines)
 
 

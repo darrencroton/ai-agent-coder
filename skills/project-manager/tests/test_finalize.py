@@ -1136,7 +1136,11 @@ class TestSteer(FinalizeTestCase):
         """TypedNotSubmitted means the correction may still land later (a
         human clears the dialog and submits the typed line) — restoring the
         rotation here would race that possible delivery, so it must stay
-        rotated, matching the (deliberately) un-unlinked correction file."""
+        rotated, matching the (deliberately) un-unlinked correction file.
+
+        The recovery SKILL.md gives next — read the pane, then relaunch —
+        archives submission 0 a second time, since the unrecorded steer never
+        consumed its number: beside the first set, never over it."""
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(self.repo.parent / "fake.sh", _result_then_drain_script())
         code, out, _err = self._init(plan_path, harness)
@@ -1149,6 +1153,8 @@ class TestSteer(FinalizeTestCase):
         self._track_current_session(run_id, token)
         artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
         self.assertTrue(self._wait_for(lambda: (artifact_dir / "result.json").is_file(), timeout=10.0))
+        code, _out, err = self.run_cli_in_repo(["observe", "--token", token])
+        self.assertEqual(code, 0, err)
         judge_current_developer(self, token, run_dir)
 
         with mock.patch.object(slice_ops.sessions, "send_line", side_effect=TypedNotSubmitted("typed but unconfirmed")):
@@ -1157,6 +1163,15 @@ class TestSteer(FinalizeTestCase):
 
         self.assertTrue((artifact_dir / "attempt-0" / "result.json").is_file())
         self.assertFalse((artifact_dir / "result.json").exists())
+
+        code, _out, err = self.run_cli_in_repo(["observe", "--token", token])
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli_in_repo(["start-slice", "--token", token])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("relaunched", out)
+        self._track_current_session(run_id, token)
+        self.assertTrue((artifact_dir / "attempt-0" / "pane-live.txt").is_file())
+        self.assertTrue((artifact_dir / "attempt-0.1" / "pane-live.txt").is_file())
 
     def test_accepted_assessment_retains_full_correction_narrative(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
@@ -2249,7 +2264,7 @@ class TestInitTokenStreams(FinalizeTestCase):
 
 
 class TestCriteriaNote(unittest.TestCase):
-    """`_criteria_note` speaks only when the current submission's judgment met fewer criteria than the slice has."""
+    """`criteria_note` speaks only when the current submission's judgment met fewer criteria than the slice has."""
 
     def _note(self, judgment: dict | None, total: int | None = 3) -> str | None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2260,7 +2275,7 @@ class TestCriteriaNote(unittest.TestCase):
                 entry["developer_judgments"] = [
                     {"judgment_id": "judgment-1", "submission": {"origin_event": {"index": 0}}, **judgment}
                 ]
-            return slice_ops._criteria_note(run_dir, entry, "Slice 1")
+            return judgments.criteria_note(entry, state_mod.read_events(run_dir))
 
     def test_fewer_met_than_total_is_named_with_the_unmet_count(self) -> None:
         self.assertEqual(

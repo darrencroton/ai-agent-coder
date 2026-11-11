@@ -830,6 +830,72 @@ class TestAttemptAccounting(SliceOpsTestCase):
         budget_stops = [e["data"] for e in events if e["kind"] == "stop"]
         self.assertEqual(budget_stops, [{"cause": "developer"}])
 
+    def test_a_stopped_slice_launched_again_archives_its_files_and_keeps_every_earlier_archive(self) -> None:
+        """A real run's sequence: launch, steer, `finalize --stop`, a fresh
+        `start-slice`, steer, relaunch. The fresh launch restarts the attempt
+        budget, as documented, but not the artifact numbering: before it, the
+        fresh launch left the stopped submission's result.json in place, the
+        second steer was refused on the first window's `steer-attempt-1.md`,
+        and the relaunch overwrote the first window's `attempt-0/`."""
+        plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
+        harness = write_fake_harness(self.repo.parent / "fake.sh", stdin_draining_idle_script())
+        code, out, _err = self._init(plan_path, harness)
+        self.assertEqual(code, 0)
+        run_id, token = parse_init_output(out)
+        run_dir = state_mod.resolve_run_dir(self.repo, run_id)
+
+        def pm(*argv: str) -> str:
+            code, out, err = self.run_cli_in_repo([*argv, "--token", token])
+            self.assertEqual(code, 0, out + err)
+            return out
+
+        def submit(label: str) -> None:
+            # Stands in for the Developer's submission files.
+            (artifact_dir / "result.json").write_text(
+                json.dumps({"slice": "Slice 1", "status": "done", "summary": label}), encoding="utf-8"
+            )
+
+        def archived(number: int) -> str:
+            return json.loads((artifact_dir / f"attempt-{number}" / "result.json").read_text(encoding="utf-8"))[
+                "summary"
+            ]
+
+        pm("start-slice")
+        self._track_current_session(run_id, token)
+        artifact_dir = Path(state_mod.load_state(run_dir, token)["current_slice"]["artifact_dir"])
+        submit("window 1, submission 0")
+        judge_current_developer(self, token, run_dir)
+        pm("finalize", "--steer", "first correction")
+        submit("window 1, submission 1")
+        judge_current_developer(self, token, run_dir)
+        pm("finalize", "--stop", "a human is needed", "--cause", "developer")
+
+        out = pm("start-slice")
+        self.assertIn("launched", out)
+        self.assertNotIn("relaunched", out)
+        self._track_current_session(run_id, token)
+        # The stopped submission's files are archived before the new session
+        # could be taken for finished on them.
+        self.assertFalse((artifact_dir / "result.json").exists())
+        self.assertEqual(archived(1), "window 1, submission 1")
+        self.assertTrue((artifact_dir / "attempt-1" / "pane.txt").is_file())
+
+        judge_current_developer(self, token, run_dir)
+        pm("finalize", "--steer", "second correction")
+        self.assertEqual((artifact_dir / "steer-attempt-1.md").read_text(encoding="utf-8"), "first correction")
+        self.assertEqual((artifact_dir / "steer-attempt-3.md").read_text(encoding="utf-8"), "second correction")
+
+        submit("window 2, submission 3")
+        judge_current_developer(self, token, run_dir)
+        self.assertIn("relaunched", pm("start-slice"))
+        self._track_current_session(run_id, token)
+        self.assertEqual(
+            {number: archived(number) for number in (0, 1, 3)},
+            {0: "window 1, submission 0", 1: "window 1, submission 1", 3: "window 2, submission 3"},
+        )
+        # The budget is the second window's own: a steer and a relaunch.
+        self.assertEqual(state_mod.load_state(run_dir, token)["slices"][0]["attempts"], 2)
+
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required for slice lifecycle tests")
 class TestLaunchPersistenceWindow(SliceOpsTestCase):
@@ -1633,10 +1699,20 @@ class TestAnswerWithoutTmux(PmTestCase):
         for name in ("question.md", "question-1.md", "answer-1.md"):
             (artifact_dir / name).write_text(name, encoding="utf-8")
         moved = slice_ops._rotate_prior_attempt(self.repo, artifact_dir, 2)
-        self.assertEqual(moved, ["question.md"])
+        self.assertEqual(moved, [artifact_dir / "attempt-2" / "question.md"])
         self.assertEqual((artifact_dir / "attempt-2" / "question.md").read_text(encoding="utf-8"), "question.md")
         self.assertTrue((artifact_dir / "question-1.md").is_file())
         self.assertTrue((artifact_dir / "answer-1.md").is_file())
+
+    def test_a_second_rotation_under_one_number_is_archived_beside_the_first(self) -> None:
+        artifact_dir = self.repo / ".pm" / "artifacts"
+        artifact_dir.mkdir(parents=True)
+        for copy in ("first", "second"):
+            (artifact_dir / "pane.txt").write_text(copy, encoding="utf-8")
+            slice_ops._rotate_prior_attempt(self.repo, artifact_dir, 2)
+        self.assertEqual((artifact_dir / "attempt-2" / "pane.txt").read_text(encoding="utf-8"), "first")
+        self.assertEqual((artifact_dir / "attempt-2.1" / "pane.txt").read_text(encoding="utf-8"), "second")
+        self.assertFalse((artifact_dir / "pane.txt").exists())
 
 
 class TestReadQuestionHead(unittest.TestCase):
@@ -2037,7 +2113,9 @@ class TestInitSandbox(_SandboxedRun):
         self.assertEqual(
             state["sandbox"],
             {
-                "policy": str(self.base_policy.resolve()),
+                # As given, not resolved: on macOS the temp root runs through
+                # the /var -> /private/var link, which the record keeps.
+                "policy": str(self.base_policy),
                 "policy_sha256": hashlib.sha256(self.base_policy.read_bytes()).hexdigest(),
                 "socket": self.socket,
                 "control_dir": str(self.control),
@@ -2225,7 +2303,7 @@ class TestRunSocketRefusals(_SandboxedRun):
             code, out, err = self.run_cli_in_repo(["status"])
         self.assertEqual(code, 0, err)
         sha = hashlib.sha256(self.base_policy.read_bytes()).hexdigest()
-        line = f"sandbox: {self.base_policy.resolve()} (sha256 {sha[:12]}) socket {self.socket}"
+        line = f"sandbox: {self.base_policy} (sha256 {sha[:12]}) socket {self.socket}"
         self.assertIn(line, out.splitlines())
         with self.on_socket(self.socket):
             code, _out, err = self.run_cli_in_repo(["status", "--report"])

@@ -771,6 +771,55 @@ class TestRunReportSurfaceGrants(PlanTestCase):
         self.assertIn("## Surface Grants\n(none)", empty_text)
 
 
+class TestRunReportCriteriaLine(PlanTestCase):
+    """An accepted slice's criteria line follows the active Developer judgment,
+    not the count frozen into its assessment at `finalize --accept`."""
+
+    _RECORDED = "Criteria met: 1 of 6 (accepted with 5 unmet; see the assessment)"
+
+    def _report(self, recorded: str | None, *judged: dict) -> str:
+        """The report of one accepted six-criterion slice whose assessment
+        holds `recorded` under `Commit:`, judged by `judged` in order (each
+        dict overrides one Developer judgment's fields)."""
+        header = ["# Assessment: Slice 1 - T", "", "Decision: ACCEPTED", "Timestamp: t", "Commit: abc"]
+        assessment = self.repo / "assessment.md"
+        assessment.write_text(
+            "\n".join([*header, *([recorded] if recorded else []), "", "## Floor", ""]), encoding="utf-8"
+        )
+        records = [
+            {
+                "judgment_id": f"developer-judgment-{number}",
+                "score": 1,
+                "defects": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+                "reason": "r",
+                "submission": {"origin_event": {"index": 0, "kind": "launch", "slice": "Slice 1"}},
+                "developer": {},
+                **fields,
+            }
+            for number, fields in enumerate(judged, 1)
+        ]
+        entry = {"id": "Slice 1", "title": "T", "status": "accepted", "criteria_total": 6}
+        entry.update(assessment=str(assessment), developer_judgments=records)
+        state = {"run_id": "r", "repo": "/repo", "plan": {}, "harness": {}, "reviewer": {}, "slices": [entry]}
+        return state_mod.render_run_report(state, [{"kind": "launch", "slice": "Slice 1"}], Path(self.repo))
+
+    def test_a_judgment_superseded_after_the_accept_replaces_the_recorded_count(self) -> None:
+        text = self._report(
+            self._RECORDED, {"criteria_met": 1}, {"criteria_met": 6, "supersedes": "developer-judgment-1"}
+        )
+        self.assertIn("Commit: abc\nCriteria met: 6 of 6 (active Developer judgment developer-judgment-2)\n", text)
+        self.assertNotIn("1 of 6", text)
+
+        # No line recorded (all met at the accept, or an assessment older than
+        # the line) and fewer met now: the active count appears, claiming no more.
+        text = self._report(None, {"criteria_met": 6}, {"criteria_met": 4, "supersedes": "developer-judgment-1"})
+        self.assertIn("Commit: abc\nCriteria met: 4 of 6 (active Developer judgment developer-judgment-2)\n", text)
+
+    def test_an_unchanged_judgment_leaves_the_assessment_as_written(self) -> None:
+        self.assertIn(f"Commit: abc\n{self._RECORDED}\n\n## Floor", self._report(self._RECORDED, {"criteria_met": 1}))
+        self.assertIn("Commit: abc\n\n## Floor", self._report(None, {"criteria_met": 6}))
+
+
 class TestRunElapsed(unittest.TestCase):
     def _duration(self, first: str, last: str) -> str:
         elapsed = state_mod.run_elapsed([{"ts": first}, {"ts": last}])
