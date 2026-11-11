@@ -581,6 +581,12 @@ class TestRunReportHeader(PlanTestCase):
         self.assertIn("- Branch: feature/x\n- Run tag: bench-a\n", self._header(run_tag="bench-a"))
         self.assertNotIn("Run tag", self._header())
 
+    def test_header_names_the_pm_model_only_when_set(self) -> None:
+        self.assertIn(
+            "- Run tag: bench-a\n- PM model: opus-x high\n", self._header(run_tag="bench-a", pm_model="opus-x high")
+        )
+        self.assertNotIn("PM model", self._header())
+
     def test_header_names_the_reviewers_that_actually_reviewed(self) -> None:
         """The recorded reviews replace the init default outright — a stale
         default alongside them would be exactly the claim this line drops."""

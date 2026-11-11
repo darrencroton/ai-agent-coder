@@ -334,6 +334,7 @@ def init_run(
     harness_command: str | None,
     model_tag: str | None,
     run_tag: str | None,
+    pm_model: str | None,
     policy: dict[str, Any] | None = None,
     sandbox_policy: Path | None = None,
 ) -> InitResult:
@@ -341,8 +342,9 @@ def init_run(
 
     Callers are expected to have already run `plan.plan_check_report` and
     stopped on errors (this function assumes the plan is clean); it does
-    not re-check the plan. `model_tag` (the run's default Developer tag) and
-    `run_tag` are stored as given, already validated by `state.tag_value`.
+    not re-check the plan. `model_tag` (the run's default Developer tag),
+    `run_tag` and `pm_model` (the model in the PM seat) are stored as given,
+    already validated by `state.tag_value`.
     `policy` is `plan.load_policy`'s result (or None): its protected entries
     and source digest are frozen into run state here, and the policy file is
     never read again for the rest of the run.
@@ -485,6 +487,7 @@ def init_run(
         slices=entries,
         run_id=run_id,
         run_tag=run_tag,
+        pm_model=pm_model,
     )
 
     if sandbox_base is None:

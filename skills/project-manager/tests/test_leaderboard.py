@@ -34,6 +34,14 @@ _CLAUDE = ("claude", "claude-opus-5-5", "high", False)
 _QWEN = ("qwen", "qwen-4", None, True)
 _ZERO_DEFECTS = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
 
+_DEVELOPER = "Developer (tool / model / effort)"
+_REVIEWER = "Reviewer (tool / model / effort)"
+_CODEX_LABEL = "codex / gpt-6.1-sol / high"
+_CLAUDE_LABEL = "claude / claude-opus-5-5 / high"
+_QWEN_LABEL = "qwen / qwen-4 / unknown / override"
+_OPUS_LABEL = "claude / claude-opus-5-5 / high"
+_SONNET_LABEL = "claude / claude-sonnet-5-5 / medium"
+
 
 def _sub(
     developer: dict,
@@ -97,19 +105,12 @@ def _failed(key: tuple, skill: str = "code-review", reason: str = "timeout") -> 
     }
 
 
-def _code(production: tuple[int, int, int], before: int, after: int) -> dict:
-    lines = {
-        category: {"code": 0, "comment": 0, "blank": 0}
-        for category in (
-            "production",
-            "test",
-            "documentation",
-            "configuration",
-            "data",
-            "other",
-        )
-    }
-    lines["production"] = dict(zip(("code", "comment", "blank"), production, strict=True))
+def _code(production: int, before: int, after: int, test: int = 0) -> dict:
+    """A code-health block: `production` and `test` code-line deltas, a complexity sum before and after."""
+    categories = ("production", "test", "documentation", "configuration", "data", "other")
+    lines = {category: {"code": 0, "comment": 1, "blank": 1} for category in categories}
+    lines["production"]["code"] = production
+    lines["test"]["code"] = test
     return {
         "lines": lines,
         "complexity": {
@@ -130,6 +131,7 @@ def _row(
     decided_at: str | None = None,
     elapsed_s: int | None = 600,
     steers: int = 0,
+    relaunches: int = 0,
     nudges: int = 0,
     code: dict | None = None,
     reviews: list[dict] | None = None,
@@ -147,13 +149,17 @@ def _row(
         "decided_at": decided_at if outcome != "open" else None,
         "elapsed_s": elapsed_s,
         "steers": steers,
-        "relaunches": 0,
+        "relaunches": relaunches,
         "nudges": nudges,
         "code": code,
         "submissions": submissions,
         "reviews": reviews or [],
         "comparisons": comparisons or [],
     }
+
+
+def _order(*review_ids: str) -> dict:
+    return {"origin": 0, "order": list(review_ids)}
 
 
 def _file(run_id: str, rows: list[dict], events: int = 10, **extra) -> bytes:
@@ -165,6 +171,10 @@ def _file(run_id: str, rows: list[dict], events: int = 10, **extra) -> bytes:
 def _render(*files: tuple[str, bytes]) -> str:
     text, _errors = leaderboard.render_leaderboard(list(files))
     return text
+
+
+def _render_rows(rows: list[dict]) -> str:
+    return _render(("h/run-1.json", _file("run-1", rows)))
 
 
 def _section(text: str, heading: str) -> str:
@@ -198,15 +208,19 @@ def _tables(section: str) -> list[list[dict[str, str]]]:
     return tables
 
 
-def _by_name(table: list[dict[str, str]]) -> dict[str, dict[str, str]]:
-    """Index a Developer table by its identity column."""
-    return {row["Developer (tool / model / effort / tag)"]: row for row in table}
+def _developers(text: str) -> list[dict[str, str]]:
+    """The one Developer table."""
+    (table,) = _tables(_section(text, "## Developers"))
+    return table
 
 
-_CODEX_LABEL = "codex / gpt-6.1-sol / high / no override / untagged"
-_CLAUDE_LABEL = "claude / claude-opus-5-5 / high / no override / untagged"
-_OPUS_LABEL = "claude / claude-opus-5-5 / high / untagged"
-_SONNET_LABEL = "claude / claude-sonnet-5-5 / medium / untagged"
+def _by_name(table: list[dict[str, str]], column: str = _DEVELOPER) -> dict[str, dict[str, str]]:
+    """Index a table by its identity column."""
+    return {row[column]: row for row in table}
+
+
+def _identity(model: str) -> dict:
+    return {"tool": "claude", "model": model, "effort": "high", "model_tag": None}
 
 
 class TestLeaderboardColumns(unittest.TestCase):
@@ -214,7 +228,8 @@ class TestLeaderboardColumns(unittest.TestCase):
 
     def _text(self) -> str:
         rows = [
-            # Two scored submissions: only the first is "first", both count.
+            # Two scored submissions: only the first is "first", so its 1, not
+            # the later 2, is this window's First score.
             _row(
                 [
                     _sub(
@@ -228,40 +243,29 @@ class TestLeaderboardColumns(unittest.TestCase):
                 ],
                 elapsed_s=600,
                 steers=1,
+                relaunches=1,
                 nudges=1,
-                code=_code((10, 2, 1), 4, 7),
+                code=_code(10, 4, 7),
                 reviews=[
-                    _rev("review-1", _CODEX, {"score": 2}),
+                    _rev("review-1", _CODEX, {"score": 2, "confirmed": 3}),
                     _rev("review-2", _CLAUDE, {"score": 1}),
                     _rev("review-3", _QWEN, {"score": 1}),
                 ],
-                comparisons=[
-                    {
-                        "origin": 0,
-                        "order": ["review-1", "review-2", "review-3"],
-                        "close": ["review-2"],
-                    }
-                ],
+                comparisons=[_order("review-1", "review-2", "review-3")],
             ),
             _row(
                 [_sub(OPUS, 2, developer_s=300)],
                 slice_id="Slice 2",
                 elapsed_s=300,
-                code=_code((20, 0, 3), 0, 1),
+                code=_code(20, 0, 1),
                 reviews=[
-                    _rev("review-1", _CODEX, {"score": 1}),
+                    _rev("review-1", _CODEX, {"score": 1, "confirmed": 0}),
                     _rev("review-2", _CLAUDE, {"score": 2}),
                 ],
-                comparisons=[
-                    {
-                        "origin": 0,
-                        "order": ["review-2", "review-1"],
-                        "close": ["review-1"],
-                    }
-                ],
+                comparisons=[_order("review-2", "review-1")],
             ),
-            # Exhausted: the unavailable first submission is skipped, so the
-            # steer is the first scored one.
+            # Exhausted: counted, but not accepted. The unavailable first
+            # submission is skipped, so the steer is the first scored one.
             _row(
                 [
                     _sub(OPUS, None),
@@ -290,98 +294,88 @@ class TestLeaderboardColumns(unittest.TestCase):
                 reviews=[_rev("review-1", _CLAUDE, None)],
             ),
         ]
-        return _render(("host/run-1.json", _file("run-1", rows)))
+        return _render_rows(rows)
 
     def test_developer_columns_match_hand_computed_values(self) -> None:
-        tables = _tables(_section(self._text(), "### All difficulties"))
-        self.assertEqual(len(tables), 1)
-        row = _by_name(tables[0])[_OPUS_LABEL]
-        expected = {
-            "Rank": "1",
-            "Score (PM), mean 0–2": "1.40 (n=5)",
-            "First-submission criteria met (PM), Σk/Σn": "9/12 (n=4)",
-            "First-submission P0+P1 defects (PM), mean": "0.75 (n=4)",
-            "First-submission P2+P3 defects (PM), mean": "1.00 (n=4)",
-            "Developer time per submission, median s": "150 (n=4)",
-            "Windows, n": "4",
-            "Accepted, share": "3/4 (75%)",
-            "Accepted on first submission, share": "2/4 (50%)",
-            "Scored submissions per window, mean": "1.25 (n=4)",
-            "Steers+nudges per window, mean": "1.25 (n=4)",
-            "Wall time per window, median s": "600 (n=3)",
-            "Δ production lines code/comment/blank, median": "15/1/2 (n=2)",
-            "Δ test lines code/comment/blank, median": "0/0/0 (n=2)",
-            "Δ complexity sum, median": "2 (n=2)",
-        }
-        self.assertEqual({key: row[key] for key in expected}, expected)
-
-    def test_difficulty_bands_without_counted_windows_say_so(self) -> None:
-        text = self._text()
+        (row,) = _developers(self._text())
         self.assertEqual(
-            _section(text, "### Difficulty: easy").strip(),
-            "No Developer-counted windows.",
+            row,
+            {
+                "Difficulty": "moderate",
+                "Rank": "1",
+                _DEVELOPER: _OPUS_LABEL,
+                # The exhausted window counts against acceptance.
+                "Accepted": "3/4 (75%)",
+                "First-pass accept": "2/4 (50%)",
+                # (1 + 2 + 0 + 2) / 4; the mean over every scored submission would be 1.40.
+                "First score (PM)": "1.25",
+                "Criteria met, first (PM)": "9/12 (75%)",
+                "Defects, first: P0–1 / P2–3 (PM)": "0.75 / 1.00",
+                # (3 + 0 + 3 + 0) / 4: the first window's relaunch counts.
+                "Interventions / window": "1.50",
+                # Median of 50, 100, 200, 300 s is 150 s.
+                "Dev time / submission": "2.5",
+                "Wall / window": "10.0",
+                "Δ code lines, prod / test": "+15 / 0",
+                "Δ complexity (Python)": "+2",
+            },
         )
-        self.assertIn(_OPUS_LABEL, _section(text, "### Difficulty: moderate"))
+
+    def test_footnote_is_left_out_when_every_window_is_credited(self) -> None:
+        self.assertNotIn("Window-level columns leave out", _section(self._text(), "## Developers"))
+
+    def test_reviewer_columns_match_hand_computed_values(self) -> None:
+        section = _section(self._text(), "### code-review")
+        reviewers = _tables(section)[0]
+
+        # Codex and Claude tie on pairwise share, so group-key order decides;
+        # Qwen has two commissions, so it follows unranked.
+        self.assertEqual(
+            [(row["Rank"], row[_REVIEWER]) for row in reviewers],
+            [("1", _CLAUDE_LABEL), ("2", _CODEX_LABEL), ("–", _QWEN_LABEL)],
+        )
+        claude, codex, qwen = reviewers
+        self.assertEqual(
+            claude,
+            {
+                "Rank": "1",
+                _REVIEWER: _CLAUDE_LABEL,
+                "Commissions": "3",
+                "Usable (PM)": "2/2 (100%)",
+                "Failed by class": "0",
+                "Score (PM)": "1.50",
+                "Confirmed defects / review (PM)": "n/a",
+                "Pairwise wins (PM)": "2/3 (67%)",
+                "Review time": "n/a",
+            },
+        )
+        self.assertEqual(codex["Score (PM)"], "1.67")
+        # Two of Codex's three rated reviews carry `confirmed`: (3 + 0) / 2.
+        self.assertEqual(codex["Confirmed defects / review (PM)"], "1.50")
+        self.assertEqual(codex["Pairwise wins (PM)"], "2/3 (67%)")
+        self.assertEqual(
+            [qwen[h] for h in ("Commissions", "Usable (PM)", "Failed by class", "Pairwise wins (PM)")],
+            ["2", "1/2 (50%)", "timeout 1", "0/2 (0%)"],
+        )
 
     def test_reviewer_review_time_is_the_median_of_known_durations_and_n_a_without_any(self) -> None:
         timed = [{**_rev(f"review-{n}", _CODEX, {"score": 1}), "elapsed_s": secs} for n, secs in ((1, 60), (2, 120))]
         timed.append({**_rev("review-3", _CODEX, {"score": 1}), "elapsed_s": None})
         untimed = [_rev(f"review-{n}", _CLAUDE, {"score": 1}) for n in (1, 2, 3)]
-        text = _render(("host/run-1.json", _file("run-1", [_row([_sub(OPUS)], reviews=[*timed, *untimed])])))
+        section = _section(_render_rows([_row([_sub(OPUS)], reviews=[*timed, *untimed])]), "### code-review")
 
-        (ranked,) = _tables(_section(text, "### code-review"))
-        by_reviewer = {row["Reviewer (tool / model / effort / override / tag)"]: row for row in ranked}
-
-        self.assertEqual(by_reviewer[_CODEX_LABEL]["Review time, median s"], "90 (n=2)")
-        self.assertEqual(by_reviewer[_CLAUDE_LABEL]["Review time, median s"], "n/a")
-
-    def test_reviewer_columns_match_hand_computed_values(self) -> None:
-        tables = _tables(_section(self._text(), "### code-review"))
-        ranked, insufficient = tables
-        # Codex and Claude tie on pairwise share, so group-key order decides.
-        self.assertEqual(
-            [row["Reviewer (tool / model / effort / override / tag)"] for row in ranked],
-            [
-                "claude / claude-opus-5-5 / high / no override / untagged",
-                "codex / gpt-6.1-sol / high / no override / untagged",
-            ],
-        )
-        claude, codex = ranked
-        self.assertEqual(
-            [
-                claude[h]
-                for h in (
-                    "Rank",
-                    "Commissions, n",
-                    "Score (PM), mean 0–2",
-                    "Panels (PM), n",
-                )
-            ],
-            ["1", "3", "1.50 (n=2)", "2"],
-        )
-        self.assertEqual(claude["Usable (PM), share rated/(rated+unavailable+failed)"], "2/2 (100%)")
-        self.assertEqual(claude["Failed by class, n"], "0")
-        self.assertEqual(claude["Pairwise wins (PM), share"], "2/3 (67%)")
-        self.assertEqual(claude["Close-call wins (PM), share"], "1/2 (50%)")
-        self.assertEqual(codex["Score (PM), mean 0–2"], "1.67 (n=3)")
-        self.assertEqual(codex["Pairwise wins (PM), share"], "2/3 (67%)")
-        self.assertEqual(codex["Close-call wins (PM), share"], "1/2 (50%)")
-        (qwen,) = insufficient
-        self.assertNotIn("Rank", qwen)
-        self.assertEqual(
-            qwen["Reviewer (tool / model / effort / override / tag)"],
-            "qwen / qwen-4 / unknown / override / untagged",
-        )
-        self.assertEqual(qwen["Commissions, n"], "2")
-        self.assertEqual(qwen["Usable (PM), share rated/(rated+unavailable+failed)"], "1/2 (50%)")
-        self.assertEqual(qwen["Failed by class, n"], "timeout 1")
-        self.assertEqual(qwen["Pairwise wins (PM), share"], "0/2 (0%)")
-        self.assertEqual(qwen["Close-call wins (PM), share"], "n/a")
+        (table,) = _tables(section)
+        by_reviewer = _by_name(table, _REVIEWER)
+        self.assertEqual(by_reviewer[_CODEX_LABEL]["Review time"], "1.5")
+        self.assertEqual(by_reviewer[_CLAUDE_LABEL]["Review time"], "n/a")
+        # No two reviewers shared a panel, so there is no head-to-head table.
+        self.assertNotIn("Head-to-head", section)
 
     def test_presentation_carries_no_wall_clock_or_composite_score(self) -> None:
         text = self._text()
         self.assertIn("## Errors\n\nNone.\n", text)
         self.assertNotIn("composite", text.replace("There is no composite score.", ""))
+        self.assertNotIn("(n=", text)
         self.assertNotIn(datetime.now(timezone.utc).strftime("%Y-%m-%d"), text)
 
 
@@ -407,19 +401,14 @@ class TestLeaderboardWindowSelection(unittest.TestCase):
                 reviews=[_rev("review-1", drift, {"score": 0}, "drift-audit")],
             ),
         ]
-        text = _render(("host/run-1.json", _file("run-1", rows)))
+        text = _render_rows(rows)
 
-        self.assertEqual(
-            _section(text, "### All difficulties").strip(),
-            "No Developer-counted windows.",
-        )
+        self.assertEqual(_section(text, "## Developers").strip().splitlines()[-1], "No Developer-counted windows.")
         (ranked,) = _tables(_section(text, "### drift-audit"))
-        self.assertEqual(ranked[0]["Commissions, n"], "3")
-        self.assertEqual(ranked[0]["Score (PM), mean 0–2"], "1.00 (n=3)")
+        self.assertEqual(ranked[0]["Commissions"], "3")
+        self.assertEqual(ranked[0]["Score (PM)"], "1.00")
 
-    def test_mixed_and_unscored_windows_are_footnoted_but_submissions_still_count(
-        self,
-    ) -> None:
+    def test_mixed_and_unscored_windows_are_footnoted_but_submissions_still_count(self) -> None:
         rows = [
             _row(
                 [
@@ -429,58 +418,24 @@ class TestLeaderboardWindowSelection(unittest.TestCase):
             ),
             _row([_sub(OPUS, None)], slice_id="Slice 2"),
         ]
-        section = _section(_render(("host/run-1.json", _file("run-1", rows))), "### All difficulties")
+        text = _render_rows(rows)
 
         self.assertIn(
             "leave out 1 window(s) with mixed Developer identities and 1 window(s) with no scored submission",
-            section,
+            _section(text, "## Developers"),
         )
-        (insufficient,) = _tables(section)
-        opus, sonnet = (
-            _by_name(insufficient)[_OPUS_LABEL],
-            _by_name(insufficient)[_SONNET_LABEL],
+        opus, sonnet = _by_name(_developers(text))[_OPUS_LABEL], _by_name(_developers(text))[_SONNET_LABEL]
+        # The first scored submission is Opus's, so its score is Opus's alone.
+        self.assertEqual(
+            [opus[h] for h in ("First score (PM)", "Criteria met, first (PM)", "Dev time / submission")],
+            ["1.00", "1/3 (33%)", "0.2"],
         )
-        self.assertEqual(opus["Score (PM), mean 0–2"], "1.00 (n=1)")
-        self.assertEqual(opus["First-submission criteria met (PM), Σk/Σn"], "1/3 (n=1)")
-        self.assertEqual(opus["Developer time per submission, median s"], "10 (n=1)")
-        self.assertEqual(sonnet["Score (PM), mean 0–2"], "2.00 (n=1)")
-        self.assertEqual(sonnet["First-submission criteria met (PM), Σk/Σn"], "n/a")
-        self.assertEqual(sonnet["Developer time per submission, median s"], "n/a")
+        self.assertEqual(
+            [sonnet[h] for h in ("First score (PM)", "Criteria met, first (PM)", "Dev time / submission")],
+            ["n/a", "n/a", "n/a"],
+        )
         for group in (opus, sonnet):
-            self.assertEqual(group["Windows, n"], "0")
-            self.assertEqual(group["Accepted, share"], "n/a")
-            self.assertEqual(group["Wall time per window, median s"], "n/a")
-
-    def test_small_groups_are_unranked_and_full_ties_keep_group_key_order(self) -> None:
-        def identity(model: str) -> dict:
-            return {"tool": "claude", "model": model, "effort": "high"}
-
-        rows = [
-            *(
-                _row([_sub(identity(model), 1)], slice_id=f"{model} {n}")
-                for model in ("beta", "alpha")
-                for n in range(3)
-            ),
-            *(_row([_sub(identity("zeta"), 2)], slice_id=f"zeta {n}") for n in range(3)),
-            *(_row([_sub(identity("aaa"), 2)], slice_id=f"aaa {n}") for n in range(2)),
-        ]
-        section = _section(_render(("host/run-1.json", _file("run-1", rows))), "### All difficulties")
-        ranked, insufficient = _tables(section)
-
-        self.assertEqual(
-            [(row["Rank"], row["Developer (tool / model / effort / tag)"]) for row in ranked],
-            [
-                ("1", "claude / zeta / high / untagged"),
-                ("2", "claude / alpha / high / untagged"),
-                ("3", "claude / beta / high / untagged"),
-            ],
-        )
-        self.assertIn("Insufficient data (fewer than 3 windows), unranked:", section)
-        self.assertEqual(
-            [row["Developer (tool / model / effort / tag)"] for row in insufficient],
-            ["claude / aaa / high / untagged"],
-        )
-        self.assertNotIn("Rank", insufficient[0])
+            self.assertEqual([group["Rank"], group["Accepted"], group["Wall / window"]], ["–", "n/a", "n/a"])
 
     def test_usable_share_leaves_unrated_reviews_out_of_both_sides(self) -> None:
         drift = ("codex", "gpt-6.1-sol", "high", False)
@@ -490,14 +445,10 @@ class TestLeaderboardWindowSelection(unittest.TestCase):
             _rev("review-3", drift, None, "drift-audit"),
             _failed(drift, "drift-audit"),
         ]
-        text = _render(("host/run-1.json", _file("run-1", [_row([_sub(OPUS)], reviews=reviews)])))
-        (ranked,) = _tables(_section(text, "### drift-audit"))
+        (ranked,) = _tables(_section(_render_rows([_row([_sub(OPUS)], reviews=reviews)]), "### drift-audit"))
 
-        self.assertEqual(ranked[0]["Commissions, n"], "4")
-        self.assertEqual(
-            ranked[0]["Usable (PM), share rated/(rated+unavailable+failed)"],
-            "1/3 (33%)",
-        )
+        self.assertEqual(ranked[0]["Commissions"], "4")
+        self.assertEqual(ranked[0]["Usable (PM)"], "1/3 (33%)")
 
     def test_failed_commissions_are_counted_by_class_in_a_fixed_order(self) -> None:
         """Classes print in the review module's order, whatever order they
@@ -507,11 +458,10 @@ class TestLeaderboardWindowSelection(unittest.TestCase):
         drift = ("codex", "gpt-6.1-sol", "high", False)
         reasons = ("capacity", "exit 3", "limit", "empty report", "limit", "capacity", "limit")
         reviews = [_failed(drift, "drift-audit", reason) for reason in reasons]
-        text = _render(("host/run-1.json", _file("run-1", [_row([_sub(OPUS)], reviews=reviews)])))
-        (ranked,) = _tables(_section(text, "### drift-audit"))
+        (ranked,) = _tables(_section(_render_rows([_row([_sub(OPUS)], reviews=reviews)]), "### drift-audit"))
 
-        self.assertEqual(ranked[0]["Failed by class, n"], "limit 3 · capacity 2 · unclassified 2")
-        self.assertEqual(ranked[0]["Usable (PM), share rated/(rated+unavailable+failed)"], "0/7 (0%)")
+        self.assertEqual(ranked[0]["Failed by class"], "limit 3 · capacity 2 · unclassified 2")
+        self.assertEqual(ranked[0]["Usable (PM)"], "0/7 (0%)")
 
 
 class TestLeaderboardRanking(unittest.TestCase):
@@ -521,8 +471,8 @@ class TestLeaderboardRanking(unittest.TestCase):
     through the rule it names.
     """
 
-    _ALPHA = {"tool": "claude", "model": "alpha", "effort": "high", "model_tag": None}
-    _ZETA = {"tool": "claude", "model": "zeta", "effort": "high", "model_tag": None}
+    _ALPHA = _identity("alpha")
+    _ZETA = _identity("zeta")
 
     def _text(self) -> str:
         drift_low = ("claude", "claude-opus-5-5", "high", False)
@@ -531,7 +481,7 @@ class TestLeaderboardRanking(unittest.TestCase):
         for n in range(3):
             rows.append(
                 # Zeta is accepted on its first submission; alpha needs a
-                # second. Both score 2 throughout, so PM mean ties.
+                # second. Both score 2 throughout, so First score ties.
                 _row(
                     [_sub(self._ZETA, 2)],
                     slice_id=f"zeta {n}",
@@ -543,100 +493,123 @@ class TestLeaderboardRanking(unittest.TestCase):
                         _rev("review-5", _CLAUDE, {"score": 2}),
                     ],
                     # Claude's code review is never in a panel.
-                    comparisons=[{"origin": 0, "order": ["review-3", "review-4"], "close": []}],
+                    comparisons=[_order("review-3", "review-4")],
                 )
             )
             rows.append(_row([_sub(self._ALPHA, 2), _sub(self._ALPHA, 2)], slice_id=f"alpha {n}"))
-        return _render(("h/run-1.json", _file("run-1", rows)))
+        return _render_rows(rows)
 
-    def test_developers_tied_on_pm_mean_rank_by_first_submission_acceptance(
-        self,
-    ) -> None:
-        (ranked,) = _tables(_section(self._text(), "### All difficulties"))
+    def test_developers_tied_on_first_score_rank_by_first_pass_acceptance(self) -> None:
+        self.assertEqual(
+            [(row["Rank"], row[_DEVELOPER]) for row in _developers(self._text())],
+            [("1", "claude / zeta / high"), ("2", "claude / alpha / high")],
+        )
+
+    def test_developers_rank_by_the_first_submission_score_not_later_ones(self) -> None:
+        # Late's later submissions lift its mean over every submission (1.33)
+        # above early's 1.00, but its first submissions all scored 0.
+        rows = [
+            *(_row([_sub(_identity("early"), 1)], slice_id=f"early {n}") for n in range(3)),
+            *(_row([_sub(_identity("late"), s) for s in (0, 2, 2)], slice_id=f"late {n}") for n in range(3)),
+        ]
 
         self.assertEqual(
-            [(row["Rank"], row["Developer (tool / model / effort / tag)"]) for row in ranked],
-            [
-                ("1", "claude / zeta / high / untagged"),
-                ("2", "claude / alpha / high / untagged"),
-            ],
+            [(row["Rank"], row[_DEVELOPER], row["First score (PM)"]) for row in _developers(_render_rows(rows))],
+            [("1", "claude / early / high", "1.00"), ("2", "claude / late / high", "0.00")],
         )
 
     def test_drift_audit_reviewers_rank_by_pm_mean(self) -> None:
         (ranked,) = _tables(_section(self._text(), "### drift-audit"))
 
         self.assertEqual(
-            [(row["Rank"], row["Reviewer (tool / model / effort / override / tag)"]) for row in ranked],
+            [(row["Rank"], row[_REVIEWER]) for row in ranked],
+            [("1", _CODEX_LABEL), ("2", _CLAUDE_LABEL)],
+        )
+        self.assertNotIn("Pairwise wins (PM)", ranked[0])
+
+    def test_a_code_reviewer_with_no_panels_ranks_last(self) -> None:
+        ranked = _tables(_section(self._text(), "### code-review"))[0]
+
+        self.assertEqual(
+            [(row["Rank"], row[_REVIEWER], row["Pairwise wins (PM)"]) for row in ranked],
             [
-                ("1", "codex / gpt-6.1-sol / high / no override / untagged"),
-                ("2", "claude / claude-opus-5-5 / high / no override / untagged"),
+                ("1", _QWEN_LABEL, "3/3 (100%)"),
+                ("2", _CODEX_LABEL, "0/3 (0%)"),
+                ("3", _CLAUDE_LABEL, "n/a"),
             ],
         )
 
-    def test_a_code_reviewer_with_no_panels_ranks_last(self) -> None:
-        (ranked,) = _tables(_section(self._text(), "### code-review"))
+
+class TestLeaderboardDifficultyBands(unittest.TestCase):
+    def test_bands_run_hard_to_easy_then_others_with_ranks_restarting_and_small_groups_inline(self) -> None:
+        def windows(model: str, score: int, count: int, difficulty: str | None) -> list[dict]:
+            return [
+                _row([_sub(_identity(model), score)], slice_id=f"{model} {difficulty} {n}", difficulty=difficulty)
+                for n in range(count)
+            ]
+
+        rows = [
+            *windows("alpha", 2, 3, "easy"),
+            *windows("alpha", 2, 1, None),
+            *windows("alpha", 2, 1, "epic"),
+            # In hard: alpha and beta tie on every statistic, so group-key
+            # order decides; aaa scores best but has too few windows to rank.
+            *windows("beta", 1, 3, "hard"),
+            *windows("alpha", 1, 3, "hard"),
+            *windows("zeta", 2, 3, "hard"),
+            *windows("aaa", 2, 2, "hard"),
+        ]
 
         self.assertEqual(
+            [(row["Difficulty"], row["Rank"], row[_DEVELOPER]) for row in _developers(_render_rows(rows))],
             [
-                (
-                    row["Reviewer (tool / model / effort / override / tag)"],
-                    row["Pairwise wins (PM), share"],
-                )
-                for row in ranked
-            ],
-            [
-                ("qwen / qwen-4 / unknown / override / untagged", "3/3 (100%)"),
-                ("codex / gpt-6.1-sol / high / no override / untagged", "0/3 (0%)"),
-                ("claude / claude-opus-5-5 / high / no override / untagged", "n/a"),
+                ("hard", "1", "claude / zeta / high"),
+                ("", "2", "claude / alpha / high"),
+                ("", "3", "claude / beta / high"),
+                ("", "–", "claude / aaa / high"),
+                ("easy", "1", "claude / alpha / high"),
+                ("epic", "–", "claude / alpha / high"),
+                ("unknown", "–", "claude / alpha / high"),
             ],
         )
 
 
 class TestLeaderboardMedians(unittest.TestCase):
-    def _section(self) -> str:
-        unparsed = {
-            **_code((-2, 1, 3), 0, 0),
-            "complexity": None,
-            "complexity_reason": "x.py:1: bad",
-        }
+    def _row(self) -> dict[str, str]:
+        unparsed = {**_code(-1, 0, 0, test=0), "complexity": None, "complexity_reason": "x.py:1: bad"}
         rows = [
-            _row([_sub(OPUS)], slice_id="Slice 1", code=_code((-4, 0, 1), 4, 7)),
-            _row([_sub(OPUS)], slice_id="Slice 2", code=_code((-1, 2, 0), 1, 3)),
+            _row([_sub(OPUS)], slice_id="Slice 1", code=_code(-4, 4, 7, test=1)),
+            _row([_sub(OPUS)], slice_id="Slice 2", code=_code(-1, 1, 3, test=2)),
             _row([_sub(OPUS)], slice_id="Slice 3", code=unparsed),
-            _row(
-                [_sub(OPUS)],
-                slice_id="Slice 4",
-                code={**unparsed, "lines": _code((-7, 0, 0), 0, 0)["lines"]},
-            ),
+            _row([_sub(OPUS)], slice_id="Slice 4", code={**unparsed, "lines": _code(-7, 0, 0)["lines"]}),
         ]
-        return _section(_render(("h/run-1.json", _file("run-1", rows))), "### All difficulties")
+        (row,) = _developers(_render_rows(rows))
+        return row
 
-    def test_line_medians_print_halves_and_negatives_exactly(self) -> None:
-        (ranked,) = _tables(self._section())
-
-        self.assertEqual(
-            ranked[0]["Δ production lines code/comment/blank, median"],
-            "-3/0.5/0.5 (n=4)",
-        )
+    def test_line_medians_print_signed_halves_exactly(self) -> None:
+        # Production -7, -4, -1, -1 and test 0, 0, 1, 2.
+        self.assertEqual(self._row()["Δ code lines, prod / test"], "-2.5 / +0.5")
 
     def test_windows_without_complexity_are_left_out_of_its_median(self) -> None:
-        (ranked,) = _tables(self._section())
+        self.assertEqual(self._row()["Δ complexity (Python)"], "+2.5")
 
-        self.assertEqual(ranked[0]["Δ complexity sum, median"], "2.5 (n=2)")
+    def test_minutes_round_half_up_from_the_exact_median(self) -> None:
+        # 855 s is 14.25 min exactly; half-even rounding would print 14.2.
+        rows = [_row([_sub(OPUS, developer_s=850), _sub(OPUS, developer_s=860)], elapsed_s=30)]
+        (row,) = _developers(_render_rows(rows))
+
+        self.assertEqual([row["Dev time / submission"], row["Wall / window"]], ["14.3", "0.5"])
 
     def test_a_median_beyond_float_precision_prints_exactly(self) -> None:
         rows = [_row([_sub(OPUS, developer_s=2**61 + offset)], slice_id=f"Slice {offset}") for offset in (1, 2)]
-        section = _section(_render(("h/run-1.json", _file("run-1", rows))), "### All difficulties")
-        (insufficient,) = _tables(section)
+        (row,) = _developers(_render_rows(rows))
 
-        self.assertEqual(
-            insufficient[0]["Developer time per submission, median s"],
-            "2305843009213693953.5 (n=2)",
-        )
+        # (2**61 + 1.5) / 60 = 38430716820228232.5583…; a float has ~16 digits.
+        self.assertEqual(row["Dev time / submission"], "38430716820228232.6")
 
 
 class TestLeaderboardTags(unittest.TestCase):
-    def test_identities_differing_only_by_tag_are_separate_groups(self) -> None:
+    def test_label_suffixes_appear_only_when_set_and_tags_split_groups(self) -> None:
         hot = {**OPUS, "model_tag": "temp-0.8"}
         rows = [
             _row(
@@ -644,79 +617,90 @@ class TestLeaderboardTags(unittest.TestCase):
                 reviews=[
                     _rev("review-1", _CODEX, {"score": 2}),
                     _rev("review-2", _CODEX, {"score": 0}, model_tag="hot"),
+                    _rev("review-3", ("codex", "gpt-6.1-sol", "high", None), {"score": 1}),
+                    _rev("review-4", _QWEN, {"score": 1}, model_tag="hot"),
                 ],
             ),
             _row([_sub(hot, 0)], slice_id="Slice 2"),
         ]
-        text = _render(("h/run-1.json", _file("run-1", rows)))
+        text = _render_rows(rows)
 
-        (developers,) = _tables(_section(text, "### All difficulties"))
         self.assertEqual(
-            {name: row["Score (PM), mean 0–2"] for name, row in _by_name(developers).items()},
-            {
-                _OPUS_LABEL: "2.00 (n=1)",
-                "claude / claude-opus-5-5 / high / temp-0.8": "0.00 (n=1)",
-            },
+            {name: row["First score (PM)"] for name, row in _by_name(_developers(text)).items()},
+            {_OPUS_LABEL: "2.00", "claude / claude-opus-5-5 / high / temp-0.8": "0.00"},
         )
         (reviewers,) = _tables(_section(text, "### code-review"))
         self.assertEqual(
+            [(row[_REVIEWER], row["Score (PM)"]) for row in reviewers],
             [
-                (
-                    row["Reviewer (tool / model / effort / override / tag)"],
-                    row["Score (PM), mean 0–2"],
-                )
-                for row in reviewers
-            ],
-            [
-                ("codex / gpt-6.1-sol / high / no override / hot", "0.00 (n=1)"),
-                ("codex / gpt-6.1-sol / high / no override / untagged", "2.00 (n=1)"),
+                ("codex / gpt-6.1-sol / high / hot", "0.00"),
+                (_CODEX_LABEL, "2.00"),
+                ("codex / gpt-6.1-sol / high / override unknown", "1.00"),
+                ("qwen / qwen-4 / unknown / override / hot", "1.00"),
             ],
         )
 
-    def test_same_identity_twice_in_a_panel_is_no_pair(self) -> None:
+
+class TestLeaderboardHeadToHead(unittest.TestCase):
+    _TINY = ("opencode", "tiny", "low", False)
+
+    def _text(self) -> str:
         rows = [
+            # Codex twice and Claude in every panel: the two Codex reviews are
+            # no pair. Slice 0 also panels Tiny, which has one commission.
             _row(
                 [_sub(OPUS)],
                 slice_id=f"Slice {n}",
                 reviews=[
-                    _rev("review-1", _CODEX, {"score": 2}),
-                    _rev("review-2", _CODEX, {"score": 2}),
-                    _rev("review-3", _CLAUDE, {"score": 1}),
+                    _rev("r1", _CODEX, {"score": 2}),
+                    _rev("r2", _CODEX, {"score": 2}),
+                    _rev("r3", _CLAUDE, {"score": 1}),
+                    *([_rev("r4", self._TINY, {"score": 2})] if n == 0 else []),
                 ],
-                comparisons=[
-                    {
-                        "origin": 0,
-                        "order": ["review-1", "review-2", "review-3"],
-                        "close": ["review-2"],
-                    }
-                ],
+                comparisons=[_order("r4", "r1", "r2", "r3") if n == 0 else _order("r1", "r2", "r3")],
             )
             for n in range(3)
         ]
-        (ranked,) = _tables(_section(_render(("h/run-1.json", _file("run-1", rows))), "### code-review"))
-        shares = {
-            row["Reviewer (tool / model / effort / override / tag)"]: (
-                row["Panels (PM), n"],
-                row["Pairwise wins (PM), share"],
-                row["Close-call wins (PM), share"],
+        # Qwen shares one panel with Claude and none with Codex.
+        rows.append(
+            _row(
+                [_sub(OPUS)],
+                slice_id="Slice 3",
+                reviews=[_rev("r1", _QWEN, {"score": 1}), _rev("r2", _CLAUDE, {"score": 1})],
+                comparisons=[_order("r2", "r1")],
             )
-            for row in ranked
-        }
+        )
+        rows += [_row([_sub(OPUS)], slice_id=f"Slice {n}", reviews=[_rev("r1", _QWEN, {"score": 1})]) for n in (4, 5)]
+        return _render_rows(rows)
+
+    def test_pairwise_shares_count_unranked_partners_but_not_same_group_pairs(self) -> None:
+        reviewers = _tables(_section(self._text(), "### code-review"))[0]
 
         self.assertEqual(
-            shares,
-            {
-                "codex / gpt-6.1-sol / high / no override / untagged": (
-                    "3",
-                    "6/6 (100%)",
-                    "n/a",
-                ),
-                "claude / claude-opus-5-5 / high / no override / untagged": (
-                    "3",
-                    "0/6 (0%)",
-                    "n/a",
-                ),
-            },
+            [(row["Rank"], row[_REVIEWER], row["Pairwise wins (PM)"]) for row in reviewers],
+            [
+                ("1", _CODEX_LABEL, "6/8 (75%)"),
+                ("2", _CLAUDE_LABEL, "1/8 (13%)"),
+                ("3", _QWEN_LABEL, "0/1 (0%)"),
+                ("–", "opencode / tiny / low", "3/3 (100%)"),
+            ],
+        )
+
+    def test_matrix_reads_row_wins_against_column_among_ranked_reviewers(self) -> None:
+        section = _section(self._text(), "### code-review")
+
+        self.assertIn(
+            "Head-to-head (PM): each row's wins–losses against each column, by rank above;"
+            " blank where two reviewers never shared a panel.",
+            section,
+        )
+        self.assertEqual(
+            _tables(section)[1],
+            [
+                {"Reviewer": f"1 · {_CODEX_LABEL}", "1": "·", "2": "6–0", "3": ""},
+                {"Reviewer": f"2 · {_CLAUDE_LABEL}", "1": "0–6", "2": "·", "3": "1–0"},
+                {"Reviewer": f"3 · {_QWEN_LABEL}", "1": "", "2": "0–1", "3": "·"},
+            ],
         )
 
 
@@ -758,9 +742,7 @@ class TestLeaderboardFiles(unittest.TestCase):
         copied = [("studio/run-1.json", one[1]), ("studio/run-2.json", two[1])]
         self.assertEqual(_render(two, *copied, one), first)
 
-    def test_more_events_win_and_equal_events_with_different_bytes_are_errors(
-        self,
-    ) -> None:
+    def test_more_events_win_and_equal_events_with_different_bytes_are_errors(self) -> None:
         files = [
             ("a/run-1.json", _file("run-1", self._rows(ledger_ts(500)), events=5)),
             ("b/run-1.json", _file("run-1", self._rows(ledger_ts(100)), events=7)),
@@ -780,7 +762,7 @@ class TestLeaderboardFiles(unittest.TestCase):
         )
         self.assertIn("different contents", errors[0])
         self.assertIn("not valid JSON", errors[1])
-        self.assertIn("missing or invalid run_id, run_tag, events or rows", errors[2])
+        self.assertIn("missing or invalid run_id, run_tag, pm_model, events or rows", errors[2])
         for error in errors:
             self.assertIn(f"- {error}", _section(text, "## Errors"))
 
@@ -799,33 +781,24 @@ class TestLeaderboardFiles(unittest.TestCase):
         undecided = _file("run-3", [_row([_sub(OPUS)], outcome="open")])
         self.assertIn("As of: unknown\n", _render(("h/run-3.json", undecided)))
 
-    def test_history_link_is_relative_to_the_output_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            history = Path(scratch) / "skill" / "ledger" / "historical-pre-ledger.md"
-            history.parent.mkdir(parents=True)
-            history.write_text("frozen\n", encoding="utf-8")
-            files = [("h/run-1.json", _file("run-1", self._rows(ledger_ts(1))))]
-            with mock.patch.object(leaderboard, "_HISTORY_PATH", history):
-                text, _ = leaderboard.render_leaderboard(files, out_dir=Path(scratch) / "out")
-            with mock.patch.object(leaderboard, "_HISTORY_PATH", history.with_name("absent.md")):
-                plain, _ = leaderboard.render_leaderboard(files, out_dir=Path(scratch) / "out")
+    def test_pm_model_line_counts_runs_most_first_with_unrecorded_last(self) -> None:
+        rows = self._rows(ledger_ts(1))
+        files = [
+            ("h/run-1.json", _file("run-1", rows, pm_model="opus")),
+            ("h/run-2.json", _file("run-2", rows, pm_model="opus")),
+            ("h/run-3.json", _file("run-3", rows, pm_model="gpt")),
+            ("h/run-4.json", _file("run-4", rows, pm_model="alpha")),
+            ("h/run-5.json", _file("run-5", rows, pm_model=None)),
+            # An older file has no `pm_model` key at all.
+            ("h/run-6.json", _file("run-6", rows)),
+        ]
+        text, errors = leaderboard.render_leaderboard(files)
 
+        self.assertEqual(errors, [])
         self.assertIn(
-            "History: [historical-pre-ledger.md](../skill/ledger/historical-pre-ledger.md)",
+            "Runs: 6; slice windows: 6.\n\nPM model: opus (2 runs) · alpha (1 run) · gpt (1 run) · unrecorded (2 runs)\n",
             text,
         )
-        self.assertNotIn("History:", plain)
-
-    def test_history_link_is_percent_encoded(self) -> None:
-        with tempfile.TemporaryDirectory() as scratch:
-            history = Path(scratch) / "my hist#1 (old)" / "historical-pre-ledger.md"
-            history.parent.mkdir()
-            history.write_text("frozen\n", encoding="utf-8")
-            files = [("h/run-1.json", _file("run-1", self._rows(ledger_ts(1))))]
-            with mock.patch.object(leaderboard, "_HISTORY_PATH", history):
-                text, _ = leaderboard.render_leaderboard(files, out_dir=Path(scratch) / "out")
-
-        self.assertIn("(../my%20hist%231%20%28old%29/historical-pre-ledger.md)", text)
 
     def test_malformed_row_interiors_are_errors_not_crashes(self) -> None:
         good = ("h/good.json", _file("good", self._rows(ledger_ts(1))))
@@ -843,10 +816,11 @@ class TestLeaderboardFiles(unittest.TestCase):
             "model_tag type": with_row(submissions=[_sub({**OPUS, "model_tag": 2})]),
             "command_override type": with_row(reviews=[{**reviewer, "command_override": 1}]),
             "run_tag type": _file("bad", [_row([_sub(OPUS)])], run_tag=7),
+            "pm_model type": _file("bad", [_row([_sub(OPUS)])], pm_model=7),
             "review_id": with_row(reviews=[{**reviewer, "review_id": ["a"]}]),
             "tool": with_row(reviews=[{**reviewer, "tool": {"x": 1}}]),
             "developer": with_row(submissions=[{**_sub(OPUS), "developer": {"tool": ["x"]}}]),
-            "order": with_row(comparisons=[{"origin": 0, "order": [["a"]], "close": []}]),
+            "order": with_row(comparisons=[{"origin": 0, "order": [["a"]]}]),
             "events": b'{"run_id": "bad", "events": ' + b"9" * 5000 + b', "rows": []}',
         }
         for name, raw in cases.items():
@@ -874,10 +848,9 @@ class TestLeaderboardFiles(unittest.TestCase):
         # Scores 1×7 and 2 → 9/8 = 1.125 exactly; binary float formatting gives 1.12.
         scores = [1] * 7 + [2]
         rows = [_row([_sub(OPUS, score)], slice_id=f"Slice {n}") for n, score in enumerate(scores)]
-        section = _section(_render(("h/run-1.json", _file("run-1", rows))), "### All difficulties")
-        (ranked,) = _tables(section)
+        (row,) = _developers(_render_rows(rows))
 
-        self.assertEqual(ranked[0]["Score (PM), mean 0–2"], "1.13 (n=8)")
+        self.assertEqual(row["First score (PM)"], "1.13")
 
 
 class TestLedgerRenderCommand(unittest.TestCase):
@@ -897,10 +870,13 @@ class TestLedgerRenderCommand(unittest.TestCase):
             code = cli.main(argv)
         return code, out.getvalue(), err.getvalue()
 
-    def test_out_path_receives_the_leaderboard(self) -> None:
+    def _seed(self) -> None:
         host = self.root / "mac"
         host.mkdir(parents=True)
         (host / "run-1.json").write_bytes(_file("run-1", [_row([_sub(OPUS)], decided_at=ledger_ts(5))]))
+
+    def test_out_path_receives_the_leaderboard(self) -> None:
+        self._seed()
         out = self.root.parent / "elsewhere" / "board.md"
 
         code, stdout, err = self._main(["ledger", "render", "--out", str(out)])
@@ -916,11 +892,6 @@ class TestLedgerRenderCommand(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f"no per-run ledger files found under {self.root}", err)
         self.assertNotIn("pm: ledger: not written", err)
-
-    def _seed(self) -> None:
-        host = self.root / "mac"
-        host.mkdir(parents=True)
-        (host / "run-1.json").write_bytes(_file("run-1", [_row([_sub(OPUS)], decided_at=ledger_ts(5))]))
 
     def test_run_tags_keep_only_runs_carrying_one_of_them(self) -> None:
         self._seed()
@@ -939,9 +910,7 @@ class TestLedgerRenderCommand(unittest.TestCase):
         self.assertIn(f"As of: {ledger_ts(5)}\n\nRun tags: alpha, beta\n", text)
         self.assertIn("Runs: 2; slice windows: 2.", text)
 
-    def test_run_tags_matching_no_run_exit_two_naming_them_and_the_directory(
-        self,
-    ) -> None:
+    def test_run_tags_matching_no_run_exit_two_naming_them_and_the_directory(self) -> None:
         self._seed()
 
         code, _stdout, err = self._main(["ledger", "render", "--run-tag", "nowhere"])
@@ -949,21 +918,6 @@ class TestLedgerRenderCommand(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f"no per-run ledger file has run tag nowhere under {self.root}", err)
         self.assertFalse((self.root / "leaderboard.md").exists())
-
-    def test_the_default_output_links_the_skills_history_not_the_override(self) -> None:
-        self._seed()
-        history = self.root.parent / "skill" / "ledger" / "historical-pre-ledger.md"
-        history.parent.mkdir(parents=True)
-        history.write_text("frozen\n", encoding="utf-8")
-
-        with mock.patch.object(leaderboard, "_HISTORY_PATH", history):
-            code, _stdout, err = self._main(["ledger", "render"])
-
-        self.assertEqual(code, 0, err)
-        self.assertIn(
-            "History: [historical-pre-ledger.md](../skill/ledger/historical-pre-ledger.md)",
-            (self.root / "leaderboard.md").read_text(encoding="utf-8"),
-        )
 
     def test_an_unwritable_out_path_is_an_error_naming_it(self) -> None:
         self._seed()
@@ -975,23 +929,6 @@ class TestLedgerRenderCommand(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f"pm: error: cannot write the leaderboard to {out}", err)
         self.assertNotIn("Traceback", err)
-
-    def test_history_link_is_relative_to_an_output_symlinks_own_directory(self) -> None:
-        self._seed()
-        history = self.root.parent / "skill" / "ledger" / "historical-pre-ledger.md"
-        history.parent.mkdir(parents=True)
-        history.write_text("frozen\n", encoding="utf-8")
-        target = self.root.parent / "deep" / "er" / "real.md"
-        target.parent.mkdir(parents=True)
-        target.write_text("old\n", encoding="utf-8")
-        out = self.root.parent / "board.md"
-        out.symlink_to(target)
-
-        with mock.patch.object(leaderboard, "_HISTORY_PATH", history):
-            code, _stdout, err = self._main(["ledger", "render", "--out", str(out)])
-
-        self.assertEqual(code, 0, err)
-        self.assertIn("(skill/ledger/historical-pre-ledger.md)", out.read_text(encoding="utf-8"))
 
 
 class TestLedgerTagCommand(unittest.TestCase):

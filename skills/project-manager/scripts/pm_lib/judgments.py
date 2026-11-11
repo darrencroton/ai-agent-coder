@@ -101,15 +101,17 @@ def _parse_input(data: dict[str, Any]) -> dict[str, Any]:
         }
 
     if skill == "drift-audit" or "score" in data or "review_id" in data:
-        allowed = common | {"review_id", "score"}
+        allowed = common | {"review_id", "score", "confirmed"}
         unknown = set(data) - allowed
+        label = "drift judgment" if skill == "drift-audit" else "code rating"
         if unknown:
-            label = "drift judgment" if skill == "drift-audit" else "code rating"
             raise PmError(f"{label} has unsupported fields: {', '.join(sorted(unknown))}")
         score = data.get("score")
         if type(score) is not int or score not in (0, 1, 2):
-            label = "drift judgment" if skill == "drift-audit" else "code rating"
             raise PmError(f"{label} score must be integer 0, 1, or 2")
+        confirmed = data.get("confirmed")
+        if "confirmed" in data and (type(confirmed) is not int or confirmed < 0):
+            raise PmError(f"{label} confirmed must be a non-negative integer")
         if skill == "drift-audit" and assessment not in (None, _RATING):
             raise PmError("drift-audit judgments support ratings only")
         if skill == "code-review" and assessment not in (None, _RATING):
@@ -121,6 +123,7 @@ def _parse_input(data: dict[str, Any]) -> dict[str, Any]:
             "reason": reason,
             "review_id": _nonempty_string(data.get("review_id"), "review_id"),
             "score": score,
+            "confirmed": confirmed,
             "assessment": _RATING,
             "supersedes": supersedes,
         }
@@ -225,6 +228,7 @@ def _input_matches(record: dict[str, Any], parsed: dict[str, Any]) -> bool:
         "review_ids",
         "review_id",
         "score",
+        "confirmed",
         "order",
         "close",
         "assessment",

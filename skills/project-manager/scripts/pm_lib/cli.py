@@ -105,6 +105,11 @@ def build_parser() -> argparse.ArgumentParser:
         "and effort strings cannot (a local model at two temperatures, say); the ledger groups by it",
     )
     init.add_argument("--run-tag", help="a label for the whole run; `ledger render --run-tag` filters by it")
+    init.add_argument(
+        "--pm-model",
+        help="the model in the PM seat for this run, e.g. a full model id and effort; the leaderboard names it "
+        "because every (PM) column is that model's judgment",
+    )
     branch_group = init.add_mutually_exclusive_group()
     branch_group.add_argument("--branch")
     branch_group.add_argument("--create-branch")
@@ -580,6 +585,7 @@ def _run_init(args: argparse.Namespace) -> int:
     sandbox_policy = _sandbox_arg(args)
     model_tag = state_mod.tag_value(args.model_tag, flag="--model-tag")
     run_tag = state_mod.tag_value(args.run_tag, flag="--run-tag")
+    pm_model = state_mod.tag_value(args.pm_model, flag="--pm-model")
     repo = git_ops.resolve_repo(Path(args.repo))
     plan_path = git_ops.resolve_plan(Path(args.plan))
 
@@ -610,6 +616,7 @@ def _run_init(args: argparse.Namespace) -> int:
         harness_command=args.harness_command,
         model_tag=model_tag,
         run_tag=run_tag,
+        pm_model=pm_model,
         policy=policy,
         sandbox_policy=sandbox_policy,
     )
@@ -1521,10 +1528,8 @@ def _run_ledger_render(args: argparse.Namespace) -> int:
         out = root / f"leaderboard-{joined}.md"
     else:
         out = root / "leaderboard.md"
-    # The write replaces `out` itself, never a symlink's target, so the
-    # History link is relative to the directory `out` is named in.
     try:
-        text, errors = leaderboard.render_leaderboard(files, out_dir=out.parent.resolve(), run_tags=run_tags)
+        text, errors = leaderboard.render_leaderboard(files, run_tags=run_tags)
     except PmError as exc:
         raise PmError(f"{exc} under {root}") from exc
     try:

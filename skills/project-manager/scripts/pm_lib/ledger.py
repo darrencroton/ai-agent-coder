@@ -146,7 +146,10 @@ def _rating(active: list[dict[str, Any]], skill: Any, review_id: Any) -> dict[st
             continue
         if record.get("status") == "unavailable":
             return {"status": "unavailable"}
-        return {"score": record.get("score")}
+        rating: dict[str, Any] = {"score": record.get("score")}
+        if type(record.get("confirmed")) is int:
+            rating["confirmed"] = record["confirmed"]
+        return rating
     return None
 
 
@@ -343,6 +346,7 @@ def write_run_file(run_dir: Path, token: str) -> Path:
         payload = {
             "run_id": run_id,
             "run_tag": state.get("run_tag"),
+            "pm_model": state.get("pm_model"),
             "events": len(events),
             "rows": run_rows(state, events),
         }

@@ -10,16 +10,16 @@ Every run already records what each model did: which model was launched for whic
 
 | Command | What it does for the ledger |
 |---|---|
-| `init --model M --run-tag TEXT --model-tag TEXT` | names the default Developer model, labels the whole run, and sets the run's default model tag |
+| `init --model M --run-tag TEXT --model-tag TEXT --pm-model TEXT` | names the default Developer model, labels the whole run, sets the run's default model tag, and names the model in the PM seat |
 | `start-slice --model M --model-tag TEXT` | launches a Developer; the model and tag override the run defaults for this launch only |
 | `review --tool T --model M --model-tag TEXT` | commissions a Reviewer with its own identity and tag |
 | `judge-developer --file F` | records the PM's score of the current Developer submission |
-| `judge-reviews --file F` | records the PM's rating of a review, or the order of a review panel |
+| `judge-reviews --file F` | records the PM's rating of a review (with its confirmed-defect count), or the order of a review panel |
 | `status --report` | regenerates the run report and confirms the run's ledger file was written |
 | `ledger render [--out PATH] [--run-tag TEXT …]` | builds the leaderboard from every run's file |
 | `ledger tag RUN_ID [--run-tag TEXT] [--model-tag OLD=NEW …]` | changes the tags on a finished run's file |
 
-The tag flags are optional. `ledger render` and `ledger tag` need no run and no token, so you can use them any time, including long after the runs and their repositories are gone.
+The tag and `--pm-model` flags are optional. `ledger render` and `ledger tag` need no run and no token, so you can use them any time, including long after the runs and their repositories are gone.
 
 ## What is measured
 
@@ -33,7 +33,7 @@ Nothing below needs a command of its own; it happens inside the commands you alr
 
 | When | What is recorded |
 |---|---|
-| `init` | the repository name, the run tag, the default Developer model and tag |
+| `init` | the repository name, the run tag, the default Developer model and tag, and the PM's model (`--pm-model`: one non-blank line, no `=`) |
 | `start-slice` | the submission's identity on the launch or relaunch event; attempt counts |
 | `send`, `finalize --steer` | nudges and steers, counted per window |
 | `review` | the review's identity, its report and hash; a timeout, non-zero exit or empty report is a `review-failed` entry carrying its failure class (`limit`, `auth`, `capacity`, `timeout`, `empty`, or `exit <N>` when nothing recognised it), one entry per commission, including each bounded re-commission |
@@ -48,7 +48,7 @@ The per-run file is `<ledger dir>/<host>/<run-id>.json`. The ledger directory is
 Two kinds of judgment, each written as a small JSON file and recorded with its command. The input formats are in [review-judgments.md](review-judgments.md).
 
 - **`judge-developer`**: a 0–2 score for the current submission, with `criteria_met` (how many of the slice's checkbox criteria it met) and `defects` (the distinct defects the PM confirmed, counted by severity P0–P3). A submission the PM cannot assess, such as a session that died before producing anything, is recorded as `unavailable` instead; `unavailable` is not a score of 0, and a submission with assessable work is scored even when its session has since died.
-- **`judge-reviews`**: a 0–2 rating (or `unavailable`) for every review of the submission, and, when two or more code-review reports share a commission context, one strict best-first `order` with `close` calls for the ones too close to call.
+- **`judge-reviews`**: a 0–2 rating (or `unavailable`) for every review of the submission, and, when two or more code-review reports share a commission context, one strict best-first `order` with `close` calls for the ones too close to call. Give every scored rating its `confirmed` count, as [review-judgments.md](review-judgments.md) defines it.
 
 The scale is the same everywhere: 0 unacceptable, 1 acceptable, 2 excellent. The **judgment gate** refuses `finalize --accept`, `--steer`, `--stop` and a relaunch until the current submission has its Developer judgment, a rating for every review commissioned on it, and an order for every panel; `pm stop`, the emergency exit, is not gated.
 
@@ -62,27 +62,32 @@ pm ledger render --run-tag bench-q4                          # only runs tagged 
 pm ledger render --run-tag bench-q4 --out ~/boards/bench-q4.md   # the same, in a file of your choosing
 ```
 
-**Each render replaces its output file.** Without `--out` an unfiltered render writes `<ledger dir>/leaderboard.md`, and a tag-filtered one writes `<ledger dir>/leaderboard-<tags joined by +>.md` beside it (tags sorted, characters other than letters, digits, `_`, `.` and `-` replaced by `_`), so a filtered view never overwrites the full board; the command says so. Give a board you want elsewhere its own `--out`. Nothing is lost by overwriting, because the board is rebuilt from the per-run files every time. A filtered board names its tags in a "Run tags:" line at the top, and runs without a run tag are left out of it. Repeat `--run-tag` to include runs carrying any of several tags.
+**Each render replaces its output file.** Without `--out` an unfiltered render writes `<ledger dir>/leaderboard.md`, and a tag-filtered one writes `<ledger dir>/leaderboard-<tags joined by +>.md` beside it (tags sorted, characters other than letters, digits, `_`, `.` and `-` replaced by `_`), so a filtered view never overwrites the full board; the command says so. Give a board you want elsewhere its own `--out`. Nothing is lost by overwriting, because the board is rebuilt from the per-run files every time. A filtered board names its tags in a "Run tags:" line at the top, and runs without a run tag are left out of it. A "PM model:" header line counts the runs by the model that sat as PM, `unrecorded` for runs without one. Repeat `--run-tag` to include runs carrying any of several tags.
 
-The output depends only on the files and the output location, never on the clock, so the same files rendered to the same place always give the same bytes. The location matters because the board's History link is written relative to it. The write is atomic, so a failed render leaves the previous board intact. The command exits 2, naming the directory it searched, when it finds no files or no run carries any of the given tags.
+The output depends only on the files, never on the clock or the output location, so the same files always give the same bytes. The write is atomic, so a failed render leaves the previous board intact. The command exits 2, naming the directory it searched, when it finds no files or no run carries any of the given tags.
 
-**Developer tables**, one overall and one per difficulty band, group rows by exact tool, model, effort and model tag. A window counts for a Developer when it was `accepted`, `exhausted`, or `stopped` with cause `developer`; every other stopped window, and windows still open, are left out. Only scored submissions count. Rows rank by mean PM score, then by the share accepted on the first submission. Columns:
+**The Developer table** is one table, grouped by difficulty band (hard, moderate, easy, then any other label) and ranked within each band only, since a rank across bands would follow each model's mix of slices. Rows group by exact tool, model, effort and model tag. A window counts for a Developer when it was `accepted`, `exhausted`, or `stopped` with cause `developer`; every other stopped window, and windows still open, are left out. Rows rank by first score (PM), then by first-pass acceptance. A window's *first* submission is its first scored one, so the score is not a mean blended with later, post-steer work. Columns:
 
-- Score (PM), mean; first-submission criteria met as Σk/Σn; first-submission P0+P1 and P2+P3 defects, mean; Developer time per submission, median (from the submission's start to the next floor check, decision or submission: a proxy that includes whatever waiting happened before the PM's first check).
-- Windows; accepted share; accepted on the first submission; scored submissions per window; steers plus nudges per window; wall time per window, median; Δ lines per category (code/comment/blank medians); Δ complexity. These window-level columns count a window only when all its scored submissions share one identity; mixed windows are counted in a footnote.
+- Accepted over windows; first-pass accept (accepted on the first submission); first score (PM), the mean; first-submission criteria met as Σk/Σn (PM); first-submission P0–1 and P2–3 defects, mean (PM).
+- Interventions per window, the mean of steers, relaunches and nudges. Dev time per submission, from the submission's start to the next floor check, decision or submission (a proxy that includes whatever waiting happened before the PM's first check). Wall time per window. Both times are median minutes.
+- Δ code lines (production and test, code lines only) and Δ complexity (Python only), medians, describing the accepted diff after any steering; comparable only between Developers given the same slices.
 
-**Reviewer tables**, one per skill, group rows the same way plus whether a custom command ran the review: commissions; usable share (rated over rated plus unavailable plus failed); failed commissions by class, for example `limit 14 · capacity 11 · unclassified 2` (classes in the order limit, auth, capacity, timeout, empty, unclassified, a zero class left out, `0` when none failed; `unclassified` is an `exit <N>` nothing recognised, or a reason recorded before the classes existed); Score (PM), mean; review time, median seconds (the review record's `at` minus `launched_at`, `n/a` for reviews recorded without a `launched_at`, so a panel can be chosen with its cost beside its ratings); panels; pairwise win share across every panel order the reviewer appeared in (a close call is still a full win); close-call win share. Two commissions of one configuration in the same panel are never paired against each other. Code-review tables rank by pairwise wins, drift-audit tables by PM score.
+The first-submission columns and Dev time credit each submission's own identity; the others count a window only when all its scored submissions share one identity, and a footnote (printed only when non-zero) counts the windows left out.
 
-Rows with fewer than three windows (Developers) or three commissions (Reviewers) are listed unranked under "Insufficient data". The "As of" line is the latest decision in the kept files. An "Errors" section names any file that was skipped and why.
+**The Reviewer tables**, one per skill, group rows the same way plus whether a custom command ran the review (`override` or `override unknown` is added to the label only when it applies). Columns: commissions; usable share (PM), rated over rated plus unavailable plus failed; failed commissions by class, for example `limit 14 · capacity 11 · unclassified 2` (classes in the order limit, auth, capacity, timeout, empty, unclassified, a zero class left out, `0` when none failed; `unclassified` is an `exit <N>` nothing recognised, or a reason recorded before the classes existed); score, mean (PM); confirmed defects per review, mean over the ratings that carry `confirmed` (PM); review time, median minutes (the review record's `at` minus `launched_at`, `n/a` without a `launched_at`, so a panel can be chosen with its cost beside its ratings). Code-review adds pairwise wins (PM), the share of panel pairings the reviewer was placed above (a close call is still a full win; two commissions of one configuration in a panel are never paired), ranks by it, and is followed by a head-to-head table of each ranked reviewer's wins–losses against every other across their shared panels, because a share depends on who a reviewer was panelled with. Drift-audit ranks by mean score.
+
+Groups below three windows (Developers) or three commissions (Reviewers) are listed in the same table, unranked, with rank `–`. The "As of" line is the latest decision in the kept files. An "Errors" section names any file that was skipped and why.
+
+The board leaves out, but the ledger file still records, comment and blank lines, the documentation, configuration, data and other categories, and panel close calls.
 
 ## Tags
 
 Two optional labels separate what the identity strings cannot.
 
-- A **model tag** names a configuration that tool, model and effort do not distinguish: one local model at two temperatures, or the same model behind two system prompts. It is part of the group key, so each tag gets its own leaderboard row; a row without one reads `untagged`.
+- A **model tag** names a configuration that tool, model and effort do not distinguish: one local model at two temperatures, or the same model behind two system prompts. It is part of the group key, so each tag gets its own leaderboard row.
 - A **run tag** labels a whole run, so you can render a board from a chosen set of runs.
 
-A tag is trimmed of surrounding spaces, and may not be blank, span lines, contain `=`, or be `untagged`, which the leaderboard reserves for "no tag". To change the tags on a finished run, use `ledger tag` with the run id:
+A tag is trimmed of surrounding spaces, and may not be blank, span lines, contain `=`, or be `untagged`, which `ledger tag` reserves for "no tag" as an old value. To change the tags on a finished run, use `ledger tag` with the run id:
 
 ```bash
 pm ledger tag 20261010T060837Z-9153ab --run-tag bench-q4
@@ -103,9 +108,9 @@ pm init … --harness codex --model gpt-6.1-sol --run-tag cmp-oct
 pm ledger render --run-tag cmp-oct --out ~/boards/cmp-oct.md
 ```
 
-Read the overall table for the PM score and acceptance columns, then the per-difficulty tables, since a model that is strong on easy slices may not be on hard ones. Models that merely happened to get different slices in ordinary runs are compared on different work, so read those rows as context, not as a verdict.
+Read each difficulty band for the PM score and acceptance columns, since a model that is strong on easy slices may not be on hard ones. Models that merely happened to get different slices in ordinary runs are compared on different work, so read those rows as context, not as a verdict.
 
-**Benchmark one local model at several settings.** Give each configuration its own model tag, either for the whole run or per launch. The leaderboard shows one row per tag. Keep one tag per slice window: a relaunch under a different tag makes the window mixed, and mixed windows drop out of the window-level columns.
+**Benchmark one local model at several settings.** Give each configuration its own model tag, either for the whole run or per launch. The leaderboard shows one row per tag. Keep one tag per slice window: a relaunch under a different tag makes the window mixed, and mixed windows drop out of the window-level columns. The same holds for a relaunch under a different model; [SKILL.md](../SKILL.md) says how to hand a slice over. The Δ columns are comparable only between models given the same plans.
 
 ```bash
 pm init … --model M --model-tag temp-0.2      # the run's default
@@ -139,5 +144,5 @@ pm ledger render
 - Time figures are proxies: Developer time runs to the next floor check or decision, so a session left overnight before the PM looks inflates it, and wall time includes review time. Medians are used for that reason.
 - Code metrics count lines lexically (binary files included) and skip symlinks; they are context for a window, not a score.
 - A Reviewer's panel figures only exist where the PM commissioned two or more code reviews on one submission; a lone report is rated but never ordered against another, so a reviewer only ever used alone has a score and no pairwise figures.
-- The comparisons are observational. Each model's rows come from whatever work it was given; the three-window minimum decides only whether a row is ranked, not whether a difference means anything; and every (PM) column reflects the model in the PM seat, including any leaning towards its own vendor. Compare on the same plans, treat small n as anecdote, and note who sat as PM.
+- The comparisons are observational. Each model's rows come from whatever work it was given; the three-window minimum decides only whether a row is ranked, not whether a difference means anything; and every (PM) column reflects the model in the PM seat, including any leaning towards its own vendor. Compare on the same plans and treat small n as anecdote.
 - The leaderboard is only as good as the PM's judgments. If scores are always 2 and defects always 0, the spread is in the acceptance and time columns, and the judgment burden is worth revisiting.

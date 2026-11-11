@@ -37,9 +37,12 @@ An individual reviewer rating uses the same payload for either review skill:
   "skill": "code-review",
   "review_id": "review-2",
   "score": 2,
+  "confirmed": 1,
   "reason": "Found the boundary defect; PM reproduced it against the contract."
 }
 ```
+
+`confirmed`, optional but to be supplied on every scored rating, is the number of distinct defects the report raised that PM confirmed (the same defects PM counts in the Developer judgment's `defects`), a non-negative integer, 0 for a clean report or one with nothing confirmed. It is refused on an `unavailable` rating and on a comparison, and it is part of the input identity: a retry that changes it needs `supersedes`. The board averages it, which makes it the only measure of a reviewer's findings as distinct from PM's overall opinion of the report; presence is not enforced.
 
 For drift, use `"skill": "drift-audit"` and its review ID. Record a code-panel order independently:
 
@@ -110,7 +113,7 @@ Developer judgments retain the originating event, evaluated `head`, `before_head
 
 ## Stored contract and coverage
 
-Reviewer judgments remain in `slices[].review_judgments`. Records carry `assessment: "rating"` or `"comparison"`, `schema_version: 1`, generated `judgment_id: "judgment-N"`, UTC `at`, `skill`, `reason`, and the applicable input payload. Developer judgments live in `slices[].developer_judgments` with generated `developer-judgment-N` IDs, timestamp, reason, score (with `criteria_met` and `defects`) or status, and the stored `submission` and `developer` context. Slice identity is inherited from the enclosing entry. No normalized points or model averages are stored.
+Reviewer judgments remain in `slices[].review_judgments`. Records carry `assessment: "rating"` or `"comparison"`, `schema_version: 1`, generated `judgment_id: "judgment-N"`, UTC `at`, `skill`, `reason`, and the applicable input payload (a rating's `confirmed` included). Developer judgments live in `slices[].developer_judgments` with generated `developer-judgment-N` IDs, timestamp, reason, score (with `criteria_met` and `defects`) or status, and the stored `submission` and `developer` context. Slice identity is inherited from the enclosing entry. No normalized points or model averages are stored.
 
 Successful `reviews[]` entries retain stable `review_id: "review-N"`, tool/model/effort, `command_override` (true iff `--reviewer-command` built this commission -- `tool` alone can name a real profile even under an override, so it cannot carry this signal by itself), `origin_event: {index, kind, slice}` and `review_context: {pm_adjudications, drift_review}`. `pm_adjudications` is null or supplied text; `drift_review` is null or `{review_id, artifact, sha256}` identifying the drift report handed to a code reviewer. Join reviewer judgments by `(run_id, slice.id, review_id)` and Developer judgments by `(run_id, slice.id, submission.origin_event.index)`, never by list position, model or artifact content.
 

@@ -106,6 +106,7 @@ class TestInitHappyPath(SliceOpsTestCase):
         self.assertEqual(state["slices"][0]["plan_risk"], state["slices"][0]["risk"])
         self.assertEqual(state["slices"][0]["difficulty"], "moderate")
         self.assertEqual(state["slices"][0]["criteria_total"], 1)
+        self.assertIsNone(state["pm_model"])
 
         pm_dir = self.repo / ".pm"
         self.assertTrue((pm_dir / ".gitignore").is_file())
@@ -135,6 +136,21 @@ class TestInitHappyPath(SliceOpsTestCase):
                 code, _out, err = self._init(plan_path, harness, extra=["--run-tag", bad])
                 self.assertEqual(code, 2)
                 self.assertIn(f"--run-tag {message}", err)
+        self.assertEqual(state_mod.resolve_run_dir(self.repo).name, run_id)
+
+    def test_init_stores_the_stripped_pm_model_and_refuses_a_blank_one(self) -> None:
+        plan_path = self.write_plan(self._plan_path())
+        harness = write_fake_harness(self.repo.parent / "fake.sh", idle_script())
+
+        code, out, err = self._init(plan_path, harness, extra=["--pm-model", " claude-opus-4-7 high "])
+        self.assertEqual(code, 0, err)
+        run_id, token = parse_init_output(out)
+        state = state_mod.load_state(state_mod.resolve_run_dir(self.repo, run_id), token)
+        self.assertEqual(state["pm_model"], "claude-opus-4-7 high")
+
+        code, _out, err = self._init(plan_path, harness, extra=["--pm-model", "  "])
+        self.assertEqual(code, 2)
+        self.assertIn("--pm-model must be one non-blank line", err)
         self.assertEqual(state_mod.resolve_run_dir(self.repo).name, run_id)
 
     def test_reinit_creates_second_run_and_repoints_current(self) -> None:

@@ -474,6 +474,35 @@ class TestRunRowsReviews(unittest.TestCase):
 
         self.assertEqual([review["elapsed_s"] for review in row["reviews"]], [85, None])
 
+    def test_a_rating_carries_confirmed_only_when_the_record_has_an_integer_one(self) -> None:
+        log = _Log()
+        first = log.launch("Slice 1", 0, OPUS)
+        log.add("accept", "Slice 1", 2)
+        rating = {"skill": "code-review", "assessment": "rating", "score": 1}
+        entry = _entry(
+            status="accepted",
+            reviews=[_review(f"review-{n}", first) for n in (1, 2, 3, 4)],
+            review_judgments=[
+                {"judgment_id": "judgment-1", "review_id": "review-1", "confirmed": 3, **rating},
+                {"judgment_id": "judgment-2", "review_id": "review-2", "confirmed": 0, **rating},
+                {"judgment_id": "judgment-3", "review_id": "review-3", **rating},
+                {
+                    "judgment_id": "judgment-4",
+                    "skill": "code-review",
+                    "assessment": "rating",
+                    "status": "unavailable",
+                    "review_ids": ["review-4"],
+                },
+            ],
+        )
+
+        (row,) = ledger.run_rows(_state(entry), log.events)
+
+        self.assertEqual(
+            [review["rating"] for review in row["reviews"]],
+            [{"score": 1, "confirmed": 3}, {"score": 1, "confirmed": 0}, {"score": 1}, {"status": "unavailable"}],
+        )
+
     def test_an_order_only_partly_inside_the_window_is_dropped(self) -> None:
         log = _Log()
         first = log.launch("Slice 1", 0, OPUS)
@@ -510,6 +539,14 @@ def _ledger_file(run_id: str) -> Path:
     return Path(os.environ["PM_LEDGER_DIR"]) / ledger.host_name() / f"{run_id}.json"
 
 
+class TestRunFilePmModel(PmTestCase):
+    def test_a_run_whose_state_has_no_pm_model_writes_null(self) -> None:
+        _state, token, run_dir = self.make_run(plan_path=self.write_plan())
+        payload = json.loads(ledger.write_run_file(run_dir, token).read_bytes())
+        self.assertIn("pm_model", payload)
+        self.assertIsNone(payload["pm_model"])
+
+
 class LedgerHookTestCase(TmuxRunTestCase):
     def _launch_and_wait(self, slices: list[dict]) -> tuple[str, str, Path]:
         plan_path = self.write_plan(self._plan_path(), slices=slices)
@@ -517,7 +554,7 @@ class LedgerHookTestCase(TmuxRunTestCase):
             self.repo.parent / "fake.sh",
             commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0),
         )
-        code, out, err = self._init(plan_path, harness, extra=["--run-tag", "hook-trial"])
+        code, out, err = self._init(plan_path, harness, extra=["--run-tag", "hook-trial", "--pm-model", "pm-x high"])
         self.assertEqual(code, 0, err)
         run_id, token = parse_init_output(out)
         self._start_and_wait(run_id, token)
@@ -578,6 +615,7 @@ class TestLedgerFileFollowsCommands(LedgerHookTestCase):
         written = path.read_bytes()
         payload = json.loads(written)
         self.assertEqual((payload["run_id"], payload["run_tag"]), (run_id, "hook-trial"))
+        self.assertEqual(payload["pm_model"], "pm-x high")
         self.assertEqual(payload["events"], len(state_mod.read_events(run_dir)))
         (row,) = payload["rows"]
         self.assertEqual(row["outcome"], "accepted")

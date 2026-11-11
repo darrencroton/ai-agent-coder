@@ -531,6 +531,86 @@ class TestReviewerJudgments(_JudgmentFixtures):
         self.assertEqual(stored[1]["supersedes"], "judgment-1")
 
 
+class TestReviewerConfirmedCount(_JudgmentFixtures):
+    """`confirmed`: an optional count of the report's PM-confirmed defects on a scored rating."""
+
+    def _rating(self, skill: str = "code-review", **overrides) -> dict:
+        data = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "skill": skill,
+            "review_id": "review-1" if skill == "drift-audit" else "review-2",
+            "score": 2,
+            "confirmed": 3,
+            "reason": "PM reproduced three distinct defects.",
+        }
+        data.update(overrides)
+        return {key: value for key, value in data.items() if value is not _MISSING}
+
+    def _stored(self, token: str, run_dir: Path) -> list[dict]:
+        return state_mod.load_state(run_dir, token)["slices"][0]["review_judgments"]
+
+    def _assert_refused(self, token: str, run_dir: Path, data: dict, fragment: str) -> None:
+        before = (run_dir / "run.json").read_bytes()
+        code, _out, err = judge_reviews(self, token, run_dir, data)
+        self.assertEqual(code, 2, err)
+        self.assertIn(fragment, err)
+        self.assertEqual((run_dir / "run.json").read_bytes(), before)
+
+    def test_a_scored_rating_stores_confirmed_only_when_given(self) -> None:
+        for skill, given in (("code-review", 0), ("code-review", _MISSING), ("drift-audit", 3)):
+            with self.subTest(skill=skill, confirmed=given):
+                _state, token, run_dir = self._run_with_reviews()
+                data = self._rating(skill, confirmed=given)
+                self.assertEqual(judge_reviews(self, token, run_dir, data)[0], 0)
+                (stored,) = self._stored(token, run_dir)
+                if given is _MISSING:
+                    self.assertNotIn("confirmed", stored)
+                else:
+                    self.assertEqual(stored["confirmed"], given)
+
+    def test_confirmed_must_be_a_non_negative_integer(self) -> None:
+        _state, token, run_dir = self._run_with_reviews()
+        for bad in (-1, True, "2", None):
+            with self.subTest(bad=bad):
+                self._assert_refused(
+                    token, run_dir, self._rating(confirmed=bad), "confirmed must be a non-negative integer"
+                )
+
+    def test_confirmed_is_refused_on_an_unavailable_rating_and_on_a_comparison(self) -> None:
+        _state, token, run_dir = self._run_with_reviews(count=3)
+        unavailable = self._rating(score=_MISSING, status="unavailable", review_ids=["review-2"], assessment="rating")
+        unavailable.pop("review_id")
+        self._assert_refused(token, run_dir, unavailable, "unsupported fields: confirmed")
+        comparison = {
+            "schema_version": 1,
+            "slice": "Slice 1",
+            "skill": "code-review",
+            "order": ["review-2", "review-3"],
+            "close": [],
+            "confirmed": 1,
+            "reason": "PM ordered the panel.",
+        }
+        self._assert_refused(token, run_dir, comparison, "unsupported fields: confirmed")
+
+    def test_an_exact_retry_returns_the_record_and_a_change_needs_supersession(self) -> None:
+        _state, token, run_dir = self._run_with_reviews()
+        data = self._rating()
+        self.assertEqual(judge_reviews(self, token, run_dir, data)[0], 0)
+        code, out, err = judge_reviews(self, token, run_dir, data)
+        self.assertEqual(code, 0, err)
+        self.assertIn("already recorded", out)
+        self.assertEqual(len(self._stored(token, run_dir)), 1)
+
+        changed = self._rating(confirmed=4)
+        self._assert_refused(token, run_dir, changed, "already have an active judgment")
+        code, _out, err = judge_reviews(self, token, run_dir, {**changed, "supersedes": "judgment-1"})
+        self.assertEqual(code, 0, err)
+        stored = self._stored(token, run_dir)
+        self.assertEqual([item["confirmed"] for item in stored], [3, 4])
+        self.assertEqual(stored[1]["supersedes"], "judgment-1")
+
+
 class TestDeveloperJudgmentFields(_JudgmentFixtures):
     def _score(self, **overrides) -> dict:
         data = {

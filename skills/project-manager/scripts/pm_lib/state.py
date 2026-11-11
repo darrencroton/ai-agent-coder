@@ -134,8 +134,9 @@ def _advisory_lock(lock_path: Path) -> Iterator[None]:
             handle.close()
 
 
-# How the leaderboard labels an identity with no model tag; reserved so a
-# supplied tag can never read as the absence of one.
+# The OLD value `ledger tag --model-tag untagged=NEW` uses to select identities
+# with no model tag; reserved so a supplied tag can never be mistaken for the
+# absence of one.
 UNTAGGED = "untagged"
 
 
@@ -144,8 +145,8 @@ def tag_value(raw: str | None, *, flag: str) -> str | None:
 
     A tag is a one-line label the ledger groups and filters by, so an empty,
     whitespace-only or multi-line value is refused rather than stored, as is
-    the reserved `UNTAGGED` label and a value containing `=` (the rename
-    separator of `ledger tag`).
+    the reserved `UNTAGGED` label (`ledger tag` uses it to select an absent
+    tag) and a value containing `=` (the rename separator of `ledger tag`).
     """
     if raw is None:
         return None
@@ -153,7 +154,7 @@ def tag_value(raw: str | None, *, flag: str) -> str | None:
     if not tag or "\n" in tag or "\r" in tag:
         raise PmError(f"{flag} must be one non-blank line of text (got {raw!r})")
     if tag == UNTAGGED:
-        raise PmError(f"{flag} cannot be {UNTAGGED!r}: the leaderboard uses it for an absent tag")
+        raise PmError(f"{flag} cannot be {UNTAGGED!r}: `ledger tag` uses it to select an absent tag")
     if "=" in tag:
         raise PmError(f"{flag} cannot contain '=': it separates OLD=NEW in `ledger tag`")
     return tag
@@ -233,6 +234,7 @@ def create_run(
     slices: list[dict[str, Any]],
     run_id: str | None = None,
     run_tag: str | None = None,
+    pm_model: str | None = None,
 ) -> tuple[dict[str, Any], str, Path]:
     """Mint a token, build the lite-2 state dict, create the run dir, write it.
 
@@ -260,6 +262,7 @@ def create_run(
         "repo_name": git_common_dir_name(repo),
         "branch": branch,
         "run_tag": run_tag,
+        "pm_model": pm_model,
         "plan": {"path": str(plan_path), "sha256": plan_sha256, "slice_count": slice_count},
         "harness": harness,
         "reviewer": reviewer,
@@ -621,6 +624,8 @@ def render_run_report(state: dict[str, Any], events: list[dict[str, Any]], run_d
     lines.append(f"- Branch: {state.get('branch')}")
     if state.get("run_tag") is not None:
         lines.append(f"- Run tag: {state['run_tag']}")
+    if state.get("pm_model") is not None:
+        lines.append(f"- PM model: {state['pm_model']}")
     lines.append(f"- Plan: {plan_info.get('path')} (sha256 {plan_sha}…)")
     sandbox_info = state.get("sandbox")
     if isinstance(sandbox_info, dict):

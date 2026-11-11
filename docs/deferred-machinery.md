@@ -46,6 +46,15 @@ The reviews this document distils are the shakedown review (2026-10-25) and the 
 - **Revisit when:** a harness exposes usage in a stable machine-readable form on the path the toolkit already captures, or an owner needs spend per seat for a budget decision the class column cannot inform.
 - **History:** 2026-11-08 proposed (sage26 item 14, second half); 2026-11-09 held.
 
+### Local-model signals in the ledger: floor-check pass rate and harness telemetry
+
+- **Proposed:** record each submission's floor-check outcome in its ledger row (the `floor` event already carries the failing facts) and render a first-check pass rate; and capture harness-level signals (tokens per second, context overflows, malformed tool calls).
+- **Evidence:** the ledger review of 2026-11-12 (70 runs, 150 windows, every Developer a frontier model): 148 windows accepted, 13 nudges plus relaunches in total, no Developer scored 0. The owner intends to start running weaker, slower local models, where these signals may discriminate.
+- **Held because:** a floor failure already forces a steer, so it shows in first-pass acceptance and interventions. Harness telemetry needs a per-harness parser (the reason the token-spend entry is held), and its symptoms already surface as time, interventions and non-accepts. No local Developer run exists yet, and `VISION.md` principle 9 allows no mechanism for a need not yet shown.
+- **Done instead:** the board keeps Accepted, Interventions and Δ complexity visible, because local models are where they will discriminate.
+- **Revisit when:** the first local-model runs show a failure the board cannot explain.
+- **History:** 2026-11-12 proposed (ledger review) and held.
+
 ### Seat advice from sage26, for the next campaign's brief
 
 - **Proposed:** nothing in the toolkit (`VISION.md`: every supported tool is eligible for any seat, and enforcement differences are documented without becoming rankings). The record is kept here so the next brief and launcher can start from it.

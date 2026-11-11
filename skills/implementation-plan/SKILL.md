@@ -221,7 +221,7 @@ Use the project-manager skill. You are the PM: the accountable supervisor of thi
 
 Handoff: HANDOFF.md in the repo root, git-ignored (add it to .git/info/exclude if it is not; a campaign child's is already excluded), is the sole entry point for a restart and for my post-run review. Create it after init and update it after every slice decision and before any stop with: run identity (never the token), seats, branch, commit authorisation, review protocol, slice log, plan decisions, residuals and follow-ups, and PM lessons.
 
-Starting the run: keep exactly one of the two mode paragraphs below and delete the other. Either way, `init` takes full model ids, efforts where the harness supports them, the run tag and, when a sandbox policy is given, `--sandbox <path>`; set `PM_TMUX_SOCKET` exactly as the `export PM_TMUX_SOCKET=…` line init prints, for every later command of the run.
+Starting the run: keep exactly one of the two mode paragraphs below and delete the other. Either way, `init` takes full model ids, efforts where the harness supports them, the run tag, your own model and effort as `--pm-model` and, when a sandbox policy is given, `--sandbox <path>`; set `PM_TMUX_SOCKET` exactly as the `export PM_TMUX_SOCKET=…` line init prints, for every later command of the run.
 
 Human present (the default):
 - If HANDOFF.md names an unfinished run of this plan, read it fully and resume that run (I will supply the token). Otherwise prepare, then confirm with me once:
@@ -232,7 +232,7 @@ Human present (the default):
 
 Campaign child (a Campaign Manager launched this run; the contract this serves is project-manager's references/campaign-mode.md):
 - Nobody is present: confirm nothing with a human. The plan is committed in the dossier at the path given, which meets the "plan committed" requirement; it is not in the product repository.
-- If HANDOFF.md names an unfinished run of this plan, read it fully and resume that run with the token you kept. Otherwise, after `check-plan` and the repo check, run `init` yourself with `--branch <branch>`, `--policy <protected-paths policy file, when given>`, `--run-tag <campaign tag>` and `--max-attempts <N>`, and hold the token.
+- If HANDOFF.md names an unfinished run of this plan, read it fully and resume that run with the token you kept. Otherwise, after `check-plan` and the repo check, run `init` yourself with `--branch <branch>`, `--policy <protected-paths policy file, when given>`, `--run-tag <campaign tag>`, `--pm-model <your own model and effort>` and `--max-attempts <N>`, and hold the token.
 - The Campaign Manager's launcher carries the owner's standing authorisation for each Developer to commit each slice on `<branch>`; never merge: the Campaign Manager merges.
 - A decision the Campaign Manager can give in a line (a reading the plan leaves genuinely open, a tolerance) goes to `.pm/campaign/cm-question.md` with the options and your recommendation; then wait for the one-line pointer to the answer.
 - For an evidence node, the "full test suite" in the per-slice steps below is reading the files the node's pinned script wrote, never running it again, and a measured `fail` or `error` faithfully reported is acceptable slice work.
@@ -243,7 +243,7 @@ Per slice, in plan order:
 1. start-slice with the Developer seat's model and effort. Wait with one long background `observe --wait`; never poll.
 2. Run finalize, then your own checks: pane, diff, validation output, full test suite, lint, differential code-health if the structure changed, and a style-guide audit (the project's guide, otherwise the baseline). Treat newly introduced, in-contract style deviations as cleanup to steer.
 3. Review as project-manager's *Risk* section sets: on a standard slice your own checks in step 2 are the review, and commissioning more is your recorded review-depth discretion; an elevated slice (`Independent audit required: yes` or a risky surface) commissions the drift audit first, which you read and rate, then the code reviewers, who share one `--adjudicated-file`. Let reviews run to completion without watching them.
-4. Rate every commissioned report, order the code panel when there is one, and score the Developer (criteria met, confirmed defects).
+4. Rate every commissioned report (with its confirmed-defect count), order the code panel when there is one, and score the Developer (criteria met, confirmed defects).
 5. Decide: accept, steer or stop. Steer only once every review is in, with all findings batched into one correction. Each follow-up round re-runs what the change needs: on an elevated slice, both reviews fresh at the new head, focused on the change since the last round through an adjudication line.
 6. Update `pm notes` for the next Developer, and HANDOFF.md for me.
 
