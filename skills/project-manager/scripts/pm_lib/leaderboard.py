@@ -7,16 +7,20 @@ table per skill, code review's followed by a head-to-head table. The
 leaderboard is a pure function of the files' names and bytes: duplicates
 across hosts collapse, every statistic is exact (`Fraction`, then half-up
 `Decimal` rounding for display), and nothing in it reads the clock.
-`retag_run_files` is the one writer here: it edits a finished run's tags in
-the per-run files themselves.
+A board can be filtered by run tag (which runs count) and by model tag (which
+rows are shown, every statistic unchanged); `load_tag_map` reads the owner's
+`model-tags.json`, which gives model tags to models by pattern.
+`retag_run_files` is the one writer here: it edits a finished run's tags and
+PM model in the per-run files themselves.
 """
 
 from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal, localcontext
+from fnmatch import fnmatchcase
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -29,6 +33,10 @@ from . import state as state_mod
 # are listed unranked, after the ranked rows.
 MIN_WINDOWS = 3
 MIN_COMMISSIONS = 3
+
+# The owner's map from model tags to model-name patterns, in the ledger
+# directory. It is the owner's own data: the toolkit ships no classification.
+MODEL_TAGS_FILE = "model-tags.json"
 
 # The rank cell of an unranked group.
 _UNRANKED = "–"
@@ -75,10 +83,59 @@ def load_run_files(root: Path) -> list[tuple[str, bytes | None]]:
     return files
 
 
-def retag_run_files(root: Path, run_id: str, *, run_tag: str | None, model_tags: dict[str, str]) -> list[Path]:
+def load_tag_map(root: Path) -> dict[str, list[str]]:
+    """The owner's ``<root>/model-tags.json``: each model tag and its model-name patterns.
+
+    The file is a JSON object ``{"<tag>": ["<pattern>", ...], ...}``; a
+    pattern is an `fnmatch.fnmatchcase` pattern over an identity's model
+    string (``claude-*``). An absent file is an empty map. Raises `PmError`
+    naming the file for one that cannot be read, is not valid JSON, is not an
+    object, has a key that is not a valid tag (`state.tag_value`, which also
+    refuses `untagged` and `=`), or has a value that is not a non-empty list
+    of non-blank strings. Keys are stripped as tags are; two keys that strip
+    to one tag share their patterns.
+    """
+    path = root / MODEL_TAGS_FILE
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise PmError(f"cannot read the model tag map {path}: {exc}") from exc
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError) as exc:
+        raise PmError(f"the model tag map {path} is not valid JSON ({type(exc).__name__}: {exc})") from exc
+    if not isinstance(payload, dict):
+        raise PmError(f"the model tag map {path} must be a JSON object of tag -> list of model patterns")
+    tag_map: dict[str, list[str]] = {}
+    for key, patterns in payload.items():
+        try:
+            tag = state_mod.tag_value(key, flag=f"its tag {key!r}")
+        except PmError as exc:
+            raise PmError(f"the model tag map {path}: {exc}") from exc
+        if not (
+            isinstance(patterns, list)
+            and patterns
+            and all(isinstance(pattern, str) and pattern.strip() for pattern in patterns)
+        ):
+            raise PmError(f"the model tag map {path}: tag {key!r} must map to a non-empty list of non-blank patterns")
+        tag_map.setdefault(str(tag), []).extend(patterns)
+    return tag_map
+
+
+def retag_run_files(
+    root: Path,
+    run_id: str,
+    *,
+    run_tag: str | None,
+    model_tags: dict[str, str],
+    pm_model: str | None = None,
+) -> list[Path]:
     """Retag every host copy of one run's per-run file in place; return the rewritten paths, sorted.
 
-    `run_tag` replaces the file's `run_tag` (None leaves it). `model_tags`
+    `run_tag` replaces the file's `run_tag` and `pm_model` its `pm_model`
+    (None leaves either). `model_tags`
     maps OLD to NEW model tags, applied in one pass to every submission's
     Developer and every review (recorded or failed), so a swap is well
     defined; OLD may be `state.UNTAGGED` to select identities with no tag.
@@ -95,6 +152,7 @@ def retag_run_files(root: Path, run_id: str, *, run_tag: str | None, model_tags:
     never leaves the run's copies disagreeing, and the error says so.
     """
     new_run_tag = state_mod.tag_value(run_tag, flag="--run-tag")
+    new_pm_model = state_mod.tag_value(pm_model, flag="--pm-model")
     mapping = {old: state_mod.tag_value(new, flag="--model-tag") for old, new in model_tags.items()}
 
     copies: list[tuple[Path, bytes, dict[str, Any]]] = []
@@ -125,6 +183,8 @@ def retag_run_files(root: Path, run_id: str, *, run_tag: str | None, model_tags:
     for path, raw, payload in copies:
         if new_run_tag is not None:
             payload["run_tag"] = new_run_tag
+        if new_pm_model is not None:
+            payload["pm_model"] = new_pm_model
         data = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
         try:
             state_mod._atomic_write_bytes(path, data)
@@ -395,6 +455,29 @@ def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
     return [line(headers), line(["---"] * len(headers)), *(line(row) for row in rows)]
 
 
+# A shown-row test over an identity's `(model, recorded model tag)`.
+_Shown = Callable[[Any, Any], bool]
+
+
+def _row_filter(model_tags: frozenset[str], tag_map: Mapping[str, Sequence[str]]) -> _Shown | None:
+    """Whether a row is shown under the model-tag selectors; None when there are none and every row is.
+
+    An identity's tags are its recorded model tag plus every tag in `tag_map`
+    with a pattern matching its model (a null model matches none). It is
+    shown when one of them is selected, or, having none, when `untagged` is.
+    """
+    if not model_tags:
+        return None
+
+    def shown(model: Any, model_tag: Any) -> bool:
+        tags = set() if model_tag is None else {model_tag}
+        if isinstance(model, str):
+            tags.update(tag for tag, patterns in tag_map.items() if any(fnmatchcase(model, p) for p in patterns))
+        return bool(tags & model_tags) if tags else state_mod.UNTAGGED in model_tags
+
+    return shown
+
+
 # --- Developer table --------------------------------------------------------------
 
 
@@ -581,14 +664,23 @@ def _developer_cells(key: tuple[Any, ...], group: dict[str, Any]) -> list[str]:
     ]
 
 
-def _developer_table(rows: list[dict[str, Any]]) -> list[str]:
-    """One table for every difficulty band, ranked within each band."""
+def _developer_table(rows: list[dict[str, Any]], shown: _Shown | None = None) -> tuple[list[str], int]:
+    """One table for every difficulty band, ranked within each band, and its row count.
+
+    `shown` (see `_row_filter`) drops rows after every figure is computed, so
+    it changes no statistic; ranks number the shown rows.
+    """
     bands = sorted({row.get("difficulty") for row in rows} - set(_DIFFICULTIES), key=_key_part)
     table: list[list[str]] = []
     mixed = unscored = 0
+    credited = False
     for band in (*_DIFFICULTIES, *bands):
         groups, band_mixed, band_unscored = _developer_groups([row for row in rows if row.get("difficulty") == band])
         mixed, unscored = mixed + band_mixed, unscored + band_unscored
+        credited = credited or bool(groups)
+        if shown is not None:
+            # Key: (tool, model, effort, model_tag).
+            groups = {key: group for key, group in groups.items() if shown(key[1], key[3])}
         ordered = _ranked_keys(
             groups,
             lambda group: group["windows"],
@@ -600,16 +692,19 @@ def _developer_table(rows: list[dict[str, Any]]) -> list[str]:
         )
         for index, (rank, key) in enumerate(ordered):
             table.append([_label(band) if index == 0 else "", rank, *_developer_cells(key, groups[key])])
-    if not table and not mixed and not unscored:
-        return ["No Developer-counted windows."]
-    lines = _table(_DEVELOPER_HEADERS, table) if table else []
+    if not credited and not mixed and not unscored:
+        return ["No Developer-counted windows."], 0
+    if table:
+        lines = _table(_DEVELOPER_HEADERS, table)
+    else:
+        lines = ["No Developer rows carry these model tags."] if shown is not None else []
     if mixed or unscored:
         lines += [
             *([""] if lines else []),
             f"Window-level columns leave out {mixed} window(s) with mixed Developer identities"
             f" and {unscored} window(s) with no scored submission.",
         ]
-    return lines
+    return lines, len(table)
 
 
 # --- Reviewer tables --------------------------------------------------------------
@@ -634,7 +729,10 @@ def _new_reviewer_group() -> dict[str, Any]:
 def _failure_class(reason: Any) -> str:
     """A `review-failed` reason as the leaderboard counts it: one of the
     review module's classes, else `unclassified` (an `exit <N>` nothing
-    recognised, or a reason recorded before the classes existed)."""
+    recognised, or another reason recorded before the classes existed)."""
+    # Files written before the classes existed record the `empty` class as `empty report`.
+    if reason == "empty report":
+        return "empty"
     return reason if reason in review_mod.FAILURE_CLASSES else "unclassified"
 
 
@@ -764,8 +862,19 @@ def _head_to_head(
     ]
 
 
-def _reviewer_table(skill: str, groups: dict[tuple[Any, ...], dict[str, Any]]) -> list[str]:
-    """One skill's Reviewer table; code review ranks by pairwise wins and adds the head-to-head."""
+def _reviewer_table(
+    skill: str, groups: dict[tuple[Any, ...], dict[str, Any]], shown: _Shown | None = None
+) -> tuple[list[str], int]:
+    """One skill's Reviewer table and its row count; code review ranks by pairwise wins and adds the head-to-head.
+
+    `shown` (see `_row_filter`) drops rows after every figure is computed, so
+    ranks and the head-to-head cover the shown rows; no shown row is no table.
+    """
+    if shown is not None:
+        # Key: (tool, model, effort, command_override, model_tag).
+        groups = {key: group for key, group in groups.items() if shown(key[1], key[4])}
+        if not groups:
+            return [], 0
     pairwise = skill == "code-review"
 
     def statistics(group: dict[str, Any]) -> tuple[Any, ...]:
@@ -788,7 +897,7 @@ def _reviewer_table(skill: str, groups: dict[tuple[Any, ...], dict[str, Any]]) -
     lines = _table(headers, [[rank, *_reviewer_cells(key, groups[key], pairwise)] for rank, key in ordered])
     if pairwise:
         lines += _head_to_head(skill, groups, [key for rank, key in ordered if rank != _UNRANKED])
-    return lines
+    return lines, len(ordered)
 
 
 # --- the document -----------------------------------------------------------------
@@ -814,27 +923,45 @@ def _pm_models(runs: list[dict[str, Any]]) -> str:
 def render_leaderboard(
     runs: list[tuple[str, bytes | None]],
     run_tags: frozenset[str] = frozenset(),
+    model_tags: frozenset[str] = frozenset(),
+    tag_map: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[str, list[str]]:
     """The leaderboard as markdown, and the files excluded from it.
 
     `runs` is `load_run_files` output in any order; the result depends only
-    on the files' contents and names, never on their order or the clock. A
-    non-empty `run_tags` keeps only the runs whose `run_tag` is in it, after
-    duplicate copies are resolved, and raises `PmError` when no run is left
-    (naming how many files were excluded as malformed, since one of them may
-    carry the tag).
+    on its arguments, never on the files' order or the clock. A non-empty
+    `run_tags` keeps only the runs whose `run_tag` is in it, after duplicate
+    copies are resolved, and raises `PmError` when no run is left (naming how
+    many files were excluded as malformed, since one of them may carry the
+    tag).
+
+    A non-empty `model_tags` shows only the Developer and Reviewer rows whose
+    identity carries one of them, recorded or given by `tag_map` (`load_tag_map`
+    output; see `_row_filter`), `untagged` selecting identities with neither.
+    It filters rows, not runs: every statistic is the unfiltered board's (a
+    pairwise share still counts pairs against hidden reviewers, so it need not
+    add up from the head-to-head), ranks number the shown rows, and the
+    `Model tags:` header line says so. It raises `PmError` when no row is shown.
     """
     kept, errors = _select_runs(runs)
+    excluded = f" ({len(errors)} malformed or conflicting file(s) excluded)" if errors else ""
     lines = ["# PM model leaderboard", ""]
     if run_tags:
         kept = [run for run in kept if run.get("run_tag") in run_tags]
         if not kept:
-            excluded = f" ({len(errors)} malformed or conflicting file(s) excluded)" if errors else ""
             raise PmError(f"no per-run ledger file has run tag {', '.join(sorted(run_tags))}{excluded}")
+    shown = _row_filter(model_tags, tag_map or {})
     rows = [row for run in kept for row in run["rows"]]
     lines += [f"As of: {_as_of(rows)}", ""]
     if run_tags:
         lines += [f"Run tags: {', '.join(sorted(run_tags))}", ""]
+    if model_tags:
+        # Said on the board: a shown share can count pairs against hidden reviewers.
+        lines += [
+            f"Model tags: {', '.join(sorted(model_tags))}. Only these rows are shown; every figure is the full board's.",
+            "",
+        ]
+    developer_lines, shown_rows = _developer_table(rows, shown)
     lines += [
         f"Runs: {len(kept)}; slice windows: {len(rows)}.",
         "",
@@ -855,22 +982,30 @@ def render_leaderboard(
         " submissions share one identity. Δ columns measure the accepted diff, so compare them only"
         " between Developers given the same slices.",
         "",
-        *_developer_table(rows),
+        *developer_lines,
         "",
         "## Reviewers",
     ]
     reviewer_groups = _reviewer_groups(kept)
+    shown_reviewers = 0
     if not reviewer_groups:
         lines += ["", "No reviews recorded."]
     for skill in sorted(reviewer_groups):
+        table, count = _reviewer_table(skill, reviewer_groups[skill], shown)
+        if not count:
+            continue
+        shown_reviewers += count
         intro = (
             "Ranked by pairwise wins across panel orders. A share depends on who a reviewer was panelled"
             " with, so read it with the head-to-head table."
             if skill == "code-review"
             else "Ranked by mean score."
         )
-        lines += ["", f"### {skill}", "", intro, ""]
-        lines += _reviewer_table(skill, reviewer_groups[skill])
+        lines += ["", f"### {skill}", "", intro, "", *table]
+    if reviewer_groups and not shown_reviewers:
+        lines += ["", "No Reviewer rows carry these model tags."]
+    if shown is not None and not shown_rows + shown_reviewers:
+        raise PmError(f"no Developer or Reviewer row carries model tag {', '.join(sorted(model_tags))}{excluded}")
     lines += ["", "## Errors", ""]
     lines += [f"- {error}" for error in errors] if errors else ["None."]
     return "\n".join(lines) + "\n", errors

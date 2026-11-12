@@ -16,8 +16,8 @@ Every run already records what each model did: which model was launched for whic
 | `judge-developer --file F` | records the PM's score of the current Developer submission |
 | `judge-reviews --file F` | records the PM's rating of a review (with its confirmed-defect count), or the order of a review panel |
 | `status --report` | regenerates the run report and confirms the run's ledger file was written |
-| `ledger render [--out PATH] [--run-tag TEXT …]` | builds the leaderboard from every run's file |
-| `ledger tag RUN_ID [--run-tag TEXT] [--model-tag OLD=NEW …]` | changes the tags on a finished run's file |
+| `ledger render [--out PATH] [--run-tag TEXT …] [--model-tag TEXT …]` | builds the leaderboard from every run's file |
+| `ledger tag RUN_ID [--run-tag TEXT] [--pm-model TEXT] [--model-tag OLD=NEW …]` | changes the tags or the PM model on a finished run's file |
 
 The tag and `--pm-model` flags are optional. `ledger render` and `ledger tag` need no run and no token, so you can use them any time, including long after the runs and their repositories are gone.
 
@@ -62,9 +62,11 @@ pm ledger render --run-tag bench-q4                          # only runs tagged 
 pm ledger render --run-tag bench-q4 --out ~/boards/bench-q4.md   # the same, in a file of your choosing
 ```
 
-**Each render replaces its output file.** Without `--out` an unfiltered render writes `<ledger dir>/leaderboard.md`, and a tag-filtered one writes `<ledger dir>/leaderboard-<tags joined by +>.md` beside it (tags sorted, characters other than letters, digits, `_`, `.` and `-` replaced by `_`), so a filtered view never overwrites the full board; the command says so. Give a board you want elsewhere its own `--out`. Nothing is lost by overwriting, because the board is rebuilt from the per-run files every time. A filtered board names its tags in a "Run tags:" line at the top, and runs without a run tag are left out of it. A "PM model:" header line counts the runs by the model that sat as PM, `unrecorded` for runs without one. Repeat `--run-tag` to include runs carrying any of several tags.
+**Each render replaces its output file.** Without `--out` an unfiltered render writes `<ledger dir>/leaderboard.md`, and a filtered one writes `<ledger dir>/leaderboard-<tags joined by +>.md` beside it (run tags, then model tags, each sorted; characters other than letters, digits, `_`, `.` and `-` replaced by `_`), so a filtered view never overwrites the full board; the command says so. Give a board you want elsewhere its own `--out`. Nothing is lost by overwriting, because the board is rebuilt from the per-run files every time. A run-tag-filtered board names its tags in a "Run tags:" line at the top, and runs without a run tag are left out of it. A "PM model:" header line counts the runs by the model that sat as PM, `unrecorded` for runs without one. Repeat `--run-tag` to include runs carrying any of several tags.
 
-The output depends only on the files, never on the clock or the output location, so the same files always give the same bytes. The write is atomic, so a failed render leaves the previous board intact. The command exits 2, naming the directory it searched, when it finds no files or no run carries any of the given tags.
+**`--model-tag` shows only some rows.** It keeps the Developer and Reviewer rows whose identity carries one of the given model tags: its recorded tag, or a tag the owner's map gives its model (see *Tags*); `untagged` selects identities with neither. It filters rows, not runs, so every figure is exactly the full board's, and a pairwise share still counts panel partners the filter hides. Ranks number the shown rows, and the head-to-head table covers the shown, ranked reviewers. The board says so in a "Model tags:" line. It combines with `--run-tag`, which still chooses which runs count, and the command exits 2 naming the tags when no row carries any of them.
+
+The output depends only on the files and, for a model-tag render, the tag map, never on the clock or the output location, so the same inputs always give the same bytes. The write is atomic, so a failed render leaves the previous board intact. The command exits 2, naming the directory it searched, when it finds no files or no run carries any of the given tags.
 
 **The Developer table** is one table, grouped by difficulty band (hard, moderate, easy, then any other label) and ranked within each band only, since a rank across bands would follow each model's mix of slices. Rows group by exact tool, model, effort and model tag. A window counts for a Developer when it was `accepted`, `exhausted`, or `stopped` with cause `developer`; every other stopped window, and windows still open, are left out. Rows rank by first score (PM), then by first-pass acceptance. A window's *first* submission is its first scored one, so the score is not a mean blended with later, post-steer work. Columns:
 
@@ -74,7 +76,7 @@ The output depends only on the files, never on the clock or the output location,
 
 The first-submission columns and Dev time credit each submission's own identity; the others count a window only when all its scored submissions share one identity, and a footnote (printed only when non-zero) counts the windows left out.
 
-**The Reviewer tables**, one per skill, group rows the same way plus whether a custom command ran the review (`override` or `override unknown` is added to the label only when it applies). Columns: commissions; usable share (PM), rated over rated plus unavailable plus failed; failed commissions by class, for example `limit 14 · capacity 11 · unclassified 2` (classes in the order limit, auth, capacity, timeout, empty, unclassified, a zero class left out, `0` when none failed; `unclassified` is an `exit <N>` nothing recognised, or a reason recorded before the classes existed); score, mean (PM); confirmed defects per review, mean over the ratings that carry `confirmed` (PM); review time, median minutes (the review record's `at` minus `launched_at`, `n/a` without a `launched_at`, so a panel can be chosen with its cost beside its ratings). Code-review adds pairwise wins (PM), the share of panel pairings the reviewer was placed above (a close call is still a full win; two commissions of one configuration in a panel are never paired), ranks by it, and is followed by a head-to-head table of each ranked reviewer's wins–losses against every other across their shared panels, because a share depends on who a reviewer was panelled with. Drift-audit ranks by mean score.
+**The Reviewer tables**, one per skill, group rows the same way plus whether a custom command ran the review (`override` or `override unknown` is added to the label only when it applies). Columns: commissions; usable share (PM), rated over rated plus unavailable plus failed; failed commissions by class, for example `limit 14 · capacity 11 · unclassified 2` (classes in the order limit, auth, capacity, timeout, empty, unclassified, a zero class left out, `0` when none failed; `unclassified` is an `exit <N>` nothing recognised, or another reason recorded before the classes existed; the old reason `empty report` counts as `empty`); score, mean (PM); confirmed defects per review, mean over the ratings that carry `confirmed` (PM); review time, median minutes (the review record's `at` minus `launched_at`, `n/a` without a `launched_at`, so a panel can be chosen with its cost beside its ratings). Code-review adds pairwise wins (PM), the share of panel pairings the reviewer was placed above (a close call is still a full win; two commissions of one configuration in a panel are never paired), ranks by it, and is followed by a head-to-head table of each ranked reviewer's wins–losses against every other across their shared panels, because a share depends on who a reviewer was panelled with. Drift-audit ranks by mean score.
 
 Groups below three windows (Developers) or three commissions (Reviewers) are listed in the same table, unranked, with rank `–`. The "As of" line is the latest decision in the kept files. An "Errors" section names any file that was skipped and why.
 
@@ -82,21 +84,26 @@ The board leaves out, but the ledger file still records, comment and blank lines
 
 ## Tags
 
-Two optional labels separate what the identity strings cannot.
+Two optional labels separate what the identity strings cannot, and the owner's own map can add more to a model.
 
 - A **model tag** names a configuration that tool, model and effort do not distinguish: one local model at two temperatures, or the same model behind two system prompts. It is part of the group key, so each tag gets its own leaderboard row.
 - A **run tag** labels a whole run, so you can render a board from a chosen set of runs.
+- The **tag map**, `<ledger dir>/model-tags.json`, is your own data: a JSON object from a tag to model-name patterns, matched against an identity's model with shell-style wildcards, case-sensitively, so a model can carry several tags. It is read only by `ledger render --model-tag`, applies to every run, past and future, without rewriting any file, and is git-ignored local data like the per-run files. The toolkit ships none. A malformed file exits 2 naming it.
 
-A tag is trimmed of surrounding spaces, and may not be blank, span lines, contain `=`, or be `untagged`, which `ledger tag` reserves for "no tag" as an old value. To change the tags on a finished run, use `ledger tag` with the run id:
+```json
+{"local": ["myhost/*"], "hosted": ["claude-*", "gpt-*"]}
+```
+
+A tag is trimmed of surrounding spaces, and may not be blank, span lines, contain `=`, or be `untagged`, which is reserved for "no tag": as the old value of `ledger tag`, and as a selector of `ledger render --model-tag`. To change the tags or the PM model on a finished run, use `ledger tag` with the run id (`--pm-model` is for a run recorded without `init --pm-model`):
 
 ```bash
-pm ledger tag 20261010T060837Z-9153ab --run-tag bench-q4
+pm ledger tag 20261010T060837Z-9153ab --run-tag bench-q4 --pm-model claude-opus-5-5
 pm ledger tag 20261010T060837Z-9153ab --model-tag untagged=temp-0.2 --model-tag hot=temp-0.9
 ```
 
 `tag` rewrites every host's copy of that run's file at once, so copies still collapse at render. `untagged` as the old value selects identities that had no tag, and all renames apply together, so a swap works. It checks everything before writing anything, and restores any copies it already rewrote if a write fails.
 
-**Retag last.** The per-run file is derived from the run's signed state, so any later token-bearing command on that run (a late rating, a superseding judgment, `status --report`) regenerates it with the original tags and no warning. If that happens, run the same `tag` command again.
+**Retag last.** The per-run file is derived from the run's signed state, so any later token-bearing command on that run (a late rating, a superseding judgment, `status --report`) regenerates it with the original tags and no warning. If that happens, run the same `tag` command again; this holds for `--pm-model` too.
 
 ## Common situations
 
@@ -116,6 +123,8 @@ Read each difficulty band for the PM score and acceptance columns, since a model
 pm init … --model M --model-tag temp-0.2      # the run's default
 pm start-slice --model M --model-tag temp-0.8 # this launch only
 ```
+
+**A board for a chosen set of models.** Write your own tag map, then render only those rows: with the file above, `pm ledger render --model-tag local` writes `<ledger dir>/leaderboard-local.md`. A campaign's evidence nodes, which run a pinned script and write no code, should get their own rows rather than sit with ordinary easy slices; the Mode B launcher in [implementation-plan's SKILL.md](../../implementation-plan/SKILL.md) has the child PM tag them.
 
 **Keep a benchmark separate from production runs.** Tag the benchmark runs at `init --run-tag`, then render the full board and the benchmark board to separate files, as shown in *Rendering the leaderboard*. If you forgot to tag a run, tag it afterwards with `ledger tag` (see *Tags*).
 

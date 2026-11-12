@@ -18,10 +18,11 @@ venv/
 .claude/
 HANDOFF.md
 
-# PM ledger: per-host run files and the rendered leaderboards are local output
+# PM ledger: per-host run files, rendered leaderboards and the owner's model-tag map are local
 skills/project-manager/ledger/*/
 skills/project-manager/ledger/leaderboard.md
 skills/project-manager/ledger/leaderboard-*.md
+skills/project-manager/ledger/model-tags.json
 
 # Archived/superseded content (never deleted, not tracked by default)
 archive/

@@ -286,7 +286,11 @@ def write_fake_harness(path: Path, body: str) -> Path:
 # Fixtures come in two families:
 #
 # * Fixed-delay, for events that only need to happen "soon" and that nothing
-#   is timed against (a harness that commits and writes its result).
+#   is timed against (a harness that commits and writes its result). Their
+#   pane must still be up when PM injects, so by default they exit only once
+#   PM submits the launch pointer (`_EXIT_AFTER_LAUNCH_POINTER`), never on a
+#   clock: a tail timed from launch let the pane vanish before `start-slice`'s
+#   required visible-pane capture whenever a busy machine slowed the launch.
 # * TRIGGER-GATED, for events a test must place at a specific moment relative
 #   to something it is measuring. A launch-relative delay cannot do this:
 #   `start-slice` takes several seconds (readiness settle plus two 1s
@@ -300,6 +304,18 @@ def write_fake_harness(path: Path, body: str) -> Path:
 # under test.
 
 _READY = "echo FAKE_HARNESS_READY"
+
+# Blocks until the first line arrives on stdin — the launch pointer, completed
+# by `send_prompt`'s first Enter — so the harness exits right after PM has
+# submitted it, however long the launch took. `send_prompt` treats a session
+# gone after that Enter as a fast-finishing harness, and tests that assert the
+# pane was never captured live rely on that prompt exit.
+_EXIT_AFTER_LAUNCH_POINTER = "read -r _launch_pointer"
+
+
+def _tail(tail_sleep: float | None) -> str:
+    """The script's last line: `sleep tail_sleep`, or by default `_EXIT_AFTER_LAUNCH_POINTER`."""
+    return _EXIT_AFTER_LAUNCH_POINTER if tail_sleep is None else f"sleep {tail_sleep}"
 
 
 def trigger_wait(trigger_path: Path) -> str:
@@ -321,10 +337,10 @@ def commit_and_result_script(
     authorized_file: str = "a.py",
     unauthorized_file: str | None = None,
     delay: float = 1.0,
-    tail_sleep: float = 3.0,
+    tail_sleep: float | None = None,
 ) -> str:
     """Echoes readiness, waits, commits (optionally touching an unauthorized
-    file too), writes result.json, then idles briefly before exiting."""
+    file too), writes result.json, then exits (see `_tail`)."""
     lines = [
         _READY,
         f"sleep {delay}",
@@ -336,12 +352,13 @@ def commit_and_result_script(
         lines.append(f'git -C "{repo}" add "{unauthorized_file}"')
     lines.append(f'git -C "{repo}" commit -q -m "slice work"')
     lines.append(result_heredoc())
-    lines.append(f"sleep {tail_sleep}")
+    lines.append(_tail(tail_sleep))
     return "\n".join(lines)
 
 
-def result_only_script(*, delay: float = 0.5, tail_sleep: float = 3.0) -> str:
-    return "\n".join([_READY, f"sleep {delay}", result_heredoc(), f"sleep {tail_sleep}"])
+def result_only_script(*, delay: float = 0.5, tail_sleep: float | None = None) -> str:
+    """`commit_and_result_script` without the commit."""
+    return "\n".join([_READY, f"sleep {delay}", result_heredoc(), _tail(tail_sleep)])
 
 
 def idle_script(*, sleep_seconds: float = 30.0) -> str:

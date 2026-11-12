@@ -733,7 +733,7 @@ class TestFinalizeFloorFailure(SliceOpsTestCase):
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh",
-            commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=2.0),
+            commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0),
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)

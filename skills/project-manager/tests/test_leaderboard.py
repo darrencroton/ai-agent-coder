@@ -452,16 +452,16 @@ class TestLeaderboardWindowSelection(unittest.TestCase):
 
     def test_failed_commissions_are_counted_by_class_in_a_fixed_order(self) -> None:
         """Classes print in the review module's order, whatever order they
-        failed in; a zero class is left out; any reason outside the classes
-        (an unrecognised exit, or an older run's `empty report`) is
-        unclassified."""
+        failed in; a zero class is left out; an older run's `empty report` is
+        the `empty` class; any other reason outside the classes (an
+        unrecognised exit) is unclassified."""
         drift = ("codex", "gpt-6.1-sol", "high", False)
-        reasons = ("capacity", "exit 3", "limit", "empty report", "limit", "capacity", "limit")
+        reasons = ("capacity", "exit 3", "limit", "empty report", "limit", "capacity", "empty", "limit")
         reviews = [_failed(drift, "drift-audit", reason) for reason in reasons]
         (ranked,) = _tables(_section(_render_rows([_row([_sub(OPUS)], reviews=reviews)]), "### drift-audit"))
 
-        self.assertEqual(ranked[0]["Failed by class"], "limit 3 · capacity 2 · unclassified 2")
-        self.assertEqual(ranked[0]["Usable (PM)"], "0/7 (0%)")
+        self.assertEqual(ranked[0]["Failed by class"], "limit 3 · capacity 2 · empty 2 · unclassified 1")
+        self.assertEqual(ranked[0]["Usable (PM)"], "0/8 (0%)")
 
 
 class TestLeaderboardRanking(unittest.TestCase):
@@ -639,6 +639,123 @@ class TestLeaderboardTags(unittest.TestCase):
                 ("qwen / qwen-4 / unknown / override / hot", "1.00"),
             ],
         )
+
+
+class TestLeaderboardModelTagFilter(unittest.TestCase):
+    """`model_tags` shows only the rows whose identity carries one; every figure stays the unfiltered board's."""
+
+    _MAP = {"frontier": ["claude-*"], "local": ["qwen-*", "adacs/*"]}
+    # Mapped `local`; recorded `evidence` and mapped `frontier`; no model, so no tag at all.
+    _LOCAL = {"tool": "opencode", "model": "adacs/coder", "effort": None, "model_tag": None}
+    _EVIDENCE = {**SONNET, "model_tag": "evidence"}
+    _BARE = {"tool": "codex", "model": None, "effort": None, "model_tag": None}
+    _LOCAL_LABEL = "opencode / adacs/coder / unknown"
+    _EVIDENCE_LABEL = f"{_SONNET_LABEL} / evidence"
+
+    def _text(self, *model_tags: str, run_tags: frozenset[str] = frozenset()) -> str:
+        rows = []
+        for n in range(3):
+            # Codex (untagged) over Claude (`frontier`) over Qwen (`local`) in every panel.
+            rows.append(
+                _row(
+                    [_sub(OPUS, 2)],
+                    slice_id=f"opus {n}",
+                    reviews=[
+                        _rev("r1", _CODEX, {"score": 2}),
+                        _rev("r2", _CLAUDE, {"score": 1}),
+                        _rev("r3", _QWEN, {"score": 0}),
+                    ],
+                    comparisons=[_order("r1", "r2", "r3")],
+                )
+            )
+            rows.append(_row([_sub(self._LOCAL, 1)], slice_id=f"local {n}"))
+        rows.append(
+            _row(
+                [_sub(self._EVIDENCE, 0)],
+                slice_id="evidence",
+                reviews=[_rev("d1", _CODEX, {"score": 2}, "drift-audit", model_tag="hot")],
+            )
+        )
+        rows.append(_row([_sub(self._BARE, 1)], slice_id="bare"))
+        text, _errors = leaderboard.render_leaderboard(
+            [("h/run-1.json", _file("run-1", rows, run_tag="bench"))],
+            run_tags=run_tags,
+            model_tags=frozenset(model_tags),
+            tag_map=self._MAP,
+        )
+        return text
+
+    def test_a_mapped_tag_shows_its_rows_renumbered_with_unfiltered_statistics(self) -> None:
+        full, local = self._text(), self._text("local")
+        full_developer = _by_name(_developers(full))[self._LOCAL_LABEL]
+        full_reviewer = _by_name(_tables(_section(full, "### code-review"))[0], _REVIEWER)[_QWEN_LABEL]
+
+        (developer,) = _developers(local)
+        self.assertEqual([full_developer["Rank"], developer["Rank"]], ["2", "1"])
+        # The band label moves to the band's first shown row; every figure stays.
+        self.assertEqual({**developer, "Rank": "2", "Difficulty": ""}, full_developer)
+        (reviewer,) = _tables(_section(local, "### code-review"))[0]
+        self.assertEqual([full_reviewer["Rank"], reviewer["Rank"]], ["3", "1"])
+        self.assertEqual(reviewer["Pairwise wins (PM)"], "0/6 (0%)")
+        self.assertEqual({**reviewer, "Rank": "3"}, full_reviewer)
+        # No drift-audit reviewer carries `local`, so that skill is left out.
+        self.assertNotIn("### drift-audit", local)
+
+    def test_a_recorded_tag_selects_its_row_and_no_reviewer_carries_it(self) -> None:
+        text = self._text("evidence")
+
+        self.assertEqual([row[_DEVELOPER] for row in _developers(text)], [self._EVIDENCE_LABEL])
+        self.assertEqual(_section(text, "## Reviewers").strip(), "No Reviewer rows carry these model tags.")
+
+    def test_several_tags_are_a_union_and_the_head_to_head_keeps_shown_ranked_reviewers(self) -> None:
+        text = self._text("frontier", "local")
+
+        self.assertEqual(
+            [(row["Rank"], row[_DEVELOPER]) for row in _developers(text)],
+            [("1", _OPUS_LABEL), ("2", self._LOCAL_LABEL), ("–", self._EVIDENCE_LABEL)],
+        )
+        reviewers, head_to_head = _tables(_section(text, "### code-review"))
+        self.assertEqual(
+            [(row["Rank"], row[_REVIEWER], row["Pairwise wins (PM)"]) for row in reviewers],
+            [("1", _CLAUDE_LABEL, "3/6 (50%)"), ("2", _QWEN_LABEL, "0/6 (0%)")],
+        )
+        self.assertEqual(
+            head_to_head,
+            [
+                {"Reviewer": f"1 · {_CLAUDE_LABEL}", "1": "·", "2": "3–0"},
+                {"Reviewer": f"2 · {_QWEN_LABEL}", "1": "0–3", "2": "·"},
+            ],
+        )
+
+    def test_untagged_selects_identities_with_neither_a_recorded_nor_a_mapped_tag(self) -> None:
+        text = self._text("untagged")
+
+        self.assertEqual([row[_DEVELOPER] for row in _developers(text)], ["codex / unknown / unknown"])
+        (reviewers,) = _tables(_section(text, "### code-review"))
+        self.assertEqual([(row["Rank"], row[_REVIEWER]) for row in reviewers], [("1", _CODEX_LABEL)])
+        # The drift-audit Codex carries `hot`.
+        self.assertNotIn("### drift-audit", text)
+
+    def test_a_reviewer_only_tag_says_no_developer_row_carries_it(self) -> None:
+        text = self._text("hot")
+
+        self.assertEqual(
+            _section(text, "## Developers").strip().splitlines()[-1], "No Developer rows carry these model tags."
+        )
+        self.assertNotIn("### code-review", text)
+        (reviewers,) = _tables(_section(text, "### drift-audit"))
+        self.assertEqual([row[_REVIEWER] for row in reviewers], [f"{_CODEX_LABEL} / hot"])
+
+    def test_the_header_names_the_model_tags_after_the_run_tags(self) -> None:
+        self.assertIn(
+            "As of: unknown\n\nRun tags: bench\n\nModel tags: frontier, local. Only these rows are shown;"
+            " every figure is the full board's.\n\nRuns: 1; slice windows: 8.\n",
+            self._text("local", "frontier", run_tags=frozenset({"bench"})),
+        )
+
+    def test_tags_no_row_carries_are_an_error_naming_them(self) -> None:
+        with self.assertRaisesRegex(leaderboard.PmError, "no Developer or Reviewer row carries model tag nowhere, zz"):
+            self._text("zz", "nowhere")
 
 
 class TestLeaderboardHeadToHead(unittest.TestCase):
@@ -919,6 +1036,56 @@ class TestLedgerRenderCommand(unittest.TestCase):
         self.assertIn(f"no per-run ledger file has run tag nowhere under {self.root}", err)
         self.assertFalse((self.root / "leaderboard.md").exists())
 
+    def test_model_tags_read_the_owners_map_and_name_the_default_file(self) -> None:
+        self._seed()
+        (self.root / "mac" / "run-2.json").write_bytes(
+            _file("run-2", [_row([_sub(SONNET)], decided_at=ledger_ts(6))], run_tag="bench")
+        )
+        (self.root / "model-tags.json").write_text(json.dumps({"frontier": ["claude-opus-*"]}), encoding="utf-8")
+
+        code, stdout, err = self._main(["ledger", "render", "--model-tag", "frontier"])
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("filtered by model tag; the default", stdout)
+        self.assertFalse((self.root / "leaderboard.md").exists())
+        text = (self.root / "leaderboard-frontier.md").read_text(encoding="utf-8")
+        self.assertEqual([row[_DEVELOPER] for row in _developers(text)], [_OPUS_LABEL])
+
+        code, stdout, err = self._main(["ledger", "render", "--model-tag", "untagged", "--run-tag", "bench"])
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("filtered by run tag and model tag", stdout)
+        text = (self.root / "leaderboard-bench+untagged.md").read_text(encoding="utf-8")
+        self.assertEqual([row[_DEVELOPER] for row in _developers(text)], [_SONNET_LABEL])
+
+    def test_an_absent_map_gives_no_tags(self) -> None:
+        self._seed()
+
+        code, _stdout, err = self._main(["ledger", "render", "--model-tag", "untagged"])
+
+        self.assertEqual(code, 0, err)
+        text = (self.root / "leaderboard-untagged.md").read_text(encoding="utf-8")
+        self.assertEqual([row[_DEVELOPER] for row in _developers(text)], [_OPUS_LABEL])
+
+    def test_a_malformed_map_exits_two_naming_it(self) -> None:
+        self._seed()
+        path = self.root / "model-tags.json"
+        cases = {
+            "invalid JSON": (b"{", "is not valid JSON"),
+            "reserved tag": (b'{"untagged": ["claude-*"]}', "cannot be 'untagged'"),
+            "empty pattern list": (b'{"frontier": []}', "must map to a non-empty list of non-blank patterns"),
+        }
+        for name, (raw, expected) in cases.items():
+            with self.subTest(name):
+                path.write_bytes(raw)
+
+                code, _stdout, err = self._main(["ledger", "render", "--model-tag", "frontier"])
+
+                self.assertEqual(code, 2)
+                self.assertIn(f"the model tag map {path}", err)
+                self.assertIn(expected, err)
+                self.assertEqual(sorted(p.name for p in self.root.glob("leaderboard*")), [])
+
     def test_an_unwritable_out_path_is_an_error_naming_it(self) -> None:
         self._seed()
         out = self.root.parent / "a-directory"
@@ -991,6 +1158,26 @@ class TestLedgerTagCommand(unittest.TestCase):
         self.assertIn(" / hot |", text)
         self.assertIn(" / warm |", text)
 
+    def test_pm_model_is_set_in_every_copy_and_reaches_the_board(self) -> None:
+        files = self._seed()
+
+        code, _stdout, err = self._main(["ledger", "tag", "run-1", "--pm-model", " opus-5 "])
+
+        self.assertEqual(code, 0, err)
+        mac = (self.root / "mac" / "run-1.json").read_bytes()
+        self.assertEqual(mac, (self.root / "studio" / "run-1.json").read_bytes())
+        payload = json.loads(mac)
+        self.assertEqual(payload["pm_model"], "opus-5")
+        # Nothing else changes: the tags stay as recorded.
+        self.assertEqual({**json.loads(files["mac/run-1.json"]), "pm_model": "opus-5"}, payload)
+
+        code, _stdout, err = self._main(["ledger", "render"])
+
+        self.assertEqual(code, 0, err)
+        text = (self.root / "leaderboard.md").read_text(encoding="utf-8")
+        self.assertIn("PM model: opus-5 (1 run) · unrecorded (1 run)\n", text)
+        self.assertIn("None.", _section(text, "## Errors"))
+
     def test_retag_refusals_exit_two_and_rewrite_nothing(self) -> None:
         files = self._seed()
         cases = {
@@ -1002,7 +1189,8 @@ class TestLedgerTagCommand(unittest.TestCase):
             "malformed form": (["run-1", "--model-tag", "cold"], "OLD=NEW"),
             "reserved NEW": (["run-1", "--model-tag", "cold=untagged"], "cannot be 'untagged'"),
             "tag containing the separator": (["run-1", "--run-tag", "a=b"], "cannot contain '='"),
-            "no tag given": (["run-1"], "needs --run-tag"),
+            "blank PM model": (["run-1", "--pm-model", "  "], "--pm-model must be one non-blank line"),
+            "no tag given": (["run-1"], "needs --run-tag, --pm-model, --model-tag"),
         }
         for name, (argv, expected) in cases.items():
             with self.subTest(name):

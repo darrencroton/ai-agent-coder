@@ -482,7 +482,8 @@ def build_parser() -> argparse.ArgumentParser:
     render = ledger_commands.add_parser("render", help="Render every per-run ledger file into one leaderboard")
     render.add_argument(
         "--out",
-        help="output path (default: <ledger dir>/leaderboard.md, or leaderboard-<run tags joined by +>.md with --run-tag)",
+        help="output path (default: <ledger dir>/leaderboard.md, or leaderboard-<run tags, then model tags, "
+        "joined by +>.md with --run-tag or --model-tag)",
     )
     render.add_argument(
         "--run-tag",
@@ -490,9 +491,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         help="render only runs with this run tag; repeatable, and untagged runs are then left out",
     )
+    render.add_argument(
+        "--model-tag",
+        action="append",
+        metavar="TEXT",
+        help="show only Developer and Reviewer rows carrying this model tag, recorded or given to their model "
+        f"by <ledger dir>/{leaderboard.MODEL_TAGS_FILE}; `untagged` selects rows with neither; repeatable. "
+        "Every statistic stays the unfiltered board's; ranks number the shown rows",
+    )
     tag = ledger_commands.add_parser("tag", help="Retag a finished run's per-run ledger files in place")
     tag.add_argument("run_id", metavar="RUN_ID")
     tag.add_argument("--run-tag", metavar="TEXT", help="set the run tag")
+    tag.add_argument(
+        "--pm-model",
+        metavar="TEXT",
+        help="set the PM model, for a run recorded without `init --pm-model`",
+    )
     tag.add_argument(
         "--model-tag",
         action="append",
@@ -1514,22 +1528,36 @@ def _run_notes(args: argparse.Namespace) -> int:
 # --- ledger render and tag ------------------------------------------------
 
 
+def _model_tag_selector(raw: str) -> str:
+    """One `ledger render --model-tag` value: a tag, or `untagged` to select identities with none.
+
+    `state.tag_value` refuses `untagged` because it may never be stored; here
+    it is only a selector, so it alone is let through.
+    """
+    if raw.strip() == state_mod.UNTAGGED:
+        return state_mod.UNTAGGED
+    return str(state_mod.tag_value(raw, flag="--model-tag"))
+
+
 def _run_ledger_render(args: argparse.Namespace) -> int:
     run_tags = frozenset(state_mod.tag_value(tag, flag="--run-tag") for tag in args.run_tag or [])
+    model_tags = frozenset(_model_tag_selector(tag) for tag in args.model_tag or [])
     root = ledger.ledger_dir()
     files = leaderboard.load_run_files(root)
     if not files:
         raise PmError(f"no per-run ledger files found under {root}")
+    tag_map = leaderboard.load_tag_map(root) if model_tags else {}
     if args.out:
         out = Path(args.out)
-    elif run_tags:
+    elif run_tags or model_tags:
         # A filtered view beside the default leaderboard, never over it.
-        joined = "+".join(re.sub(r"[^\w.-]+", "_", tag) for tag in sorted(run_tags))
+        labels = [*sorted(run_tags), *sorted(model_tags)]
+        joined = "+".join(re.sub(r"[^\w.-]+", "_", label) for label in labels)
         out = root / f"leaderboard-{joined}.md"
     else:
         out = root / "leaderboard.md"
     try:
-        text, errors = leaderboard.render_leaderboard(files, run_tags=run_tags)
+        text, errors = leaderboard.render_leaderboard(files, run_tags=run_tags, model_tags=model_tags, tag_map=tag_map)
     except PmError as exc:
         raise PmError(f"{exc} under {root}") from exc
     try:
@@ -1537,8 +1565,9 @@ def _run_ledger_render(args: argparse.Namespace) -> int:
     except OSError as exc:
         raise PmError(f"cannot write the leaderboard to {out}: {exc}") from exc
     print(f"leaderboard: {out}")
-    if run_tags and not args.out:
-        print(f"filtered by run tag; the default {root / 'leaderboard.md'} is untouched")
+    if (run_tags or model_tags) and not args.out:
+        kinds = " and ".join(kind for kind, given in (("run tag", run_tags), ("model tag", model_tags)) if given)
+        print(f"filtered by {kinds}; the default {root / 'leaderboard.md'} is untouched")
     for error in errors:
         print(f"WARNING: excluded {error}")
     return 0
@@ -1553,10 +1582,10 @@ def _run_ledger_tag(args: argparse.Namespace) -> int:
         if old in model_tags:
             raise PmError(f"--model-tag {old!r} is given twice")
         model_tags[old] = new
-    if args.run_tag is None and not model_tags:
-        raise PmError("ledger tag needs --run-tag, --model-tag, or both")
+    if args.run_tag is None and args.pm_model is None and not model_tags:
+        raise PmError("ledger tag needs --run-tag, --pm-model, --model-tag, or several of them")
     for path in leaderboard.retag_run_files(
-        ledger.ledger_dir(), args.run_id, run_tag=args.run_tag, model_tags=model_tags
+        ledger.ledger_dir(), args.run_id, run_tag=args.run_tag, model_tags=model_tags, pm_model=args.pm_model
     ):
         print(f"retagged: {path}")
     return 0

@@ -227,9 +227,7 @@ class TestSandboxedAcceptCompletesTheRun(SandboxedRunTestCase):
 class TestFullAcceptance(FinalizeTestCase):
     def test_accept_writes_assessment_clears_slice_and_regenerates_report(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -347,9 +345,7 @@ class TestFullAcceptance(FinalizeTestCase):
 class TestAcceptWithFailingCodeMetrics(FinalizeTestCase):
     def test_metrics_failure_is_stored_and_reported_but_never_blocks_accept(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -381,7 +377,7 @@ class TestAcceptRefusedOnFloorFailure(FinalizeTestCase):
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
         harness = write_fake_harness(
             self.repo.parent / "fake.sh",
-            commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0, tail_sleep=2.0),
+            commit_and_result_script(self.repo, unauthorized_file="b.py", delay=1.0),
         )
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
@@ -453,9 +449,7 @@ class TestAcceptRefusedOnShortReasoning(PmTestCase):
 class TestElevatedReviewFreshness(FinalizeTestCase):
     def test_missing_then_stale_then_fresh_reviews(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"], "risky": "touches auth"}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -574,9 +568,7 @@ class TestElevatedReviewFreshness(FinalizeTestCase):
 class TestRiskRatchet(FinalizeTestCase):
     def test_ratchet_arms_review_requirement_rejects_lowering_and_persists(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -617,9 +609,7 @@ _LONG_GRANT_EVIDENCE = "Repository investigation confirms this path must change 
 class TestGrantRatchetsAcceptance(FinalizeTestCase):
     def test_accept_refused_after_grant_for_missing_mandatory_reviews(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -648,9 +638,7 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
 
     def test_accepted_assessment_contains_surface_grants_block(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -725,9 +713,7 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
         the gate must key on is the recorded `grants_seen`, not the timing that
         produced it."""
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -787,9 +773,7 @@ class TestGrantRatchetsAcceptance(FinalizeTestCase):
         exactly as a missing-reviews acceptance would, and the slice must NOT
         be accepted."""
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -1409,9 +1393,7 @@ class TestNotesCommand(FinalizeTestCase):
 class TestReportFromControllerDataAlone(FinalizeTestCase):
     def test_status_report_recreates_mirror_after_pm_deleted(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
@@ -1618,9 +1600,7 @@ class TestAcceptReapsHungReviewer(FinalizeTestCase, HungReviewerTestCase):
 
     def test_accept_kills_reviewer_process_group(self) -> None:
         plan_path = self.write_plan(self._plan_path(), slices=[{"files": ["a.py"]}])
-        harness = write_fake_harness(
-            self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0, tail_sleep=2.0)
-        )
+        harness = write_fake_harness(self.repo.parent / "fake.sh", commit_and_result_script(self.repo, delay=1.0))
         code, out, _err = self._init(plan_path, harness)
         self.assertEqual(code, 0)
         run_id, token = parse_init_output(out)
