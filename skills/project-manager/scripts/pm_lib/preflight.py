@@ -8,6 +8,18 @@ launch. Each check passes, fails with what to do, or is a note for a human
 (harness trust cannot be checked from here). A failure is a question to the
 owner, never something the CM fixes in the dossier. The pin lines it reads
 are the ones `references/dossier-template.md` shows.
+
+Owner mode (`owner=True`, `--owner`) is the owner's pre-launch reading of the
+same checks. What is merely not done yet (the dossier's repository and first
+commit, its changed owner files, the integration branch and checkout, the
+node worktree parent and the results root) is a `todo`, a `Check` that
+carries the action `--commit` runs, instead of a failure; the checks that
+read the integration head read the pinned base while the branch is absent;
+and an uncommitted owner file does not put the owner's files in doubt. Every
+other check, and every check without `owner`, is as strict as ever, and the
+todos are appended in the order their actions must run, the dossier's commit
+last. `read_launcher` reads the campaign launcher the owner fills, so the
+owner types no path or harness.
 """
 
 from __future__ import annotations
@@ -18,12 +30,15 @@ import platform
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 from . import PmError
 from . import campaign
 from . import git_ops
+from . import profiles
 from . import sandbox
 
 # A placeholder is any `<…>` outside a code span, or, inside one, an
@@ -50,8 +65,9 @@ OWNER_FILES = ("brief.md", "setup.sh", sandbox.DOSSIER_POLICY_NAME)
 @dataclass
 class Check:
     name: str
-    passed: bool | None  # None: a note for a human, neither pass nor fail
-    detail: str = ""
+    passed: bool | None  # None: a note for a human, or a todo (see `action`); neither pass nor fail
+    detail: str = ""  # a failure's fix; a todo's description of its action
+    action: Callable[[], None] | None = None  # a todo: what `--commit` runs to close the gap
 
 
 def sha256_of(path: Path) -> str:
@@ -130,6 +146,100 @@ def _pinned_file_bytes(name: str, dossier: Path, repo: Path, head: str) -> tuple
     return None
 
 
+def _tracking(dossier: Path, name: str) -> tuple[str, str]:
+    """How `name` stands in the dossier's repository: "untracked", "changed"
+    (differs from the last commit), "clean", or "error" with git's message.
+    The name is a literal path, never a pathspec (`runner[1].sh` is not a glob)."""
+    if git_ops.git_result(dossier, "--literal-pathspecs", "ls-files", "--error-unmatch", name)[0] != 0:
+        return "untracked", ""
+    code, status, err = git_ops.git_result(dossier, "--literal-pathspecs", "status", "--porcelain", "--", name)
+    if code != 0:
+        return "error", err.strip() or "unknown error"
+    return ("changed" if status.strip() else "clean"), ""
+
+
+def _listed_by_status(dossier: Path, name: str) -> bool:
+    """Whether `git status` lists `name` as untracked or changed: an ignored file is not listed, so it is
+    never a file a commit could take. A git failure counts as listed, for the commit to report."""
+    code, status, _ = git_ops.git_result(dossier, "--literal-pathspecs", "status", "--porcelain", "--", name)
+    return code != 0 or bool(status.strip())
+
+
+def _dossier_pin_files(brief: str, dossier: Path) -> list[str]:
+    """The generic pins that resolve to a file inside the dossier: owner files
+    beside `brief.md` and `setup.sh`, committed with them."""
+    inside = []
+    for name, _pinned in _generic_pins(brief, _dedicated_pins(brief)):
+        candidate = (dossier / name).resolve()
+        if candidate.is_relative_to(dossier) and candidate.is_file():
+            inside.append(name)
+    return inside
+
+
+def _first_commit_listing(dossier: Path, *, is_repository: bool) -> tuple[int, list[str], str]:
+    """(git's exit code, the sorted file names, git's stderr) for the first
+    commit: what `git add -A --dry-run` says it will stage, with the dossier's
+    own `.gitignore` applied and nothing staged, plus what an earlier, failed
+    first commit already staged (the dry run does not list it). Before `git
+    init`, the dry run is against a scratch repository over the dossier's tree."""
+    already_staged: set[str] = set()
+    if is_repository:
+        code, listing, err = git_ops.git_result(dossier, "add", "-A", "--dry-run")
+        already_staged = set(git_ops.git_result(dossier, "diff", "--cached", "--name-only")[1].splitlines())
+    else:
+        with tempfile.TemporaryDirectory(prefix="pm-preflight-") as scratch:
+            git_ops.git(Path(scratch), "init", "-q")
+            code, listing, err = git_ops.git_result(
+                dossier, "--git-dir", str(Path(scratch) / ".git"), "--work-tree", str(dossier), "add", "-A", "--dry-run"
+            )
+    added = {line[4:].strip("'") for line in listing.splitlines() if line.startswith("add ")}
+    return code, sorted(added | already_staged), err
+
+
+def _overlaps(first: Path, second: Path) -> bool:
+    """Whether either path is, or lies inside, the other, as real paths."""
+    one, two = Path(os.path.realpath(first)), Path(os.path.realpath(second))
+    return one.is_relative_to(two) or two.is_relative_to(one)
+
+
+# The actions a `todo` carries: each runs one step of `--commit` and raises
+# PmError, carrying git's own message, when it fails.
+def _init_dossier(dossier: Path) -> None:
+    git_ops.git(dossier, "init", "-q")
+
+
+def _create_branch(repo: Path, branch: str, base: str) -> None:
+    git_ops.git(repo, "branch", branch, base)
+
+
+def _add_checkout(repo: Path, checkout: Path, branch: str) -> None:
+    git_ops.git(repo, "worktree", "add", "-q", str(checkout), branch)
+
+
+def _make_directory(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PmError(f"could not create {path}: {exc}") from exc
+
+
+def _commit_owner_files(dossier: Path, files: list[str] | None) -> None:
+    """The dossier's owner commit. `files` None is the first commit, which
+    takes everything the `.gitignore` leaves (`git add -A`); afterwards only
+    the named owner files are staged and committed, by literal path, so nothing
+    else the CM has staged or modified is swept in, and a file staged then
+    restored is no commit. The identity is git's own."""
+    if files is None:
+        git_ops.git(dossier, "add", "-A")
+        git_ops.git(dossier, "commit", "-q", "-m", f"Brief: {dossier.name}")
+        return
+    git_ops.git(dossier, "--literal-pathspecs", "add", "--", *files)
+    if git_ops.git_result(dossier, "--literal-pathspecs", "diff", "--cached", "--quiet", "--", *files)[0] != 0:
+        git_ops.git(
+            dossier, "--literal-pathspecs", "commit", "-q", "-m", f"Brief: update {', '.join(files)}", "--", *files
+        )
+
+
 def campaign_preflight(
     *,
     dossier: Path,
@@ -138,6 +248,7 @@ def campaign_preflight(
     worktree: Path | None = None,
     digest: str | None = None,
     harnesses: tuple[str, ...] = (),
+    owner: bool = False,
 ) -> list[Check]:
     checks: list[Check] = []
 
@@ -150,6 +261,23 @@ def campaign_preflight(
     def note(name: str) -> None:
         checks.append(Check(name, None))
 
+    def todo(name: str, detail: str, action: Callable[[], None]) -> Check:
+        """A gap `--commit` closes (owner mode only); not appended, so the caller places it."""
+        return Check(name, None, detail, action)
+
+    def pin_fix(actual: str, cm_text: str) -> str:
+        """What to do about a pin mismatch: the owner's action, or the CM's question to the owner."""
+        return f"update the pin in brief.md to `{actual}`, or restore the pinned file" if owner else cm_text
+
+    def directory(label: str, path: Path) -> None:
+        name = f"{label} {path} exists and is writable"
+        if path.is_dir() and os.access(path, os.W_OK):
+            ok(name)
+        elif owner and not os.path.lexists(path):
+            checks.append(todo(name, f"mkdir -p {path}", partial(_make_directory, path)))
+        else:
+            fail(name, f"mkdir -p {path}")
+
     dossier = dossier.expanduser().resolve()
     brief_path = dossier / "brief.md"
     if not brief_path.is_file():
@@ -159,37 +287,75 @@ def campaign_preflight(
 
     # The dossier: its own git repository, with the owner's files committed
     # and unchanged. The CM's files (work.md, evidence.md, …) may be dirty.
+    # In owner mode a repository not made yet, a first commit not made yet and
+    # owner files not yet committed are todos, and the last two do not put the
+    # owner's files in doubt: nothing has been committed to be in doubt about.
     code, top, _ = git_ops.git_result(dossier, "rev-parse", "--show-toplevel")
-    if code != 0 or Path(top.strip()).resolve() != dossier:
+    is_repository = code == 0 and Path(top.strip()).resolve() == dossier
+    first_commit = False
+    commit_todo: Check | None = None  # appended last: its action runs last
+    if is_repository:
+        ok("dossier is its own git repository")
+        first_commit = owner and git_ops.git_head(dossier) is None
+    elif owner and code != 0:
+        checks.append(
+            todo("dossier is its own git repository", f"git -C {dossier} init", partial(_init_dossier, dossier))
+        )
+        first_commit = True
+    else:
         fail(
             "dossier is its own git repository",
             f"git -C {dossier} init (the dossier is a repository of its own, outside the product)",
         )
         integrity = False
-    else:
-        ok("dossier is its own git repository")
+    if first_commit:
+        code, staged, err = _first_commit_listing(dossier, is_repository=is_repository)
+        if code != 0:
+            fail("the dossier's first commit can be staged", f"git add -A --dry-run failed: {err.strip()}")
+        else:
+            more = ", …" if len(staged) > 10 else ""
+            commit_todo = todo(
+                "dossier has a first commit",
+                f"git add -A, then commit as `Brief: {dossier.name}`: {len(staged)} file(s): "
+                f"{', '.join(staged[:10])}{more}",
+                partial(_commit_owner_files, dossier, None),
+            )
+    elif is_repository:
+        unsettled: list[str] = []
         for name in OWNER_FILES:
             if name != "brief.md" and not (dossier / name).exists():
                 continue
-            if git_ops.git_result(dossier, "ls-files", "--error-unmatch", name)[0] != 0:
+            state, git_error = _tracking(dossier, name)
+            if state == "untracked" and owner:
+                unsettled.append(name)
+            elif state == "untracked":
                 fail(f"{name} is tracked in the dossier", f"git -C {dossier} add {name} and commit")
                 integrity = False
+            elif state == "error":
+                fail(f"{name} is committed and unchanged", f"git status failed in the dossier: {git_error}")
+                integrity = False
+            elif state == "changed" and owner:
+                unsettled.append(name)
+            elif state == "changed":
+                fail(
+                    f"{name} is committed and unchanged",
+                    f"{name} differs from the dossier's last commit; commit it, then take the digest again",
+                )
+                integrity = False
             else:
-                code, status, err = git_ops.git_result(dossier, "status", "--porcelain", "--", name)
-                if code != 0:
-                    fail(
-                        f"{name} is committed and unchanged",
-                        f"git status failed in the dossier: {err.strip() or 'unknown error'}",
-                    )
-                    integrity = False
-                elif status.strip():
-                    fail(
-                        f"{name} is committed and unchanged",
-                        f"{name} differs from the dossier's last commit; commit it, then take the digest again",
-                    )
-                    integrity = False
-                else:
-                    ok(f"{name} is committed and unchanged")
+                ok(f"{name} is committed and unchanged")
+        if owner:
+            unsettled += [
+                name
+                for name in _dossier_pin_files(brief, dossier)
+                if name not in unsettled and _listed_by_status(dossier, name)
+            ]
+            if unsettled:
+                commit_todo = todo(
+                    "dossier's owner files are committed and unchanged",
+                    f"commit {', '.join(unsettled)} (staged and committed by path; nothing else is swept in)",
+                    partial(_commit_owner_files, dossier, unsettled),
+                )
 
     missing = placeholders(brief)
     if missing:
@@ -222,14 +388,44 @@ def campaign_preflight(
         ok("dossier is outside the product repository")
     code, head, _ = git_ops.git_result(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{integration_branch}")
     head = head.strip() if code == 0 else ""
-    if not head:
+    base_match = BASE.search(brief)
+    base = ""
+    if base_match:
+        code, resolved, _ = git_ops.git_result(
+            repo, "rev-parse", "--verify", "--quiet", f"{base_match.group(2)}^{{commit}}"
+        )
+        base = resolved.strip() if code == 0 else ""
+    # The tree the head-reading checks below read: the head, or in owner mode
+    # the base the absent branch will be created at.
+    tree = head or (base if owner else "")
+    # A name git would take as an option, or refuse, is no branch to schedule.
+    name_code, _, name_error = (
+        git_ops.git_result(repo, "check-ref-format", "--branch", integration_branch)
+        if not head and owner
+        else (0, "", "")
+    )
+    if name_code != 0:
+        fail(
+            f"integration branch {integration_branch} is a valid branch name",
+            name_error.strip() or "git refuses it",
+        )
+    elif not head and owner and base:
+        checks.append(
+            todo(
+                f"integration branch {integration_branch} exists in {repo}",
+                f"git -C {repo} branch {integration_branch} {base[:12]} (the campaign base)",
+                partial(_create_branch, repo, integration_branch, base),
+            )
+        )
+    elif not head:
         fail(
             f"integration branch {integration_branch} exists in {repo}",
             "create it at the campaign base: git worktree add -b <branch> <checkout> <base>",
         )
     else:
         ok(f"integration branch {integration_branch} at {head[:12]}")
-        if git_ops.git_result(repo, "cat-file", "-e", f"{head}:HANDOFF.md")[0] == 0:
+    if tree:
+        if git_ops.git_result(repo, "cat-file", "-e", f"{tree}:HANDOFF.md")[0] == 0:
             fail(
                 "integration head does not track HANDOFF.md",
                 "launch-child refuses a base that tracks HANDOFF.md; untrack it on the integration branch",
@@ -237,29 +433,36 @@ def campaign_preflight(
         else:
             ok("integration head does not track HANDOFF.md")
 
-    base_match = BASE.search(brief)
     if not base_match:
         fail("brief pins a campaign base", "add `- Campaign base: `<branch>` at `<SHA>`` under Pinned references")
+    elif not base:
+        fail(
+            f"campaign base {base_match.group(2)} resolves", "the pinned base is not a commit in the product repository"
+        )
     else:
-        base_ref = base_match.group(2)
-        code, base, _ = git_ops.git_result(repo, "rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}")
-        base = base.strip() if code == 0 else ""
-        if not base:
-            fail(f"campaign base {base_ref} resolves", "the pinned base is not a commit in the product repository")
-        else:
-            ok(f"campaign base {base[:12]} resolves")
-            if head:
-                if git_ops.git_result(repo, "merge-base", "--is-ancestor", base, head)[0] == 0:
-                    ok("integration head descends from the base")
-                else:
-                    fail(
-                        "integration head descends from the base",
-                        f"{integration_branch} is not built on {base[:12]}; re-pin the base or reset the branch",
-                    )
+        ok(f"campaign base {base[:12]} resolves")
+        if head:
+            if git_ops.git_result(repo, "merge-base", "--is-ancestor", base, head)[0] == 0:
+                ok("integration head descends from the base")
+            else:
+                fail(
+                    "integration head descends from the base",
+                    f"{integration_branch} is not built on {base[:12]}; re-pin the base or reset the branch",
+                )
 
     if worktree is not None:
         wt = worktree.expanduser()
-        if not wt.is_dir():
+        if owner and tree and not os.path.lexists(wt):
+            # `git -C <repo> worktree add` reads a relative path against the repository, not this shell.
+            wt = wt.absolute()
+            checks.append(
+                todo(
+                    f"integration checkout {wt} exists",
+                    f"git -C {repo} worktree add {wt} {integration_branch}",
+                    partial(_add_checkout, repo, wt, integration_branch),
+                )
+            )
+        elif not wt.is_dir():
             fail(f"integration checkout {wt} exists", f"git -C {repo} worktree add -b {integration_branch} {wt} <base>")
         else:
             common = git_ops.git_result(wt, "rev-parse", "--path-format=absolute", "--git-common-dir")[1].strip()
@@ -281,14 +484,15 @@ def campaign_preflight(
                     "integration checkout is clean", "; ".join(dirty[:5])
                 )
 
-    # The protected-paths policy file, as committed at the integration head.
+    # The protected-paths policy file, as committed at the integration head (the base, in owner mode, until
+    # the branch exists).
     policy_text = _pin_line(brief, "Protected-paths policy file")
     policy_path = BACKTICKED.search(policy_text.split("SHA-256")[0]) if policy_text else None
     policy_sha = SHA256.search(policy_text) if policy_text else None
     if not policy_path or not policy_sha:
         fail("brief pins the policy file", "write `- Protected-paths policy file: `<path>`, SHA-256 `<digest>``")
-    elif head:
-        blob = git_ops.git_bytes(repo, "cat-file", "blob", f"{head}:{policy_path.group(1)}")
+    elif tree:
+        blob = git_ops.git_bytes(repo, "cat-file", "blob", f"{tree}:{policy_path.group(1)}")
         if blob is None:
             fail(
                 f"policy file {policy_path.group(1)} is committed at the integration head",
@@ -299,7 +503,10 @@ def campaign_preflight(
         else:
             fail(
                 "policy file at the integration head matches its pin",
-                "the committed file differs from the brief's SHA-256; a changed policy is a question to the owner",
+                pin_fix(
+                    hashlib.sha256(blob).hexdigest(),
+                    "the committed file differs from the brief's SHA-256; a changed policy is a question to the owner",
+                ),
             )
 
     # The brief's product exclusions, read once: the setup trial applies them
@@ -328,14 +535,15 @@ def campaign_preflight(
         elif sha256_of(setup_path) != setup_pin.group(1):
             fail(
                 "setup.sh matches its pin",
-                f"its SHA-256 is {sha256_of(setup_path)}; a changed script is a question to the owner",
+                f"its SHA-256 is {sha256_of(setup_path)}; "
+                + pin_fix(sha256_of(setup_path), "a changed script is a question to the owner"),
             )
             integrity = False
         elif not setup_path.read_text(encoding="utf-8", errors="replace").strip():
             fail("setup.sh is not blank", "launch-child refuses a blank script")
         else:
             ok("setup.sh matches its pin")
-            if not head:
+            if not tree:
                 fail("setup.sh trial", "no integration head to run it against")
             elif not integrity:
                 fail(
@@ -349,7 +557,7 @@ def campaign_preflight(
                     "as a launch would",
                 )
             else:
-                checks.append(_trial_setup(repo, head, setup_path, exclusions))
+                checks.append(_trial_setup(repo, tree, setup_path, exclusions))
     elif "none" not in setup_section.lower():
         fail("Worktree setup names setup.sh or none", "the section is present but names neither")
     else:
@@ -385,7 +593,8 @@ def campaign_preflight(
             elif policy_sha256 != sandbox_pin:
                 fail(
                     "sandbox.json matches its pin",
-                    f"its SHA-256 is {policy_sha256}; a changed policy is a question to the owner",
+                    f"its SHA-256 is {policy_sha256}; "
+                    + pin_fix(policy_sha256, "a changed policy is a question to the owner"),
                 )
                 integrity = False
             else:
@@ -430,7 +639,7 @@ def campaign_preflight(
             # The sandbox deny is a glob at any depth, so a short or common
             # name hides every same-named path inside the sandbox too.
             note(f"exclusions: a sandboxed child denies /**/{path}, every path of that name at any depth")
-            if head and git_ops.git_result(repo, "cat-file", "-e", f"{head}:{path}")[0] != 0:
+            if tree and git_ops.git_result(repo, "cat-file", "-e", f"{tree}:{path}")[0] != 0:
                 note(
                     f"exclusions: product path {path} is not in the integration head's tree; a typo, or a path"
                     " that does not exist yet"
@@ -454,17 +663,18 @@ def campaign_preflight(
 
     # Every other file the brief pins by SHA-256, in the dossier or at the head.
     for name, pinned in _generic_pins(brief, _dedicated_pins(brief)):
-        found = _pinned_file_bytes(name, dossier, repo, head)
+        found = _pinned_file_bytes(name, dossier, repo, tree)
         if found is None:
             fail(
                 f"pinned file {name} is in the dossier or at the integration head",
                 "the brief pins it by SHA-256 but it is in neither; commit it, or correct the brief",
             )
         elif hashlib.sha256(found[0]).hexdigest() != pinned:
+            actual = hashlib.sha256(found[0]).hexdigest()
             fail(
                 f"pinned file {name} matches its pin",
-                f"its SHA-256 in {found[1]} is {hashlib.sha256(found[0]).hexdigest()}; "
-                "a changed pinned file is a question to the owner",
+                f"its SHA-256 in {found[1]} is {actual}; "
+                + pin_fix(actual, "a changed pinned file is a question to the owner"),
             )
         else:
             ok(f"pinned file {name} matches its pin (in {found[1]})")
@@ -484,27 +694,68 @@ def campaign_preflight(
         if toolkit_head == toolkit_pin.group(1):
             ok(f"toolkit checkout HEAD is its pinned commit {toolkit_head[:12]}")
         else:
+            repin = (
+                f"re-pin the Campaign toolkit line to `{toolkit_head}` after reading what changed, "
+                "or check out the pinned commit"
+                if owner and toolkit_head
+                else "check out the pinned commit, or ask the owner to re-pin"
+            )
             fail(
                 "toolkit checkout is at its pinned commit",
                 f"the toolkit is at {(toolkit_head or 'no readable commit')[:12]}, the brief pins "
-                f"{toolkit_pin.group(1)[:12]}; check out the pinned commit, or ask the owner to re-pin",
+                f"{toolkit_pin.group(1)[:12]}; {repin}",
             )
 
-    # The node worktree parent.
+    # The node worktree parent, and the results root `stop-child --archive` writes each node's outputs to.
     parent_text = _pin_line(brief, "Node worktree parent", 0)
     parent = BACKTICKED.search(parent_text) if parent_text else None
+    parent_dir: Path | None = None
     if not parent:
         fail("brief names the node worktree parent", "write `- Node worktree parent: `<absolute dir>``")
     else:
         parent_dir = Path(parent.group(1)).expanduser()
         if not parent_dir.is_absolute():
             fail(f"node worktree parent {parent_dir} is absolute", "name the directory by its absolute path")
-        elif parent_dir.is_dir() and os.access(parent_dir, os.W_OK):
-            ok(f"node worktree parent {parent_dir} exists and is writable")
         else:
-            fail(f"node worktree parent {parent_dir} exists and is writable", f"mkdir -p {parent_dir}")
+            directory("node worktree parent", parent_dir)
         note(
-            f"trust: every child harness must open a new worktree under {parent_dir} without a trust dialog; the owner checks this once by hand"
+            f"trust: a harness that asks per linked worktree (Claude Code does) shows a trust dialog for each new node"
+            f" worktree under {parent_dir}; the CM asks the owner once, at its first reconcile, for permission to add"
+            " those entries (references/sandbox.md Troubleshooting)"
+        )
+
+    results_text = _pin_line(brief, "Results root", 0)
+    results = BACKTICKED.search(results_text) if results_text else None
+    if not results:
+        fail(
+            "brief names the results root",
+            "add `- Results root: `<absolute directory>`` under Allowed paths; stop-child --archive writes each "
+            "node's outputs there",
+        )
+    else:
+        results_dir = Path(results.group(1)).expanduser()
+        if not results_dir.is_absolute():
+            fail(f"results root {results_dir} is absolute", "name the directory by its absolute path")
+        else:
+            others = {"the dossier": dossier}
+            if parent_dir is not None and parent_dir.is_absolute():
+                others["the node worktree parent"] = parent_dir
+            if worktree is not None:
+                others["the integration checkout"] = worktree.expanduser()
+            overlapped = [what for what, other in others.items() if _overlaps(results_dir, other)]
+            if overlapped:
+                fail(
+                    f"results root {results_dir} is separate from the campaign's own directories",
+                    f"it overlaps {', '.join(overlapped)}; name a directory outside all of them",
+                )
+            else:
+                ok(f"results root {results_dir} is separate from the campaign's own directories")
+            directory("results root", results_dir)
+
+    if os.environ.get("VIRTUAL_ENV"):
+        note(
+            f"VIRTUAL_ENV={os.environ['VIRTUAL_ENV']} is set and every seat inherits it; "
+            "start the CM from a shell without the product's virtualenv"
         )
 
     # Tools on this machine.
@@ -518,6 +769,8 @@ def campaign_preflight(
         ok(f"harness {harness} on PATH") if shutil.which(harness) else fail(
             f"harness {harness} on PATH", "install it or change the seats"
         )
+    if commit_todo is not None:
+        checks.append(commit_todo)
     return checks
 
 
@@ -558,3 +811,85 @@ def _trial_setup(repo: Path, head: str, setup_path: Path, exclusions: list[str])
                 f"the trial worktree {trial} could not be removed; remove it by hand (git worktree remove --force {trial})",
             )
     return result
+
+
+# The campaign launcher (`references/campaign-mode.md`, *The campaign launcher*): `Key: value` lines.
+LAUNCHER_PATHS = ("Dossier", "Product repo", "Created from")
+LAUNCHER_SEATS = ("Child PM", "Child seats", "Task-node delegate", "Plan reviewer", "Acceptance auditor")
+# A harness named on a seat line is a standalone word: `claude-sonnet-5-5` and `opencode-go/x` are model ids.
+HARNESS_WORD = re.compile(rf"(?<![\w/-])(?:{'|'.join(map(re.escape, profiles.SUPPORTED_HARNESSES))})(?![\w/-])")
+
+
+@dataclass(frozen=True)
+class PreflightInputs:
+    """Where the campaign's files are and which harnesses its seats use: the explicit options, or what
+    `read_launcher` takes from the owner's launcher file in their place."""
+
+    dossier: Path
+    repo: Path  # the product repository to read: Product repo when it exists, else Created from
+    worktree: Path | None  # the integration checkout: Product repo
+    integration_branch: str
+    harnesses: tuple[str, ...]
+
+
+def _launcher_line(key: str) -> re.Pattern[str]:
+    """The launcher's `<key>:` line: group 1 the key and its separator, group 2 the value."""
+    return re.compile(rf"^([ \t]*{re.escape(key)}:[ \t]*)([^\r\n]*)", re.M)
+
+
+def read_launcher(path: Path) -> PreflightInputs:
+    """Read the paths, integration branch and seat harnesses from the launcher
+    file `path` (the filled template, fence or no fence). A missing or
+    repeated line, a value still holding `<…>`, a path that is not absolute,
+    a seat line naming no harness, or a file inside the dossier (the CM writes
+    the dossier, and the owner's digest must not sit where it writes) is a
+    PmError naming it. The `Brief digest:` line must appear exactly once but
+    may be blank or a placeholder: `--commit` fills it in."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PmError(f"cannot read the launcher {path}: {exc}") from exc
+
+    def value(key: str, *, filled: bool = True) -> str:
+        found = _launcher_line(key).findall(text)
+        if len(found) != 1:
+            raise PmError(f"the launcher {path} must have exactly one `{key}:` line, it has {len(found)}")
+        result = found[0][1].strip()
+        if filled and (not result or ANGLE.search(result)):
+            raise PmError(f"the launcher {path}: fill in `{key}:` (it holds {result or 'nothing'!r})")
+        return result
+
+    value("Brief digest", filled=False)
+    paths: dict[str, Path] = {}
+    for key in LAUNCHER_PATHS:
+        paths[key] = Path(value(key)).expanduser()
+        if not paths[key].is_absolute():
+            raise PmError(f"the launcher {path}: `{key}:` must be an absolute path, it is {paths[key]}")
+    branch = value("Integration branch")
+    harnesses: list[str] = []
+    for key in LAUNCHER_SEATS:
+        named = HARNESS_WORD.findall(value(key))
+        if not named:
+            supported = ", ".join(profiles.SUPPORTED_HARNESSES)
+            raise PmError(f"the launcher {path}: `{key}:` names none of the supported harnesses ({supported})")
+        harnesses += dict.fromkeys(name for name in named if name not in harnesses)
+    dossier = paths["Dossier"]
+    if Path(os.path.realpath(path)).is_relative_to(Path(os.path.realpath(dossier))):
+        raise PmError(f"the launcher {path} lies inside the dossier {dossier}; keep it beside the dossier")
+    product = paths["Product repo"]
+    return PreflightInputs(
+        dossier=dossier,
+        repo=product if product.is_dir() else paths["Created from"],
+        worktree=product,
+        integration_branch=branch,
+        harnesses=tuple(harnesses),
+    )
+
+
+def write_launcher_digest(path: Path, digest: str) -> None:
+    """Replace the value on the launcher's one `Brief digest:` line and nothing else, byte for byte."""
+    text = path.read_bytes().decode("utf-8")
+    updated, count = _launcher_line("Brief digest").subn(lambda match: match.group(1) + digest, text)
+    if count != 1:
+        raise PmError(f"the launcher {path} must have exactly one `Brief digest:` line, it has {count}")
+    path.write_bytes(updated.encode("utf-8"))

@@ -24,6 +24,7 @@ from pm_lib import preflight
 from pm_lib import sandbox
 
 TEMPLATE = Path(__file__).resolve().parent.parent / "references" / "dossier-template.md"
+CAMPAIGN_MODE = Path(__file__).resolve().parent.parent / "references" / "campaign-mode.md"
 POLICY = json.dumps({"schema": 1, "protected_paths": ["instruments"]}) + "\n"
 
 
@@ -46,6 +47,8 @@ class PreflightTestCase(PmTestCase):
         self._git("branch", "integration/t", self.base)
         self.parent = self.repo.parent / "worktrees"
         self.parent.mkdir()
+        self.results = self.repo.parent / "results"
+        self.results.mkdir()
         self.dossier = self.repo.parent / "dossier"
         self.dossier.mkdir()
         self.setup = "ln -s README.md scaffold\n"
@@ -64,6 +67,7 @@ class PreflightTestCase(PmTestCase):
             f"- Campaign base: `main` at `{self.base}`.\n"
             "## Allowed paths\n"
             f"- Node worktree parent: `{self.parent}`.\n"
+            f"- Results root: `{self.results}`.\n"
             f"- Protected-paths policy file: `campaign-policy.json`, SHA-256 `{policy_sha}`.\n"
             + ("- Git-ignored output directories: none\n" if output_line else "")
             + f"## Worktree setup\n- `setup.sh` in this dossier, SHA-256 `{setup_sha}`.\n"
@@ -90,18 +94,20 @@ class PreflightTestCase(PmTestCase):
             check=True,
         )
 
-    def preflight(self, *extra: str) -> tuple[int, str, str]:
+    def preflight(self, *extra: str, explicit: bool = True) -> tuple[int, str, str]:
         """Run the command with tmux stubbed present, so the machine's tmux
-        does not decide a test about the brief."""
-        argv = [
-            "campaign-preflight",
-            "--dossier",
-            str(self.dossier),
-            "--repo",
-            str(self.repo),
-            "--integration-branch",
-            "integration/t",
-        ]
+        does not decide a test about the brief. `explicit` False leaves the
+        paths out, for a test that passes `--launcher`."""
+        argv = ["campaign-preflight"]
+        if explicit:
+            argv += [
+                "--dossier",
+                str(self.dossier),
+                "--repo",
+                str(self.repo),
+                "--integration-branch",
+                "integration/t",
+            ]
         real_which = preflight.shutil.which
         with mock.patch.object(
             preflight.shutil, "which", side_effect=lambda n: "/usr/bin/tmux" if n == "tmux" else real_which(n)
@@ -118,13 +124,15 @@ class TestPreflight(PreflightTestCase):
         self._git("worktree", "add", "-q", str(checkout), "integration/t")
         (self.dossier / "work.md").write_text("## Now\n- mid-edit, uncommitted\n", encoding="utf-8")
         digest = hashlib.sha256((self.dossier / "brief.md").read_bytes()).hexdigest()
-        code, out, err = self.preflight("--digest", digest, "--worktree", str(checkout))
+        with mock.patch.dict(os.environ, {"VIRTUAL_ENV": "/somewhere/venv"}):
+            code, out, err = self.preflight("--digest", digest, "--worktree", str(checkout))
         self.assertEqual(code, 0, out + err)
         self.assertEqual(self.failures(out), [])
         self.assertIn("brief.md matches the owner's digest", out)
         self.assertIn(f"integration checkout {checkout} is on integration/t at its head", out)
         self.assertIn("setup.sh runs in a fresh worktree and leaves it clean", out)
-        self.assertIn("note  trust:", out)
+        self.assertIn("note  trust: a harness that asks per linked worktree", out)
+        self.assertIn("note  VIRTUAL_ENV=/somewhere/venv is set and every seat inherits it", out)
         self.assertEqual(self._git("worktree", "list", "--porcelain").stdout.count("worktree "), 2)
         self.assertNotIn("scaffold", self._git("status", "--short").stdout)
 
@@ -622,6 +630,341 @@ class TestPreflightSandbox(PreflightTestCase):
         self.assert_failed_with_instruction(
             out, "brief's Sandbox section names sandbox.json or none", "without its pin"
         )
+
+
+class TestResultsRoot(PreflightTestCase):
+    """The brief's `- Results root:` line: present, absolute, separate from the campaign's own directories, and a
+    writable directory, which owner mode lets `--commit` create."""
+
+    def with_results_line(self, line: str | None) -> None:
+        self.write_brief()
+        brief = self.dossier / "brief.md"
+        old = f"- Results root: `{self.results}`.\n"
+        text = brief.read_text(encoding="utf-8").replace(old, "" if line is None else f"- Results root: `{line}`.\n")
+        brief.write_text(text, encoding="utf-8")
+        self._commit_dossier()
+
+    def test_a_missing_line_or_one_overlapping_the_campaigns_directories_fails(self) -> None:
+        cases = {
+            "missing": (None, "brief names the results root"),
+            "inside the node worktree parent": (f"{self.parent}/results", "results root"),
+            "holding the dossier": (str(self.repo.parent), "results root"),
+            "relative": ("results", "results root"),
+        }
+        for label, (line, failure) in cases.items():
+            with self.subTest(label):
+                self.with_results_line(line)
+                code, out, err = self.preflight()
+                self.assertEqual(code, 1, out + err)
+                self.assertTrue(any(f.startswith(failure) for f in self.failures(out)), out)
+                self.with_results_line(str(self.results))
+        self.assertEqual(self.preflight()[0], 0)
+
+    def test_an_absent_directory_is_a_failure_and_with_owner_a_todo(self) -> None:
+        self.results.rmdir()
+        code, out, err = self.preflight()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn(f"results root {self.results} exists and is writable", self.failures(out))
+        code, out, err = self.preflight("--owner")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"todo  results root {self.results} exists and is writable\n      -> --commit: mkdir -p", out)
+        self.assertIn("ready: read brief.md once more as the contract", out)
+
+
+class OwnerSetupCase(PreflightTestCase):
+    """A campaign as the owner has it before the first launch: the dossier's brief and setup script written but
+    not a repository, no integration branch or checkout, no directories. `make_fresh` takes the fixture back to
+    that state; the identity git commits under comes from the environment, as on a configured machine."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        identity = {
+            f"GIT_{role}_{field}": "t@example.invalid" if field == "EMAIL" else "t"
+            for role in ("AUTHOR", "COMMITTER")
+            for field in ("NAME", "EMAIL")
+        }
+        patcher = mock.patch.dict(os.environ, identity)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.checkout = self.repo.parent / "integration"
+
+    def make_fresh(self) -> None:
+        shutil.rmtree(self.dossier / ".git")
+        self._git("branch", "-D", "integration/t")
+        self.parent.rmdir()
+        self.results.rmdir()
+
+    def owner(self, *extra: str) -> tuple[int, str, str]:
+        return self.preflight("--owner", "--worktree", str(self.checkout), *extra)
+
+    def dossier_git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.dossier), *args], check=True, text=True, capture_output=True
+        ).stdout.strip()
+
+
+class TestOwnerMode(OwnerSetupCase):
+    """`--owner`: what is merely not done yet is a `todo`, everything else is as strict as ever, and a plain run
+    still fails on a fresh campaign."""
+
+    def test_a_fresh_campaign_has_only_todos_the_trial_runs_at_the_base_and_nothing_is_created(self) -> None:
+        self.make_fresh()
+        code, out, err = self.owner()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.failures(out), [])
+        for todo in (
+            "dossier is its own git repository",
+            "dossier has a first commit",
+            f"integration branch integration/t exists in {self.repo.resolve()}",
+            f"integration checkout {self.checkout} exists",
+            f"node worktree parent {self.parent} exists and is writable",
+            f"results root {self.results} exists and is writable",
+        ):
+            self.assertIn(f"todo  {todo}\n", out)
+        self.assertIn("2 file(s): brief.md, setup.sh", out)
+        self.assertIn("ok    setup.sh runs in a fresh worktree and leaves it clean", out)
+        self.assertTrue(
+            out.rstrip().endswith(
+                "ready: read brief.md once more as the contract, then run this command again with --commit"
+            ),
+            out,
+        )
+        self.assertFalse((self.dossier / ".git").exists() or self.checkout.exists() or self.parent.exists())
+        self.assertEqual(self._git("branch", "--list", "integration/t").stdout, "")
+        code, out, err = self.preflight("--worktree", str(self.checkout))
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("dossier is its own git repository", self.failures(out))
+        self.assertIn("setup.sh trial", self.failures(out))
+
+    def test_a_pin_mismatch_fails_with_the_owners_fix_and_the_unverified_script_is_not_run(self) -> None:
+        self.make_fresh()
+        self.write_brief(setup_sha="1" * 64)
+        code, out, err = self.owner()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("setup.sh matches its pin", self.failures(out))
+        self.assertIn(f"update the pin in brief.md to `{_sha(self.setup)}`, or restore the pinned file", out)
+        self.assertNotIn("setup.sh runs in a fresh worktree", out)
+        self.assertIn("campaign preflight: 1 problem(s); fix the FAIL lines and run it again", out)
+
+    def test_a_branch_name_git_refuses_is_a_failure_not_a_todo(self) -> None:
+        self.make_fresh()
+        code, out, err = self.preflight("--owner", "--integration-branch=-bad")
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("integration branch -bad is a valid branch name", self.failures(out))
+        self.assertNotIn("todo  integration branch", out)
+
+    def test_a_dossier_inside_another_repository_still_fails(self) -> None:
+        self.make_fresh()
+        subprocess.run(["git", "init", "-q", str(self.repo.parent)], check=True)
+        code, out, err = self.owner()
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("dossier is its own git repository", self.failures(out))
+
+    def test_a_changed_owner_file_after_the_first_commit_is_one_todo_and_does_not_skip_the_trial(self) -> None:
+        self.write_brief(extra="\n- more: yes")
+        (self.dossier / "setup.sh").write_text(self.setup + "# edited\n", encoding="utf-8")
+        code, out, err = self.preflight("--owner")
+        self.assertEqual(code, 1, out + err)  # setup.sh no longer matches its pin: that is not a gap `--commit` closes
+        self.write_brief(extra="\n- more: yes")
+        (self.dossier / "setup.sh").write_text(self.setup, encoding="utf-8")
+        code, out, err = self.preflight("--owner")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(
+            "todo  dossier's owner files are committed and unchanged\n      -> --commit: commit brief.md", out
+        )
+        self.assertIn("ok    setup.sh runs in a fresh worktree and leaves it clean", out)
+        self._commit_dossier()
+        code, out, err = self.preflight("--owner")
+        self.assertEqual(code, 0, out + err)
+        brief_digest = _sha((self.dossier / "brief.md").read_text(encoding="utf-8"))
+        self.assertTrue(
+            out.rstrip().endswith(f"campaign preflight: all checks passed; brief digest {brief_digest}"), out
+        )
+
+
+class TestCommit(OwnerSetupCase):
+    """`--owner --commit`: the todos' actions in order, the dossier's commit last, then the CM's own check."""
+
+    def test_a_fresh_campaign_is_set_up_committed_checked_as_the_cm_will_and_a_repeat_changes_nothing(self) -> None:
+        self.make_fresh()
+        code, out, err = self.owner("--commit")
+        self.assertEqual(code, 0, out + err)
+        digest = _sha((self.dossier / "brief.md").read_text(encoding="utf-8"))
+        self.assertIn("ok    brief.md matches the owner's digest", out)
+        self.assertTrue(out.rstrip().endswith(f"brief digest {digest}"), out)
+        self.assertEqual(self.dossier_git("log", "--format=%s"), "Brief: dossier")
+        self.assertEqual(git_branch(self.checkout), "integration/t")
+        self.assertTrue(self.parent.is_dir() and self.results.is_dir())
+        self.assertEqual(self.dossier_git("status", "--porcelain"), "")
+        code, out, err = self.owner("--commit")
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("done  ", out)
+        self.assertEqual(self.dossier_git("rev-list", "--count", "HEAD"), "1")
+
+    def test_after_the_first_commit_only_the_changed_owner_files_are_committed_by_path(self) -> None:
+        self._git("worktree", "add", "-q", str(self.checkout), "integration/t")
+        (self.dossier / "work.md").write_text("## Now\n- the CM's own edit\n", encoding="utf-8")
+        self.dossier_git("add", "work.md")
+        self.write_brief(extra="\n- more: yes")
+        code, out, err = self.owner("--commit")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.dossier_git("show", "--name-only", "--format=", "HEAD"), "brief.md")
+        self.assertEqual(self.dossier_git("diff", "--cached", "--name-only"), "work.md")
+
+    def test_a_relative_checkout_is_made_where_the_check_looked_for_it(self) -> None:
+        """`git -C <repo> worktree add` reads a relative path against the repository, not the shell."""
+        previous = os.getcwd()
+        os.chdir(self.repo.parent)
+        self.addCleanup(os.chdir, previous)
+        code, out, err = self.preflight("--owner", "--commit", "--worktree", "integration")
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue((self.repo.parent / "integration").is_dir())
+        self.assertFalse((self.repo / "integration").exists())
+
+    def test_a_pinned_dossier_file_that_git_ignores_is_never_a_todo_and_does_not_block_a_later_commit(self) -> None:
+        (self.dossier / ".gitignore").write_text("notes.txt\n", encoding="utf-8")
+        (self.dossier / "notes.txt").write_text("private\n", encoding="utf-8")
+        pin = f"\n- Owner note: `notes.txt`, SHA-256 `{_sha('private' + chr(10))}`."
+        self.write_brief(extra=pin)
+        self._commit_dossier()
+        for change in ("\n- more: one", "\n- more: two"):
+            self.write_brief(extra=pin + change)
+            code, out, err = self.preflight("--owner", "--commit")
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(self.dossier_git("show", "--name-only", "--format=", "HEAD"), "brief.md")
+        code, out, err = self.preflight("--owner")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("campaign preflight: all checks passed", out)
+
+    def test_a_failure_creates_and_commits_nothing(self) -> None:
+        self.make_fresh()
+        self.write_brief(setup_sha="1" * 64)
+        code, out, err = self.owner("--commit")
+        self.assertEqual(code, 1, out + err)
+        self.assertNotIn("done  ", out)
+        self.assertFalse((self.dossier / ".git").exists() or self.checkout.exists() or self.parent.exists())
+
+    def test_commit_needs_owner_and_owner_excludes_the_digest(self) -> None:
+        code, out, err = self.preflight("--commit")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("--commit", err)
+        self.assertIn("--owner", err)
+        code, out, err = self.preflight("--owner", "--digest", "f" * 64)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("not allowed with", err)
+
+
+def git_branch(checkout: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "--abbrev-ref", "HEAD"], check=True, text=True, capture_output=True
+    ).stdout.strip()
+
+
+def filled_launcher(values: dict[str, str]) -> str:
+    """The toolkit's own launcher template, with the lines in `values` filled; a key the template does not
+    hold on a line of its own (it may share one) is appended as one."""
+    text = CAMPAIGN_MODE.read_text(encoding="utf-8")
+    block = re.search(r"## The campaign launcher\n.*?```md\n(.*?)```", text, re.S).group(1)
+    lines = block.splitlines()
+    for key, value in values.items():
+        entry = f"{key}: {value}"
+        index = next((i for i, line in enumerate(lines) if line.startswith(f"{key}:")), None)
+        if index is None:
+            lines.append(entry)
+        else:
+            lines[index] = entry
+    return "\n".join(lines) + "\n"
+
+
+class TestLauncher(OwnerSetupCase):
+    """`--launcher FILE`: the paths and the seats' harnesses come from the launcher the owner fills."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.values = {
+            "Dossier": str(self.dossier),
+            "Product repo": str(self.checkout),
+            "Integration branch": "integration/t",
+            "Created from": str(self.repo),
+            "Child PM": "claude claude-sonnet-5-5 high",
+            "Child seats": "Developer codex gpt-6.1-sol high; drift auditor claude claude-sonnet-5-5 high; "
+            "code reviewers opencode opencode-go/x high; fallback reviewer codex gpt-6.1-sol high",
+            "Task-node delegate": "codex gpt-6.1-sol high",
+            "Plan reviewer": "codex gpt-6.1-sol high",
+            "Acceptance auditor": "claude claude-sonnet-5-5 high",
+        }
+        self.launcher = self.repo.parent / "launcher.md"
+        fake_bin = self.repo.parent / "fake-bin"
+        fake_bin.mkdir()
+        for name in ("claude", "codex", "opencode"):
+            (fake_bin / name).write_text("#!/bin/sh\n", encoding="utf-8")
+            (fake_bin / name).chmod(0o755)
+        patcher = mock.patch.dict(os.environ, {"PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_launcher(self, **overrides: str) -> None:
+        values = {**self.values, **{key.replace("_", " "): value for key, value in overrides.items()}}
+        self.launcher.write_text(filled_launcher(values), encoding="utf-8")
+
+    def test_a_filled_template_yields_the_paths_the_integration_checkout_and_each_harness_once(self) -> None:
+        self.write_launcher()
+        inputs = preflight.read_launcher(self.launcher)
+        self.assertEqual(
+            (inputs.dossier, inputs.repo, inputs.worktree, inputs.integration_branch),
+            (self.dossier, self.repo, self.checkout, "integration/t"),
+        )
+        self.assertEqual(inputs.harnesses, ("claude", "codex", "opencode"))  # the model ids add none
+        self.checkout.mkdir()
+        self.assertEqual(preflight.read_launcher(self.launcher).repo, self.checkout)
+        self.checkout.rmdir()
+        self.make_fresh()
+        code, out, err = self.preflight("--owner", "--launcher", str(self.launcher), explicit=False)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"todo  integration checkout {self.checkout} exists", out)
+        for harness in ("claude", "codex", "opencode"):
+            self.assertIn(f"ok    harness {harness} on PATH", out)
+
+    def test_a_missing_line_a_placeholder_a_seat_without_a_harness_and_a_launcher_in_the_dossier_are_refused(
+        self,
+    ) -> None:
+        cases = {
+            "Plan reviewer": dict(Plan_reviewer="codx gpt-6.1-sol high"),
+            "Integration branch": dict(Integration_branch="<branch>"),
+            "Created from": dict(Created_from=""),
+        }
+        for key, overrides in cases.items():
+            with self.subTest(key):
+                self.write_launcher(**overrides)
+                code, out, err = self.preflight("--launcher", str(self.launcher), explicit=False)
+                self.assertEqual(code, 2, out + err)
+                self.assertIn(key, err)
+        self.write_launcher()
+        self.launcher.write_text(self.launcher.read_text(encoding="utf-8") + "Brief digest: again\n", encoding="utf-8")
+        code, out, err = self.preflight("--launcher", str(self.launcher), explicit=False)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("exactly one `Brief digest:` line", err)
+        self.launcher = self.dossier / "launcher.md"
+        self.write_launcher()
+        code, out, err = self.preflight("--launcher", str(self.launcher), explicit=False)
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("inside the dossier", err)
+        code, out, err = self.preflight("--launcher", str(self.launcher))
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("--launcher replaces --dossier, --repo, --integration-branch", err)
+
+    def test_commit_with_a_launcher_writes_the_digest_line_and_nothing_else(self) -> None:
+        self.make_fresh()
+        self.write_launcher()
+        before = self.launcher.read_text(encoding="utf-8")
+        code, out, err = self.preflight("--owner", "--commit", "--launcher", str(self.launcher), explicit=False)
+        self.assertEqual(code, 0, out + err)
+        digest = _sha((self.dossier / "brief.md").read_text(encoding="utf-8"))
+        self.assertEqual(
+            self.launcher.read_text(encoding="utf-8"),
+            re.sub(r"^(Brief digest: ).*$", rf"\g<1>{digest}", before, flags=re.M),
+        )
+        self.assertIn(f"wrote the digest to {self.launcher}", out)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 # Campaign Dossier Template
 
-The layout of a campaign dossier and a template for each of its files. This is a template only: the rules that govern every file (who writes it, when, and what the Campaign Manager does with it) are in [campaign-mode.md](campaign-mode.md), and nothing here restates them. Keep the backticked pin lines in the shape shown (the campaign base, the campaign toolkit's commit, the node worktree parent, and each pinned file with its SHA-256 digest: the policy file, `setup.sh`, `sandbox.json` and every owner script): `campaign-preflight` reads them.
+The layout of a campaign dossier and a template for each of its files. This is a template only: the rules that govern every file (who writes it, when, and what the Campaign Manager does with it) are in [campaign-mode.md](campaign-mode.md), and nothing here restates them. Keep the backticked pin lines in the shape shown (the campaign base, the campaign toolkit's commit, the node worktree parent, the results root, and each pinned file with its SHA-256 digest: the policy file, `setup.sh`, `sandbox.json` and every owner script): `campaign-preflight` reads them.
 
 ## Layout
 
 ```text
 <dossier>/                      a git repository of its own, outside the product repository
   brief.md                      the owner's brief
+  .gitignore                    keeps the orchestrator's run directories out of the dossier
   setup.sh                      the owner's worktree setup script, when brief.md's Worktree setup names one
   sandbox.json                  the owner's srt base policy, when brief.md's Sandbox section names one
   work.md                       now, and the node table
@@ -18,6 +19,13 @@ The layout of a campaign dossier and a template for each of its files. This is a
   nodes/<node>/reviews/round-<N>/  one review-plan round: delegate-policy.json, request.json, report.md, status.json, and the CM's dispositions.md (its orchestrator/ run directory git-ignored)
   validation/<node>/            one directory per node: its archived run and, for an evidence node, its receipt
   retrospective.md              the campaign's retrospective, written at acceptance
+```
+
+## `.gitignore`
+
+```text
+.orchestrator/
+nodes/*/reviews/*/orchestrator/
 ```
 
 ## `brief.md`
@@ -44,6 +52,7 @@ The layout of a campaign dossier and a template for each of its files. This is a
 - <product path the campaign may change>
 - Instrument paths: <product paths that become protected once their controls pass; none>
 - Node worktree parent: `<absolute directory the owner has trusted in each harness>`
+- Results root: `<absolute directory outside the product repository, the dossier and the node worktree parent; stop-child --archive copies each node's outputs there>`
 - Protected-paths policy file: `<path in the product repository>`, SHA-256 `<digest of the file, from shasum -a 256>` (see [campaign-mode.md](campaign-mode.md) *Launching and watching a child*)
 - Git-ignored output directories: <product directories, comma-separated, or none; stop-child --archive copies each to the results root before the node worktree is removed>
 

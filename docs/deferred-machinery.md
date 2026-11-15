@@ -63,6 +63,15 @@ The reviews this document distils are the shakedown review (2026-10-25) and the 
 - **Revisit when:** every campaign; the next campaign's ledger supersedes these figures.
 - **History:** 2026-11-08 recorded (sage26 item 13).
 
+### Tracking `TMPDIR` across CM restarts
+
+- **Proposed:** the toolkit records which `TMPDIR` owns each sandboxed child's temp dir, so `stop-child` finds and removes it however the CM was restarted.
+- **Evidence:** the lab campaigns' owner guide had to tell the owner to keep one terminal open for every CM restart. No incident is recorded yet.
+- **Held because:** it needs design (which `TMPDIR` owns a temp dir), not a check, and `campaign.py` deliberately leaves another `TMPDIR`'s temp dirs in place (see the `sandbox_stopped` property and the `stop_child` docstring in `skills/project-manager/scripts/pm_lib/campaign.py`).
+- **Done instead:** `skills/project-manager/README.md` *Start a campaign* states the rule: start the CM, and every restart, from the same shell.
+- **Revisit when:** a restart from another shell leaves a temp dir behind in a real campaign.
+- **History:** 2026-11-15 proposed (campaign owner setup plan) and held.
+
 ---
 
 ## Closed

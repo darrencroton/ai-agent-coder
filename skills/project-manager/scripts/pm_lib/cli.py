@@ -426,14 +426,28 @@ def build_parser() -> argparse.ArgumentParser:
         "campaign-preflight",
         help="Check a campaign dossier and product repository before any session exists: the mechanical half of reconcile",
     )
-    preflight_parser.add_argument(
-        "--dossier", required=True, metavar="PATH", help="the dossier repository holding brief.md"
-    )
-    preflight_parser.add_argument("--repo", required=True, metavar="PATH", help="the product repository")
-    preflight_parser.add_argument("--integration-branch", required=True, metavar="NAME")
+    # --dossier, --repo and --integration-branch are required unless --launcher supplies them; the handler checks.
+    preflight_parser.add_argument("--dossier", metavar="PATH", help="the dossier repository holding brief.md")
+    preflight_parser.add_argument("--repo", metavar="PATH", help="the product repository")
+    preflight_parser.add_argument("--integration-branch", metavar="NAME")
     preflight_parser.add_argument("--worktree", metavar="PATH", help="the integration checkout, when one exists")
+    reading = preflight_parser.add_mutually_exclusive_group()
+    reading.add_argument("--digest", metavar="HEX", help="the owner's SHA-256 of brief.md; the CM always passes it")
+    reading.add_argument(
+        "--owner",
+        action="store_true",
+        help="the owner's pre-launch reading: what is merely not done yet prints as todo, not FAIL",
+    )
     preflight_parser.add_argument(
-        "--digest", metavar="HEX", help="the owner's SHA-256 of brief.md; the CM always passes it"
+        "--commit",
+        action="store_true",
+        help="with --owner: do the todos (checkout, directories, dossier commit), then check as the CM will",
+    )
+    preflight_parser.add_argument(
+        "--launcher",
+        metavar="FILE",
+        help="the campaign launcher file: read the dossier, repositories, branch and harnesses from it "
+        "instead of --dossier/--repo/--integration-branch/--worktree/--harness; --commit writes its digest line",
     )
     preflight_parser.add_argument(
         "--harness",
@@ -1397,30 +1411,113 @@ def _run_launch_child(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_campaign_preflight(args: argparse.Namespace) -> int:
-    checks = preflight.campaign_preflight(
+def _preflight_inputs(args: argparse.Namespace) -> preflight.PreflightInputs:
+    """The campaign's paths, branch and harnesses: from `--launcher`, which
+    replaces the explicit options (given together they are refused, so there is
+    no precedence rule), or from the explicit options, three of which are then
+    required."""
+    if args.commit and not args.owner:
+        raise PmError("--commit is the owner's second step and needs --owner")
+    explicit = {
+        "--dossier": args.dossier,
+        "--repo": args.repo,
+        "--integration-branch": args.integration_branch,
+        "--worktree": args.worktree,
+        "--harness": args.harness,
+    }
+    if args.launcher:
+        given = [flag for flag, value in explicit.items() if value]
+        if given:
+            raise PmError(f"--launcher replaces {', '.join(given)}; pass one or the other")
+        return preflight.read_launcher(Path(args.launcher))
+    missing = [flag for flag in ("--dossier", "--repo", "--integration-branch") if not explicit[flag]]
+    if missing:
+        raise PmError(f"campaign-preflight needs {', '.join(missing)}, or --launcher")
+    return preflight.PreflightInputs(
         dossier=Path(args.dossier),
         repo=Path(args.repo),
-        integration_branch=args.integration_branch,
         worktree=Path(args.worktree) if args.worktree else None,
-        digest=args.digest,
+        integration_branch=args.integration_branch,
         harnesses=tuple(args.harness),
     )
+
+
+def _print_checks(checks: list[preflight.Check]) -> None:
     for check in checks:
-        if check.passed is None:
+        if check.action is not None:
+            print(f"todo  {check.name}")
+            print(f"      -> --commit: {check.detail}")
+        elif check.passed is None:
             print(f"note  {check.name}")
         elif check.passed:
             print(f"ok    {check.name}")
         else:
             print(f"FAIL  {check.name}")
             print(f"      -> {check.detail}")
+
+
+def _preflight_verdict(checks: list[preflight.Check], *, owner: bool, brief: Path) -> int:
+    """The closing line and exit code. The owner's reading adds `ready` (only
+    todos left) and names the digest when nothing is."""
     failed = [check for check in checks if check.passed is False]
     if failed:
-        print(f"campaign preflight: {len(failed)} check(s) failed; every failure is a question to the owner")
+        if owner:
+            print(f"campaign preflight: {len(failed)} problem(s); fix the FAIL lines and run it again")
+        else:
+            print(f"campaign preflight: {len(failed)} check(s) failed; every failure is a question to the owner")
         return 1
-    compared = any(check.name == "brief.md matches the owner's digest" for check in checks)
-    print("campaign preflight: all checks passed" + ("" if compared else "; no owner digest was compared"))
+    if any(check.action is not None for check in checks):
+        print("ready: read brief.md once more as the contract, then run this command again with --commit")
+    elif owner:
+        print(f"campaign preflight: all checks passed; brief digest {preflight.sha256_of(brief)}")
+    else:
+        compared = any(check.name == "brief.md matches the owner's digest" for check in checks)
+        print("campaign preflight: all checks passed" + ("" if compared else "; no owner digest was compared"))
     return 0
+
+
+def _run_campaign_preflight(args: argparse.Namespace) -> int:
+    inputs = _preflight_inputs(args)
+    brief = inputs.dossier.expanduser().resolve() / "brief.md"
+
+    def run(**extra: object) -> list[preflight.Check]:
+        return preflight.campaign_preflight(
+            dossier=inputs.dossier,
+            repo=inputs.repo,
+            integration_branch=inputs.integration_branch,
+            worktree=inputs.worktree,
+            harnesses=inputs.harnesses,
+            **extra,
+        )
+
+    checks = run(digest=args.digest, owner=args.owner)
+    if not args.commit or any(check.passed is False for check in checks):
+        _print_checks(checks)
+        return _preflight_verdict(checks, owner=args.owner, brief=brief)
+
+    # --commit: the owner's reading found no failure, so run each todo's action in the order the
+    # checks listed them (the dossier's commit last), then check as the CM will at its first reconcile.
+    for check in checks:
+        if check.action is None:
+            continue
+        try:
+            check.action()
+        except PmError as exc:
+            print(f"FAIL  {check.detail}")
+            print(f"      -> {exc}")
+            return 1
+        print(f"done  {check.detail}")
+    digest = preflight.sha256_of(brief)
+    print("checking again as the CM will, with the committed brief's digest")
+    checks = run(digest=digest)
+    _print_checks(checks)
+    code = _preflight_verdict(checks, owner=False, brief=brief)
+    if code == 0:
+        print(f"brief digest {digest}")
+        if args.launcher:
+            preflight.write_launcher_digest(Path(args.launcher), digest)
+            print(f"wrote the digest to {args.launcher}")
+    return code
 
 
 def _run_wait_child(args: argparse.Namespace) -> int:
