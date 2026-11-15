@@ -591,6 +591,8 @@ def _run_check_plan(args: argparse.Namespace) -> int:
         print(f"{item['slice']}: risk {item['risk']}{why}")
     gated = ", ".join(report["approval_gated"]) if report["approval_gated"] else "none"
     print(f"{report['slice_count']} slice(s); approval-gated: {gated}")
+    if report["plan_level_sections"]:
+        print("outside every slice, so sent to no Developer or reviewer: " + "; ".join(report["plan_level_sections"]))
     _print_protected_line(policy, report)
     return 0
 

@@ -130,6 +130,8 @@ When the brief's `## Sandbox` section pins the dossier's `sandbox.json`, every c
 
 The capture-only runner skeleton ([evidence-runner.sh](evidence-runner.sh)) already carries a sparse-clone step, `require`, per-stage declared files and the heredoc exception for the clean-tree checks, so a runner adds none of them itself.
 
+A run longer than a harness's tool timeout is started through [detached-launch.py](detached-launch.py), copied into `nodes/<node>/` and pinned like the runner, never with `nohup` or `&`, which leave signals ignored and can change what an instrument measures; it writes a pid file, the only liveness check a sandboxed seat has.
+
 A check the CM reruns on the host, outside any sandbox, before a merge (a rebuild, a gate already measured by an evidence node) is the CM's own verification of a measurement a node already made, recorded in `work.md` with its command and commit, and never a receipt or a first measurement; the receipt comes only from an evidence node, and a measurement the sandbox cannot make is a question to the owner. The final evidence node's bundle is every receipt and every accepted node's verification entry, so acceptance's claims read is a lookup rather than a re-derivation.
 
 A receipt records: the measured product SHA, the instrument version, the configuration, the command, the outcome (pass, fail or error), and the artifact hashes. The artifacts it hashes are copied into `validation/<node>/artifacts/` at cleanup, because `git worktree remove` deletes the git-ignored output they sit in; a receipt whose artifact was not copied states that the artifact was not retained, so its hash is the only record.
@@ -151,7 +153,7 @@ A campaign is accepted on a final evidence node at the final integration head, a
 
 ## Worktrees and parallelism
 
-With `max_parallel: 1` in `brief.md`, nodes run serially. Going parallel is launching a second child before waiting on the first, under disjoint surfaces, with exclusive resources respected and merges still one at a time; the per-child tmux sockets and per-run ledgers already hold.
+With `max_parallel: 1` in `brief.md`, nodes run serially. That limits children, not planning: while a child runs, the CM may write and review the next node's plan (steps 3 and 4), and before launching it checks that plan again against the integration head the finished node left (judgement). Going parallel is launching a second child before waiting on the first, under disjoint surfaces, with exclusive resources respected and merges still one at a time; the per-child tmux sockets and per-run ledgers already hold.
 
 ## The campaign launcher
 

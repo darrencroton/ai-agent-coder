@@ -59,6 +59,7 @@ _TOP_LEVEL_ONLY_SURFACE_ENTRIES = {"*"}
 _DIFFICULTIES = frozenset({"easy", "moderate", "hard"})
 _CHECKBOX_RE = re.compile(r"^\s*- \[[ xX]\]", flags=re.MULTILINE)
 _SLICE_HEADING_RE = re.compile(r"^## Slice\s+(?P<number>\d+):\s*(?P<title>.+?)\s*$", flags=re.MULTILINE)
+_LEVEL2_HEADING_RE = re.compile(r"^## (?P<title>.*)$", flags=re.MULTILINE)
 _SLICE_LIKE_HEADING_RE = re.compile(
     r"^[ ]{0,3}#{1,6}\s+Slice(?:\s|:|\d|$)[^\n]*$",
     flags=re.IGNORECASE | re.MULTILINE,
@@ -537,6 +538,8 @@ def plan_check_report(path: Path, repo: Path | None = None, protected: list[str]
     entries are additionally linted against the worktree. When `protected`
     is given (normalized entries from `load_policy`), every valid authorized
     entry whose literal prefix overlaps a protected path is an error.
+    `plan_level_sections` lists the level-2 headings outside fenced blocks
+    that are not slice headings: text under them reaches no seat.
     """
     text = path.read_text(encoding="utf-8")
     slices = parse_plan(path)
@@ -630,6 +633,12 @@ def plan_check_report(path: Path, repo: Path | None = None, protected: list[str]
             "atomic slices in plan order and ignores batch groupings"
         )
 
+    plan_level_sections: list[str] = []
+    for match in _LEVEL2_HEADING_RE.finditer(masked_text):
+        title = match.group("title").strip()
+        if title and not _SLICE_HEADING_RE.fullmatch(match.group(0)) and title not in plan_level_sections:
+            plan_level_sections.append(title)
+
     return {
         "plan_path": str(path),
         "slice_count": len(slices),
@@ -637,6 +646,7 @@ def plan_check_report(path: Path, repo: Path | None = None, protected: list[str]
         "warnings": warnings,
         "approval_gated": approval_gated,
         "slice_risks": slice_risks,
+        "plan_level_sections": plan_level_sections,
         "protected_count": len(protected or []),
     }
 

@@ -32,6 +32,24 @@ class TestCheckPlanCleanAndMultiDefect(PlanTestCase):
         self.assertEqual(report["errors"], [])
         self.assertEqual(report["slice_count"], 2)
 
+    def test_plan_level_sections_outside_every_slice_are_named(self) -> None:
+        text = (
+            "# Plan\n\n"
+            "## Facts\n\nWritten above the slices.\n\n"
+            + render_slice(1)
+            + "```\n## Fenced\n```\n\n"
+            + render_slice(2)
+            + "### Not level two\n\n## Planning Receipt\n\nWritten after the last slice.\n"
+        )
+        path = self.repo / "plan.md"
+        path.write_text(text, encoding="utf-8")
+        report = plan_mod.plan_check_report(path)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["plan_level_sections"], ["Facts", "Planning Receipt"])
+        code, out, _err = self.run_cli(["check-plan", "--plan", str(path)])
+        self.assertEqual(code, 0)
+        self.assertIn("outside every slice, so sent to no Developer or reviewer: Facts; Planning Receipt\n", out)
+
     def test_multi_defect_plan_reports_every_error_at_once(self) -> None:
         text = (
             "# Plan\n\n"
