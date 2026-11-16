@@ -206,8 +206,11 @@ done < "$OUT/declared.txt"
 # atomically.
 files=$(cd "$OUT" && find . -type f ! -path ./manifest.sha256 ! -path ./manifest.tmp ! -path '*/.git/*' | sed 's|^\./||' | sort) || die "cannot list $OUT"
 nonempty find "$files"
-# shellcheck disable=SC2086 # files is a list of runner-written plain names, split on purpose
-(cd "$OUT" && shasum -a 256 $files > manifest.tmp) || die "cannot write the manifest"
+# The names go through xargs -0, never one command line: a capture of a few
+# thousand files exceeds ARG_MAX, and a manifest that fails then would lose
+# the whole measurement. NUL-separated, so a quote, backslash or space in a
+# copied product file's name is not parsed. xargs exits non-zero if any batch fails.
+(cd "$OUT" && printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 shasum -a 256 > manifest.tmp) || die "cannot write the manifest"
 count=$(wc -l < "$OUT/manifest.tmp" | tr -d ' ') || die "cannot count the manifest"
 mv "$OUT/manifest.tmp" "$OUT/manifest.sha256" || die "cannot write manifest.sha256"
 echo "run.sh: captured $count files, listed in $OUT/manifest.sha256"

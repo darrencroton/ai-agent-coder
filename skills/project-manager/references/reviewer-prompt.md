@@ -23,6 +23,7 @@ Task: apply the {skill_name} skill to the pinned change below and write your com
 
 Repository (read-only): {repo}
 Slice under review: {slice_id} - {slice_title}
+Plan file: {plan_path} (read it for the shared facts and conventions above the slices, which the contract below relies on)
 Reviewed range: {before_head}..{reviewed_head} (this exact range; the tree at {reviewed_head} is the state under review)
 Pinned diff file: {diff_path}
 Pinned changed files: 

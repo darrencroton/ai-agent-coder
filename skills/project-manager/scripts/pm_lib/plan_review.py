@@ -13,8 +13,9 @@ the clean-or-revise reading, whether a finding is right, and the dispositions
 written for the next round are the CM's judgement (VISION principle 2). What
 it does check is the evidence shape it hands back: a round whose delegate
 failed, timed out, broke its `SECTION:` contract, or returned an empty report
-or one that does not open with `RESULT: clean` or `RESULT: revise` is an
-error, so a broken round can never read as a review.
+or one without exactly one `RESULT: clean` or `RESULT: revise` line before
+its first `SECTION:` is an error, so a broken round can never read as a
+review. A status sentence before it is tolerated.
 
 Every round is a fresh request rather than an orchestrator continuation: the
 prior report and dispositions travel inline in `context`, which needs no
@@ -68,6 +69,25 @@ _RESULT_RE = re.compile(r"^RESULT: (clean|revise)\b")
 # hyphens in each part.
 _LABEL_UNSAFE_RE = re.compile(r"[^a-z0-9]+")
 
+
+def _result_line(report: str) -> str:
+    """The report's `RESULT: clean|revise` line, stripped, or "".
+
+    Only lines before the first `SECTION:` are read, so a status sentence
+    ahead of the result line is passed over and a result quoted inside the
+    findings never counts. Fail closed: exactly one line there may start with
+    `RESULT:`, and it must be `clean` or `revise`.
+    """
+    head = []
+    for raw in report.splitlines():
+        line = raw.strip()
+        if line.startswith("SECTION:"):
+            break
+        head.append(line)
+    results = [line for line in head if line.startswith("RESULT:")]
+    return results[0] if len(results) == 1 and _RESULT_RE.match(results[0]) else ""
+
+
 # The plan-review template's constraints and output contract
 # (skills/orchestrator/references/templates.md, *Plan review*), adapted to a
 # fresh request per round: the dispositions section answers the previous
@@ -107,9 +127,10 @@ def round_dir(node_dir: Path, number: int) -> Path:
 
 def _last_reported_round(node_dir: Path, before: int) -> Path | None:
     """The highest `round-<N>` below `before` whose delegate ended `completed`
-    (its recorded `status.json`) and whose `report.md` opens with a `RESULT:`
-    line, or None: a failed round keeps whatever came back as its report, so
-    neither a report nor a result line alone makes a round one to disposition."""
+    (its recorded `status.json`) and whose `report.md` has a result line
+    (`_result_line`), or None: a failed round keeps whatever came back as its
+    report, so neither a report nor a result line alone makes a round one to
+    disposition."""
     for number in range(before - 1, 0, -1):
         candidate = round_dir(node_dir, number)
         try:
@@ -117,8 +138,7 @@ def _last_reported_round(node_dir: Path, before: int) -> Path | None:
         except (OSError, ValueError):
             continue
         report = _read_optional(candidate / "report.md")
-        first = next((line.strip() for line in (report or "").splitlines() if line.strip()), "")
-        if isinstance(status, dict) and status.get("state") == "completed" and _RESULT_RE.match(first):
+        if isinstance(status, dict) and status.get("state") == "completed" and _result_line(report or ""):
             return candidate
     return None
 
@@ -234,9 +254,10 @@ def review_plan(
     `wait` that fails (the orchestrator fails it on `failed` and on
     `incomplete`, a clean exit whose output never met the `SECTION:`
     contract) or times out (the delegate is then cancelled), an empty report,
-    or one whose first non-blank line is not `RESULT: clean` or
-    `RESULT: revise`. Whatever came back is still written to `report.md`
-    first, so the CM can read it. The result is quoted, never interpreted.
+    or one without exactly one `RESULT: clean` or `RESULT: revise` line
+    before its first `SECTION:`. Whatever came back is still written to
+    `report.md` first, so the CM can read it. The result is quoted, never
+    interpreted.
     """
     node_dir = node.expanduser().resolve()
     if not node_dir.is_dir():
@@ -310,14 +331,16 @@ def review_plan(
             f"{where}: the delegate did not finish cleanly (state={status.get('state')}, "
             f"returncode={status.get('returncode')}){kept}"
         )
-    first = next((line.strip() for line in report_text.splitlines() if line.strip()), "")
-    if not first:
+    if not report_text.strip():
         raise PmError(f"{where}: the delegate's report is empty")
-    if not _RESULT_RE.match(first):
+    result_line = _result_line(report_text)
+    if not result_line:
+        first = next(line.strip() for line in report_text.splitlines() if line.strip())
         raise PmError(
-            f"{where}: the report does not open with RESULT: clean or RESULT: revise (got {first[:80]!r}){kept}"
+            f"{where}: the report has no single RESULT: clean or RESULT: revise line before its first SECTION: "
+            f"(it opens {first[:80]!r}){kept}"
         )
-    return ReviewRound(round_dir=this_round, label=label, result_line=first, report=report)
+    return ReviewRound(round_dir=this_round, label=label, result_line=result_line, report=report)
 
 
 def _status(step, run_dir: str, label: str) -> dict:

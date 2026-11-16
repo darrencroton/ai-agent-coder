@@ -248,10 +248,32 @@ class ReviewPlanLaunchTests(PlanReviewFixture):
         self.assertEqual(report.read_text(encoding="utf-8"), "I looked at it and it seems fine.\n")
 
     def test_a_report_without_a_result_line_fails(self) -> None:
-        self.configure(report="SECTION: FINDINGS\n- none\n")
+        for report in (
+            "SECTION: FINDINGS\n- none\n",
+            "SECTION: FINDINGS\n- quoted: RESULT: clean\nRESULT: clean\n",
+            "RESULT: clean\nRESULT: revise\nSECTION: FINDINGS\n- none\n",
+            "RESULT: blocked\nRESULT: clean\nSECTION: FINDINGS\n- none\n",
+        ):
+            with self.subTest(report=report):
+                self.configure(report=report)
+                with self.assertRaisesRegex(
+                    PmError, "no single RESULT: clean or RESULT: revise line before its first SECTION"
+                ):
+                    self.review()
 
-        with self.assertRaisesRegex(PmError, "does not open with RESULT"):
-            self.review()
+    def test_a_status_sentence_ahead_of_the_result_line_is_tolerated(self) -> None:
+        self.configure(
+            report="Review complete; findings below.\n\nRESULT: revise\nSECTION: FINDINGS\n- FIX Slice 1: x.\n"
+        )
+
+        first = self.review()
+        self.assertEqual(first.result_line, "RESULT: revise")
+
+        # Such a round is a reported round: the next one carries it forward.
+        self.configure(report="RESULT: clean\nSECTION: FINDINGS\n- none\n")
+        second = self.review()
+        context = json.loads((second.round_dir / "request.json").read_text())["context"]
+        self.assertIn("Review complete; findings below.", context)
 
     def test_the_cli_prints_the_round_label_result_and_report(self) -> None:
         self.configure(report="RESULT: revise\nSECTION: FINDINGS\n- FIX Slice 1: name the test.\n")

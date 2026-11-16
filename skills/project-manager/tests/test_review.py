@@ -351,6 +351,7 @@ class TestRenderReviewerPrompt(unittest.TestCase):
             repo="/repo",
             slice_id="Slice 3",
             slice_title="Do the thing",
+            plan_path="/repo/docs/plan.md",
             before_head="a" * 40,
             reviewed_head="b" * 40,
             diff_path="/x.patch",
@@ -375,6 +376,9 @@ class TestRenderReviewerPrompt(unittest.TestCase):
         self.assertIn("/repo", rendered)
         self.assertIn("Slice 3", rendered)
         self.assertIn("Do the thing", rendered)
+        # The plan file is named, so the reviewer can read what binds every
+        # slice above the slices themselves.
+        self.assertIn("Plan file: /repo/docs/plan.md", rendered)
         self.assertIn("a" * 40, rendered)
         self.assertIn("b" * 40, rendered)
         self.assertIn("review-input-code-review.patch", rendered)
@@ -388,7 +392,7 @@ class TestRenderReviewerPrompt(unittest.TestCase):
         self.assertIn("BEGIN EMBEDDED SKILL FILE:", rendered)
         self.assertIn("Use this as a required checklist", rendered)
         # No leftover unresolved placeholder field names.
-        for field in ("skill_name", "repo", "slice_id", "before_head", "reviewed_head", "diff_path"):
+        for field in ("skill_name", "repo", "slice_id", "plan_path", "before_head", "reviewed_head", "diff_path"):
             self.assertNotIn("{" + field + "}", rendered)
 
     def test_sandboxed_review_adds_only_the_sandbox_paragraph(self) -> None:
@@ -564,6 +568,7 @@ class TestRenderReviewerPrompt(unittest.TestCase):
                     repo="/repo",
                     slice_id="Slice 1",
                     slice_title="T",
+                    plan_path="/plan.md",
                     before_head="a",
                     reviewed_head="b",
                     diff_path="/x.patch",

@@ -510,6 +510,7 @@ class _Pinned:
     diff_error: str | None
     changed_files: list[str]
     plan_slice: plan_mod.PlanSlice
+    plan_path: str
     commissioned_grants: list[dict[str, Any]]
     drift_record: tuple[dict[str, Any], str] | None
     origin_event: dict[str, Any]
@@ -568,6 +569,7 @@ def _commission(pinned: _Pinned, seat: _Seat) -> ReviewOutcome | FailedCommissio
         repo=str(repo),
         slice_id=slice_id,
         slice_title=pinned.plan_slice.title,
+        plan_path=pinned.plan_path,
         before_head=pinned.before_head,
         reviewed_head=pinned.reviewed_head,
         diff_path=str(diff_path),
@@ -1052,6 +1054,7 @@ def run_review(
         diff_error=diff_error,
         changed_files=changed_files,
         plan_slice=plan_slice,
+        plan_path=str(state["plan"]["path"]),
         commissioned_grants=commissioned_grants,
         drift_record=(
             None

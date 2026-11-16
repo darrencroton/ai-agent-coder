@@ -111,6 +111,26 @@ class TestDeclaredFiles(EvidenceRunnerCase):
                 self.assertFalse((self.out / "manifest.sha256").exists())
                 shutil.rmtree(self.out)
 
+    def test_a_capture_whose_names_exceed_arg_max_still_gets_its_manifest(self) -> None:
+        """A capture of thousands of files must not fail at the manifest and lose the measurement."""
+        arg_max = int(subprocess.run(["getconf", "ARG_MAX"], text=True, capture_output=True, check=True).stdout)
+        # 200-character names: past ARG_MAX on one command line (capped for an unlimited stack).
+        count = min(arg_max // 200 + 100, 50_000)
+        step = (
+            "python3 -c 'import pathlib, sys\n"
+            'out = pathlib.Path(sys.argv[1]) / "many"\n'
+            "out.mkdir()\n"
+            "for i in range(int(sys.argv[2])):\n"
+            '    (out / (f"{i:06d}" + "x" * 194)).write_text("x")\n'
+            # Names copied from the product can hold quotes and spaces.
+            '(out / ("it" + chr(39) + "s here")).write_text("x")\n'
+            f'\' "$OUT" {count}\n'
+        )
+        result = self.run_steps(step)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.manifest_names(), self.written_files())
+        self.assertEqual(sum(1 for name in self.manifest_names() if name.startswith("many/")), count + 1)
+
 
 class TestRequire(EvidenceRunnerCase):
     def test_an_unmet_expected_value_stops_the_runner(self) -> None:

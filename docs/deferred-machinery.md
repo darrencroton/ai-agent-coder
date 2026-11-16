@@ -72,6 +72,15 @@ The reviews this document distils are the shakedown review (2026-10-25) and the 
 - **Revisit when:** a restart from another shell leaves a temp dir behind in a real campaign.
 - **History:** 2026-11-15 proposed (campaign owner setup plan) and held.
 
+### One home for a fact two node plans share
+
+- **Proposed:** a dossier convention or check so that a fact two node plans rely on (an output order, a schema) is written once and cited, never restated.
+- **Evidence:** lab-universe E7: the CM wrote the order of `verdicts.json`'s tests into two plans in two forms; each node's tests held its own literal order, so neither could see the other, and a figure would have pointed at the wrong tests. The CM's own cross-check caught it before the merge, and one change node (`wiring`) fixed it.
+- **Held because:** it is CM practice, not machinery, and a check would need to know which facts are shared; the CM's retrospective already records the lesson.
+- **Done instead:** nothing in the toolkit.
+- **Revisit when:** a second campaign loses a node to a restated cross-node fact.
+- **History:** 2026-11-17 proposed (lab-universe E7) and held.
+
 ---
 
 ## Closed
@@ -131,6 +140,11 @@ Proposals declined with a reason that does not depend on evidence growing. Each 
 
 - **Closed because:** the ledger is the toolkit's model-performance record, kept in the toolkit checkout by design (`PM_LEDGER_DIR`), survives worktree removal and is not campaign evidence.
 - **History:** 2026-10-25 declined (shakedown D7).
+
+### Claude Code's dangerous-`rm` dialog in an unattended child
+
+- **Closed because:** the toolkit has no lever on the harness's own prompt, and the harness resolved it safely (blocked after about two minutes; the child carried on) while the CM correctly left the human gate unanswered.
+- **History:** 2026-11-17 seen once in lab-universe (E6) and closed.
 
 ### Cosmetic, deferred until the code is next touched
 
