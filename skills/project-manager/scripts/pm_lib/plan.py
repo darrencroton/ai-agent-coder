@@ -58,7 +58,11 @@ _TOP_LEVEL_ONLY_SURFACE_ENTRIES = {"*"}
 
 _DIFFICULTIES = frozenset({"easy", "moderate", "hard"})
 _CHECKBOX_RE = re.compile(r"^\s*- \[[ xX]\]", flags=re.MULTILINE)
-_SLICE_HEADING_RE = re.compile(r"^## Slice\s+(?P<number>\d+):\s*(?P<title>.+?)\s*$", flags=re.MULTILINE)
+# A heading match ends on its own line (`[ \t\r]*$`, never `\s*$`): the text
+# after it is cut from the match's end, and `\s*` would run on through blank
+# lines, and through a fenced block once masking has blanked it.
+_SLICE_HEADING_RE = re.compile(r"^## Slice\s+(?P<number>\d+):\s*(?P<title>.+?)[ \t\r]*$", flags=re.MULTILINE)
+_SECTION_HEADING_RE = re.compile(r"^### (?P<name>.+?)[ \t\r]*$", flags=re.MULTILINE)
 _LEVEL2_HEADING_RE = re.compile(r"^## (?P<title>.*)$", flags=re.MULTILINE)
 _SLICE_LIKE_HEADING_RE = re.compile(
     r"^[ ]{0,3}#{1,6}\s+Slice(?:\s|:|\d|$)[^\n]*$",
@@ -94,9 +98,15 @@ class PlanSlice:
     def missing_sections(self) -> list[str]:
         return [section for section in REQUIRED_SECTIONS if not self.sections.get(section, "").strip()]
 
+    def _unfenced(self, section: str) -> str:
+        """Section `section` with its fenced code blocks blanked. The
+        mechanical readers use it, so a file list, flag line or checkbox
+        inside a fence is an example and never the slice's own."""
+        return mask_fenced_blocks(self.sections.get(section, ""))[0]
+
     @property
     def authorized_files(self) -> list[str]:
-        section = self.sections.get("Authorized Surface", "")
+        section = self._unfenced("Authorized Surface")
         # Capture the lines under "Files allowed to change:", stopping at the
         # next column-0 bullet (a sibling such as "Functions/... allowed to
         # change: none.", or any stray top-level bullet). Sub-bullets (the
@@ -123,7 +133,7 @@ class PlanSlice:
         """
         match = re.search(
             rf"^\s*(?:[-*+]\s*)?{label}\s*:\s*(?P<value>[^\n]+)",
-            self.sections.get("Risk Flags", ""),
+            self._unfenced("Risk Flags"),
             flags=re.IGNORECASE | re.MULTILINE,
         )
         return match.group("value").strip().lower().rstrip(".") if match else None
@@ -150,8 +160,7 @@ class PlanSlice:
     def criteria_total(self) -> int:
         """Count of `- [ ]` / `- [x]` checkbox lines in "Acceptance Criteria",
         outside fenced code blocks (an example checkbox is not a criterion)."""
-        masked, _unclosed = mask_fenced_blocks(self.sections.get("Acceptance Criteria", ""))
-        return len(_CHECKBOX_RE.findall(masked))
+        return len(_CHECKBOX_RE.findall(self._unfenced("Acceptance Criteria")))
 
     @property
     def risky_surfaces_clear(self) -> bool:
@@ -224,15 +233,24 @@ def verify_plan_unchanged(state: dict[str, Any], plan_path: Path) -> None:
 
 
 def parse_plan(path: Path) -> list[PlanSlice]:
+    """The plan's slices, in file order.
+
+    Headings are found in the text with fenced code blocks blanked, so a
+    line inside a fence (the `## main...origin/main` that opens `git status
+    -sb` output, a quoted `### ` label) neither ends a slice or section nor
+    starts one. Masking keeps every offset, so bodies and sections are cut
+    from the original text and reach a seat verbatim, fences included.
+    """
     text = path.read_text(encoding="utf-8")
-    headers = list(_SLICE_HEADING_RE.finditer(text))
+    masked, _unclosed = mask_fenced_blocks(text)
+    headers = list(_SLICE_HEADING_RE.finditer(masked))
     slices: list[PlanSlice] = []
     for index, header in enumerate(headers):
         start = header.end()
         end_candidates = []
         if index + 1 < len(headers):
             end_candidates.append(headers[index + 1].start())
-        next_non_slice_heading = re.search(r"^## (?!Slice\s+\d+:).+$", text[start:], flags=re.MULTILINE)
+        next_non_slice_heading = re.search(r"^## (?!Slice\s+\d+:).+$", masked[start:], flags=re.MULTILINE)
         if next_non_slice_heading:
             end_candidates.append(start + next_non_slice_heading.start())
         end = min(end_candidates) if end_candidates else len(text)
@@ -250,7 +268,8 @@ def parse_plan(path: Path) -> list[PlanSlice]:
 
 
 def parse_sections(body: str) -> dict[str, str]:
-    matches = list(re.finditer(r"^### (?P<name>.+?)\s*$", body, flags=re.MULTILINE))
+    masked, _unclosed = mask_fenced_blocks(body)
+    matches = list(_SECTION_HEADING_RE.finditer(masked))
     sections: dict[str, str] = {}
     for index, match in enumerate(matches):
         start = match.end()
@@ -332,30 +351,41 @@ def directory_surface_lint(entry: str, repo: Path) -> str | None:
 def mask_fenced_blocks(text: str) -> tuple[str, bool]:
     """Blank out fenced code blocks, preserving offsets and line structure.
 
-    Returns the masked text and whether a fence was left unclosed. Heading
-    scans compare against the masked text so a '## Slice ...' example inside
-    a fence is reported as ambiguous instead of being read as (or hidden
-    from) a machine-consumed heading.
+    A fence line opens with three or more backticks or tildes at any
+    indentation, so a fence inside a list item counts; it closes only on a
+    line indented at most three columns past its opener, so a fence quoted
+    inside a fenced example stays content. Returns the masked text and
+    whether a fence was left unclosed. Every heading, section and field scan
+    reads the masked text, so nothing inside a fence is machine-consumed;
+    `plan_check_report` still refuses a slice-like heading inside a fence and
+    an unclosed fence, because either may be planned work that the masking
+    would hide.
     """
     masked_lines: list[str] = []
-    fence: tuple[str, int] | None = None
+    fence: tuple[str, int, int] | None = None  # character, run length, indentation
     for line in text.split("\n"):
-        stripped = line.lstrip(" ")
-        indent = len(line) - len(stripped)
+        stripped = line.lstrip(" \t")
+        # In columns: a leading tab is four, so it cannot pass for a shallow indent.
+        indent = len(line[: len(line) - len(stripped)].expandtabs(4))
         marker: tuple[str, int, str] | None = None
-        if indent <= 3 and stripped[:3] in ("```", "~~~"):
+        if stripped[:3] in ("```", "~~~"):
             char = stripped[0]
             run = len(stripped) - len(stripped.lstrip(char))
-            marker = (char, run, stripped[run:].strip())
+            rest = stripped[run:].strip()
+            # As in CommonMark, a backtick fence's info string holds no
+            # backtick: a line that opens with inline code is not a fence.
+            if char != "`" or "`" not in rest:
+                marker = (char, run, rest)
         if fence is None:
             if marker:
-                fence = (marker[0], marker[1])
+                fence = (marker[0], marker[1], indent)
                 masked_lines.append(" " * len(line))
             else:
                 masked_lines.append(line)
         else:
             masked_lines.append(" " * len(line))
-            if marker and marker[0] == fence[0] and marker[1] >= fence[1] and not marker[2]:
+            closes = marker and marker[0] == fence[0] and marker[1] >= fence[1] and not marker[2]
+            if closes and indent <= fence[2] + 3:
                 fence = None
     return "\n".join(masked_lines), fence is not None
 
@@ -532,12 +562,13 @@ def plan_check_report(path: Path, repo: Path | None = None, protected: list[str]
     any harness launches, instead of mid-run at whichever slice carries it.
     Errors are conditions that would block a slice or hide work (missing
     sections, empty authorized surface, unclear approval flags, duplicate
-    numbers, fenced or malformed slice headings). Warnings are lint for
-    conditions PM cannot mechanically guard against mid-run (heuristic stop
-    surfaces, Mode-A-only plan features). When `repo` is given, authorized
-    entries are additionally linted against the worktree. When `protected`
-    is given (normalized entries from `load_policy`), every valid authorized
-    entry whose literal prefix overlaps a protected path is an error.
+    numbers, fenced or malformed slice headings, an unclosed fence). Warnings
+    are lint for conditions PM cannot mechanically guard against mid-run
+    (heuristic stop surfaces, Mode-A-only plan features). When `repo` is
+    given, authorized entries are additionally linted against the worktree.
+    When `protected` is given (normalized entries from `load_policy`), every
+    valid authorized entry whose literal prefix overlaps a protected path is
+    an error.
     `plan_level_sections` lists the level-2 headings outside fenced blocks
     that are not slice headings: text under them reaches no seat.
     """
@@ -560,8 +591,9 @@ def plan_check_report(path: Path, repo: Path | None = None, protected: list[str]
             continue
         if not masked_text[match.start() : match.end()].strip():
             errors.append(
-                f"slice-like heading {heading!r} sits inside a fenced code block; PM's parser reads "
-                "headings literally, so fenced examples can silently change the slice set — move or reword it"
+                f"slice-like heading {heading!r} sits inside a fenced code block, where PM's parser reads "
+                "nothing; reword it if it is an example, or fix the fence if it is planned work that would "
+                "be silently skipped"
             )
             continue
         if not _SLICE_HEADING_RE.fullmatch(heading):

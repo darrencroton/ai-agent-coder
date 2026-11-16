@@ -91,6 +91,16 @@ class PlanReviewFixture(PlanTestCase):
 
 
 class BuildRoundTests(PlanReviewFixture):
+    def test_a_fenced_level_two_line_does_not_cut_a_cited_decision(self) -> None:
+        (self.dossier / "decisions.md").write_text(
+            "## D2: Title\n- Decision: x\n\n```\n## main...origin/main\n```\nAFTER-THE-FENCE\n\n"
+            "## D3: Next\nONLY-IN-D3\n",
+            encoding="utf-8",
+        )
+        cited = plan_review._cited_decisions("This plan rests on D2.", self.dossier)
+        self.assertIn("AFTER-THE-FENCE", cited)
+        self.assertNotIn("ONLY-IN-D3", cited)
+
     def test_a_later_round_carries_the_plan_policy_cited_decision_and_prior_round(self) -> None:
         prior = plan_review.round_dir(self.node_dir, 1)
         prior.mkdir(parents=True)

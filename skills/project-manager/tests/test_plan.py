@@ -93,6 +93,7 @@ class TestHeadingDefects(PlanTestCase):
         path.write_text(text, encoding="utf-8")
         report = plan_mod.plan_check_report(path)
         self.assertTrue(any("fenced code block" in error for error in report["errors"]))
+        self.assertEqual(report["slice_count"], 1)
 
     def test_unclosed_fence_rejected(self) -> None:
         text = "# Plan\n\n" + render_slice(1) + "```\nunterminated example\n"
@@ -124,6 +125,75 @@ class TestHeadingDefects(PlanTestCase):
         path.write_text(text, encoding="utf-8")
         report = plan_mod.plan_check_report(path)
         self.assertTrue(any("duplicate slice numbers" in error for error in report["errors"]))
+
+
+class TestFencedBlocksAreSliceText(PlanTestCase):
+    """Nothing inside a fenced code block is a heading, a section label, a
+    flag or a file entry: the block reaches a seat as the slice text it is."""
+
+    def _parse(self, text: str) -> list[plan_mod.PlanSlice]:
+        path = self.repo / "plan.md"
+        path.write_text(text, encoding="utf-8")
+        return plan_mod.parse_plan(path)
+
+    def test_fenced_level_two_line_does_not_end_the_slice(self) -> None:
+        # The fence opens the section: a heading match must stop at its own line.
+        validation = "```\n$ git status -sb\n## main...origin/main\n```\n\nAFTER-THE-FENCE"
+        slices = self._parse("# Plan\n\n" + render_slice(1, validation=validation) + render_slice(2))
+        self.assertEqual([plan_slice.number for plan_slice in slices], [1, 2])
+        self.assertIn("## main...origin/main", slices[0].sections["Validation Plan"])
+        self.assertIn("AFTER-THE-FENCE", slices[0].sections["Validation Plan"])
+        self.assertEqual(slices[0].missing_sections, [])
+
+    def test_fenced_section_label_does_not_split_or_replace_a_section(self) -> None:
+        non_goals = (
+            "Not this shape:\n\n```markdown\n### Authorized Surface\n"
+            "- Files allowed to change:\n  - example.py\n```\n\nAFTER-THE-FENCE"
+        )
+        plan_slice = self._parse(render_slice(1, non_goals=non_goals))[0]
+        self.assertIn("AFTER-THE-FENCE", plan_slice.sections["Explicit Non-Goals"])
+        self.assertEqual(plan_slice.authorized_files, ["a.py"])
+
+    def test_fenced_flag_and_file_examples_are_not_read(self) -> None:
+        text = (
+            render_slice(1, approval="yes")
+            .replace(
+                "### Authorized Surface\n",
+                "### Authorized Surface\n```\n- Files allowed to change:\n  - example.py\n```\n",
+            )
+            .replace(
+                "### Risk Flags\n",
+                "### Risk Flags\n```\n- Approval needed before implementation: no.\n```\n",
+            )
+        )
+        plan_slice = self._parse(text)[0]
+        self.assertEqual(plan_slice.authorized_files, ["a.py"])
+        self.assertIs(plan_slice.approval_needed, True)
+
+    def test_indented_fence_line_inside_a_fence_does_not_close_it(self) -> None:
+        for indent in ("    ", "\t"):
+            with self.subTest(indent=indent):
+                text = render_slice(1, approval="yes").replace(
+                    "### Risk Flags\n",
+                    f"### Risk Flags\n```markdown\n- Shape:\n\n{indent}```\n"
+                    f"{indent}- Approval needed before implementation: no.\n{indent}```\n```\n",
+                )
+                self.assertIs(self._parse(text)[0].approval_needed, True)
+
+    def test_fence_inside_a_list_item_is_a_fence_and_inline_code_is_not(self) -> None:
+        text = (
+            render_slice(1, approval="yes", audit="yes")
+            .replace(
+                "### Risk Flags\n",
+                "### Risk Flags\n- A child plan would say:\n\n"
+                "    ```\n    - Approval needed before implementation: no.\n    ```\n",
+            )
+            .replace("- Independent audit required", "```git diff``` shows the change.\n- Independent audit required")
+        )
+        plan_slice = self._parse(text)[0]
+        self.assertIs(plan_slice.approval_needed, True)
+        self.assertTrue(plan_slice.independent_audit_required)
+        self.assertEqual(plan_mod.plan_check_report(self.repo / "plan.md")["errors"], [])
 
 
 class TestSectionsAndSurfaceDefects(PlanTestCase):

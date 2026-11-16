@@ -58,7 +58,8 @@ DEFAULT_TIMEOUT_SECONDS = 3600.0
 # How much of a failed step's output an error quotes.
 _TAIL_CHARS = 2000
 
-# A `## D<n>: <title>` entry in decisions.md runs to the next level-2 heading.
+# A `## D<n>: <title>` entry in decisions.md runs to the next level-2 heading
+# outside a fenced code block.
 _DECISION_HEADING_RE = re.compile(r"^## D(\d+):", re.MULTILINE)
 _LEVEL2_HEADING_RE = re.compile(r"^## ", re.MULTILINE)
 _DECISION_CITE_RE = re.compile(r"\bD(\d+)\b")
@@ -340,10 +341,15 @@ def _cited_decisions(plan_text: str, dossier: Path) -> str:
     if not cited or decisions is None:
         return ""
     entries = []
-    for heading in _DECISION_HEADING_RE.finditer(decisions):
+    # An unclosed fence would blank every later entry, so the file is then
+    # read literally, as it was before fences were recognised.
+    masked, unclosed = plan_mod.mask_fenced_blocks(decisions)
+    if unclosed:
+        masked = decisions
+    for heading in _DECISION_HEADING_RE.finditer(masked):
         if int(heading.group(1)) not in cited:
             continue
-        following = _LEVEL2_HEADING_RE.search(decisions, heading.end())
+        following = _LEVEL2_HEADING_RE.search(masked, heading.end())
         entries.append(decisions[heading.start() : following.start() if following else len(decisions)].strip())
     return "\n\n".join(entries)
 
