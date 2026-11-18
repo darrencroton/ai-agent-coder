@@ -142,6 +142,16 @@ class TestRenderAnswerPointer(unittest.TestCase):
             self.assertEqual(rendered, "CUSTOM_ANSWER_MARKER_7c55 read /p/answer-1.md")
 
 
+class TestRenderNotePointer(unittest.TestCase):
+    def test_single_line_pointer_names_the_note_path_and_states_frozen_contract(self) -> None:
+        rendered = prompts.render_note_pointer(Path("/w/.pm/campaign/cm-note-1.md"))
+        self.assertNotIn("\n", rendered)
+        self.assertIn("/w/.pm/campaign/cm-note-1.md", rendered)
+        self.assertNotIn("{note_path}", rendered)
+        self.assertIn("frozen contract", rendered)
+        self.assertIn("never widens your authorized surface", rendered)
+
+
 class TestRenderLaunchPointer(unittest.TestCase):
     def test_single_line_pointer_names_the_contract_path(self) -> None:
         rendered = prompts.render_launch_pointer(Path("/runs/x/slices/slice-001/prompt.md"))

@@ -357,7 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
     answer_child = subparsers.add_parser(
         "answer-child",
         help="Answer the child PM's open question (cm-question.md): writes cm-answer-<n>.md, archives the "
-        "question as cm-question-<n>.md, and sends a one-line pointer into the child's session",
+        "question as cm-question-<n>.md, and sends a one-line pointer into the child's session; --redeliver, "
+        "--follow-up and --note re-send the last answer, follow it up, or send a note when no question is open",
     )
     answer_child.add_argument("--worktree", required=True, metavar="PATH", help="the node worktree")
     answer_child_mode = answer_child.add_mutually_exclusive_group(required=True)
@@ -375,6 +376,13 @@ def build_parser() -> argparse.ArgumentParser:
         "verbatim through cm-answer-<n>-followup-<k>.md with the same one-line pointer; refused when a new question "
         "is open (use --text), the completion file exists, the text is blank or there is no answer; one that did "
         "not land is sent again with another --follow-up",
+    )
+    answer_child_mode.add_argument(
+        "--note",
+        metavar="TEXT",
+        help="a message that answers no question (the child is waiting on something that will not signal), "
+        "delivered verbatim through cm-note-<k>.md with a one-line pointer; refused when a question is open "
+        "(use --text), the completion file exists or the text is blank",
     )
 
     stop_child = subparsers.add_parser(
@@ -925,14 +933,17 @@ def _print_no_signal_note(outcome, actions: str) -> None:
         )
 
 
-def _print_delivery(delivered: bool) -> None:
-    """The one line saying whether a pointer's Enter visibly reached the pane (`sessions.Delivery`)."""
+def _print_delivery(delivered: bool, *, resend: str = "--redeliver") -> None:
+    """The one line saying whether a pointer's Enter visibly reached the pane (`sessions.Delivery`).
+
+    `resend` is what to run when the child did not react: `--redeliver` where that re-sends the message.
+    """
     if delivered:
         print("delivery: confirmed")
     else:
         print(
             "delivery: unconfirmed (the pane did not change after Enter; re-check with observe/wait-child, "
-            "then --redeliver if the child did not react)"
+            f"then {resend} if the child did not react)"
         )
 
 
@@ -1548,16 +1559,25 @@ def _run_wait_child(args: argparse.Namespace) -> int:
 
 def _run_answer_child(args: argparse.Namespace) -> int:
     outcome = campaign.answer_child(
-        Path(args.worktree), text=args.text, redeliver=args.redeliver, follow_up=args.follow_up
+        Path(args.worktree), text=args.text, redeliver=args.redeliver, follow_up=args.follow_up, note=args.note
     )
     if args.redeliver:
         print(f"redelivered: {outcome.answer_path}")
     elif args.follow_up is not None:
         print(f"follow-up: {outcome.answer_path} (to answer {outcome.answer_number})")
+    elif args.note is not None:
+        print(f"note: {outcome.answer_path}")
     else:
         print(f"answered: {outcome.answer_path}")
         print(f"question archived: {outcome.question_archived_path}")
-    _print_delivery(outcome.delivered)
+    resend = (
+        "send another --follow-up"
+        if args.follow_up is not None
+        else "send another --note"
+        if args.note is not None
+        else "--redeliver"
+    )
+    _print_delivery(outcome.delivered, resend=resend)
     return 0
 
 

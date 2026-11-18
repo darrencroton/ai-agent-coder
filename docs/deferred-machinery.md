@@ -26,7 +26,7 @@ The reviews this document distils are the shakedown review (2026-10-25) and the 
 - **Held because:** one campaign's shape. A ratchet at every head is sage26's method, and the generator took the CM a day to write in the dossier. A toolkit node kind, a template digest and a substitution-diff review are a new concept with its own state, and principle 9 says no mechanism for a need one campaign has shown.
 - **Done instead:** the contract now allows the review shape without the tooling: a node generated from a template the owner approved passes the plan-review rule with the template reviewed once and its substitution diff recorded as the instance's review (`references/campaign-mode.md` *Nodes*). The generator stays a dossier script.
 - **Revisit when:** a second campaign writes the same generator, or a campaign's templated nodes again outnumber its change nodes. The design then starts from sage26's `make_rnode.py` and `rnode_receipt.py` in its dossier.
-- **History:** 2026-11-08 proposed (sage26 item 8); 2026-11-09 held, contract clause written.
+- **History:** 2026-11-08 proposed (sage26 item 8); 2026-11-09 held, contract clause written; 2026-11-18 lab-families derived N16 and N17 by hand from the reviewed runners and plans of N13 and N14, which cut their plan reviews to two rounds each; no generator was written, so the trigger is not met.
 
 ### Host-check receipts: `pm.py host-check <runner> --at <commit>`
 
@@ -80,6 +80,24 @@ The reviews this document distils are the shakedown review (2026-10-25) and the 
 - **Done instead:** nothing in the toolkit.
 - **Revisit when:** a second campaign loses a node to a restated cross-node fact.
 - **History:** 2026-11-17 proposed (lab-universe E7) and held.
+
+### Observe waking on a Developer idle at its prompt
+
+- **Proposed:** `observe` and `wait-child` return when a Developer sits idle at its prompt after a commit with no `result.json`, instead of only when the wait runs out.
+- **Evidence:** lab-families E6 and D5: one incident in the six campaigns searched (shakedown, shakedown2, sage26, lab-physics, lab-universe, lab-families), about 20 minutes lost while the child PM waited with no signal.
+- **Held because:** detecting idle means reading each harness's screen, and every supported harness stays eligible for every seat (principle 9 allows no mechanism for a need one campaign has shown).
+- **Done instead:** `answer-child --note`, which makes the existing no-signal return actionable: the CM can tell the child that its Developer stopped without its result file.
+- **Revisit when:** a second campaign loses time to a Developer that stopped without its result file.
+- **History:** 2026-11-18 proposed (lab-families E6, D5) and held.
+
+### A controls gate in the evidence-runner skeleton
+
+- **Proposed:** the skeleton runs every control, writes a gate file, and runs the confirming phase only when every control status is zero.
+- **Evidence:** lab-families N13: the CM's own runner did this.
+- **Held because:** the skeleton is capture-only and judges capture, never outcome; it is one campaign's runner; and the cause of the audit failures, controls missing at the wrong grain, is answered by the *Trust before use* text in `references/campaign-mode.md` *Validation*.
+- **Done instead:** that text.
+- **Revisit when:** a second campaign writes the same gate into its runner.
+- **History:** 2026-11-18 proposed (lab-families N13) and held.
 
 ---
 
@@ -145,6 +163,16 @@ Proposals declined with a reason that does not depend on evidence growing. Each 
 
 - **Closed because:** the toolkit has no lever on the harness's own prompt, and the harness resolved it safely (blocked after about two minutes; the child carried on) while the CM correctly left the human gate unanswered.
 - **History:** 2026-11-17 seen once in lab-universe (E6) and closed.
+
+### An evidence-runner collect step that copies every file a comparison lists as DIFFERENT
+
+- **Closed because:** the runner owns its capture list, and the skeleton cannot know a product's comparisons.
+- **History:** 2026-11-18 declined (lab-families N11, where the CM copied the files afterwards).
+
+### A plan criterion that names a target verdict
+
+- **Closed because:** target verdicts are the CM's by the brief, and a plan asks for measurements; this is CM practice, settled in one answer.
+- **History:** 2026-11-18 declined (lab-families D17).
 
 ### Cosmetic, deferred until the code is next touched
 

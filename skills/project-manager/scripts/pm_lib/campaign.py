@@ -100,6 +100,8 @@ _OWNED_SESSION_RE = re.compile(r"^(campaign|pm)-")
 _ANSWER_FILE_RE = re.compile(r"^cm-answer-(\d+)\.md$")
 # Matches `cm-answer-<n>-followup-<k>.md`; `answer-child --follow-up` numbers its next from these.
 _FOLLOWUP_FILE_RE = re.compile(r"^cm-answer-(\d+)-followup-(\d+)\.md$")
+# Matches `cm-note-<k>.md`; `answer-child --note` numbers its next from these.
+_NOTE_FILE_RE = re.compile(r"^cm-note-(\d+)\.md$")
 # The server-environment mark `launch-child` sets on a child's server: the
 # worktree it was launched for. `stop-child` kills no server without it.
 _OWNER_ENV_VAR = "PM_CHILD_WORKTREE"
@@ -1208,9 +1210,12 @@ def wait_child(worktree: Path, *, wait: float | None = None, seen_markers: Seque
 
 @dataclass
 class AnswerChildOutcome:
+    # The file the pointer names: the answer, the follow-up or the note.
     answer_path: Path
-    question_archived_path: Path
-    answer_number: int
+    # None for a note, which answers no question.
+    question_archived_path: Path | None = None
+    # The answer a follow-up or a re-send belongs to; None for a note.
+    answer_number: int | None = None
     # False when the pane did not change after the pointer's Enter (see `sessions.Delivery`).
     delivered: bool = True
 
@@ -1221,8 +1226,9 @@ def answer_child(
     text: str | None = None,
     redeliver: bool = False,
     follow_up: str | None = None,
+    note: str | None = None,
 ) -> AnswerChildOutcome:
-    """Deliver the CM's answer to the child's open `cm-question.md`, re-send the last one, or follow it up.
+    """Deliver the CM's answer to the child's open `cm-question.md`, re-send the last one, follow it up, or send a note.
 
     With `text`: refused, before any file is touched, with no live session, no
     open question, a completion file already present, or blank text. Delivery
@@ -1243,10 +1249,16 @@ def answer_child(
     with `text`), a completion file, blank text, or no answer to follow up.
     A follow-up that did not land is sent again as another `follow_up`, not
     with `redeliver`, which re-sends the answer and not the follow-ups.
+
+    With `note` (and no other mode): a message that answers no question, for a
+    child that is waiting on something that will not signal. It is a new file,
+    `cm-note-<k>.md`, numbered apart from the answers, and the pointer names
+    it. Refused, before any file is touched, with no live session, an open
+    `cm-question.md` (answer it with `text`), a completion file, or blank text.
     """
-    if [text is not None, redeliver, follow_up is not None].count(True) != 1:
+    if [text is not None, redeliver, follow_up is not None, note is not None].count(True) != 1:
         raise PmError(
-            "answer-child takes exactly one of --text (answer the open question), --redeliver and --follow-up"
+            "answer-child takes exactly one of --text (answer the open question), --redeliver, --follow-up and --note"
         )
     worktree = worktree.expanduser().resolve()
     manifest = load_manifest(worktree)
@@ -1261,6 +1273,8 @@ def answer_child(
             return _redeliver_answer(worktree, directory, session)
         if follow_up is not None:
             return _follow_up_answer(worktree, directory, session, follow_up)
+        if note is not None:
+            return _note_child(worktree, directory, session, note)
         assert text is not None
         if not pm_paths.pm_file_present(worktree, question_path):
             raise PmError(f"no open child question: {question_path} does not exist")
@@ -1281,7 +1295,7 @@ def answer_child(
 def _refuse_if_child_finished(worktree: Path, result_path: Path) -> None:
     if pm_paths.pm_file_present(worktree, result_path):
         raise PmError(
-            f"the child has written its completion file ({result_path}); an answer cannot reach a finished run"
+            f"the child has written its completion file ({result_path}); a message cannot reach a finished run"
         )
 
 
@@ -1331,29 +1345,57 @@ def _follow_up_answer(worktree: Path, directory: Path, session: str, text: str) 
         int(match.group(2)) for match in map(_FOLLOWUP_FILE_RE.match, names) if match and int(match.group(1)) == number
     ]
     follow_up_path = directory / f"cm-answer-{number}-followup-{max(followups, default=0) + 1}.md"
-    try:
-        pm_paths.write_pm_text(worktree, follow_up_path, text, exclusive=True)
-    except FileExistsError as exc:
-        raise PmError(
-            f"{follow_up_path} already exists; the follow-up numbering is off — read the files by hand"
-        ) from exc
-    try:
-        delivery = sessions.send_line(session, prompts.render_answer_pointer(follow_up_path))
-    except TypedNotSubmitted:
-        # The pointer is typed in the child's input line: removing the file it
-        # names would leave it dangling (the rule `deliver_answer` follows).
-        raise
-    except PmError:
-        # Nothing was typed, so the file points nowhere the child will look;
-        # removing it keeps the next follow-up's number free.
-        follow_up_path.unlink(missing_ok=True)
-        raise
+    pointer = prompts.render_answer_pointer(follow_up_path)
+    delivery = _write_and_send_pointer(worktree, session, follow_up_path, text, pointer, "follow-up")
     return AnswerChildOutcome(
         answer_path=follow_up_path,
         question_archived_path=directory / f"cm-question-{number}.md",
         answer_number=number,
         delivered=bool(delivery.confirmed),
     )
+
+
+def _write_and_send_pointer(
+    worktree: Path, session: str, path: Path, text: str, pointer: str, label: str
+) -> sessions.Delivery:
+    """Write `text` exclusively to `path`, then send `pointer` (one line naming it) into the child's session.
+
+    `label` names the kind of file in the numbering error. A pointer typed but
+    not submitted keeps the file, which the typed line names; any other send
+    failure removes it, so its number stays free.
+    """
+    try:
+        pm_paths.write_pm_text(worktree, path, text, exclusive=True)
+    except FileExistsError as exc:
+        raise PmError(f"{path} already exists; the {label} numbering is off — read the files by hand") from exc
+    try:
+        return sessions.send_line(session, pointer)
+    except TypedNotSubmitted:
+        # The pointer is typed in the child's input line: removing the file it
+        # names would leave it dangling (the rule `deliver_answer` follows).
+        raise
+    except PmError:
+        # Nothing was typed, so the file points nowhere the child will look;
+        # removing it keeps the next number free.
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _note_child(worktree: Path, directory: Path, session: str, text: str) -> AnswerChildOutcome:
+    """Write and send a note to the child; `answer_child` has checked the session."""
+    question_path = directory / "cm-question.md"
+    if pm_paths.pm_file_present(worktree, question_path):
+        raise PmError(f"{question_path} is open: a question is waiting, answer it with --text rather than a note")
+    _refuse_if_child_finished(worktree, directory / "child-result.json")
+    if not text.strip():
+        raise PmError("--note text must be non-empty (there is nothing to deliver)")
+    names = [path.name for path in directory.glob("cm-note-*.md")]
+    notes = [int(match.group(1)) for match in map(_NOTE_FILE_RE.match, names) if match]
+    note_path = directory / f"cm-note-{max(notes, default=0) + 1}.md"
+    delivery = _write_and_send_pointer(
+        worktree, session, note_path, text, prompts.render_note_pointer(note_path), "note"
+    )
+    return AnswerChildOutcome(answer_path=note_path, delivered=bool(delivery.confirmed))
 
 
 # --- stop-child -----------------------------------------------------------------

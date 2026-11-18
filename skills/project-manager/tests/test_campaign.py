@@ -231,7 +231,7 @@ class TestCampaignParsers(unittest.TestCase):
             "--sandbox",
         },
         "wait-child": {"--worktree", "--wait", "--seen-marker"},
-        "answer-child": {"--worktree", "--text", "--redeliver", "--follow-up"},
+        "answer-child": {"--worktree", "--text", "--redeliver", "--follow-up", "--note"},
         "stop-child": {"--worktree", "--reason", "--archive"},
     }
 
@@ -1574,7 +1574,7 @@ class TestAnswerChildDelivery(CampaignTestCase):
             path = self.directory / f"cm-answer-1-followup-{k}.md"
             self.assertEqual(path.read_text(encoding="utf-8"), f"and also B{k}")
             self.assertIn(f"follow-up: {path} (to answer 1)", out)
-            self.assertIn("delivery: ", out)
+            self.assertIn("then send another --follow-up if the child did not react)", out)
             pointer = self.followup_pointer(1, k)
             self.assertTrue(self._wait_for(lambda seen=pointer: seen in self.inputs()), self.inputs())
         # The answer is untouched and `--redeliver` still resolves to it, not to a follow-up.
@@ -1617,6 +1617,58 @@ class TestAnswerChildDelivery(CampaignTestCase):
                 self.assertEqual(code, 2, err)
         with self.assertRaises(PmError):
             campaign.answer_child(self.worktree, text="A", follow_up="x")
+
+    def note_pointer(self, k: int) -> str:
+        return prompts.render_note_pointer(self.directory / f"cm-note-{k}.md")
+
+    def test_note_writes_a_numbered_file_and_sends_its_pointer_with_no_question(self) -> None:
+        for k in (1, 2):
+            text = f"the result file is not coming, N{k}\nnudge your Developer"
+            code, out, err = self.run_cli([*self.argv, "--note", text])
+            self.assertEqual(code, 0, out + err)
+            path = self.directory / f"cm-note-{k}.md"
+            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            self.assertIn(f"note: {path}", out)
+            self.assertIn("then send another --note if the child did not react)", out)
+            self.assertNotIn("question archived", out)
+            pointer = self.note_pointer(k)
+            self.assertTrue(self._wait_for(lambda seen=pointer: seen in self.inputs()), self.inputs())
+        self.assertEqual(self.files(), ["cm-note-1.md", "cm-note-2.md"])
+        self.assert_socket_untouched()
+
+    def test_note_refusals_touch_nothing(self) -> None:
+        # An open question wants --text, not a note.
+        (self.directory / "cm-question.md").write_text("which?\n", encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--note", "x"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("answer it with --text", err)
+        (self.directory / "cm-question.md").unlink()
+        # A finished child cannot be reached.
+        (self.directory / "child-result.json").write_text(_RESULT_JSON, encoding="utf-8")
+        code, out, err = self.run_cli([*self.argv, "--note", "x"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("completion file", err)
+        (self.directory / "child-result.json").unlink()
+        # Blank text.
+        code, out, err = self.run_cli([*self.argv, "--note", "  "])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("must be non-empty", err)
+        self.assertEqual(self.files(), [])
+        time.sleep(1.0)
+        self.assertNotIn(self.note_pointer(1), self.inputs())
+
+    def test_a_note_refused_before_anything_is_typed_leaves_no_file(self) -> None:
+        with mock.patch.object(campaign.sessions, "send_line", side_effect=PmError("refusing to send into a dialog")):
+            code, out, err = self.run_cli([*self.argv, "--note", "x"])
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("refusing to send into a dialog", err)
+        self.assertEqual(self.files(), [])
+
+    def test_note_is_exclusive_with_the_other_modes(self) -> None:
+        code, _out, err = self.run_cli([*self.argv, "--text", "A", "--note", "x"])
+        self.assertEqual(code, 2, err)
+        with self.assertRaises(PmError):
+            campaign.answer_child(self.worktree, text="A", note="x")
 
 
 @unittest.skipUnless(_HAS_TMUX, "tmux is required to host the marked server")

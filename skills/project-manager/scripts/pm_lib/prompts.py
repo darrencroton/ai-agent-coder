@@ -53,6 +53,7 @@ _SANDBOX_MARKER_PREFIX_RE = re.compile(r"\[/?sandboxed")
 _STEER_MESSAGE_HEADING = "## Steer Message Template"
 _LAUNCH_POINTER_HEADING = "## Launch Pointer"
 _ANSWER_POINTER_HEADING = "## Answer Pointer"
+_NOTE_POINTER_HEADING = "## Note Pointer"
 _CHILD_LAUNCH_POINTER_HEADING = "## Child Launch Pointer"
 
 
@@ -267,6 +268,22 @@ def render_answer_pointer(answer_path: Path, *, reference_path: Path | None = No
     path = reference_path or _DEFAULT_REFERENCE_PATH
     template = load_template(path, heading=_ANSWER_POINTER_HEADING)
     return _render(template, path, "answer pointer", answer_path=str(answer_path))
+
+
+def render_note_pointer(note_path: Path, *, reference_path: Path | None = None) -> str:
+    """Render the one-line pointer that tells a live child PM session to read
+    its Campaign Manager's note from `note_path`.
+
+    The note is written verbatim to `note_path` for the reason an answer is
+    (see `render_answer_pointer`): it may be multi-line, and no harness TUI is
+    trusted with such a paste. Wording is sourced from the "## Note Pointer"
+    section of `references/developer-prompt.md` so it lives in exactly one
+    place. The result must be one line — `sessions.send_line` rejects a
+    newline.
+    """
+    path = reference_path or _DEFAULT_REFERENCE_PATH
+    template = load_template(path, heading=_NOTE_POINTER_HEADING)
+    return _render(template, path, "note pointer", note_path=str(note_path))
 
 
 def render_child_launch_pointer(launcher_path: Path, *, reference_path: Path | None = None) -> str:

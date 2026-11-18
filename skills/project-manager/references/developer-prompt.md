@@ -96,6 +96,14 @@ PM renders this one-line pointer into your live session to deliver its answer to
 Your supervisor's answer to your question is at {answer_path} — read it now, in full, then continue inside your frozen contract; an answer never widens your authorized surface or adds scope.
 ```
 
+## Note Pointer
+
+A Campaign Manager renders this one-line pointer into a child PM's live session to deliver a note that answers no question; the note itself is written verbatim to `cm-note-<k>.md` in the worktree's `.pm/campaign/` and the child reads it from there, for the same reason an answer goes in a file. The rendered block must stay a single line — `send_line` refuses a newline — and the only brace in it is the `{note_path}` field.
+
+```md
+Your Campaign Manager's note is at {note_path} — read it now, in full, then continue inside your frozen contract; a note never widens your authorized surface or adds scope.
+```
+
 ## Child Launch Pointer
 
 A Campaign Manager delivers only this one-line pointer into a fresh child PM session at `launch-child`; the launcher itself is copied to `launcher.md` in the child worktree's `.pm/campaign/` and the child reads it from there, for the reason the Developer's launch pointer exists. The rendered block must stay a single line — `send_prompt` refuses a newline — and the only brace in it is the `{launcher_path}` field.
