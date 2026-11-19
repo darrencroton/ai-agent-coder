@@ -79,6 +79,8 @@ nodes/*/reviews/*/orchestrator/
 
 For a documentation target in the Targets table, each measured statement names its record (the receipt or evidence entry) as it is written, so the acceptance claims read is a lookup.
 
+A target whose findings quote numbers says which of them need a controlled instrument: those a target or verdict rests on. The campaign's own record (run times, review rounds, questions, change sizes) is quoted from `pm dossier counts`, so a brief that makes every quoted number an instrument makes each of those one too ([campaign-mode.md](campaign-mode.md) *Trust before use*). A brief whose verdicts rest on confirming runs names the data they hold out (*A holdout stays unseen*).
+
 ## `work.md`
 
 ```md
@@ -169,7 +171,7 @@ The acceptance-criteria lines an evidence slice uses with [evidence-runner.sh](e
 
 ```md
 - [ ] The Developer checked the runner's SHA-256 against the plan's pin before running it, and recorded the check.
-- [ ] The runner ran once, from the node worktree root, and exited 0; `shasum -a 256 -c manifest.sha256` in the output directory reports every listed file OK, N of N.
+- [ ] The runner ran once, from the node worktree root, and exited 0, as its `<output dir>.exit` record says; `shasum -a 256 -c manifest.sha256` in the output directory reports every listed file OK, N of N.
 - [ ] The report quotes each step's `.status` verbatim and the tail of each named log verbatim.
 - [ ] The measured SHA in `context.txt` is distinct from the commit that adds the report.
 - [ ] A runner exit of 2 is recorded as such, the measurement is not used, and the run stops.

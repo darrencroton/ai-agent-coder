@@ -12,9 +12,12 @@ skeleton when it is installed.
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -51,15 +54,22 @@ class EvidenceRunnerCase(PlanTestCase):
     def _git(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["git", "-C", str(self.repo), *args], check=True, text=True, capture_output=True)
 
-    def run_steps(self, steps: str) -> subprocess.CompletedProcess:
-        """Install the skeleton with `steps` as its measurements and run it."""
+    def install_steps(self, steps: str) -> None:
+        """Install the skeleton as `run.sh` with `steps` as its measurements."""
         text = SKELETON.read_text(encoding="utf-8")
         text = text.replace("OUT=output/REPLACE_NODE_ID", f"OUT=output/{NODE_ID}")
         text = text.replace("EXPECTED_HEAD=REPLACE_WITH_THE_MEASURED_PRODUCT_SHA", f"EXPECTED_HEAD={self.head}")
         start = text.index(_BEGIN) + len(_BEGIN)
         text = text[:start] + steps + "\n" + text[text.index(_END) :]
         (self.repo / "run.sh").write_text(text, encoding="utf-8")
+
+    def run_steps(self, steps: str) -> subprocess.CompletedProcess:
+        """Install the skeleton with `steps` as its measurements and run it."""
+        self.install_steps(steps)
         return subprocess.run(["sh", "run.sh"], cwd=self.repo, text=True, capture_output=True, check=False)
+
+    def exit_file(self) -> Path:
+        return self.repo / "output" / f"{NODE_ID}.exit"
 
     def manifest_names(self) -> list[str]:
         lines = (self.out / "manifest.sha256").read_text(encoding="utf-8").splitlines()
@@ -110,6 +120,7 @@ class TestDeclaredFiles(EvidenceRunnerCase):
                 self.assertIn(missing, result.stderr)
                 self.assertFalse((self.out / "manifest.sha256").exists())
                 shutil.rmtree(self.out)
+                self.exit_file().unlink()
 
     def test_a_capture_whose_names_exceed_arg_max_still_gets_its_manifest(self) -> None:
         """A capture of thousands of files must not fail at the manifest and lose the measurement."""
@@ -186,10 +197,98 @@ class TestSparseClone(EvidenceRunnerCase):
         ).stdout.strip()
         self.assertEqual(head, self.head)
 
+    def test_the_clone_copies_no_hook_templates(self) -> None:
+        """A sandbox denies writes under .git/hooks, so the clone must not copy a template's hooks."""
+        template = Path(self._tmp.name) / "template"
+        (template / "hooks").mkdir(parents=True)
+        (template / "hooks" / "pre-commit.sample").write_text("#!/bin/sh\n", encoding="utf-8")
+        result = self.run_steps(f'export GIT_TEMPLATE_DIR="{template}"\nsparse_clone clone\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hooks = self.out / "clone" / ".git" / "hooks"
+        self.assertEqual(list(hooks.iterdir()) if hooks.exists() else [], [])
+
     def test_a_clone_that_cannot_be_made_stops_the_runner(self) -> None:
         result = self.run_steps('mkdir "$OUT/clone" && echo x > "$OUT/clone/f"\nsparse_clone clone\n')
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("clone", result.stderr)
+
+
+class TestStepNames(EvidenceRunnerCase):
+    def test_a_steps_own_variables_survive_the_helpers(self) -> None:
+        """POSIX sh has no locals: a step's loop over f, with t and got set, must not be clobbered."""
+        result = self.run_steps(
+            "t=mine\n"
+            "got=mine\n"
+            "for f in a b; do\n"
+            '  expect "extra-$f.txt"\n'
+            '  measure "$f.log" "$f.status" echo "$f"\n'
+            "  require a.status 0\n"
+            '  echo "$f $t $got" >> "$OUT/seen.txt"\n'
+            "done\n"
+            "expect seen.txt\n"
+            'for n in a b; do echo x > "$OUT/extra-$n.txt"; done\n'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.out / "seen.txt").read_text(encoding="utf-8"), "a mine mine\nb mine mine\n")
+
+
+class TestExitRecord(EvidenceRunnerCase):
+    def test_a_successful_run_records_zero_beside_the_output(self) -> None:
+        result = self.run_steps("measure a.log a.status echo hello\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.exit_file().read_text(encoding="utf-8"), "0\n")
+        self.assertNotIn(self.exit_file().name, self.manifest_names())
+        self.assertFalse(self.exit_file().with_suffix(".exit.tmp").exists())
+
+    def test_a_failure_after_the_reservation_records_two(self) -> None:
+        result = self.run_steps("require nothing.status\n")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.exit_file().read_text(encoding="utf-8"), "2\n")
+
+    def test_a_refused_second_run_leaves_the_first_record_alone(self) -> None:
+        self.assertEqual(self.run_steps("measure a.log a.status echo hello\n").returncode, 0)
+        second = self.run_steps("measure a.log a.status echo hello\n")
+        self.assertEqual(second.returncode, 2, second.stderr)
+        self.assertIn("already exists", second.stderr)
+        self.assertEqual(self.exit_file().read_text(encoding="utf-8"), "0\n")
+
+    def test_a_pre_existing_record_refuses_the_run_before_the_reservation(self) -> None:
+        self.exit_file().parent.mkdir()
+        self.exit_file().write_text("7\n", encoding="utf-8")
+        result = self.run_steps("measure a.log a.status echo hello\n")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(f"{self.exit_file().relative_to(self.repo)} already exists", result.stderr)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.exit_file().read_text(encoding="utf-8"), "7\n")
+
+    def test_a_run_killed_by_a_signal_does_not_record_zero(self) -> None:
+        """Under macOS /bin/sh the EXIT trap after SIGTERM sees the status of the last completed command, 0;
+        dash runs no EXIT trap on a signal and writes no record. Either way, never 0."""
+        self.install_steps("measure a.log a.status sh -c 'echo up; exec sleep 60'\n")
+        runner = subprocess.Popen(
+            ["sh", "run.sh"],
+            cwd=self.repo,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            log = self.out / "a.log"
+            deadline = time.monotonic() + 30
+            while not (log.exists() and log.read_text(encoding="utf-8")):  # the step is running
+                self.assertLess(time.monotonic(), deadline, "the step never started")
+                time.sleep(0.05)
+            os.kill(runner.pid, signal.SIGTERM)
+            runner.wait(timeout=30)
+        finally:
+            try:
+                os.killpg(runner.pid, signal.SIGKILL)  # the orphaned sleep
+            except ProcessLookupError:
+                pass
+        if sys.platform == "darwin":  # /bin/sh is bash there, which runs the trap
+            self.assertTrue(self.exit_file().exists())
+        if self.exit_file().exists():
+            self.assertEqual(self.exit_file().read_text(encoding="utf-8"), "2\n")
 
 
 @unittest.skipUnless(shutil.which("shellcheck"), "shellcheck is not installed")

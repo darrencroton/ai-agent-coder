@@ -8,10 +8,10 @@ product files may go in `files`, and the carry-forward of the last reported
 round's report and the CM's dispositions), launches it, and records the
 round under `<node dir>/reviews/round-<N>/`, a directory never reused.
 
-It decides nothing. The `RESULT:` line it prints is the reviewer's, quoted;
-the clean-or-revise reading, whether a finding is right, and the dispositions
-written for the next round are the CM's judgement (VISION principle 2). What
-it does check is the evidence shape it hands back: a round whose delegate
+It decides nothing. The `RESULT:` line it prints is the reviewer's, quoted (less Markdown
+emphasis); the clean-or-revise reading, whether a finding is right, and the
+dispositions written for the next round are the CM's judgement (VISION
+principle 2). What it does check is the evidence shape it hands back: a round whose delegate
 failed, timed out, broke its `SECTION:` contract, or returned an empty report
 or one without exactly one `RESULT: clean` or `RESULT: revise` line before
 its first `SECTION:` is an error, so a broken round can never read as a
@@ -64,24 +64,31 @@ _TAIL_CHARS = 2000
 _DECISION_HEADING_RE = re.compile(r"^## D(\d+):", re.MULTILINE)
 _LEVEL2_HEADING_RE = re.compile(r"^## ", re.MULTILINE)
 _DECISION_CITE_RE = re.compile(r"\bD(\d+)\b")
-_RESULT_RE = re.compile(r"^RESULT: (clean|revise)\b")
+_RESULT_RE = re.compile(r"^RESULT: (clean|revise)(?=[.;]?(?:\s|$))")
+# The orchestrator's section rule (skills/orchestrator/scripts/delegate_jobs.py SECTION_RE), applied to an
+# emphasis-free, stripped line: a `# SECTION:` heading ends the head as a plain one does.
+_SECTION_RE = re.compile(r"^(?:#+\s*)?SECTION:")
+_EMPHASIS = str.maketrans("", "", "*_`")
 # The orchestrator's label shape allows only lowercase letters, digits and
 # hyphens in each part.
 _LABEL_UNSAFE_RE = re.compile(r"[^a-z0-9]+")
 
 
 def _result_line(report: str) -> str:
-    """The report's `RESULT: clean|revise` line, stripped, or "".
+    """The report's `RESULT: clean|revise` line, stripped of emphasis, or "".
 
-    Only lines before the first `SECTION:` are read, so a status sentence
-    ahead of the result line is passed over and a result quoted inside the
-    findings never counts. Fail closed: exactly one line there may start with
+    Markdown emphasis and code markers (`*`, `_`, backtick) are dropped from
+    every line first: reviewers bold the result (`**RESULT: revise**`), and a
+    literal reading would fail the round for what is plainly a result. Only
+    lines before the first `SECTION:` (or `# SECTION:`) are read, so a status sentence ahead of
+    the result line is passed over and a result quoted inside the findings
+    never counts. Fail closed: exactly one line there may start with
     `RESULT:`, and it must be `clean` or `revise`.
     """
     head = []
     for raw in report.splitlines():
-        line = raw.strip()
-        if line.startswith("SECTION:"):
+        line = raw.translate(_EMPHASIS).strip()
+        if _SECTION_RE.match(line):
             break
         head.append(line)
     results = [line for line in head if line.startswith("RESULT:")]

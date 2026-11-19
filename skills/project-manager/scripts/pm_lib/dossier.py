@@ -6,7 +6,8 @@ same facts would be a second source of truth. What a tool can own without one
 is the part a hand edit gets wrong: the next `D<n>`/`E<n>` number, the UTC
 `At` stamp, and the `Head SHA` cell of a node row. Everything else (a row's
 status, the objective, the prose of an entry) is the CM's to write and is never
-touched here.
+touched here. `counts` only reads, and prints the numbers a findings report
+quotes about the campaign's own record.
 
 Each command is idempotent so a CM that dies after the write and repeats the
 command records nothing twice. The parsing is deliberately plain regexes on
@@ -16,7 +17,9 @@ headings and table rows; the layout it reads is the one
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import PmError
@@ -35,6 +38,9 @@ _NODES_HEADING_RE = re.compile(r"^## Nodes[ \t\r]*$", re.MULTILINE)
 _SEPARATOR_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 # A pipe the Markdown has not escaped: the template's `change \| evidence` is one cell.
 _PIPE_RE = re.compile(r"(?<!\\)\|")
+# The template's three node kinds, and the one open or archived CM question file name.
+_KINDS = ("change", "evidence", "task")
+_QUESTION_RE = re.compile(r"cm-question(-\d+)?\.md")
 
 
 def add_decision(
@@ -189,3 +195,209 @@ def _tables(lines: list[str]) -> list[tuple[int, int]]:
             tables.append((index, end))
         index = end + 1
     return tables
+
+
+def counts(dossier: Path, *, repo: Path | None = None, diff: str | None = None) -> list[str]:
+    """The campaign's countable record as fixed, sorted output lines.
+
+    Reads only what the toolkit writes or defines: `work.md`'s Nodes table,
+    each `nodes/<node>/reviews/round-<N>/status.json`, each archived child run
+    `validation/<node>/state/<run>/` (`run.json` and `events.jsonl`: the
+    controller's own state, not its Markdown report), the open
+    `validation/<node>/campaign/cm-question.md` and archived
+    `cm-question-<N>.md` and, with `repo` and `diff` (a `BASE..HEAD` range of
+    two revisions), `git diff --numstat` of the range. A review round with no
+    `status.json` (a `review-plan` that failed or was killed) and a run with
+    no timestamped event are counted and shown `untimed`, and left out of the
+    time totals. Anything else unreadable or malformed raises PmError naming
+    the file: a count is never a silent zero. Diff files with line counts are
+    the text files; a binary file has none and is counted on its own line.
+    """
+    lines: list[str] = []
+
+    kinds: dict[str, int] = {}
+    for kind in _node_kinds(dossier / "work.md"):
+        kinds[kind] = kinds.get(kind, 0) + 1
+    lines.append(f"nodes total {sum(kinds.values())}")
+    lines.extend(f"nodes kind {kind} {kinds[kind]}" for kind in sorted(kinds))
+
+    rounds = total = untimed_total = 0
+    for reviews in sorted((dossier / "nodes").glob("*/reviews")):
+        round_dirs = [path for path in reviews.glob("round-*") if path.is_dir()]
+        timed = [seconds for path in round_dirs if (seconds := _round_seconds(path / "status.json")) is not None]
+        untimed = len(round_dirs) - len(timed)
+        rounds, total, untimed_total = rounds + len(round_dirs), total + sum(timed), untimed_total + untimed
+        lines.append(f"review rounds {reviews.parent.name} {len(round_dirs)} {_duration(sum(timed))} untimed {untimed}")
+    lines.append(f"review rounds total {rounds} {_duration(total)} untimed {untimed_total}")
+
+    by_status: dict[str, int] = {}
+    runs = steers = total = untimed_total = 0
+    for run_dir in sorted((dossier / "validation").glob("*/state/*")):
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            continue
+        status, stop, seconds, run_steers = _run_state(run_dir)
+        by_status[status] = by_status.get(status, 0) + 1
+        runs, steers, total = runs + 1, steers + run_steers, total + (seconds or 0)
+        untimed_total += seconds is None
+        lines.append(
+            f"run {run_dir.parts[-3]} {run_dir.name} status {status} steers/relaunches {run_steers} "
+            f"{'untimed' if seconds is None else _duration(seconds)} stop {stop}"
+        )
+    lines.append(f"runs total {runs} steers/relaunches {steers} {_duration(total)} untimed {untimed_total}")
+    lines.extend(f"runs status {status} {by_status[status]}" for status in sorted(by_status))
+
+    questions: dict[str, int] = {}
+    for path in (dossier / "validation").glob("*/campaign/cm-question*.md"):
+        if _QUESTION_RE.fullmatch(path.name) and path.is_file():
+            questions[path.parts[-3]] = questions.get(path.parts[-3], 0) + 1
+    lines.extend(f"cm questions {node} {questions[node]}" for node in sorted(questions))
+    lines.append(f"cm questions total {sum(questions.values())}")
+
+    if repo is not None and diff is not None:
+        lines.extend(_diff_counts(repo, diff))
+    return lines
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PmError(f"cannot read {path}: {exc}") from exc
+
+
+def _duration(seconds: int) -> str:
+    hours, remainder = divmod(seconds, 3600)
+    return f"seconds {seconds} = {hours}h {remainder // 60}m {remainder % 60}s"
+
+
+def _node_kinds(path: Path) -> list[str]:
+    """The Kind cell of every row of `work.md`'s Nodes table, which needs Id and Kind columns.
+
+    A Kind outside the template's three and an Id that two rows share are
+    refused: the counts would otherwise quote a typo or a repeated node.
+    """
+    text = _read(path)
+    heading = _NODES_HEADING_RE.search(text)
+    if heading is None:
+        raise PmError(f"{path} has no '## Nodes' heading")
+    following = _HEADING_RE.search(text, heading.end())
+    lines = text[heading.end() : following.start() if following else len(text)].splitlines()
+    tables = [table for table in _tables(lines) if {"Id", "Kind"} <= {cell.strip() for cell in _cells(lines[table[0]])}]
+    if len(tables) != 1:
+        raise PmError(f"{path}: the '## Nodes' section needs exactly one table with Id and Kind columns")
+    first, last = tables[0]
+    header = [cell.strip() for cell in _cells(lines[first])]
+    id_column, kind_column = header.index("Id"), header.index("Kind")
+    kinds, ids = [], set()
+    for line in lines[first + 2 : last + 1]:
+        cells = _cells(line)
+        if len(cells) <= max(id_column, kind_column) or not cells[id_column].strip() or not cells[kind_column].strip():
+            raise PmError(f"{path}: a Nodes row has no Id or Kind: {line.strip()!r}")
+        node, kind = cells[id_column].strip(), cells[kind_column].strip()
+        if kind not in _KINDS:
+            raise PmError(f"{path}: node {node!r} has Kind {kind!r}, not one of {', '.join(_KINDS)}")
+        if node in ids:
+            raise PmError(f"{path}: two Nodes rows have the Id {node!r}")
+        ids.add(node)
+        kinds.append(kind)
+    return kinds
+
+
+def _utc(path: Path, stamp: object) -> datetime:
+    try:
+        return datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise PmError(f"{path}: {stamp!r} is not a YYYY-MM-DDTHH:MM:SSZ timestamp") from None
+
+
+def _round_seconds(path: Path) -> int | None:
+    """Seconds between `started_at` and `finished_at` in a review round's `status.json`, or None when it has none.
+
+    A round directory without the file, or a file whose `finished_at` is null, is what a
+    `review-plan` that failed or was interrupted leaves (`plan_review` treats it as a round);
+    a file that cannot be read, or a timestamp that is not one, is refused.
+    """
+    if not path.exists():
+        return None
+    try:
+        status = json.loads(_read(path))
+    except ValueError as exc:
+        raise PmError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(status, dict):
+        raise PmError(f"{path} is not a JSON object")
+    if status.get("finished_at") is None:
+        return None
+    seconds = int((_utc(path, status.get("finished_at")) - _utc(path, status.get("started_at"))).total_seconds())
+    if seconds < 0:
+        raise PmError(f"{path}: finished_at is before started_at")
+    return seconds
+
+
+def _run_state(run_dir: Path) -> tuple[str, str, int | None, int]:
+    """(status, stop reason, seconds or None, steers/relaunches) of an archived child run.
+
+    Read from the controller's `run.json` and `events.jsonl`: the same figures
+    `render_run_report` prints, without the Markdown table, whose cells a `|`
+    in a slice title or decision shifts. Seconds span the first to the last
+    parseable event timestamp, rounded as `state.run_elapsed` does, and are
+    None when no event carries one.
+    """
+    path = run_dir / "run.json"
+    try:
+        data = json.loads(_read(path))
+    except ValueError as exc:
+        raise PmError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict) or "status" not in data or not isinstance(data.get("slices"), list):
+        raise PmError(f"{path} is not a JSON object with a status and a slices list")
+    attempts = [entry.get("attempts", 0) if isinstance(entry, dict) else None for entry in data["slices"]]
+    if not all(isinstance(count, int) and not isinstance(count, bool) for count in attempts):
+        raise PmError(f"{path}: a slice has no integer attempts")
+    try:
+        events = state_mod.read_events(run_dir)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise PmError(f"cannot read {run_dir / 'events.jsonl'}: {exc}") from exc
+    stamps = [stamp for event in events if (stamp := state_mod.parse_event_ts(event.get("ts"))) is not None]
+    seconds = int(round((max(stamps) - min(stamps)).total_seconds())) if stamps else None
+    return str(data["status"]), str(data.get("stop_reason")), seconds, sum(attempts)
+
+
+def _diff_counts(repo: Path, diff: str) -> list[str]:
+    """Totals and per-extension counts of `git diff --numstat` of a `BASE..HEAD` range, a rename shown as a delete and an add.
+
+    The range is two revisions, each resolved to a commit before git sees it, so a single
+    revision (which would count the working tree) or an option-shaped value is refused.
+    """
+    base, dots, head = diff.partition("..")
+    if not dots or not base or not head or base.startswith("-") or head.startswith("-"):
+        raise PmError(f"--diff must be BASE..HEAD, two revisions that do not start with '-', not {diff!r}")
+    ids = []
+    for endpoint in (base, head):
+        try:
+            ids.append(git_ops.git(repo, "rev-parse", "--verify", "--end-of-options", f"{endpoint}^{{commit}}"))
+        except PmError as exc:
+            raise PmError(f"--diff endpoint {endpoint!r} is not a commit in {repo}: {exc}") from exc
+    raw = git_ops.git_bytes(repo, "diff", "--numstat", "-z", "--no-renames", *ids)
+    if raw is None:
+        raise PmError(f"git diff --numstat {ids[0]} {ids[1]} failed in {repo}")
+    files = added = deleted = binary = 0
+    by_extension: dict[str, list[int]] = {}
+    for record in raw.decode("utf-8", errors="surrogateescape").split("\0")[:-1]:
+        plus, minus, name = (record.split("\t", 2) + ["", ""])[:3]
+        if plus == minus == "-":
+            binary += 1
+            continue
+        if not (plus.isdigit() and minus.isdigit() and name):
+            raise PmError(f"git diff --numstat {diff} gave an unreadable record: {record!r}")
+        row = by_extension.setdefault(Path(name).suffix or "(none)", [0, 0, 0])
+        row[0] += 1
+        row[1] += int(plus)
+        row[2] += int(minus)
+        files, added, deleted = files + 1, added + int(plus), deleted + int(minus)
+    return [
+        f"diff files {files} added {added} deleted {deleted}",
+        *(
+            f"diff extension {ext} files {row[0]} added {row[1]} deleted {row[2]}"
+            for ext, row in sorted(by_extension.items())
+        ),
+        f"diff binary files {binary}",
+    ]

@@ -12,8 +12,9 @@ are the ones `references/dossier-template.md` shows.
 Owner mode (`owner=True`, `--owner`) is the owner's pre-launch reading of the
 same checks. What is merely not done yet (the dossier's repository and first
 commit, its changed owner files, the integration branch and checkout, the
-node worktree parent and the results root) is a `todo`, a `Check` that
-carries the action `--commit` runs, instead of a failure; the checks that
+node worktree parent and the results root, and `gc.packRefs false` when a
+sandbox is pinned) is a `todo`, a `Check` that carries the action `--commit`
+runs, instead of a failure; the checks that
 read the integration head read the pinned base while the branch is absent;
 and an uncommitted owner file does not put the owner's files in doubt. Every
 other check, and every check without `owner`, is as strict as ever, and the
@@ -221,6 +222,10 @@ def _make_directory(path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise PmError(f"could not create {path}: {exc}") from exc
+
+
+def _disable_ref_packing(repo: Path) -> None:
+    git_ops.git(repo, "config", "gc.packRefs", "false")
 
 
 def _commit_owner_files(dossier: Path, files: list[str] | None) -> None:
@@ -765,6 +770,25 @@ def campaign_preflight(
             ok(f"srt {sandbox.srt_version()} on PATH")
         except PmError as exc:
             fail("srt on PATH", f"{exc}; the brief pins a sandbox, and launch-child refuses it without srt")
+        # A sandboxed child in a linked worktree may write only the literal files of its own
+        # branch ref. A ref pack (host-side `git gc`) prunes the empty `refs/heads/<…>/` directory
+        # that ref needs, and the child's next commit then fails; the repository's config is
+        # shared by every worktree, so one setting covers the campaign. It does not stop an explicit
+        # `git pack-refs` or a `git maintenance` pack-refs task.
+        name = f"gc.packRefs is false in {repo}"
+        action = f"git -C {repo} config gc.packRefs false"
+        if git_ops.git_result(repo, "config", "--type=bool", "--get", "gc.packRefs")[1].strip() == "false":
+            ok(name)
+        elif owner:
+            checks.append(
+                todo(
+                    name,
+                    f"{action} (a ref pack removes the directory a sandboxed child's branch ref needs)",
+                    partial(_disable_ref_packing, repo),
+                )
+            )
+        else:
+            fail(name, f"{action}; a ref pack removes the directory a sandboxed child's branch ref needs")
     for harness in harnesses:
         ok(f"harness {harness} on PATH") if shutil.which(harness) else fail(
             f"harness {harness} on PATH", "install it or change the seats"

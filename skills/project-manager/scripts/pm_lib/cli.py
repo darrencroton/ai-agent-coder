@@ -496,6 +496,13 @@ def build_parser() -> argparse.ArgumentParser:
     set_head.add_argument("--dossier", required=True, metavar="PATH", help="the dossier repository")
     set_head.add_argument("--node", required=True, help="the row's Id")
     set_head.add_argument("--head", required=True, help="the node branch head, a full 40-hex SHA")
+    counts = dossier_commands.add_parser(
+        "counts",
+        help="Print the campaign record's counts (nodes, plan-review rounds, child runs, questions, change size)",
+    )
+    counts.add_argument("--dossier", required=True, metavar="PATH", help="the dossier repository")
+    counts.add_argument("--repo", metavar="PATH", help="with --diff: the product repository the range is read in")
+    counts.add_argument("--diff", metavar="BASE..HEAD", help="with --repo: the range whose change size is counted")
 
     # Reads only the ledger directory: no run, no token, so the post-command
     # ledger hook never fires for it.
@@ -1736,6 +1743,11 @@ def _run_dossier(args: argparse.Namespace) -> int:
             uncertainty=args.uncertainty,
         )
         print(f"E{number}: {'recorded' if new else 'already recorded'}")
+    elif args.dossier_command == "counts":
+        if (args.repo is None) != (args.diff is None):
+            raise PmError("--repo and --diff go together")
+        for line in dossier_mod.counts(dossier, repo=Path(args.repo) if args.repo else None, diff=args.diff):
+            print(line)
     else:
         if dossier_mod.set_head(dossier, node=args.node, head=args.head):
             print(f"head SHA set for {args.node}")

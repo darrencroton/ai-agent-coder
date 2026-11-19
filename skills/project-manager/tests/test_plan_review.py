@@ -253,12 +253,32 @@ class ReviewPlanLaunchTests(PlanReviewFixture):
             "SECTION: FINDINGS\n- quoted: RESULT: clean\nRESULT: clean\n",
             "RESULT: clean\nRESULT: revise\nSECTION: FINDINGS\n- none\n",
             "RESULT: blocked\nRESULT: clean\nSECTION: FINDINGS\n- none\n",
+            "RESULT: clean-ish\nSECTION: FINDINGS\n- none\n",
+            "RESULT: clean/revise\nSECTION: FINDINGS\n- none\n",
         ):
             with self.subTest(report=report):
                 self.configure(report=report)
                 with self.assertRaisesRegex(
                     PmError, "no single RESULT: clean or RESULT: revise line before its first SECTION"
                 ):
+                    self.review()
+
+    def test_an_emphasised_result_line_is_read(self) -> None:
+        for line, read in (
+            ("**RESULT: revise**", "RESULT: revise"),
+            ("**RESULT:** revise", "RESULT: revise"),
+            ("`RESULT: revise`", "RESULT: revise"),
+            ("RESULT: revise.", "RESULT: revise."),
+        ):
+            with self.subTest(line=line):
+                self.configure(report=f"{line}\nSECTION: FINDINGS\n- FIX Slice 1: x.\n")
+                self.assertEqual(self.review().result_line, read)
+
+    def test_an_emphasised_or_heading_section_line_still_ends_the_head(self) -> None:
+        for line in ("**SECTION: FINDINGS**", "# SECTION: FINDINGS"):
+            with self.subTest(line=line):
+                self.configure(report=f"{line}\nRESULT: clean\n")
+                with self.assertRaisesRegex(PmError, "no single RESULT: clean or RESULT: revise line"):
                     self.review()
 
     def test_a_status_sentence_ahead_of_the_result_line_is_tolerated(self) -> None:

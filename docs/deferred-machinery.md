@@ -99,6 +99,30 @@ The reviews this document distils are the shakedown review (2026-10-25) and the 
 - **Revisit when:** a second campaign writes the same gate into its runner.
 - **History:** 2026-11-18 proposed (lab-families N13) and held.
 
+### `observe --wait` ignoring a `result.json` left from before a steer
+
+- **Proposed:** after a steer, `observe --wait` waits for a fresh `result.json` rather than returning at once on the previous one.
+- **Evidence:** lab-build E41: one child PM reported it in its HANDOFF.md and watched with its own loop instead; the CM did not reproduce it.
+- **Held because:** seen once, second-hand, with a workaround the child found unaided.
+- **Revisit when:** a second report, or one the CM reproduces.
+- **History:** 2026-11-19 proposed (lab-build E41) and held.
+
+### An evidence-node lens for the plan reviewer
+
+- **Proposed:** the plan-review request asks, for an evidence node, that every comparator has its good and bad control.
+- **Evidence:** lab-build E43 and D17: a clause survived six review rounds, and no round noticed that two comparators lacked controls.
+- **Held because:** the gaps were in what the value map was asked to cover, which *Trust before use* now scopes; a reviewer checklist would repeat that contract in a second home.
+- **Revisit when:** a campaign's value map was complete and plan review still passed an uncontrolled comparator.
+- **History:** 2026-11-19 proposed (lab-build E43) and held.
+
+### `launch-child` and `stop-child` options for the CM's per-node steps
+
+- **Proposed:** `launch-child` options for a worktree trust entry and the dossier snapshot, and a collect option on `stop-child` that copies a receipt's artifacts into `validation/<node>/`.
+- **Evidence:** lab-build E42: the CM repeated four small steps at every node launch and close (one, the ref-directory check, is answered by `campaign-preflight`'s `gc.packRefs` todo).
+- **Held because:** each is small, and their contents vary by campaign (which files a snapshot excludes, which artifacts a receipt hashes); the CM's own judgement is the cheaper home.
+- **Revisit when:** a missed step costs a node or a receipt.
+- **History:** 2026-11-19 proposed (lab-build E42) and held.
+
 ---
 
 ## Closed
@@ -190,8 +214,10 @@ Proposals that were first held or declined and later built when the evidence cha
 - **Declined 2026-10-25** (shakedown D1): product-shaped, and principle 9. The convention (a pinned dossier script, a steer edits the report only) plus a worked example was the proportionate cost.
 - **Built after the second shakedown** as the capture-only skeleton `references/evidence-runner.sh`, once the convention had settled and every runner was re-deriving the same provenance checks.
 - **Extended 2026-11-09** with the four additions sage26's ten runners all made (a sparse-clone step, `require`, per-stage declared files, the heredoc exception). The skeleton stays capture-only: it judges capture, never outcome.
+- **Fixed 2026-11-19** after lab-build (E31, E39, E40): the sparse clone copies no hook templates, which the sandbox denies; every variable the runner sets is `_ev_`-prefixed, so it cannot overwrite a step's own; and the runner records its own exit status in `$OUT.exit`.
 
 ### Dossier bookkeeping commands
 
 - **Declined 2026-10-25** in the form of a scripted table editor ("trim the table rather than add tooling").
 - **Built 2026-11-09** in the smallest form: `pm.py dossier add-decision`, `add-evidence` and `set-head`, which own only numbering and timestamps; the Markdown stays the source and a value a tool cannot know stays the CM's to write. sage26's 550 hand edits were the evidence.
+- **Extended 2026-11-19** with `dossier counts`, which counts the record a findings report quotes (child runs and their run times, plan-review rounds, child questions, a range's change size) from files the toolkit writes. lab-build's audit and value map found such counts uncontrolled one class at a time, and its CM had written the same counter for itself (E43).

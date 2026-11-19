@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -190,6 +192,121 @@ class DossierCliTests(DossierTestCase):
         code, out, err = self.run_cli(head[:-1] + ["abc"])
         self.assertEqual((code, out), (2, ""))
         self.assertIn("pm: error:", err)
+
+
+COUNTED_WORK = WORK.replace("| change \\| evidence |", "| evidence |")
+
+
+def _write_run(run_dir: Path, status: str, stop: str | None, attempts: list[int], stamps: list[str | None]) -> None:
+    """The `run.json` and `events.jsonl` of an archived child run; a None stamp is an event with no `ts`."""
+    run_dir.mkdir(parents=True)
+    slices = [{"id": f"s{n}", "title": "a | b", "attempts": count} for n, count in enumerate(attempts, 1)]
+    (run_dir / "run.json").write_text(json.dumps({"status": status, "stop_reason": stop, "slices": slices}))
+    events = [{"event": "e"} if stamp is None else {"event": "e", "ts": stamp} for stamp in stamps]
+    (run_dir / "events.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+
+
+class CountsTests(DossierTestCase):
+    def build(self) -> None:
+        """Node rows evidence and change; node a with two timed review rounds (90 s, 60 s) and one without a
+        status.json, b with one timed (10 s) and one whose finished_at is null (interrupted); child runs a/r1 (3 steers, 1h 2m 3s), a/r3 (no timestamped event)
+        and b/r2 (0 steers, 45 s); from a the open question and two archived ones."""
+        self.write_work(COUNTED_WORK)
+        for node, number, started, finished in (
+            ("a", 1, "2026-01-01T09:00:00Z", "2026-01-01T09:01:30Z"),
+            ("a", 2, "2026-01-01T09:05:00Z", "2026-01-01T09:06:00Z"),
+            ("a", 3, None, None),
+            ("b", 1, "2026-01-01T09:00:00Z", "2026-01-01T09:00:10Z"),
+            ("b", 2, "2026-01-01T09:10:00Z", None),
+        ):
+            rnd = self.dossier / "nodes" / node / "reviews" / f"round-{number}"
+            rnd.mkdir(parents=True)
+            if started:
+                (rnd / "status.json").write_text(json.dumps({"started_at": started, "finished_at": finished}))
+        validation = self.dossier / "validation"
+        _write_run(
+            validation / "a/state/r1",
+            "stopped",
+            "plan stop rule",
+            [2, 1],
+            ["2026-01-01T09:00:00Z", None, "2026-01-01T10:02:03Z"],
+        )
+        _write_run(validation / "a/state/r3", "stopped", "owner stop", [], [None])
+        _write_run(validation / "b/state/r2", "complete", None, [0], ["2026-01-01T09:00:00Z", "2026-01-01T09:00:45Z"])
+        (validation / "a/state/current").write_text("r3\n")
+        (validation / "a" / "campaign").mkdir()
+        for name in ("cm-question.md", "cm-question-1.md", "cm-question-2.md", "cm-answer-1.md", "cm-question-x.md"):
+            (validation / "a" / "campaign" / name).write_text("q\n")
+
+    def product_repo(self) -> Path:
+        """A repository whose BASE..HEAD range changes a.py (+2 -1), adds bé.py (+3) and Makefile (+1), and a binary."""
+        repo = Path(self._tmp.name) / "product"
+        repo.mkdir()
+
+        def git(*args: str) -> None:
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.email=t@example.invalid", "-c", "user.name=t", *args],
+                check=True,
+                capture_output=True,
+            )
+
+        git("init", "-q", "-b", "main")
+        (repo / "a.py").write_text("1\n2\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        (repo / "a.py").write_text("1\nA\nB\n")
+        (repo / "bé.py").write_text("x\ny\nz\n")
+        (repo / "Makefile").write_text("all:\n")
+        (repo / "img.bin").write_bytes(b"\x00\x01\x02")
+        git("add", "-A")
+        git("commit", "-q", "-m", "change")
+        return repo
+
+    def test_every_section_counts_what_the_fixture_holds(self) -> None:
+        self.build()
+        repo = self.product_repo()
+        code, out, err = self.run_cli(
+            ["dossier", "counts", "--dossier", str(self.dossier), "--repo", str(repo), "--diff", "HEAD~1..HEAD"]
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            "nodes total 2\n"
+            "nodes kind change 1\n"
+            "nodes kind evidence 1\n"
+            "review rounds a 3 seconds 150 = 0h 2m 30s untimed 1\n"
+            "review rounds b 2 seconds 10 = 0h 0m 10s untimed 1\n"
+            "review rounds total 5 seconds 160 = 0h 2m 40s untimed 2\n"
+            "run a r1 status stopped steers/relaunches 3 seconds 3723 = 1h 2m 3s stop plan stop rule\n"
+            "run a r3 status stopped steers/relaunches 0 untimed stop owner stop\n"
+            "run b r2 status complete steers/relaunches 0 seconds 45 = 0h 0m 45s stop None\n"
+            "runs total 3 steers/relaunches 3 seconds 3768 = 1h 2m 48s untimed 1\n"
+            "runs status complete 1\n"
+            "runs status stopped 2\n"
+            "cm questions a 3\n"
+            "cm questions total 3\n"
+            "diff files 3 added 6 deleted 1\n"
+            "diff extension (none) files 1 added 1 deleted 0\n"
+            "diff extension .py files 2 added 5 deleted 1\n"
+            "diff binary files 1\n",
+        )
+
+    def test_a_diff_that_is_not_a_two_revision_range_is_refused(self) -> None:
+        self.build()
+        repo = self.product_repo()
+        for diff in ("HEAD", "--output=x..HEAD"):
+            with self.subTest(diff=diff), self.assertRaisesRegex(PmError, "BASE..HEAD"):
+                dossier.counts(self.dossier, repo=repo, diff=diff)
+        self.assertFalse((repo / "x").exists())
+
+    def test_a_malformed_input_is_refused_naming_its_file(self) -> None:
+        self.write_work(COUNTED_WORK)
+        status = self.dossier / "nodes" / "a" / "reviews" / "round-1" / "status.json"
+        status.parent.mkdir(parents=True)
+        status.write_text(json.dumps({"started_at": "yesterday", "finished_at": "2026-01-01T09:00:10Z"}))
+        code, out, err = self.run_cli(["dossier", "counts", "--dossier", str(self.dossier)])
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn(str(status), err)
 
 
 if __name__ == "__main__":

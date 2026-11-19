@@ -497,6 +497,7 @@ class TestPreflightSandbox(PreflightTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.policy = minimal_base_policy()
+        self._git("config", "gc.packRefs", "false")  # the sound campaign; the ref-packing tests unset it
 
     def pin_sandbox(self, *, policy: dict | None = None, sha: str | None = None, section: str | None = None) -> None:
         """Write `sandbox.json` when `policy` is given, add a `## Sandbox` section to the brief (`section`, or a
@@ -511,7 +512,7 @@ class TestPreflightSandbox(PreflightTestCase):
         brief.write_text(brief.read_text(encoding="utf-8") + f"## Sandbox\n{section}\n", encoding="utf-8")
         self._commit_dossier()
 
-    def run_preflight(self, *, srt_present: bool = True) -> tuple[int, str]:
+    def run_preflight(self, *extra: str, srt_present: bool = True) -> tuple[int, str]:
         real_which = shutil.which
 
         def which(name: str, *args, **kwargs) -> str | None:
@@ -523,7 +524,7 @@ class TestPreflightSandbox(PreflightTestCase):
 
         argv = ["campaign-preflight", "--dossier", str(self.dossier), "--repo", str(self.repo)]
         with mock.patch.object(preflight.shutil, "which", side_effect=which):
-            code, out, err = self.run_cli(argv + ["--integration-branch", "integration/t"])
+            code, out, err = self.run_cli(argv + ["--integration-branch", "integration/t", *extra])
         self.assertEqual(err, "")
         return code, out
 
@@ -613,6 +614,34 @@ class TestPreflightSandbox(PreflightTestCase):
         code, out = self.run_preflight(srt_present=False)
         self.assertEqual(code, 1, out)
         self.assert_failed_with_instruction(out, "srt on PATH", "srt is required")
+
+    def test_ref_packing_must_be_off_when_a_policy_is_pinned(self) -> None:
+        """A ref pack prunes the directory a sandboxed child's branch ref needs: unset is a failure, and the owner's todo."""
+        repo = self.repo.resolve()
+        name = f"gc.packRefs is false in {repo}"
+        self.pin_sandbox(policy=self.policy)
+        code, out = self.run_preflight()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"ok    {name}\n", out)
+
+        self._git("config", "--unset", "gc.packRefs")
+        code, out = self.run_preflight()
+        self.assertEqual(code, 1, out)
+        self.assert_failed_with_instruction(out, name, f"git -C {repo} config gc.packRefs false")
+
+        code, out = self.run_preflight("--owner")
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"todo  {name}\n      -> --commit: git -C {repo} config gc.packRefs false", out)
+        code, out = self.run_preflight("--owner", "--commit")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self._git("config", "--get", "gc.packRefs").stdout.strip(), "false")
+        self.assertIn(f"ok    {name}\n", self.run_preflight()[1])
+
+    def test_ref_packing_is_not_checked_without_a_pinned_policy(self) -> None:
+        self._git("config", "--unset", "gc.packRefs")
+        code, out = self.run_preflight()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("ref packing", out)
 
     def test_a_changed_policy_fails_the_owner_file_check_and_a_malformed_section_fails(self) -> None:
         self.pin_sandbox(policy=self.policy)
