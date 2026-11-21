@@ -45,6 +45,7 @@ nodes/*/reviews/*/orchestrator/
 - Campaign base: `<integration branch's starting branch>` at `<SHA>`
 - Campaign toolkit: <checkout path> at `<commit>`
 - <reference>: <repository or path> at <SHA>
+- <method toolkit, if nodes load one>: <checkout path> at <commit>; the skills or reader briefs nodes may load (not checked by `campaign-preflight`: the CM reads them at this commit)
 - <owner script>: `<file>` in this dossier, SHA-256 `<digest of the file, from shasum -a 256>`, copied byte for byte into each node that runs it
 - Previous <what it pinned>: `<file>`, SHA-256 `<superseded digest>` (optional history of a re-pin; `campaign-preflight` checks every other pin line and skips an item that opens with `Previous`)
 

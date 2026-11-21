@@ -73,7 +73,7 @@ A node generated from a template the owner approved (the approval recorded in `d
 11. Ratchet: after a merge, run the cheap checks as an evidence node at the new integration head, through steps 3–10 (*Validation*).
 12. Update `work.md` *Now* and return to step 2. When every target has a passing receipt at the integration head, go to *Acceptance and retrospective*.
 
-A task node takes steps 2, 8 and 12 only: its prompt goes to the read-only delegate through `orchestrator` (for a plan review, the prompt is the `review-plan` request of step 4), and its findings go into `evidence.md`.
+A task node takes steps 2, 8 and 12 only: its prompt goes to the read-only delegate through `orchestrator` (for a plan review, the prompt is the `review-plan` request of step 4), and its findings go into `evidence.md`. The prompt may also be a reader brief from a method toolkit that `brief.md` pins (an independent challenge of a claim, or a check of a report's citations, say), read at its pin. The CM fills it as the toolkit's own rule for a commissioner outside its usual workspace says, gives the delegate what that rule asks for as for any task node (excerpts inline, or the dossier as the delegate's repository where the reader needs the whole of it), keeps the reader's whole report at a path the brief names and cites it from the evidence entry, and judges it like any task node's findings.
 
 The rules:
 
@@ -143,7 +143,7 @@ A question to the owner is recorded in `work.md` *Now* with the nodes it blocks,
 
 ## Acceptance and retrospective
 
-A campaign is accepted on a final evidence node at the final integration head, an independent audit run as a read-only task node on a model different from the CM's, and the owner's sign-off. The retrospective records:
+A campaign is accepted on a final evidence node at the final integration head, an independent audit run as a read-only task node on a model different from the CM's, and the owner's sign-off. The audit may ask for a read-only check of an input, not only re-read the receipts, and the CM runs it as a node. A findings report the targets ask for stays short, leaves listings in the receipts, and ends with a list of every file it cites. The retrospective records:
 
 - owner attention: when and for how long the owner was needed, harness stops (a classifier or permission refusal that needed the owner) included;
 - the questions asked, and whether each was necessary;
